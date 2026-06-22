@@ -1,0 +1,10 @@
+{
+  "name": "agentic-visual-spec",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Spec-driven, comment-in-browser editing for React/TSX surfaces — engine and CLI (skills live in a separate repo).",
+  "scripts": {
+    "test": "pnpm -r test"
+  }
+}

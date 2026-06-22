@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Visual Specs · by Uncle-Dev</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&display=swap" rel="stylesheet" />
+    <style>
+      * { box-sizing: border-box; }
+      html, body, #root { height: 100%; margin: 0; }
+      body { font-family: system-ui, sans-serif; color: #0f172a; }
+      .md { line-height: 1.7; }
+      .md h1 { font-size: 30px; margin: 24px 0 12px; }
+      .md h2 { font-size: 23px; margin: 22px 0 10px; padding-top: 6px; border-top: 1px solid #f1f5f9; }
+      .md h3 { font-size: 18px; margin: 18px 0 8px; }
+      .md p, .md li { font-size: 15px; }
+      .md code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+      .md pre { background: #f8fafc; color: #0f172a; padding: 12px 14px 12px 0; border: 1px solid #e2e8f0; border-radius: 8px; overflow: auto; counter-reset: ln; }
+      .md pre code { background: none; color: inherit; padding: 0; display: block; }
+      .md-line { display: block; white-space: pre; position: relative; padding-left: 3.6em; }
+      .md-line::before { counter-increment: ln; content: counter(ln); position: absolute; left: 0; width: 2.6em; text-align: right; color: #94a3b8; user-select: none; }
+      .md table { border-collapse: collapse; }
+      .md th, .md td { border: 1px solid #e2e8f0; padding: 6px 10px; font-size: 14px; }
+      .md blockquote { border-left: 3px solid #cbd5e1; margin: 0; padding-left: 14px; color: #475569; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/ui/main.tsx"></script>
+  </body>
+</html>
