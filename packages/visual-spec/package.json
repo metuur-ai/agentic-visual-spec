@@ -1,6 +1,6 @@
 {
   "name": "@metuur/visual-spec",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Browse any directory in the browser and comment on files, line ranges, and folders, then let an agent apply the comments.",
   "main": "./dist/index.js",
