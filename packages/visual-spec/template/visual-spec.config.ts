@@ -1,4 +1,4 @@
-import { defineConfig } from '@visual-spec/core/config';
+import { defineConfig } from 'visual-spec/config';
 
 export default defineConfig({
   surfacesDir: 'surfaces',

@@ -1,4 +1,4 @@
-import { InspectorProvider, useComments } from '@visual-spec/core/app';
+import { InspectorProvider, useComments } from '../core/app';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { FileTree } from './file-tree';
 import { GenericEditor } from './generic-editor';

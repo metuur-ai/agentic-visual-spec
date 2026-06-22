@@ -1,9 +1,9 @@
 import { isAbsolute, join } from 'node:path';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
-// Source import: pulls in the virtual-surfaces stub so `@visual-spec/core/app`
-// resolves cleanly during the static build (markdown mode has no TSX surfaces).
-import { visualSpecMarkdown } from '../core/src/vite/md-plugin';
+// Source import: pulls in the virtual-surfaces stub so the UI's `../core/app`
+// import resolves cleanly during the static build (markdown mode has no TSX surfaces).
+import { visualSpecMarkdown } from './core/vite/md-plugin';
 
 // `pnpm --filter visual-spec dev <dir>` sets VS_CONTENT_DIR to the specs folder
 // to serve in dev (see dev.mjs). For the static build it's unset → default 'content'.
@@ -18,5 +18,4 @@ const commentsFile = isAbsolute(contentDir)
 export default defineConfig({
   plugins: [react(), ...visualSpecMarkdown({ contentDir, commentsFile })],
   build: { outDir: 'dist/ui', emptyOutDir: true },
-  optimizeDeps: { exclude: ['@visual-spec/core'] },
 });

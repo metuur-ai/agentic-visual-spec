@@ -3,7 +3,7 @@
  * line range within a code/text file, an image, or a folder. (Markdown keeps its
  * own inspector-based panel in comment-panel.tsx.)
  */
-import { useComments } from '@visual-spec/core/app';
+import { useComments } from '../core/app';
 import { useState } from 'react';
 import type { LineSelection } from './code-view';
 import type { FileKind } from './use-tree';

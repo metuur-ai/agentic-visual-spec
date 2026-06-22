@@ -3,7 +3,7 @@
  * The InspectorProvider is supplied by App (so the header's inspector toggle
  * shares the same context); this renders the markdown surface + overlay + panel.
  */
-import { InspectOverlay, SelectionReporter, useMarkdownSource } from '@visual-spec/core/app';
+import { InspectOverlay, SelectionReporter, useMarkdownSource } from '../core/app';
 import { CommentPanel } from './comment-panel';
 import { MarkdownSurface } from './markdown-surface';
 import { toSurfaceId } from './md-path';

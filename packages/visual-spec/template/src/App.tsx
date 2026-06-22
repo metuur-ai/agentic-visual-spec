@@ -4,7 +4,7 @@ import {
   SelectionReporter,
   SurfaceHost,
   useSurfaceModule,
-} from '@visual-spec/core/app';
+} from 'visual-spec/app';
 import { useState } from 'react';
 
 const SURFACE_ID = 'example';

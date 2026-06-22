@@ -10,8 +10,8 @@
     "noUnusedParameters": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "types": ["node"],
+    "types": ["node", "vitest/globals", "vite/client"],
     "noEmit": true
   },
-  "include": ["src", "ui", "vite.config.ts"]
+  "include": ["src", "ui", "core", "vite.config.ts", "tsup.config.ts", "vitest.config.ts"]
 }

@@ -21,15 +21,15 @@ import { type IncomingMessage, type ServerResponse, createServer } from 'node:ht
 import { extname, join, normalize, resolve } from 'node:path';
 // Relative source imports into core — bundled at build time (esbuild), so the
 // shipped dist/cli.js carries this logic inline with no runtime dependency.
-import { mdSurfaceStore } from '../../core/src/vite/md-store';
-import { pickDirectoryNative } from '../../core/src/vite/native-pick';
-import type { SurfaceStore } from '../../core/src/vite/surface-store';
-import { type TreeStore, treeStore } from '../../core/src/vite/tree-store';
+import { mdSurfaceStore } from '../core/vite/md-store';
+import { pickDirectoryNative } from '../core/vite/native-pick';
+import type { SurfaceStore } from '../core/vite/surface-store';
+import { type TreeStore, treeStore } from '../core/vite/tree-store';
 import {
   type CommentDocStore,
   fileCommentStore,
   handleCommentsRequest,
-} from '../../core/src/vite/routes/comments';
+} from '../core/vite/routes/comments';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',

@@ -1,5 +1,5 @@
 import react from '@vitejs/plugin-react';
-import { visualSpec } from '@visual-spec/core/vite';
+import { visualSpec } from 'visual-spec/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({

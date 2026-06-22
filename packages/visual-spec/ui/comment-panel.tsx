@@ -1,4 +1,4 @@
-import { collectSection, headingBlockOf, useComments, useInspector } from '@visual-spec/core/app';
+import { collectSection, headingBlockOf, useComments, useInspector } from '../core/app';
 import { useState } from 'react';
 import { toPath } from './md-path';
 import { WorkflowSelect, loadWorkflow } from './workflow-select';

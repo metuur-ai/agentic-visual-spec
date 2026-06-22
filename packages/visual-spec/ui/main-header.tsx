@@ -1,4 +1,4 @@
-import { type CommentRecord, useComments, useInspector, useSpecsRoot } from '@visual-spec/core/app';
+import { type CommentRecord, useComments, useInspector, useSpecsRoot } from '../core/app';
 import { useEffect, useRef, useState } from 'react';
 
 function CommentIcon({ size = 14 }: { size?: number }) {
