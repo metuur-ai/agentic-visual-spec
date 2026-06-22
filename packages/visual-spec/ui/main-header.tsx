@@ -1,5 +1,6 @@
 import { type CommentRecord, useComments, useInspector, useSpecsRoot } from '../core/app';
 import { useEffect, useRef, useState } from 'react';
+import { HelpButton } from './help-page';
 
 function CommentIcon({ size = 14 }: { size?: number }) {
   return (
@@ -200,6 +201,7 @@ export function MainHeader({ file, onNavigate, withInspector = false }: { file: 
       <Brand file={file} />
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+        <HelpButton />
         {withInspector && <InspectorToggle />}
 
         {copied && <span style={toast}>✓ Copied</span>}
@@ -268,6 +270,9 @@ export function BrandHeader() {
   return (
     <header style={bar}>
       <Brand file="" />
+      <div style={{ flexShrink: 0 }}>
+        <HelpButton />
+      </div>
     </header>
   );
 }

@@ -1,6 +1,6 @@
 {
   "name": "@metuur/visual-spec",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Browse any directory in the browser and comment on files, line ranges, and folders, then let an agent apply the comments.",
   "main": "./dist/index.js",
@@ -9,13 +9,30 @@
     "visual-spec": "dist/cli.js"
   },
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-    "./config": { "types": "./dist/config.d.ts", "default": "./dist/config.js" },
-    "./editing": { "types": "./dist/editing/index.d.ts", "default": "./dist/editing/index.js" },
-    "./app": { "types": "./dist/app/index.d.ts", "default": "./dist/app/index.js" },
-    "./vite": { "types": "./dist/vite/index.d.ts", "default": "./dist/vite/index.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "default": "./dist/config.js"
+    },
+    "./editing": {
+      "types": "./dist/editing/index.d.ts",
+      "default": "./dist/editing/index.js"
+    },
+    "./app": {
+      "types": "./dist/app/index.d.ts",
+      "default": "./dist/app/index.js"
+    },
+    "./vite": {
+      "types": "./dist/vite/index.d.ts",
+      "default": "./dist/vite/index.js"
+    }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup && vite build && node build.mjs",
     "build:lib": "tsup",
@@ -54,6 +71,6 @@
     "tsup": "^8.3.0",
     "typescript": "^5.5.0",
     "vite": "^6.0.0",
-    "vitest": "^2.0.0"
+    "vitest": "^4.1.9"
   }
 }

@@ -46,10 +46,10 @@ async function serve(args: string[]) {
 
   const { server, commentsPath } = createVisualSpecServer({ contentDir, uiDir: UI_DIR, port: requestedPort });
 
-  let port = requestedPort;
-  const MAX_TRIES = 20;
-
   server.on('listening', () => {
+    // The real bound port — differs from requestedPort after a port-0 fallback.
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : requestedPort;
     const url = `http://localhost:${port}`;
     console.log(`\n  visual-spec`);
     console.log(`  ➜  dir:      ${contentDir}`);
@@ -60,20 +60,22 @@ async function serve(args: string[]) {
 
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
-      // Honor an explicit --port (fail loudly); otherwise hop to the next free one.
-      if (explicitPort || port - requestedPort >= MAX_TRIES) {
-        console.error(`Port ${port} is already in use. Try a different --port.`);
+      // An explicit --port is a hard request → fail loudly. Otherwise the
+      // preferred port is taken, so let the OS hand us a guaranteed-free one
+      // (listen on 0) rather than colliding or guessing.
+      if (explicitPort) {
+        console.error(`Port ${requestedPort} is already in use. Try a different --port.`);
         process.exit(1);
       }
-      port += 1;
-      setTimeout(() => server.listen(port), 0);
+      console.warn(`Port ${requestedPort} is in use — falling back to a free port…`);
+      setTimeout(() => server.listen(0), 0);
       return;
     }
     console.error(`Server error: ${err.message}`);
     process.exit(1);
   });
 
-  server.listen(port);
+  server.listen(requestedPort);
 }
 
 async function init(args: string[]) {
