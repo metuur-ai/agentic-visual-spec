@@ -16,6 +16,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { extname, isAbsolute, join } from 'node:path';
 import type { Connect, Plugin } from 'vite';
 import { type CommentDocStore, fileCommentStore, handleCommentsRequest } from './routes/comments';
+import { serveApply } from './routes/apply';
 import { currentPlugin } from './current-plugin';
 import { mdSurfaceStore } from './md-store';
 import { pickDirectoryNative } from './native-pick';
@@ -180,6 +181,19 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
 
       server.middlewares.use('/__vs/comments', middleware((req, query, pathname, body) =>
         handleCommentsRequest(comments, req.method ?? 'GET', pathname, query, body)));
+
+      // Apply the open comments via `claude -p`, streaming progress over SSE.
+      // One run at a time — a concurrent claude would race on the same files.
+      let applying = false;
+      server.middlewares.use('/__vs/apply', (req, res, next) => {
+        const url = new URL(req.url ?? '', 'http://localhost');
+        if (url.pathname !== '/' && url.pathname !== '') return next();
+        if (applying) return sendJson(res, 409, { error: 'an apply is already running' });
+        applying = true;
+        void serveApply({ cwd: specsRoot, comments }, res).finally(() => {
+          applying = false;
+        });
+      });
 
       // Live-reload: when a .md file under the specs dir changes (it may live
       // outside the Vite root), ping the client to refetch the surface/list.

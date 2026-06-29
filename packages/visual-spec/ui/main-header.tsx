@@ -1,4 +1,4 @@
-import { type CommentRecord, useComments, useInspector, useSpecsRoot } from '../core/app';
+import { type CommentRecord, buildApplyPrompt, useComments, useInspector, useSpecsRoot } from '../core/app';
 import { useEffect, useRef, useState } from 'react';
 import { HelpButton } from './help-page';
 
@@ -132,30 +132,132 @@ function ChangeDirButton() {
   );
 }
 
-/** Build a paste-into-chat prompt from the collected comments (the "cart"). */
+/** Paste-into-chat variant: the shared prompt, with a placeholder header to fill in. */
 function buildPrompt(open: CommentRecord[]): string {
-  const lines: string[] = [];
-  lines.push('{{your skill/command/prompt}}');
-  lines.push('');
-  lines.push(`Apply ${open.length} review comment(s) I left in the visual-spec browser using the "apply-comments" skill.`);
-  lines.push('');
-  lines.push('Source of truth is visual-spec-comments.json. Take only status:"open" and GROUP BY workflow. For each comment, locate the target by SNIPPET (+ heading for markdown; the line number may have drifted, do not trust it blindly). For workflow "visual-spec", apply the change in place and keep the file well-formed; for any other workflow, hand the resolved comment to that workflow skill. Then set each handled comment\'s status to "applied" (audit trail — do not delete). Finish with a traceability table: id · workflow · target · what changed / handed off.');
-  lines.push('');
-  lines.push(`Comments (${open.length}):`);
-  open.forEach((c, i) => {
-    const t = c.target;
-    const isRange = t.endLine != null && t.endLine > (t.startLine ?? 0);
-    lines.push('');
-    lines.push(`${i + 1}. [${c.workflow}] ${t.kind === 'folder' ? 'Folder' : 'File'}: ${t.path}`);
-    if (t.kind !== 'folder') {
-      const where = t.startLine != null ? (isRange ? `lines ${t.startLine}–${t.endLine}` : `line ${t.startLine}`) : 'whole file';
-      lines.push(`   Where: ${t.heading ? `${t.heading} · ` : ''}${where}`);
-      if (t.snippet) lines.push(`   ${isRange ? 'From' : 'Context'}: "${t.snippet}"`);
-      if (isRange && t.endSnippet) lines.push(`   Through: "${t.endSnippet}"`);
+  return `{{your skill/command/prompt}}\n\n${buildApplyPrompt(open)}`;
+}
+
+type ApplyEvent =
+  | { type: 'start'; openCount: number }
+  | { type: 'log'; level: string; text: string }
+  | { type: 'done'; ok: boolean; applied: number; exitCode: number | null }
+  | { type: 'error'; message: string };
+
+/**
+ * Run the apply-comments skill on the server (`claude -p`) and stream progress.
+ * Consumes the SSE response via fetch streaming (not EventSource) so there is no
+ * auto-reconnect — a dropped connection must never silently re-spawn claude.
+ * On completion, refreshes both the comment cart and the rendered source.
+ */
+function ApplyButton({ openCount }: { openCount: number }) {
+  const [phase, setPhase] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const [logLines, setLogLines] = useState<string[]>([]);
+  const [summary, setSummary] = useState('');
+  const [open, setOpen] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const handle = (e: ApplyEvent) => {
+    if (e.type === 'start') setLogLines([`Applying ${e.openCount} comment(s)…`]);
+    else if (e.type === 'log') setLogLines((l) => [...l.slice(-300), e.text]);
+    else if (e.type === 'error') setLogLines((l) => [...l.slice(-300), `⚠ ${e.message}`]);
+    else if (e.type === 'done') {
+      setPhase(e.ok ? 'done' : 'error');
+      setSummary(e.ok ? `Applied ${e.applied} comment(s)` : `claude exited ${e.exitCode ?? '—'}`);
+      // The skill edited files + flipped statuses on disk; pull both fresh.
+      window.dispatchEvent(new CustomEvent('vs:comments-changed'));
+      window.dispatchEvent(new CustomEvent('vs:source-changed'));
     }
-    lines.push(`   Comment: ${c.comment}`);
-  });
-  return lines.join('\n');
+  };
+
+  const run = async () => {
+    if (phase === 'running' || openCount === 0) return;
+    setPhase('running');
+    setSummary('');
+    setLogLines(['Starting…']);
+    setOpen(true);
+    const ac = new AbortController();
+    abortRef.current = ac;
+    try {
+      const res = await fetch('/__vs/apply', { signal: ac.signal });
+      if (res.status === 409) {
+        setPhase('error');
+        setSummary('An apply is already running.');
+        return;
+      }
+      if (!res.ok || !res.body) throw new Error(`${res.status}`);
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let sep: number;
+        // biome-ignore lint/suspicious/noAssignInExpressions: SSE frame split
+        while ((sep = buf.indexOf('\n\n')) >= 0) {
+          const frame = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          const data = frame.split('\n').find((l) => l.startsWith('data:'));
+          if (data) handle(JSON.parse(data.slice(5).trim()) as ApplyEvent);
+        }
+      }
+      // Stream ended without a done frame (e.g. server crash).
+      setPhase((p) => (p === 'running' ? 'error' : p));
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') return;
+      setPhase('error');
+      setSummary((err as Error).message || 'Apply failed');
+    } finally {
+      abortRef.current = null;
+    }
+  };
+
+  const running = phase === 'running';
+  return (
+    <div style={{ position: 'relative' }}>
+      <button
+        type="button"
+        onClick={() => (logLines.length ? setOpen((v) => !v) : void run())}
+        disabled={openCount === 0 && phase === 'idle'}
+        title="Apply the open comments with claude (runs the apply-comments skill)"
+        style={{ ...applyBtn, opacity: openCount === 0 && phase === 'idle' ? 0.5 : 1 }}
+      >
+        {running ? <Spinner /> : '✨'} {running ? 'Applying…' : 'Apply'}
+      </button>
+      {open && logLines.length > 0 && (
+        <div style={applyPop}>
+          <div style={applyPopHead}>
+            <span style={{ fontWeight: 700 }}>
+              {running ? 'Applying comments' : phase === 'done' ? '✓ Done' : phase === 'error' ? '⚠ Stopped' : 'Apply'}
+            </span>
+            {!running && (
+              <button type="button" onClick={() => void run()} style={rerunBtn} title="Run again">
+                ↻ Run again
+              </button>
+            )}
+          </div>
+          {summary && <div style={{ fontSize: 12, color: phase === 'error' ? '#b91c1c' : '#15803d', padding: '0 10px 6px' }}>{summary}</div>}
+          <pre style={applyLog}>{logLines.join('\n')}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Spinner() {
+  return (
+    <span
+      style={{
+        display: 'inline-block',
+        width: 12,
+        height: 12,
+        border: '2px solid rgba(255,255,255,0.5)',
+        borderTopColor: 'white',
+        borderRadius: '50%',
+        animation: 'vs-spin 0.7s linear infinite',
+      }}
+    />
+  );
 }
 
 /** The inspector on/off toggle — only meaningful for markdown (needs InspectorProvider). */
@@ -227,11 +329,14 @@ export function MainHeader({ file, onNavigate, withInspector = false }: { file: 
           onClick={copy}
           disabled={open.length === 0}
           title="Copy a prompt for your agent to apply these comments"
-          style={{ ...primary, opacity: open.length === 0 ? 0.5 : 1 }}
+          style={{ ...secondary, opacity: open.length === 0 ? 0.5 : 1 }}
         >
           📋 Copy prompt
         </button>
+
+        <ApplyButton openCount={open.length} />
       </div>
+      <style>{'@keyframes vs-spin{to{transform:rotate(360deg)}}'}</style>
     </header>
   );
 }
@@ -330,7 +435,12 @@ const pathFile: React.CSSProperties = { font: '600 11.5px ui-monospace, "SF Mono
 const cart: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 5, background: '#f1f5f9', borderRadius: 99, padding: '3px 10px', fontSize: 13, color: '#475569' };
 const startBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 12px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#334155', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
 const startBtnActive: React.CSSProperties = { ...startBtn, border: '1px solid #2563eb', background: '#eff6ff', color: '#1d4ed8' };
-const primary: React.CSSProperties = { padding: '7px 14px', border: 'none', borderRadius: 8, background: '#7c3aed', color: 'white', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
+const secondary: React.CSSProperties = { padding: '7px 14px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#334155', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
+const applyBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 7, padding: '7px 14px', border: 'none', borderRadius: 8, background: '#7c3aed', color: 'white', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
+const applyPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc(100% + 6px)', width: 420, maxWidth: '80vw', background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 12px 40px rgba(0,0,0,0.16)', zIndex: 41, overflow: 'hidden' };
+const applyPopHead: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 10px', borderBottom: '1px solid #f1f5f9', fontSize: 13 };
+const rerunBtn: React.CSSProperties = { padding: '3px 8px', border: '1px solid #d1d5db', borderRadius: 6, background: 'white', color: '#475569', cursor: 'pointer', font: '12px system-ui', fontWeight: 600 };
+const applyLog: React.CSSProperties = { margin: 0, padding: '8px 10px', maxHeight: 280, overflow: 'auto', font: '11.5px ui-monospace, "SF Mono", monospace', color: '#334155', whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: '#fbfaff' };
 const toast: React.CSSProperties = { color: '#16a34a', fontWeight: 600, fontSize: 13 };
 const allPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc(100% + 6px)', width: 340, background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 12px 40px rgba(0,0,0,0.16)', padding: 10, zIndex: 41 };
 const allTitle: React.CSSProperties = { fontSize: 12, opacity: 0.6, padding: '2px 4px 8px', borderBottom: '1px solid #f1f5f9', marginBottom: 4 };

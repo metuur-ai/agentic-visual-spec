@@ -50,9 +50,16 @@ export function useMarkdownSource(surfaceId: string): { source: string; loading:
 
   useEffect(() => {
     refetch();
+    // Dev mode pings over HMR when a watched .md changes. The standalone server
+    // has no HMR, so the Apply button fires a window event after `claude -p`
+    // rewrites the file — listen for both.
     const hot = import.meta.hot;
     hot?.on('visual-spec:surface-changed', refetch);
-    return () => hot?.off('visual-spec:surface-changed', refetch);
+    window.addEventListener('vs:source-changed', refetch);
+    return () => {
+      hot?.off('visual-spec:surface-changed', refetch);
+      window.removeEventListener('vs:source-changed', refetch);
+    };
   }, [refetch]);
 
   return { source, loading };

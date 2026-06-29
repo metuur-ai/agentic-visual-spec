@@ -131,19 +131,41 @@ function Sidebar({ entries, current, loading, onPick, width }: { entries: TreeEn
 
   return (
     <nav style={{ ...sidebar, width }}>
-      <div style={{ padding: 12, borderBottom: '1px solid #e5e7eb', position: 'sticky', top: 0, background: 'white', zIndex: 1 }}>
+      <div style={{ padding: 12, borderBottom: '1px solid #e5e7eb', background: 'white', flexShrink: 0 }}>
         <div style={{ fontWeight: 700, marginBottom: 8 }}>
           Files <span style={{ opacity: 0.5, fontWeight: 400 }}>({fileCount})</span>
         </div>
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="filter…" style={filter} />
       </div>
-      <div style={{ padding: 8 }}>
+      <div style={{ padding: 8, flex: 1, overflow: 'auto' }}>
         {loading ? <div style={{ opacity: 0.6, padding: 8 }}>Loading…</div> : <FileTree entries={entries} current={current} filter={q} onPick={onPick} commentCounts={commentCounts} />}
       </div>
+      <SidebarFooter />
     </nav>
   );
 }
 
-const sidebar: React.CSSProperties = { height: '100%', flexShrink: 0, borderRight: '1px solid #e5e7eb', background: 'white', overflow: 'auto', font: '13px system-ui' };
+declare const __APP_VERSION__: string;
+
+/** A gentle, muted footer pinned to the bottom of the sidebar. */
+function SidebarFooter() {
+  return (
+    <footer style={footer}>
+      <div>© 2026 Visual Specs v{__APP_VERSION__}</div>
+      <div style={{ marginTop: 2 }}>
+        Made with <span style={{ color: '#ef4444' }}>❤</span> by{' '}
+        {/* <a href="https://github.com/javierhbr" target="_blank" rel="noreferrer" style={footerLink}>@javierhbr</a> */}
+        javierhbr
+      </div>
+      <a href="https://www.buymeacoffee.com/javierhbr" target="_blank" rel="noreferrer" style={{ ...footerLink, display: 'inline-block', marginTop: 4 }}>
+        ☕ Buy me a coffee
+      </a>
+    </footer>
+  );
+}
+
+const sidebar: React.CSSProperties = { height: '100%', flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid #e5e7eb', background: 'white', overflow: 'hidden', font: '13px system-ui' };
+const footer: React.CSSProperties = { flexShrink: 0, padding: '10px 12px', borderTop: '1px solid #f1f5f9', background: '#fbfaff', font: '11px system-ui', color: '#94a3b8', lineHeight: 1.5 };
+const footerLink: React.CSSProperties = { color: '#a78bca', textDecoration: 'none', fontWeight: 600 };
 const splitter: React.CSSProperties = { width: 6, flexShrink: 0, cursor: 'col-resize', background: 'transparent', transition: 'background 120ms', marginLeft: -3, zIndex: 5 };
 const filter: React.CSSProperties = { width: '100%', padding: '5px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: 'inherit' };

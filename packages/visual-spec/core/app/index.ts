@@ -8,6 +8,7 @@ export { useMarkdownSource, useSpecsRoot, useSurfaceList } from './lib/use-markd
 export { useComments } from './lib/use-comments';
 export type { NewComment, UseComments } from './lib/use-comments';
 export type { CommentRecord, CommentTarget, CommentTargetKind } from '../editing/comment-doc';
+export { buildApplyPrompt } from '../editing/apply-prompt';
 
 export { SurfaceHost } from './components/surface-host';
 export {

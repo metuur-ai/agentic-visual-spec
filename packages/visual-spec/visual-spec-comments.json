@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "comments": [
+    {
+      "id": "c-7a6d2ee1",
+      "workflow": "visual-spec",
+      "target": {
+        "path": "INSTALL.md",
+        "kind": "range",
+        "startLine": 8,
+        "snippet": "1. Build & pack (on this machine)",
+        "heading": "1. Build & pack (on this machine)"
+      },
+      "comment": "rename the title",
+      "status": "applied",
+      "ts": "2026-06-29T12:36:52.596Z"
+    }
+  ]
+}

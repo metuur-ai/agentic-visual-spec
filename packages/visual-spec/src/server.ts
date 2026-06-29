@@ -30,6 +30,7 @@ import {
   fileCommentStore,
   handleCommentsRequest,
 } from '../core/vite/routes/comments';
+import { serveApply } from '../core/vite/routes/apply';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -126,6 +127,9 @@ export function createVisualSpecServer(opts: ServeOptions) {
   let specsRoot = contentDir;
   let commentsPath = opts.commentsFile ?? join(contentDir, 'visual-spec-comments.json');
   let comments: CommentDocStore = fileCommentStore(commentsPath);
+  // One apply at a time: `claude -p` edits files on disk, so a concurrent run
+  // would race. A second request while one is in flight gets 409.
+  let applying = false;
 
   /** Re-root every store at a new directory (comments follow to <dir>/…json). */
   const setRoot = (dir: string) => {
@@ -202,6 +206,18 @@ export function createVisualSpecServer(opts: ServeOptions) {
           const query = Object.fromEntries(url.searchParams.entries());
           const r = await handleSource(surfaces, method, sub, query, specsRoot);
           return sendJson(res, r.status, r.json);
+        }
+
+        // Apply the open comments via `claude -p` and stream progress (SSE).
+        if (url.pathname === '/__vs/apply') {
+          if (applying) return sendJson(res, 409, { error: 'an apply is already running' });
+          applying = true;
+          try {
+            await serveApply({ cwd: contentDir, comments }, res);
+          } finally {
+            applying = false;
+          }
+          return;
         }
 
         if (url.pathname === '/__vs/comments' || url.pathname.startsWith('/__vs/comments/')) {
