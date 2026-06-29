@@ -1,5 +1,5 @@
 import { type CommentRecord, buildApplyPrompt, useComments, useInspector, useSpecsRoot } from '../core/app';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useReducer, useRef, useState } from 'react';
 import { HelpButton } from './help-page';
 
 function CommentIcon({ size = 14 }: { size?: number }) {
@@ -137,124 +137,214 @@ function buildPrompt(open: CommentRecord[]): string {
   return `{{your skill/command/prompt}}\n\n${buildApplyPrompt(open)}`;
 }
 
-type ApplyEvent =
-  | { type: 'start'; openCount: number }
-  | { type: 'log'; level: string; text: string }
-  | { type: 'done'; ok: boolean; applied: number; exitCode: number | null }
+// ---- Apply activity: a SHARED, server-side job. Every tab on the same
+// directory subscribes to /__vs/apply/events and watches the identical stream;
+// starting/cancelling is a separate POST. So two browsers see the same run.
+
+type ApplyLogKind = 'system' | 'tool' | 'assistant' | 'result' | 'error';
+type Row = { kind: ApplyLogKind; text?: string; tool?: string; target?: string };
+type ApplyFrame =
+  | { type: 'sync'; running: boolean; startedAt: number | null; events: ApplyFrame[] }
+  | { type: 'start'; openCount: number; startedAt: number }
+  | { type: 'log'; kind: ApplyLogKind; text?: string; tool?: string; target?: string }
+  | { type: 'done'; ok: boolean; applied: number; exitCode: number | null; cancelled?: boolean }
   | { type: 'error'; message: string };
 
-/**
- * Run the apply-comments skill on the server (`claude -p`) and stream progress.
- * Consumes the SSE response via fetch streaming (not EventSource) so there is no
- * auto-reconnect — a dropped connection must never silently re-spawn claude.
- * On completion, refreshes both the comment cart and the rendered source.
- */
+type ApplyPhase = 'idle' | 'running' | 'done' | 'error' | 'cancelled';
+type ApplyState = { phase: ApplyPhase; startedAt: number | null; rows: Row[]; summary: string };
+const APPLY_INIT: ApplyState = { phase: 'idle', startedAt: null, rows: [], summary: '' };
+const ROW_CAP = 400;
+
+function applyReduce(s: ApplyState, e: ApplyFrame): ApplyState {
+  switch (e.type) {
+    case 'sync': {
+      // Rebuild from a fresh snapshot — makes EventSource reconnects idempotent.
+      let st: ApplyState = { ...APPLY_INIT, startedAt: e.startedAt };
+      for (const ev of e.events) st = applyReduce(st, ev);
+      return e.running ? { ...st, phase: 'running' } : st;
+    }
+    case 'start':
+      return { phase: 'running', startedAt: e.startedAt, rows: [], summary: '' };
+    case 'log':
+      return { ...s, rows: [...s.rows.slice(-ROW_CAP), { kind: e.kind, text: e.text, tool: e.tool, target: e.target }] };
+    case 'error':
+      return { ...s, rows: [...s.rows.slice(-ROW_CAP), { kind: 'error', text: e.message }] };
+    case 'done':
+      return {
+        ...s,
+        phase: e.cancelled ? 'cancelled' : e.ok ? 'done' : 'error',
+        summary: e.cancelled
+          ? `Cancelled — ${e.applied} applied before stop`
+          : e.ok
+            ? `Applied ${e.applied} comment${e.applied === 1 ? '' : 's'}`
+            : `claude exited ${e.exitCode ?? '—'}`,
+      };
+    default:
+      return s;
+  }
+}
+
+const TOOL_GLYPH: Record<string, string> = {
+  Read: '⌖', Edit: '✎', Write: '✎', MultiEdit: '✎', NotebookEdit: '✎',
+  Bash: '⌘', Skill: '✦', Task: '⚇', Grep: '⌕', Glob: '⌕', TodoWrite: '☑', AskUserQuestion: '?',
+};
+const toolGlyph = (t?: string) => (t && TOOL_GLYPH[t]) || '▸';
+const kindGlyph = (k: ApplyLogKind) => (k === 'error' ? '!' : k === 'result' ? '✓' : '·');
+const basename = (p: string) => p.split(/[\\/]/).pop() || p;
+const fmtElapsed = (ms: number) => {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
+
+/** The Apply control: shared live activity feed + timer + cancel. */
 function ApplyButton({ openCount }: { openCount: number }) {
-  const [phase, setPhase] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
-  const [logLines, setLogLines] = useState<string[]>([]);
-  const [summary, setSummary] = useState('');
+  const [state, dispatch] = useReducer(applyReduce, APPLY_INIT);
   const [open, setOpen] = useState(false);
-  const abortRef = useRef<AbortController | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const feedRef = useRef<HTMLDivElement>(null);
 
-  const handle = (e: ApplyEvent) => {
-    if (e.type === 'start') setLogLines([`Applying ${e.openCount} comment(s)…`]);
-    else if (e.type === 'log') setLogLines((l) => [...l.slice(-300), e.text]);
-    else if (e.type === 'error') setLogLines((l) => [...l.slice(-300), `⚠ ${e.message}`]);
-    else if (e.type === 'done') {
-      setPhase(e.ok ? 'done' : 'error');
-      setSummary(e.ok ? `Applied ${e.applied} comment(s)` : `claude exited ${e.exitCode ?? '—'}`);
-      // The skill edited files + flipped statuses on disk; pull both fresh.
-      window.dispatchEvent(new CustomEvent('vs:comments-changed'));
-      window.dispatchEvent(new CustomEvent('vs:source-changed'));
-    }
-  };
+  // Always-on subscription — this is what makes activity shared across tabs.
+  useEffect(() => {
+    const es = new EventSource('/__vs/apply/events');
+    es.onmessage = (ev) => {
+      const frame = JSON.parse(ev.data) as ApplyFrame;
+      dispatch(frame);
+      // A live `done` (sync's done events are nested, never land here): the skill
+      // edited files + flipped statuses on disk — refresh the cart and the source.
+      if (frame.type === 'done') {
+        window.dispatchEvent(new CustomEvent('vs:comments-changed'));
+        window.dispatchEvent(new CustomEvent('vs:source-changed'));
+      }
+    };
+    return () => es.close();
+  }, []);
 
-  const run = async () => {
-    if (phase === 'running' || openCount === 0) return;
-    setPhase('running');
-    setSummary('');
-    setLogLines(['Starting…']);
+  const running = state.phase === 'running';
+
+  // Live timer. startedAt is server-authoritative, so every tab shows the same.
+  useEffect(() => {
+    if (!running || !state.startedAt) return;
+    const startedAt = state.startedAt;
+    const tick = () => setElapsed(Date.now() - startedAt);
+    tick();
+    const id = window.setInterval(tick, 250);
+    return () => window.clearInterval(id);
+  }, [running, state.startedAt]);
+
+  // Stick the feed to the newest row.
+  useEffect(() => {
+    if (open && feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
+  }, [state.rows.length, open]);
+
+  const start = () => {
+    if (running || openCount === 0) return;
     setOpen(true);
-    const ac = new AbortController();
-    abortRef.current = ac;
-    try {
-      const res = await fetch('/__vs/apply', { signal: ac.signal });
-      if (res.status === 409) {
-        setPhase('error');
-        setSummary('An apply is already running.');
-        return;
-      }
-      if (!res.ok || !res.body) throw new Error(`${res.status}`);
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let buf = '';
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let sep: number;
-        // biome-ignore lint/suspicious/noAssignInExpressions: SSE frame split
-        while ((sep = buf.indexOf('\n\n')) >= 0) {
-          const frame = buf.slice(0, sep);
-          buf = buf.slice(sep + 2);
-          const data = frame.split('\n').find((l) => l.startsWith('data:'));
-          if (data) handle(JSON.parse(data.slice(5).trim()) as ApplyEvent);
-        }
-      }
-      // Stream ended without a done frame (e.g. server crash).
-      setPhase((p) => (p === 'running' ? 'error' : p));
-    } catch (err) {
-      if ((err as Error).name === 'AbortError') return;
-      setPhase('error');
-      setSummary((err as Error).message || 'Apply failed');
-    } finally {
-      abortRef.current = null;
-    }
+    void fetch('/__vs/apply/start', { method: 'POST' }).catch(() => {}); // activity arrives via the stream
   };
+  const cancel = () => void fetch('/__vs/apply/cancel', { method: 'POST' }).catch(() => {});
+  const onButton = () => (running || state.rows.length ? setOpen((v) => !v) : start());
 
-  const running = phase === 'running';
+  const showPanel = open && (running || state.rows.length > 0 || !!state.summary);
+  const titles: Record<ApplyPhase, string> = { running: 'Applying comments', done: 'Done', cancelled: 'Cancelled', error: 'Stopped', idle: 'Apply' };
+  const title = titles[state.phase];
+
   return (
     <div style={{ position: 'relative' }}>
       <button
         type="button"
-        onClick={() => (logLines.length ? setOpen((v) => !v) : void run())}
-        disabled={openCount === 0 && phase === 'idle'}
+        onClick={onButton}
+        disabled={openCount === 0 && state.phase === 'idle'}
         title="Apply the open comments with claude (runs the apply-comments skill)"
-        style={{ ...applyBtn, opacity: openCount === 0 && phase === 'idle' ? 0.5 : 1 }}
+        style={{ ...applyBtn, opacity: openCount === 0 && state.phase === 'idle' ? 0.5 : 1 }}
       >
-        {running ? <Spinner /> : '✨'} {running ? 'Applying…' : 'Apply'}
+        {running ? <PulseDot /> : '✨'} {running ? `Applying · ${fmtElapsed(elapsed)}` : 'Apply'}
       </button>
-      {open && logLines.length > 0 && (
+      {showPanel && (
         <div style={applyPop}>
           <div style={applyPopHead}>
-            <span style={{ fontWeight: 700 }}>
-              {running ? 'Applying comments' : phase === 'done' ? '✓ Done' : phase === 'error' ? '⚠ Stopped' : 'Apply'}
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+              <StatusDot phase={state.phase} />
+              <span style={{ fontWeight: 700 }}>{title}</span>
+              {(running || state.startedAt) && <span style={timerPill}>{fmtElapsed(elapsed)}</span>}
             </span>
-            {!running && (
-              <button type="button" onClick={() => void run()} style={rerunBtn} title="Run again">
+            {running ? (
+              <button type="button" onClick={cancel} style={cancelBtn} title="Stop the run (kills claude)">
+                ■ Cancel
+              </button>
+            ) : (
+              <button type="button" onClick={start} disabled={openCount === 0} style={{ ...rerunBtn, opacity: openCount === 0 ? 0.5 : 1 }} title="Run again">
                 ↻ Run again
               </button>
             )}
           </div>
-          {summary && <div style={{ fontSize: 12, color: phase === 'error' ? '#b91c1c' : '#15803d', padding: '0 10px 6px' }}>{summary}</div>}
-          <pre style={applyLog}>{logLines.join('\n')}</pre>
+          {state.summary && (
+            <div style={{ ...summaryLine, color: state.phase === 'error' ? '#b91c1c' : state.phase === 'cancelled' ? '#b45309' : '#15803d' }}>
+              {state.summary}
+            </div>
+          )}
+          <div ref={feedRef} style={feedScroll}>
+            {state.rows.length === 0 ? (
+              <div style={{ padding: '14px 12px', color: '#94a3b8', fontSize: 12.5 }}>Waiting for claude…</div>
+            ) : (
+              <ul style={feedList}>
+                {state.rows.map((row, i) => (
+                  // biome-ignore lint/suspicious/noArrayIndexKey: append-only feed
+                  <ActivityRow key={i} row={row} />
+                ))}
+              </ul>
+            )}
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-function Spinner() {
+/** One row of the activity feed — a glyph chip + content tuned to the kind. */
+function ActivityRow({ row }: { row: Row }) {
+  if (row.kind === 'tool') {
+    const display = row.target ? (row.tool === 'Bash' ? row.target.slice(0, 80) : basename(row.target)) : '';
+    return (
+      <li style={rowLi}>
+        <span style={{ ...glyphChip, background: '#ede9fe', color: '#6d28d9' }}>{toolGlyph(row.tool)}</span>
+        <div style={rowBody}>
+          <span style={{ fontWeight: 600, color: '#3730a3' }}>{row.tool}</span>
+          {display && (
+            <code style={targetChip} title={row.target}>
+              {display}
+            </code>
+          )}
+        </div>
+      </li>
+    );
+  }
+  const tone =
+    row.kind === 'error'
+      ? { dot: { background: '#fee2e2', color: '#b91c1c' }, text: { color: '#b91c1c' } }
+      : row.kind === 'result'
+        ? { dot: { background: '#dcfce7', color: '#15803d' }, text: { color: '#0f172a', fontWeight: 600 } }
+        : { dot: { background: '#f1f5f9', color: '#94a3b8' }, text: { color: '#64748b', fontStyle: 'italic' as const } };
+  return (
+    <li style={rowLi}>
+      <span style={{ ...glyphChip, ...tone.dot }}>{kindGlyph(row.kind)}</span>
+      <div style={{ ...rowBody, ...tone.text }}>{row.text}</div>
+    </li>
+  );
+}
+
+/** A pulsing dot for the button while a run is in flight. */
+function PulseDot() {
+  return <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: 'white', animation: 'vs-pulse 1.1s ease-in-out infinite' }} />;
+}
+
+/** Header status indicator, colour-coded per phase. */
+function StatusDot({ phase }: { phase: ApplyPhase }) {
+  const color = phase === 'running' ? '#7c3aed' : phase === 'done' ? '#16a34a' : phase === 'error' ? '#dc2626' : phase === 'cancelled' ? '#d97706' : '#94a3b8';
   return (
     <span
       style={{
-        display: 'inline-block',
-        width: 12,
-        height: 12,
-        border: '2px solid rgba(255,255,255,0.5)',
-        borderTopColor: 'white',
-        borderRadius: '50%',
-        animation: 'vs-spin 0.7s linear infinite',
+        display: 'inline-block', width: 9, height: 9, borderRadius: '50%', background: color,
+        ...(phase === 'running' ? { animation: 'vs-pulse 1.1s ease-in-out infinite' } : {}),
       }}
     />
   );
@@ -336,7 +426,7 @@ export function MainHeader({ file, onNavigate, withInspector = false }: { file: 
 
         <ApplyButton openCount={open.length} />
       </div>
-      <style>{'@keyframes vs-spin{to{transform:rotate(360deg)}}'}</style>
+      <style>{'@keyframes vs-pulse{0%,100%{opacity:1}50%{opacity:0.35}}'}</style>
     </header>
   );
 }
@@ -436,11 +526,19 @@ const cart: React.CSSProperties = { display: 'inline-flex', alignItems: 'center'
 const startBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 12px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#334155', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
 const startBtnActive: React.CSSProperties = { ...startBtn, border: '1px solid #2563eb', background: '#eff6ff', color: '#1d4ed8' };
 const secondary: React.CSSProperties = { padding: '7px 14px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#334155', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
-const applyBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 7, padding: '7px 14px', border: 'none', borderRadius: 8, background: '#7c3aed', color: 'white', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
-const applyPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc(100% + 6px)', width: 420, maxWidth: '80vw', background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 12px 40px rgba(0,0,0,0.16)', zIndex: 41, overflow: 'hidden' };
-const applyPopHead: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 10px', borderBottom: '1px solid #f1f5f9', fontSize: 13 };
-const rerunBtn: React.CSSProperties = { padding: '3px 8px', border: '1px solid #d1d5db', borderRadius: 6, background: 'white', color: '#475569', cursor: 'pointer', font: '12px system-ui', fontWeight: 600 };
-const applyLog: React.CSSProperties = { margin: 0, padding: '8px 10px', maxHeight: 280, overflow: 'auto', font: '11.5px ui-monospace, "SF Mono", monospace', color: '#334155', whiteSpace: 'pre-wrap', wordBreak: 'break-word', background: '#fbfaff' };
+const applyBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 7, padding: '7px 14px', border: 'none', borderRadius: 8, background: '#7c3aed', color: 'white', cursor: 'pointer', font: '13px system-ui', fontWeight: 600, minWidth: 92, justifyContent: 'center' };
+const applyPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc(100% + 6px)', width: 440, maxWidth: '82vw', background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 16px 48px rgba(76,29,149,0.18)', zIndex: 41, overflow: 'hidden' };
+const applyPopHead: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '9px 11px', borderBottom: '1px solid #f1f5f9', fontSize: 13, background: 'linear-gradient(180deg,#ffffff,#fbfaff)' };
+const rerunBtn: React.CSSProperties = { padding: '3px 9px', border: '1px solid #d1d5db', borderRadius: 6, background: 'white', color: '#475569', cursor: 'pointer', font: '12px system-ui', fontWeight: 600, flexShrink: 0 };
+const cancelBtn: React.CSSProperties = { padding: '3px 10px', border: '1px solid #fecaca', borderRadius: 6, background: '#fef2f2', color: '#dc2626', cursor: 'pointer', font: '12px system-ui', fontWeight: 700, flexShrink: 0 };
+const timerPill: React.CSSProperties = { font: '11.5px ui-monospace, "SF Mono", monospace', color: '#6d28d9', background: '#f3f0fc', border: '1px solid #ece6fb', borderRadius: 999, padding: '1px 8px' };
+const summaryLine: React.CSSProperties = { fontSize: 12.5, fontWeight: 600, padding: '6px 12px 8px' };
+const feedScroll: React.CSSProperties = { maxHeight: 300, overflow: 'auto', background: '#fbfaff' };
+const feedList: React.CSSProperties = { listStyle: 'none', margin: 0, padding: '6px 0' };
+const rowLi: React.CSSProperties = { display: 'flex', gap: 9, alignItems: 'flex-start', padding: '4px 12px', lineHeight: 1.45 };
+const glyphChip: React.CSSProperties = { flexShrink: 0, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 18, height: 18, marginTop: 1, borderRadius: 6, fontSize: 11, fontWeight: 700, fontFamily: 'ui-monospace, monospace' };
+const rowBody: React.CSSProperties = { minWidth: 0, fontSize: 12.5, display: 'flex', alignItems: 'baseline', gap: 7, flexWrap: 'wrap', overflowWrap: 'anywhere' };
+const targetChip: React.CSSProperties = { font: '11.5px ui-monospace, "SF Mono", monospace', color: '#475569', background: '#f1f5f9', borderRadius: 5, padding: '1px 6px' };
 const toast: React.CSSProperties = { color: '#16a34a', fontWeight: 600, fontSize: 13 };
 const allPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc(100% + 6px)', width: 340, background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 12px 40px rgba(0,0,0,0.16)', padding: 10, zIndex: 41 };
 const allTitle: React.CSSProperties = { fontSize: 12, opacity: 0.6, padding: '2px 4px 8px', borderBottom: '1px solid #f1f5f9', marginBottom: 4 };

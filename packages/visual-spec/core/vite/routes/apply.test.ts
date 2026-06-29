@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import type { CommentDoc, CommentRecord } from '../../editing/comment-doc';
-import { type ApplyEvent, type ClaudeChild, runApply, summarize } from './apply';
+import { type ApplyEvent, type ClaudeChild, createApplyHub, runApply, summarize } from './apply';
 import type { CommentDocStore } from './comments';
 
 function rec(id: string, status: 'open' | 'applied' = 'open'): CommentRecord {
@@ -33,14 +33,31 @@ function fakeChild(lines: string[], code: number, onClose: () => void): ClaudeCh
   } as ClaudeChild;
 }
 
+/** A child that never ends on its own — only kill() closes it. */
+function hungChild(): ClaudeChild {
+  const ee = new EventEmitter();
+  return {
+    stdout: new Readable({ read() {} }),
+    stderr: null,
+    on: (event: string, cb: (a: never) => void) => ee.on(event, cb as (...a: unknown[]) => void),
+    kill: () => setImmediate(() => ee.emit('close', null)),
+  } as ClaudeChild;
+}
+
 describe('summarize', () => {
-  it('maps tool_use blocks to a friendly line', () => {
+  it('maps a tool_use block to a structured tool row', () => {
     const line = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: 'a.md' } }] } });
-    expect(summarize(line)).toEqual({ type: 'log', level: 'assistant', text: '→ Edit a.md' });
+    expect(summarize(line)).toEqual([{ type: 'log', kind: 'tool', tool: 'Edit', target: 'a.md' }]);
+  });
+  it('maps a text block to an assistant row and the result to a result row', () => {
+    expect(summarize(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'thinking' }] } }))).toEqual([
+      { type: 'log', kind: 'assistant', text: 'thinking' },
+    ]);
+    expect(summarize(JSON.stringify({ type: 'result', result: 'done' }))).toEqual([{ type: 'log', kind: 'result', text: 'done' }]);
   });
   it('ignores non-JSON / unrelated lines', () => {
-    expect(summarize('not json')).toBeNull();
-    expect(summarize(JSON.stringify({ type: 'user' }))).toBeNull();
+    expect(summarize('not json')).toEqual([]);
+    expect(summarize(JSON.stringify({ type: 'user' }))).toEqual([]);
   });
 });
 
@@ -52,7 +69,7 @@ describe('runApply', () => {
     expect(events).toEqual([{ type: 'done', ok: true, applied: 0, exitCode: 0 }]);
   });
 
-  it('spawns claude, streams logs, then counts what flipped to applied', async () => {
+  it('spawns claude, streams structured logs, then counts what flipped to applied', async () => {
     const mem = memoryStore([rec('c-1'), rec('c-2')]);
     const events: ApplyEvent[] = [];
     const lines = [
@@ -64,42 +81,75 @@ describe('runApply', () => {
       {
         cwd: '/tmp',
         comments: mem.store,
+        now: () => 1000,
         // When claude "runs", it flips c-1 to applied (c-2 stays open).
         spawnClaude: () => fakeChild(lines, 0, () => mem.set([rec('c-1', 'applied'), rec('c-2')])),
       },
       (e) => events.push(e),
     );
 
-    expect(events[0]).toEqual({ type: 'start', openCount: 2 });
-    expect(events.some((e) => e.type === 'log' && e.text === '→ Edit a.md')).toBe(true);
+    expect(events[0]).toEqual({ type: 'start', openCount: 2, startedAt: 1000 });
+    expect(events.some((e) => e.type === 'log' && e.kind === 'tool' && e.tool === 'Edit' && e.target === 'a.md')).toBe(true);
     expect(events.at(-1)).toEqual({ type: 'done', ok: true, applied: 1, exitCode: 0 });
   });
 
   it('SIGKILLs and reports when claude exceeds the timeout', async () => {
     const mem = memoryStore([rec('c-1')]);
     const events: ApplyEvent[] = [];
-    // A child that never closes on its own; only kill() ends it.
-    const hung = (): ClaudeChild => {
-      const ee = new EventEmitter();
-      return {
-        stdout: new Readable({ read() {} }), // stays open
-        stderr: null,
-        on: (event: string, cb: (a: never) => void) => ee.on(event, cb as (...a: unknown[]) => void),
-        kill: () => setImmediate(() => ee.emit('close', null)),
-      } as ClaudeChild;
-    };
-    await runApply({ cwd: '/tmp', comments: mem.store, spawnClaude: hung, timeoutMs: 20 }, (e) => events.push(e));
+    await runApply({ cwd: '/tmp', comments: mem.store, spawnClaude: hungChild, timeoutMs: 20 }, (e) => events.push(e));
     expect(events.some((e) => e.type === 'error' && /timed out/.test(e.message))).toBe(true);
     expect(events.at(-1)).toMatchObject({ type: 'done', ok: false });
+  });
+
+  it('cancels via AbortSignal → done is marked cancelled', async () => {
+    const mem = memoryStore([rec('c-1')]);
+    const events: ApplyEvent[] = [];
+    const ac = new AbortController();
+    const p = runApply({ cwd: '/tmp', comments: mem.store, spawnClaude: hungChild }, (e) => events.push(e), ac.signal);
+    setImmediate(() => ac.abort());
+    await p;
+    expect(events.at(-1)).toMatchObject({ type: 'done', ok: false, cancelled: true });
   });
 
   it('reports a non-zero exit as not-ok', async () => {
     const mem = memoryStore([rec('c-1')]);
     const events: ApplyEvent[] = [];
-    await runApply(
-      { cwd: '/tmp', comments: mem.store, spawnClaude: () => fakeChild([], 1, () => {}) },
-      (e) => events.push(e),
-    );
+    await runApply({ cwd: '/tmp', comments: mem.store, spawnClaude: () => fakeChild([], 1, () => {}) }, (e) => events.push(e));
     expect(events.at(-1)).toEqual({ type: 'done', ok: false, applied: 0, exitCode: 1 });
+  });
+});
+
+describe('createApplyHub', () => {
+  it('start → 409 while running → status reflects the run', async () => {
+    const mem = memoryStore([rec('c-1')]);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => { release = r; });
+    const slow = (): ClaudeChild => {
+      const ee = new EventEmitter();
+      void gate.then(() => ee.emit('close', 0));
+      return {
+        stdout: new Readable({ read() {} }),
+        stderr: null,
+        on: (event: string, cb: (a: never) => void) => ee.on(event, cb as (...a: unknown[]) => void),
+      } as ClaudeChild;
+    };
+    const hub = createApplyHub(() => ({ cwd: '/tmp', comments: mem.store, spawnClaude: slow }));
+
+    expect(hub.start().status).toBe(200);
+    // Let the start event flush so `running` is true.
+    await new Promise((r) => setImmediate(r));
+    expect((hub.status().json as { running: boolean }).running).toBe(true);
+    expect(hub.start().status).toBe(409); // already running
+
+    release();
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    expect((hub.status().json as { running: boolean }).running).toBe(false);
+  });
+
+  it('cancel with no run in flight → 409', () => {
+    const mem = memoryStore([]);
+    const hub = createApplyHub(() => ({ cwd: '/tmp', comments: mem.store }));
+    expect(hub.cancel().status).toBe(409);
   });
 });

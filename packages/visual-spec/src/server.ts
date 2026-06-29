@@ -30,7 +30,7 @@ import {
   fileCommentStore,
   handleCommentsRequest,
 } from '../core/vite/routes/comments';
-import { serveApply } from '../core/vite/routes/apply';
+import { createApplyHub } from '../core/vite/routes/apply';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -127,9 +127,10 @@ export function createVisualSpecServer(opts: ServeOptions) {
   let specsRoot = contentDir;
   let commentsPath = opts.commentsFile ?? join(contentDir, 'visual-spec-comments.json');
   let comments: CommentDocStore = fileCommentStore(commentsPath);
-  // One apply at a time: `claude -p` edits files on disk, so a concurrent run
-  // would race. A second request while one is in flight gets 409.
-  let applying = false;
+  // The apply job is shared across every connected browser: one run at a time,
+  // many SSE subscribers. The thunk reads the current (mutable) dir + store so a
+  // runtime "change directory" re-roots the next run too.
+  const applyHub = createApplyHub(() => ({ cwd: contentDir, comments }));
 
   /** Re-root every store at a new directory (comments follow to <dir>/…json). */
   const setRoot = (dir: string) => {
@@ -208,16 +209,24 @@ export function createVisualSpecServer(opts: ServeOptions) {
           return sendJson(res, r.status, r.json);
         }
 
-        // Apply the open comments via `claude -p` and stream progress (SSE).
-        if (url.pathname === '/__vs/apply') {
-          if (applying) return sendJson(res, 409, { error: 'an apply is already running' });
-          applying = true;
-          try {
-            await serveApply({ cwd: contentDir, comments }, res);
-          } finally {
-            applying = false;
+        // Apply the open comments via `claude -p` — a shared job any browser can
+        // watch (SSE), start, or cancel.
+        if (url.pathname === '/__vs/apply' || url.pathname.startsWith('/__vs/apply/')) {
+          const sub = url.pathname.slice('/__vs/apply'.length);
+          if (method === 'GET' && sub === '/events') return applyHub.subscribe(res);
+          if (method === 'POST' && sub === '/start') {
+            const r = applyHub.start();
+            return sendJson(res, r.status, r.json);
           }
-          return;
+          if (method === 'POST' && sub === '/cancel') {
+            const r = applyHub.cancel();
+            return sendJson(res, r.status, r.json);
+          }
+          if (method === 'GET' && (sub === '' || sub === '/')) {
+            const r = applyHub.status();
+            return sendJson(res, r.status, r.json);
+          }
+          return sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
         }
 
         if (url.pathname === '/__vs/comments' || url.pathname.startsWith('/__vs/comments/')) {
