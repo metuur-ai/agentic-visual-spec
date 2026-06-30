@@ -23,20 +23,26 @@ import type { CommentDocStore } from './comments';
 /** Category of a streamed activity row — drives the icon + styling in the UI. */
 export type ApplyLogKind = 'system' | 'tool' | 'assistant' | 'result' | 'error';
 
+/** A comment that flipped to "applied" during a run — shown in the result modal. */
+export type AppliedComment = { id: string; path: string; comment: string; workflow: string };
+
 /** A frame pushed to subscribers as it happens. */
 export type ApplyEvent =
   | { type: 'start'; openCount: number; startedAt: number }
-  | { type: 'log'; kind: ApplyLogKind; text?: string; tool?: string; target?: string }
-  | { type: 'done'; ok: boolean; applied: number; exitCode: number | null; cancelled?: boolean }
+  | { type: 'log'; kind: ApplyLogKind; text?: string; tool?: string; target?: string; agentId?: string }
+  | { type: 'agent-start'; agentId: string; agentType: string; task?: string }
+  | { type: 'agent-done'; agentId: string }
+  | { type: 'done'; ok: boolean; applied: number; appliedComments: AppliedComment[]; exitCode: number | null; cancelled?: boolean }
   | { type: 'error'; message: string };
 
 /** The first frame a subscriber receives: the run so far, so a tab that joins
  *  mid-run (or after) catches up to the same activity + timer. */
 export type ApplySync = { type: 'sync'; running: boolean; startedAt: number | null; events: ApplyEvent[] };
 
-/** A run that hangs holds the apply lock forever — bound it. Generous: applying
- *  a batch of comments can legitimately take a few minutes. */
-const DEFAULT_TIMEOUT_MS = 5 * 60_000;
+/** A run that hangs holds the apply lock forever — bound it. Generous: a real
+ *  batch (many comments, sub-agents, a headless cold start) legitimately runs
+ *  past five minutes, so give it room before SIGKILL. */
+const DEFAULT_TIMEOUT_MS = 15 * 60_000;
 
 /** Minimal child-process shape used here — lets tests inject a fake. */
 export interface ClaudeChild {
@@ -84,17 +90,42 @@ export function summarize(line: string): ApplyEvent[] {
   }
   if (ev.type === 'system' && ev.subtype === 'init') return [{ type: 'log', kind: 'system', text: 'Session started' }];
   if (ev.type === 'assistant') {
+    // Sub-agent events carry `parent_tool_use_id` pointing at the Task that spawned
+    // them — attribute their rows so the UI can group sub-agent activity.
+    const agentId = typeof ev.parent_tool_use_id === 'string' ? ev.parent_tool_use_id : undefined;
     const content = (ev.message as { content?: unknown[] } | undefined)?.content ?? [];
     const out: ApplyEvent[] = [];
     for (const block of content as Array<Record<string, unknown>>) {
       if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
-        out.push({ type: 'log', kind: 'assistant', text: block.text.trim().slice(0, 2000) });
+        out.push({ type: 'log', kind: 'assistant', text: block.text.trim().slice(0, 2000), ...(agentId ? { agentId } : {}) });
       } else if (block.type === 'tool_use') {
-        const tool = String(block.name ?? 'tool');
         const input = (block.input ?? {}) as Record<string, unknown>;
+        // A Task spawns a sub-agent — surface it as an agent lane, not a plain row.
+        if (block.name === 'Task') {
+          out.push({
+            type: 'agent-start',
+            agentId: String(block.id ?? input.subagent_type ?? 'agent'),
+            agentType: String(input.subagent_type ?? 'agent'),
+            ...(input.description ? { task: String(input.description).slice(0, 200) } : {}),
+          });
+          continue;
+        }
+        const tool = String(block.name ?? 'tool');
         const raw = input.file_path ?? input.path ?? input.command ?? input.pattern ?? input.description;
         const target = raw ? String(raw).slice(0, 300) : undefined;
-        out.push({ type: 'log', kind: 'tool', tool, ...(target ? { target } : {}) });
+        out.push({ type: 'log', kind: 'tool', tool, ...(target ? { target } : {}), ...(agentId ? { agentId } : {}) });
+      }
+    }
+    return out;
+  }
+  // A tool_result closes its tool_use; for a Task id this ends the sub-agent. We emit
+  // agent-done for every result and let the consumer ignore ids it isn't tracking.
+  if (ev.type === 'user') {
+    const content = (ev.message as { content?: unknown[] } | undefined)?.content ?? [];
+    const out: ApplyEvent[] = [];
+    for (const block of content as Array<Record<string, unknown>>) {
+      if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+        out.push({ type: 'agent-done', agentId: block.tool_use_id });
       }
     }
     return out;
@@ -110,12 +141,15 @@ export function summarize(line: string): ApplyEvent[] {
  * exits. `signal` cancels the run (SIGKILL). Never throws for an empty comment
  * set — emits a no-op `done` instead.
  */
-export async function runApply(deps: ApplyDeps, emit: (e: ApplyEvent) => void, signal?: AbortSignal): Promise<void> {
+export async function runApply(deps: ApplyDeps, emit: (e: ApplyEvent) => void, signal?: AbortSignal, ids?: string[]): Promise<void> {
   const now = deps.now ?? (() => Date.now());
   const before = await deps.comments.read();
-  const open = before.comments.filter((c) => c.status === 'open');
+  // `ids` scopes the run (a subset of open comments the user picked); absent → all open.
+  // Everything downstream — prompt, openCount, applied diff — derives from this set.
+  const wanted = ids ? new Set(ids) : null;
+  const open = before.comments.filter((c) => c.status === 'open' && (!wanted || wanted.has(c.id)));
   if (open.length === 0) {
-    emit({ type: 'done', ok: true, applied: 0, exitCode: 0 });
+    emit({ type: 'done', ok: true, applied: 0, appliedComments: [], exitCode: 0 });
     return;
   }
   emit({ type: 'start', openCount: open.length, startedAt: now() });
@@ -126,7 +160,7 @@ export async function runApply(deps: ApplyDeps, emit: (e: ApplyEvent) => void, s
     child = spawnClaude(buildApplyPrompt(open), deps.cwd);
   } catch (err) {
     emit({ type: 'error', message: `Could not start claude: ${(err as Error).message}` });
-    emit({ type: 'done', ok: false, applied: 0, exitCode: null });
+    emit({ type: 'done', ok: false, applied: 0, appliedComments: [], exitCode: null });
     return;
   }
 
@@ -176,8 +210,10 @@ export async function runApply(deps: ApplyDeps, emit: (e: ApplyEvent) => void, s
   // Re-read the sidecar: the skill flipped applied comments to status "applied".
   const after = await deps.comments.read();
   const stillOpen = new Set(after.comments.filter((c) => c.status === 'open').map((c) => c.id));
-  const applied = open.filter((c) => !stillOpen.has(c.id)).length;
-  emit({ type: 'done', ok: !cancelled && exitCode === 0, applied, exitCode, ...(cancelled ? { cancelled } : {}) });
+  const appliedComments: AppliedComment[] = open
+    .filter((c) => !stillOpen.has(c.id))
+    .map((c) => ({ id: c.id, path: c.target.path, comment: c.comment, workflow: c.workflow }));
+  emit({ type: 'done', ok: !cancelled && exitCode === 0, applied: appliedComments.length, appliedComments, exitCode, ...(cancelled ? { cancelled } : {}) });
 }
 
 export type RouteResult = { status: number; json: unknown };
@@ -186,7 +222,8 @@ export type RouteResult = { status: number; json: unknown };
 export interface ApplyHub {
   /** Attach an SSE subscriber (writes headers + a `sync` snapshot, then streams). */
   subscribe(res: ServerResponse): void;
-  start(): RouteResult;
+  /** Begin a run. `ids` scopes it to a subset of open comments; omit for all open. */
+  start(ids?: string[]): RouteResult;
   cancel(): RouteResult;
   status(): RouteResult;
 }
@@ -223,16 +260,16 @@ export function createApplyHub(getDeps: () => ApplyDeps): ApplyHub {
       subs.add(res);
       res.on('close', () => subs.delete(res));
     },
-    start() {
+    start(ids) {
       if (running) return { status: 409, json: { error: 'an apply is already running' } };
       running = true;
       events = [];
       startedAt = null;
       abort = new AbortController();
-      void runApply(getDeps(), broadcast, abort.signal)
+      void runApply(getDeps(), broadcast, abort.signal, ids)
         .catch((err) => {
           broadcast({ type: 'error', message: (err as Error).message });
-          broadcast({ type: 'done', ok: false, applied: 0, exitCode: null });
+          broadcast({ type: 'done', ok: false, applied: 0, appliedComments: [], exitCode: null });
         })
         .finally(() => {
           running = false;

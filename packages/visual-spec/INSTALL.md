@@ -5,7 +5,7 @@ produces a tarball of exactly what gets published (the `dist/` folder, per the
 `files` field in `package.json`), which you then install globally. No need to copy
 `node_modules` or source.
 
-## 1. Build & package (on this machine)
+## 1. Build & package locally
 
 ```bash
 cd packages/visual-spec

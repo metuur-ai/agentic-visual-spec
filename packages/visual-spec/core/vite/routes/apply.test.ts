@@ -59,6 +59,28 @@ describe('summarize', () => {
     expect(summarize('not json')).toEqual([]);
     expect(summarize(JSON.stringify({ type: 'user' }))).toEqual([]);
   });
+
+  it('maps a Task tool_use to an agent-start lane (type + task), not a plain tool row', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_1', name: 'Task', input: { subagent_type: 'code-reviewer', description: 'review login' } }] },
+    });
+    expect(summarize(line)).toEqual([{ type: 'agent-start', agentId: 'toolu_1', agentType: 'code-reviewer', task: 'review login' }]);
+  });
+
+  it('tags a sub-agent tool_use with its parent agentId', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      parent_tool_use_id: 'toolu_1',
+      message: { content: [{ type: 'tool_use', name: 'Grep', input: { pattern: 'validate' } }] },
+    });
+    expect(summarize(line)).toEqual([{ type: 'log', kind: 'tool', tool: 'Grep', target: 'validate', agentId: 'toolu_1' }]);
+  });
+
+  it('maps a tool_result (user event) to agent-done', () => {
+    const line = JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1' }] } });
+    expect(summarize(line)).toEqual([{ type: 'agent-done', agentId: 'toolu_1' }]);
+  });
 });
 
 describe('runApply', () => {
@@ -66,7 +88,7 @@ describe('runApply', () => {
     const { store } = memoryStore([rec('c-1', 'applied')]);
     const events: ApplyEvent[] = [];
     await runApply({ cwd: '/tmp', comments: store, spawnClaude: () => { throw new Error('should not spawn'); } }, (e) => events.push(e));
-    expect(events).toEqual([{ type: 'done', ok: true, applied: 0, exitCode: 0 }]);
+    expect(events).toEqual([{ type: 'done', ok: true, applied: 0, appliedComments: [], exitCode: 0 }]);
   });
 
   it('spawns claude, streams structured logs, then counts what flipped to applied', async () => {
@@ -90,7 +112,45 @@ describe('runApply', () => {
 
     expect(events[0]).toEqual({ type: 'start', openCount: 2, startedAt: 1000 });
     expect(events.some((e) => e.type === 'log' && e.kind === 'tool' && e.tool === 'Edit' && e.target === 'a.md')).toBe(true);
-    expect(events.at(-1)).toEqual({ type: 'done', ok: true, applied: 1, exitCode: 0 });
+    expect(events.at(-1)).toEqual({
+      type: 'done',
+      ok: true,
+      applied: 1,
+      appliedComments: [{ id: 'c-1', path: 'a.md', comment: 'x', workflow: 'visual-spec' }],
+      exitCode: 0,
+    });
+  });
+
+  it('ids scopes the run: only the picked comment is prompted, counted, and applied', async () => {
+    // Two open comments; the user picks only c-2. The fake "applies" whatever it was
+    // asked to (we flip c-2), and the diff must ignore c-1 entirely.
+    const mem = memoryStore([rec('c-1'), rec('c-2')]);
+    const events: ApplyEvent[] = [];
+    let prompted = '';
+    await runApply(
+      {
+        cwd: '/tmp',
+        comments: mem.store,
+        now: () => 1000,
+        spawnClaude: (prompt) => {
+          prompted = prompt;
+          return fakeChild([], 0, () => mem.set([rec('c-1'), rec('c-2', 'applied')]));
+        },
+      },
+      (e) => events.push(e),
+      undefined,
+      ['c-2'],
+    );
+
+    expect(prompted).toContain('1 review comment'); // scoped to one, not two
+    expect(events[0]).toEqual({ type: 'start', openCount: 1, startedAt: 1000 });
+    expect(events.at(-1)).toEqual({
+      type: 'done',
+      ok: true,
+      applied: 1,
+      appliedComments: [{ id: 'c-2', path: 'a.md', comment: 'x', workflow: 'visual-spec' }],
+      exitCode: 0,
+    });
   });
 
   it('SIGKILLs and reports when claude exceeds the timeout', async () => {
@@ -115,7 +175,7 @@ describe('runApply', () => {
     const mem = memoryStore([rec('c-1')]);
     const events: ApplyEvent[] = [];
     await runApply({ cwd: '/tmp', comments: mem.store, spawnClaude: () => fakeChild([], 1, () => {}) }, (e) => events.push(e));
-    expect(events.at(-1)).toEqual({ type: 'done', ok: false, applied: 0, exitCode: 1 });
+    expect(events.at(-1)).toEqual({ type: 'done', ok: false, applied: 0, appliedComments: [], exitCode: 1 });
   });
 });
 

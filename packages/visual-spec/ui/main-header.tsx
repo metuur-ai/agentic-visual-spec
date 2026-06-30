@@ -1,5 +1,5 @@
 import { type CommentRecord, buildApplyPrompt, useComments, useInspector, useSpecsRoot } from '../core/app';
-import { useEffect, useReducer, useRef, useState } from 'react';
+import { memo, useEffect, useReducer, useRef, useState } from 'react';
 import { HelpButton } from './help-page';
 
 function CommentIcon({ size = 14 }: { size?: number }) {
@@ -143,16 +143,20 @@ function buildPrompt(open: CommentRecord[]): string {
 
 type ApplyLogKind = 'system' | 'tool' | 'assistant' | 'result' | 'error';
 type Row = { kind: ApplyLogKind; text?: string; tool?: string; target?: string };
+type AppliedComment = { id: string; path: string; comment: string; workflow: string };
+type Agent = { id: string; type: string; task?: string; status: 'running' | 'done' };
 type ApplyFrame =
   | { type: 'sync'; running: boolean; startedAt: number | null; events: ApplyFrame[] }
   | { type: 'start'; openCount: number; startedAt: number }
-  | { type: 'log'; kind: ApplyLogKind; text?: string; tool?: string; target?: string }
-  | { type: 'done'; ok: boolean; applied: number; exitCode: number | null; cancelled?: boolean }
+  | { type: 'log'; kind: ApplyLogKind; text?: string; tool?: string; target?: string; agentId?: string }
+  | { type: 'agent-start'; agentId: string; agentType: string; task?: string }
+  | { type: 'agent-done'; agentId: string }
+  | { type: 'done'; ok: boolean; applied: number; appliedComments?: AppliedComment[]; exitCode: number | null; cancelled?: boolean }
   | { type: 'error'; message: string };
 
 type ApplyPhase = 'idle' | 'running' | 'done' | 'error' | 'cancelled';
-type ApplyState = { phase: ApplyPhase; startedAt: number | null; rows: Row[]; summary: string };
-const APPLY_INIT: ApplyState = { phase: 'idle', startedAt: null, rows: [], summary: '' };
+type ApplyState = { phase: ApplyPhase; startedAt: number | null; rows: Row[]; summary: string; applied: AppliedComment[]; agents: Agent[] };
+const APPLY_INIT: ApplyState = { phase: 'idle', startedAt: null, rows: [], summary: '', applied: [], agents: [] };
 const ROW_CAP = 400;
 
 function applyReduce(s: ApplyState, e: ApplyFrame): ApplyState {
@@ -164,14 +168,27 @@ function applyReduce(s: ApplyState, e: ApplyFrame): ApplyState {
       return e.running ? { ...st, phase: 'running' } : st;
     }
     case 'start':
-      return { phase: 'running', startedAt: e.startedAt, rows: [], summary: '' };
+      return { ...APPLY_INIT, phase: 'running', startedAt: e.startedAt };
     case 'log':
       return { ...s, rows: [...s.rows.slice(-ROW_CAP), { kind: e.kind, text: e.text, tool: e.tool, target: e.target }] };
+    case 'agent-start':
+      // Dedupe by id — a replayed sync must not double-list an agent.
+      return s.agents.some((a) => a.id === e.agentId)
+        ? s
+        : { ...s, agents: [...s.agents, { id: e.agentId, type: e.agentType, task: e.task, status: 'running' }] };
+    case 'agent-done':
+      // Ignore ids we never tracked (every tool_result emits one, not just Tasks).
+      return s.agents.some((a) => a.id === e.agentId)
+        ? { ...s, agents: s.agents.map((a) => (a.id === e.agentId ? { ...a, status: 'done' } : a)) }
+        : s;
     case 'error':
       return { ...s, rows: [...s.rows.slice(-ROW_CAP), { kind: 'error', text: e.message }] };
     case 'done':
       return {
         ...s,
+        applied: e.appliedComments ?? [],
+        // Any sub-agent still flagged running when the run ends is, by definition, finished.
+        agents: s.agents.map((a) => ({ ...a, status: 'done' })),
         phase: e.cancelled ? 'cancelled' : e.ok ? 'done' : 'error',
         summary: e.cancelled
           ? `Cancelled — ${e.applied} applied before stop`
@@ -196,60 +213,109 @@ const fmtElapsed = (ms: number) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
 
-/** The Apply control: shared live activity feed + timer + cancel. */
-function ApplyButton({ openCount }: { openCount: number }) {
+/**
+ * The running clock, isolated in its own leaf so its 250ms tick re-renders only
+ * this text node — NOT the parent ApplyButton and its (up to 400-row) feed. Keeps
+ * the activity panel from pegging the CPU while a run is in flight. When not
+ * running it holds the last value (the SAME instance persists across the
+ * running→done transition, so the duration stays put).
+ */
+function ElapsedTimer({ startedAt, running }: { startedAt: number | null; running: boolean }) {
+  const [elapsed, setElapsed] = useState(() => (startedAt ? Date.now() - startedAt : 0));
+  useEffect(() => {
+    if (!running || !startedAt) return;
+    const tick = () => setElapsed(Date.now() - startedAt);
+    tick();
+    const id = window.setInterval(tick, 2000);
+    return () => window.clearInterval(id);
+  }, [running, startedAt]);
+  return <>{fmtElapsed(elapsed)}</>;
+}
+
+type ApplyView = 'closed' | 'scope' | 'activity';
+
+/** The Apply control: scope chooser → shared live activity feed + timer + cancel. */
+function ApplyButton({ open, file }: { open: CommentRecord[]; file: string }) {
   const [state, dispatch] = useReducer(applyReduce, APPLY_INIT);
-  const [open, setOpen] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
+  const [view, setView] = useState<ApplyView>('closed');
   const feedRef = useRef<HTMLDivElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  const openCount = open.length;
+  // The active file is whatever is shown in the main section; its comments share its path.
+  const activeFile = open.filter((c) => c.target.path === file);
 
   // Always-on subscription — this is what makes activity shared across tabs.
+  // Frames are coalesced and flushed once per animation frame: a fast `claude`
+  // can emit a burst of stream-json lines, and dispatching each one separately
+  // would re-render (and re-reconcile the feed) per line — enough to peg a core.
+  // Batching collapses a burst into a single render.
   useEffect(() => {
     const es = new EventSource('/__vs/apply/events');
+    let pending: ApplyFrame[] = [];
+    let raf: number | null = null;
+    const flush = () => {
+      raf = null;
+      const batch = pending;
+      pending = [];
+      for (const f of batch) dispatch(f); // React 18 batches these into one render
+    };
     es.onmessage = (ev) => {
       const frame = JSON.parse(ev.data) as ApplyFrame;
-      dispatch(frame);
+      pending.push(frame);
       // A live `done` (sync's done events are nested, never land here): the skill
       // edited files + flipped statuses on disk — refresh the cart and the source.
       if (frame.type === 'done') {
         window.dispatchEvent(new CustomEvent('vs:comments-changed'));
         window.dispatchEvent(new CustomEvent('vs:source-changed'));
       }
+      if (raf == null) raf = requestAnimationFrame(flush);
     };
-    return () => es.close();
+    return () => {
+      es.close();
+      if (raf != null) cancelAnimationFrame(raf);
+    };
   }, []);
 
   const running = state.phase === 'running';
 
-  // Live timer. startedAt is server-authoritative, so every tab shows the same.
-  useEffect(() => {
-    if (!running || !state.startedAt) return;
-    const startedAt = state.startedAt;
-    const tick = () => setElapsed(Date.now() - startedAt);
-    tick();
-    const id = window.setInterval(tick, 250);
-    return () => window.clearInterval(id);
-  }, [running, state.startedAt]);
-
   // Stick the feed to the newest row.
   useEffect(() => {
-    if (open && feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
-  }, [state.rows.length, open]);
+    if (view === 'activity' && feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
+  }, [state.rows.length, view]);
 
-  const start = () => {
-    if (running || openCount === 0) return;
-    setOpen(true);
-    void fetch('/__vs/apply/start', { method: 'POST' }).catch(() => {}); // activity arrives via the stream
+  // Click-outside closes the popover (the SSE subscription stays connected regardless).
+  useEffect(() => {
+    if (view === 'closed') return;
+    const onDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setView('closed');
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [view]);
+
+  const start = (ids?: string[]) => {
+    setView('activity');
+    void fetch('/__vs/apply/start', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(ids ? { ids } : {}),
+    }).catch(() => {}); // activity arrives via the stream
   };
   const cancel = () => void fetch('/__vs/apply/cancel', { method: 'POST' }).catch(() => {});
-  const onButton = () => (running || state.rows.length ? setOpen((v) => !v) : start());
 
-  const showPanel = open && (running || state.rows.length > 0 || !!state.summary);
+  // Button click: while there's a run (live or finished) toggle the activity panel;
+  // otherwise open the scope chooser to pick what to apply.
+  const onButton = () => {
+    if (running || state.rows.length || state.summary) setView((v) => (v === 'closed' ? 'activity' : 'closed'));
+    else setView((v) => (v === 'scope' ? 'closed' : 'scope'));
+  };
+
   const titles: Record<ApplyPhase, string> = { running: 'Applying comments', done: 'Done', cancelled: 'Cancelled', error: 'Stopped', idle: 'Apply' };
   const title = titles[state.phase];
 
   return (
-    <div style={{ position: 'relative' }}>
+    <div ref={rootRef} style={{ position: 'relative' }}>
       <button
         type="button"
         onClick={onButton}
@@ -257,31 +323,64 @@ function ApplyButton({ openCount }: { openCount: number }) {
         title="Apply the open comments with claude (runs the apply-comments skill)"
         style={{ ...applyBtn, opacity: openCount === 0 && state.phase === 'idle' ? 0.5 : 1 }}
       >
-        {running ? <PulseDot /> : '✨'} {running ? `Applying · ${fmtElapsed(elapsed)}` : 'Apply'}
+        {running ? <PulseDot /> : '✨'}{' '}
+        {running ? (
+          <>
+            Applying · <ElapsedTimer startedAt={state.startedAt} running={running} />
+          </>
+        ) : (
+          'Apply'
+        )}
       </button>
-      {showPanel && (
+
+      {view === 'scope' && (
+        <ScopeChooser
+          workspaceCount={openCount}
+          activeFile={activeFile}
+          file={file}
+          onClose={() => setView('closed')}
+          onRun={start}
+        />
+      )}
+
+      {view === 'activity' && (
         <div style={applyPop}>
           <div style={applyPopHead}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
               <StatusDot phase={state.phase} />
               <span style={{ fontWeight: 700 }}>{title}</span>
-              {(running || state.startedAt) && <span style={timerPill}>{fmtElapsed(elapsed)}</span>}
+              {(running || state.startedAt) && (
+                <span style={timerPill}>
+                  <ElapsedTimer startedAt={state.startedAt} running={running} />
+                </span>
+              )}
             </span>
-            {running ? (
-              <button type="button" onClick={cancel} style={cancelBtn} title="Stop the run (kills claude)">
-                ■ Cancel
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              {running ? (
+                <button type="button" onClick={cancel} style={cancelBtn} title="Stop the run (kills claude)">
+                  ■ Cancel
+                </button>
+              ) : (
+                <button type="button" onClick={() => setView('scope')} disabled={openCount === 0} style={{ ...rerunBtn, opacity: openCount === 0 ? 0.5 : 1 }} title="Run again">
+                  ↻ Run again
+                </button>
+              )}
+              <button type="button" onClick={() => setView('closed')} style={closeBtn} title="Close" aria-label="Close">
+                ✕
               </button>
-            ) : (
-              <button type="button" onClick={start} disabled={openCount === 0} style={{ ...rerunBtn, opacity: openCount === 0 ? 0.5 : 1 }} title="Run again">
-                ↻ Run again
-              </button>
-            )}
+            </span>
           </div>
+
           {state.summary && (
             <div style={{ ...summaryLine, color: state.phase === 'error' ? '#b91c1c' : state.phase === 'cancelled' ? '#b45309' : '#15803d' }}>
               {state.summary}
             </div>
           )}
+
+          {state.applied.length > 0 && <AppliedList applied={state.applied} />}
+
+          {(running || state.agents.length > 0) && <AgentStrip phase={state.phase} agents={state.agents} />}
+
           <div ref={feedRef} style={feedScroll}>
             {state.rows.length === 0 ? (
               <div style={{ padding: '14px 12px', color: '#94a3b8', fontSize: 12.5 }}>Waiting for claude…</div>
@@ -294,14 +393,165 @@ function ApplyButton({ openCount }: { openCount: number }) {
               </ul>
             )}
           </div>
+          <div style={modelNote}>Runs with your default Claude model.</div>
         </div>
       )}
     </div>
   );
 }
 
-/** One row of the activity feed — a glyph chip + content tuned to the kind. */
-function ActivityRow({ row }: { row: Row }) {
+/** Pre-run scope picker: whole workspace, the active file, or a hand-picked subset. */
+function ScopeChooser({
+  workspaceCount,
+  activeFile,
+  file,
+  onClose,
+  onRun,
+}: {
+  workspaceCount: number;
+  activeFile: CommentRecord[];
+  file: string;
+  onClose: () => void;
+  onRun: (ids?: string[]) => void;
+}) {
+  const [picking, setPicking] = useState(false);
+  const [checked, setChecked] = useState<Set<string>>(new Set());
+  const fileName = file ? basename(file) : '';
+  const toggle = (id: string) =>
+    setChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  return (
+    <div style={applyPop}>
+      <div style={applyPopHead}>
+        <span style={{ fontWeight: 700 }}>Apply comments…</span>
+        <button type="button" onClick={onClose} style={closeBtn} title="Close" aria-label="Close">
+          ✕
+        </button>
+      </div>
+
+      {!picking ? (
+        <div style={{ padding: 8 }}>
+          <button type="button" onClick={() => onRun()} disabled={workspaceCount === 0} style={scopeRow}>
+            <span style={scopeTitle}>Whole workspace</span>
+            <span style={scopeCount}>{workspaceCount}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onRun(activeFile.map((c) => c.id))}
+            disabled={activeFile.length === 0}
+            style={{ ...scopeRow, opacity: activeFile.length === 0 ? 0.5 : 1 }}
+            title={fileName ? `Apply comments on ${fileName}` : 'Open a file to scope to it'}
+          >
+            <span style={scopeTitle}>This file{fileName ? <span style={scopeSub}> · {fileName}</span> : ''}</span>
+            <span style={scopeCount}>{activeFile.length}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setPicking(true)}
+            disabled={activeFile.length === 0}
+            style={{ ...scopeRow, opacity: activeFile.length === 0 ? 0.5 : 1 }}
+          >
+            <span style={scopeTitle}>Pick comments…</span>
+            <span style={{ ...scopeCount, background: 'transparent', color: '#94a3b8' }}>›</span>
+          </button>
+        </div>
+      ) : (
+        <>
+          <ul style={{ ...feedList, maxHeight: 280, overflow: 'auto' }}>
+            {activeFile.map((c) => (
+              <li key={c.id} style={pickItem}>
+                <label style={pickLabel}>
+                  <input type="checkbox" checked={checked.has(c.id)} onChange={() => toggle(c.id)} style={{ marginTop: 3 }} />
+                  <span style={{ minWidth: 0 }}>
+                    <span style={{ fontSize: 11, opacity: 0.55, display: 'block' }}>
+                      {c.target.heading ?? '(top)'}
+                      {c.target.startLine != null ? ` · L${c.target.startLine}` : ''}
+                    </span>
+                    <span>{c.comment}</span>
+                  </span>
+                </label>
+              </li>
+            ))}
+          </ul>
+          <div style={pickFooter}>
+            <button type="button" onClick={() => setPicking(false)} style={rerunBtn}>
+              ‹ Back
+            </button>
+            <button
+              type="button"
+              onClick={() => onRun([...checked])}
+              disabled={checked.size === 0}
+              style={{ ...applyBtn, minWidth: 0, padding: '6px 12px', opacity: checked.size === 0 ? 0.5 : 1 }}
+            >
+              ✨ Apply selected ({checked.size})
+            </button>
+          </div>
+        </>
+      )}
+      <div style={modelNote}>Runs with your default Claude model.</div>
+    </div>
+  );
+}
+
+/** Structured list of the comments that flipped to "applied" this run. */
+function AppliedList({ applied }: { applied: AppliedComment[] }) {
+  return (
+    <div style={appliedWrap}>
+      <div style={appliedHead}>
+        ✅ Applied {applied.length} comment{applied.length === 1 ? '' : 's'}
+      </div>
+      <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
+        {applied.map((c) => (
+          <li key={c.id} style={appliedItem}>
+            <code style={appliedPath} title={c.path}>
+              {basename(c.path)}
+            </code>
+            {c.workflow !== 'visual-spec' && <span style={appliedFlow}>{c.workflow}</span>}
+            <span style={appliedText} title={c.comment}>
+              {c.comment}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+const AGENT_GLYPH = (type: string) => (type === 'main' ? '✦' : '⚇');
+
+/** Compact strip of agents: the main session + each spawned sub-agent, with status. */
+function AgentStrip({ phase, agents }: { phase: ApplyPhase; agents: Agent[] }) {
+  const mainStatus: 'running' | 'done' = phase === 'running' ? 'running' : 'done';
+  const chips = [{ id: 'main', type: 'apply-comments', status: mainStatus }, ...agents];
+  return (
+    <div style={agentStrip}>
+      {chips.map((a) => (
+        <span key={a.id} style={agentChip} title={('task' in a && a.task) || a.type}>
+          <span style={{ opacity: 0.7 }}>{AGENT_GLYPH(a.id === 'main' ? 'main' : a.type)}</span>
+          <span style={{ fontWeight: 600 }}>{a.type}</span>
+          {a.status === 'running' ? <PulseAgentDot /> : <span style={{ color: '#16a34a' }}>✓</span>}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** A small purple pulse for an in-flight agent chip. */
+function PulseAgentDot() {
+  return <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: '#7c3aed', animation: 'vs-pulse 1.1s ease-in-out infinite' }} />;
+}
+
+/**
+ * One row of the activity feed — a glyph chip + content tuned to the kind.
+ * Memoized: row objects keep identity across renders (the reducer never mutates
+ * them), so an incoming frame only re-renders the new row, not the whole list.
+ */
+const ActivityRow = memo(function ActivityRow({ row }: { row: Row }) {
   if (row.kind === 'tool') {
     const display = row.target ? (row.tool === 'Bash' ? row.target.slice(0, 80) : basename(row.target)) : '';
     return (
@@ -330,7 +580,7 @@ function ActivityRow({ row }: { row: Row }) {
       <div style={{ ...rowBody, ...tone.text }}>{row.text}</div>
     </li>
   );
-}
+});
 
 /** A pulsing dot for the button while a run is in flight. */
 function PulseDot() {
@@ -424,7 +674,7 @@ export function MainHeader({ file, onNavigate, withInspector = false }: { file: 
           📋 Copy prompt
         </button>
 
-        <ApplyButton openCount={open.length} />
+        <ApplyButton open={open} file={file} />
       </div>
       <style>{'@keyframes vs-pulse{0%,100%{opacity:1}50%{opacity:0.35}}'}</style>
     </header>
@@ -484,6 +734,11 @@ const bar: React.CSSProperties = {
   background: 'linear-gradient(180deg, #ffffff 0%, #fbfaff 100%)',
   font: '13px system-ui',
   flexShrink: 0,
+  // Establish a stacking context above the content below so header popovers
+  // (Apply activity, all-comments) paint over the editor + inspector instead of
+  // being overlapped by them. Below the full-screen help modal (zIndex 100).
+  position: 'relative',
+  zIndex: 60,
 };
 const wordmarkRow: React.CSSProperties = { display: 'flex', alignItems: 'baseline', gap: 8, lineHeight: 1 };
 const wordmark: React.CSSProperties = {
@@ -531,6 +786,23 @@ const applyPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'ca
 const applyPopHead: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '9px 11px', borderBottom: '1px solid #f1f5f9', fontSize: 13, background: 'linear-gradient(180deg,#ffffff,#fbfaff)' };
 const rerunBtn: React.CSSProperties = { padding: '3px 9px', border: '1px solid #d1d5db', borderRadius: 6, background: 'white', color: '#475569', cursor: 'pointer', font: '12px system-ui', fontWeight: 600, flexShrink: 0 };
 const cancelBtn: React.CSSProperties = { padding: '3px 10px', border: '1px solid #fecaca', borderRadius: 6, background: '#fef2f2', color: '#dc2626', cursor: 'pointer', font: '12px system-ui', fontWeight: 700, flexShrink: 0 };
+const closeBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 22, height: 22, padding: 0, border: '1px solid #e5e7eb', borderRadius: 6, background: 'white', color: '#64748b', cursor: 'pointer', font: '12px system-ui', fontWeight: 700, flexShrink: 0 };
+const modelNote: React.CSSProperties = { padding: '7px 12px', borderTop: '1px solid #f1f5f9', color: '#94a3b8', fontSize: 11, fontStyle: 'italic', background: '#fbfaff' };
+const scopeRow: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, width: '100%', textAlign: 'left', padding: '10px 11px', margin: '2px 0', border: '1px solid #ece6fb', borderRadius: 9, background: '#fbfaff', color: '#1e293b', cursor: 'pointer', font: '13px system-ui' };
+const scopeTitle: React.CSSProperties = { fontWeight: 600, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+const scopeSub: React.CSSProperties = { fontWeight: 400, color: '#7c3aed', font: '12px ui-monospace, monospace' };
+const scopeCount: React.CSSProperties = { flexShrink: 0, minWidth: 22, textAlign: 'center', background: '#ede9fe', color: '#6d28d9', borderRadius: 999, padding: '1px 8px', fontSize: 12, fontWeight: 700 };
+const pickItem: React.CSSProperties = { padding: '6px 12px', borderTop: '1px solid #f6f4fd' };
+const pickLabel: React.CSSProperties = { display: 'flex', gap: 9, alignItems: 'flex-start', cursor: 'pointer', fontSize: 12.5, color: '#334155', lineHeight: 1.4 };
+const pickFooter: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '8px 11px', borderTop: '1px solid #f1f5f9' };
+const appliedWrap: React.CSSProperties = { padding: '8px 12px', borderBottom: '1px solid #f1f5f9', background: '#f7fdf9' };
+const appliedHead: React.CSSProperties = { fontSize: 12, fontWeight: 700, color: '#15803d', marginBottom: 5 };
+const appliedItem: React.CSSProperties = { display: 'flex', alignItems: 'baseline', gap: 7, padding: '2px 0', fontSize: 12.5, color: '#334155', overflow: 'hidden' };
+const appliedPath: React.CSSProperties = { flexShrink: 0, font: '600 11px ui-monospace, monospace', color: '#15803d', background: '#dcfce7', borderRadius: 5, padding: '1px 6px' };
+const appliedFlow: React.CSSProperties = { flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: '#7c3aed', background: '#ede9fe', borderRadius: 5, padding: '1px 6px' };
+const appliedText: React.CSSProperties = { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+const agentStrip: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 6, padding: '8px 12px', borderBottom: '1px solid #f1f5f9', background: '#faf9ff' };
+const agentChip: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '3px 9px', border: '1px solid #ece6fb', borderRadius: 999, background: 'white', fontSize: 11.5, color: '#475569' };
 const timerPill: React.CSSProperties = { font: '11.5px ui-monospace, "SF Mono", monospace', color: '#6d28d9', background: '#f3f0fc', border: '1px solid #ece6fb', borderRadius: 999, padding: '1px 8px' };
 const summaryLine: React.CSSProperties = { fontSize: 12.5, fontWeight: 600, padding: '6px 12px 8px' };
 const feedScroll: React.CSSProperties = { maxHeight: 300, overflow: 'auto', background: '#fbfaff' };

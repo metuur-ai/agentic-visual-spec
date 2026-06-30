@@ -215,7 +215,9 @@ export function createVisualSpecServer(opts: ServeOptions) {
           const sub = url.pathname.slice('/__vs/apply'.length);
           if (method === 'GET' && sub === '/events') return applyHub.subscribe(res);
           if (method === 'POST' && sub === '/start') {
-            const r = applyHub.start();
+            const body = await readJsonBody(req);
+            const ids = Array.isArray(body.ids) ? (body.ids as string[]) : undefined;
+            const r = applyHub.start(ids);
             return sendJson(res, r.status, r.json);
           }
           if (method === 'POST' && sub === '/cancel') {

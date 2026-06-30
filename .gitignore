@@ -6,3 +6,4 @@ coverage/
 .DS_Store
 .devlocal/
 .playwright-mcp/
+graphify-out/
