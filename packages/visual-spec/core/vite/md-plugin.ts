@@ -36,7 +36,7 @@ const RAW_MIME: Record<string, string> = {
 };
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
-  if (req.method !== 'POST' && req.method !== 'PATCH') return {};
+  if (req.method !== 'POST' && req.method !== 'PATCH' && req.method !== 'PUT') return {};
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
   const raw = Buffer.concat(chunks).toString('utf8');
@@ -75,11 +75,18 @@ async function handleTree(store: TreeStore, method: string, pathname: string, qu
   return { status: 404, json: { error: `no route: ${method} /__vs/tree${pathname}` } };
 }
 
-async function handleSource(store: SurfaceStore, method: string, pathname: string, query: Record<string, string>, root: string) {
+async function handleSource(store: SurfaceStore, method: string, pathname: string, query: Record<string, string>, root: string, body?: Record<string, unknown>) {
   if (method === 'GET' && pathname === '/list') return { status: 200, json: await store.list() };
   if (method === 'GET' && pathname === '/root') return { status: 200, json: { root } };
   if (method === 'GET' && (pathname === '' || pathname === '/')) {
     return { status: 200, json: { surfaceId: query.surfaceId, source: await store.read(query.surfaceId!) } };
+  }
+  // Save an edited surface back to disk. Body: { source: string }.
+  if (method === 'PUT' && (pathname === '' || pathname === '/')) {
+    if (!query.surfaceId) return { status: 400, json: { error: 'missing surfaceId' } };
+    if (typeof body?.source !== 'string') return { status: 400, json: { error: 'missing source' } };
+    await store.write(query.surfaceId, body.source);
+    return { status: 200, json: { surfaceId: query.surfaceId, ok: true } };
   }
   return { status: 404, json: { error: `no route: ${method} /__vs/source${pathname}` } };
 }
@@ -176,8 +183,8 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         })();
       });
 
-      server.middlewares.use('/__vs/source', middleware((req, query, pathname) =>
-        handleSource(surfaces, req.method ?? 'GET', pathname, query, specsRoot)));
+      server.middlewares.use('/__vs/source', middleware((req, query, pathname, body) =>
+        handleSource(surfaces, req.method ?? 'GET', pathname, query, specsRoot, body)));
 
       server.middlewares.use('/__vs/comments', middleware((req, query, pathname, body) =>
         handleCommentsRequest(comments, req.method ?? 'GET', pathname, query, body)));

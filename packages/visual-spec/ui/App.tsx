@@ -2,8 +2,9 @@ import { InspectorProvider, useComments } from '../core/app';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { FileTree } from './file-tree';
 import { GenericEditor } from './generic-editor';
-import { BrandHeader, MainHeader } from './main-header';
+import { BrandHeader, MainHeader, type ViewMode } from './main-header';
 import { MarkdownEditor } from './markdown-editor';
+import { MarkdownDocEditor } from './markdown-doc-editor';
 import { toSurfaceId } from './md-path';
 import { type TreeEntry, useTree } from './use-tree';
 
@@ -15,6 +16,7 @@ const CMT_MAX_W = 720;
 export function App() {
   const { entries, loading } = useTree();
   const [selected, setSelected] = useState<TreeEntry | null>(null);
+  const [mode, setMode] = useState<ViewMode>('view');
   const [width, setWidth] = useState<number>(() => {
     const saved = Number(localStorage.getItem('vs:sidebarWidth'));
     return saved >= MIN_W && saved <= MAX_W ? saved : 280;
@@ -35,24 +37,37 @@ export function App() {
     localStorage.setItem('vs:commentWidth', String(clamped));
   };
 
+  // Selecting a different file always returns to View mode (Edit is per-file).
+  const pick = (e: TreeEntry) => {
+    setSelected(e);
+    setMode('view');
+  };
+
   // Jump to a path from the cart dropdown.
   const navigate = (path: string) => {
     const e = entries.find((x) => x.path === path);
-    if (e) setSelected(e);
+    if (e) pick(e);
   };
 
   const current = selected?.path ?? '';
   const isMarkdown = selected?.type === 'file' && selected.kind === 'markdown';
+  const editing = isMarkdown && mode === 'edit';
   const commentSplitter = <Splitter onResize={resizeComment} fromRight />;
 
   const shell = (
     <>
-      {selected ? <MainHeader file={current} onNavigate={navigate} withInspector={isMarkdown} /> : <BrandHeader />}
+      {selected ? (
+        <MainHeader file={current} onNavigate={navigate} withInspector={isMarkdown} isMarkdown={isMarkdown} mode={mode} onModeChange={setMode} />
+      ) : (
+        <BrandHeader />
+      )}
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-        <Sidebar entries={entries} current={current} loading={loading} onPick={setSelected} width={width} />
+        <Sidebar entries={entries} current={current} loading={loading} onPick={pick} width={width} />
         <Splitter onResize={resize} />
         {selected ? (
-          isMarkdown ? (
+          editing ? (
+            <MarkdownDocEditor key={current} path={current} previewWidth={commentWidth} splitter={commentSplitter} />
+          ) : isMarkdown ? (
             <MarkdownEditor path={current} commentWidth={commentWidth} splitter={commentSplitter} />
           ) : (
             <GenericEditor key={current} entry={selected} commentWidth={commentWidth} splitter={commentSplitter} />

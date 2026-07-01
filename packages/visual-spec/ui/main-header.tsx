@@ -610,7 +610,44 @@ function InspectorToggle() {
   );
 }
 
-export function MainHeader({ file, onNavigate, withInspector = false }: { file: string; onNavigate?: (f: string) => void; withInspector?: boolean }) {
+export type ViewMode = 'view' | 'edit';
+
+/** Segmented View / Edit switch — shown only for markdown files. */
+function ModeToggle({ mode, onModeChange }: { mode: ViewMode; onModeChange: (m: ViewMode) => void }) {
+  return (
+    <div style={segWrap} role="tablist" aria-label="View or edit">
+      {(['view', 'edit'] as const).map((m) => (
+        <button
+          key={m}
+          type="button"
+          role="tab"
+          aria-selected={mode === m}
+          onClick={() => onModeChange(m)}
+          style={mode === m ? segBtnActive : segBtn}
+          title={m === 'view' ? 'Read & comment' : 'Edit the markdown source'}
+        >
+          {m === 'view' ? 'View' : 'Edit'}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export function MainHeader({
+  file,
+  onNavigate,
+  withInspector = false,
+  isMarkdown = false,
+  mode = 'view',
+  onModeChange,
+}: {
+  file: string;
+  onNavigate?: (f: string) => void;
+  withInspector?: boolean;
+  isMarkdown?: boolean;
+  mode?: ViewMode;
+  onModeChange?: (m: ViewMode) => void;
+}) {
   const { comments } = useComments(); // all files = the cart
   const open = comments.filter((c) => c.status === 'open');
   const [copied, setCopied] = useState(false);
@@ -644,7 +681,8 @@ export function MainHeader({ file, onNavigate, withInspector = false }: { file: 
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
         <HelpButton />
-        {withInspector && <InspectorToggle />}
+        {isMarkdown && onModeChange && <ModeToggle mode={mode} onModeChange={onModeChange} />}
+        {withInspector && mode === 'view' && <InspectorToggle />}
 
         {copied && <span style={toast}>✓ Copied</span>}
         <div ref={cartRef} style={{ position: 'relative' }}>
@@ -778,6 +816,9 @@ const pathText: React.CSSProperties = { font: '11.5px ui-monospace, "SF Mono", m
 const pathSep: React.CSSProperties = { color: '#cbd5e1', fontSize: 13, flexShrink: 0 };
 const pathFile: React.CSSProperties = { font: '600 11.5px ui-monospace, "SF Mono", monospace', color: '#7c3aed', flexShrink: 0 };
 const cart: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 5, background: '#f1f5f9', borderRadius: 99, padding: '3px 10px', fontSize: 13, color: '#475569' };
+const segWrap: React.CSSProperties = { display: 'inline-flex', padding: 2, gap: 2, background: '#f1f5f9', border: '1px solid #e5e7eb', borderRadius: 9 };
+const segBtn: React.CSSProperties = { padding: '5px 12px', border: 'none', borderRadius: 7, background: 'transparent', color: '#64748b', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
+const segBtnActive: React.CSSProperties = { ...segBtn, background: 'white', color: '#4f46e5', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' };
 const startBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 12px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#334155', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
 const startBtnActive: React.CSSProperties = { ...startBtn, border: '1px solid #2563eb', background: '#eff6ff', color: '#1d4ed8' };
 const secondary: React.CSSProperties = { padding: '7px 14px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#334155', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
