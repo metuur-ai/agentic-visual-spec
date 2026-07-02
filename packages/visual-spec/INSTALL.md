@@ -1,9 +1,22 @@
+---
+title: Install Guide
+version: 0.1.5
+---
+
 # Build & install on another computer
 
 The cleanest way to move Visual Specs to another machine is `npm pack` — it
 produces a tarball of exactly what gets published (the `dist/` folder, per the
 `files` field in `package.json`), which you then install globally. No need to copy
 `node_modules` or source.
+
+| asdasd | asdasd | asdasd |
+| --- | --- | --- |
+| asdasd | asdasd | asdasd |
+
+<p align="center">
+![IMG_2238.jpeg](assets/IMG_2238.jpeg)
+</p>
 
 ## 1. Build & package locally
 
@@ -38,19 +51,19 @@ required there).
   source unnecessarily. If you do want a plain zip, build first and zip only what
   ships:
 
-  ```bash
+```bash
   npm run build && zip -r visual-spec.zip dist package.json
-  ```
+```
 
   Then on the other side: `npm install -g /path/to/unzipped-folder`. The `.tgz`
   route is simpler and produces an identical result.
 
 - **scp one-liner:**
 
-  ```bash
+```bash
   scp metuur-visual-spec-0.1.3.tgz user@host:~/
   # then SSH over and run the install command above
-  ```
+```
 
 - The tarball is **self-contained**: `@babel/*` and `ignore` are bundled into
   `dist/cli.js` at build time (esbuild), so the global install pulls only the

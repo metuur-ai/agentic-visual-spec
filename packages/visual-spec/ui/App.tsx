@@ -1,5 +1,5 @@
 import { InspectorProvider, useComments } from '../core/app';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FileTree } from './file-tree';
 import { GenericEditor } from './generic-editor';
 import { BrandHeader, MainHeader, type ViewMode } from './main-header';
@@ -37,10 +37,36 @@ export function App() {
     localStorage.setItem('vs:commentWidth', String(clamped));
   };
 
+  // Live dirty state + a success-returning save, reported up by the doc editor,
+  // so switching to View can guard unsaved edits instead of dropping them.
+  const editorState = useRef<{ dirty: boolean; save: () => Promise<boolean> }>({ dirty: false, save: async () => true });
+  const [confirmView, setConfirmView] = useState(false);
+  const onEditorState = useCallback((s: { dirty: boolean; save: () => Promise<boolean> }) => {
+    editorState.current = s;
+  }, []);
+
+  const exitToView = useCallback(() => {
+    editorState.current = { dirty: false, save: async () => true };
+    setMode('view');
+  }, []);
+
+  // Guarded mode switch: leaving Edit for View with unsaved edits opens a
+  // Save / Discard / Cancel prompt rather than silently unmounting the buffer.
+  const requestMode = useCallback(
+    (next: ViewMode) => {
+      if (next === 'view' && editorState.current.dirty) {
+        setConfirmView(true);
+        return;
+      }
+      setMode(next);
+    },
+    [],
+  );
+
   // Selecting a different file always returns to View mode (Edit is per-file).
   const pick = (e: TreeEntry) => {
     setSelected(e);
-    setMode('view');
+    exitToView();
   };
 
   // Jump to a path from the cart dropdown.
@@ -57,7 +83,7 @@ export function App() {
   const shell = (
     <>
       {selected ? (
-        <MainHeader file={current} onNavigate={navigate} withInspector={isMarkdown} isMarkdown={isMarkdown} mode={mode} onModeChange={setMode} />
+        <MainHeader file={current} onNavigate={navigate} withInspector={isMarkdown} isMarkdown={isMarkdown} mode={mode} onModeChange={requestMode} />
       ) : (
         <BrandHeader />
       )}
@@ -66,7 +92,7 @@ export function App() {
         <Splitter onResize={resize} />
         {selected ? (
           editing ? (
-            <MarkdownDocEditor key={current} path={current} previewWidth={commentWidth} splitter={commentSplitter} />
+            <MarkdownDocEditor key={current} path={current} previewWidth={commentWidth} splitter={commentSplitter} onExitToView={exitToView} onStateChange={onEditorState} />
           ) : isMarkdown ? (
             <MarkdownEditor path={current} commentWidth={commentWidth} splitter={commentSplitter} />
           ) : (
@@ -78,6 +104,20 @@ export function App() {
           </main>
         )}
       </div>
+      {confirmView && (
+        <UnsavedDialog
+          onSaveAndView={async () => {
+            const ok = await editorState.current.save();
+            setConfirmView(false);
+            if (ok) exitToView();
+          }}
+          onDiscard={() => {
+            setConfirmView(false);
+            exitToView();
+          }}
+          onCancel={() => setConfirmView(false)}
+        />
+      )}
     </>
   );
 
@@ -90,6 +130,30 @@ export function App() {
       ) : (
         shell
       )}
+    </div>
+  );
+}
+
+/** Guard shown when leaving Edit for View with unsaved changes. */
+function UnsavedDialog({ onSaveAndView, onDiscard, onCancel }: { onSaveAndView: () => void; onDiscard: () => void; onCancel: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onCancel();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onCancel]);
+  return (
+    <div style={dialogBackdrop} onMouseDown={onCancel}>
+      <div style={dialogCard} onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Unsaved changes">
+        <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 6 }}>Unsaved changes</div>
+        <div style={{ fontSize: 13, color: '#475569', marginBottom: 16 }}>You have edits that aren’t saved yet. Save them before switching to View?</div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          <button type="button" onClick={onDiscard} style={dialogDiscard}>Discard</button>
+          <button type="button" onClick={onCancel} style={dialogCancel}>Cancel</button>
+          <button type="button" onClick={onSaveAndView} style={dialogPrimary} autoFocus>Save &amp; View</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -184,3 +248,8 @@ const footer: React.CSSProperties = { flexShrink: 0, padding: '10px 12px', borde
 const footerLink: React.CSSProperties = { color: '#a78bca', textDecoration: 'none', fontWeight: 600 };
 const splitter: React.CSSProperties = { width: 6, flexShrink: 0, cursor: 'col-resize', background: 'transparent', transition: 'background 120ms', marginLeft: -3, zIndex: 5 };
 const filter: React.CSSProperties = { width: '100%', padding: '5px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: 'inherit' };
+const dialogBackdrop: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 100, display: 'grid', placeItems: 'center', background: 'rgba(15,23,42,0.35)' };
+const dialogCard: React.CSSProperties = { width: 380, maxWidth: 'calc(100vw - 32px)', padding: 20, borderRadius: 12, background: 'white', boxShadow: '0 20px 50px rgba(0,0,0,0.28)', font: 'system-ui' };
+const dialogPrimary: React.CSSProperties = { padding: '7px 14px', border: 'none', borderRadius: 8, background: '#7c3aed', color: 'white', cursor: 'pointer', font: '600 13px system-ui' };
+const dialogCancel: React.CSSProperties = { padding: '7px 14px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#475569', cursor: 'pointer', font: '600 13px system-ui' };
+const dialogDiscard: React.CSSProperties = { padding: '7px 14px', border: '1px solid #fecaca', borderRadius: 8, background: 'white', color: '#b91c1c', cursor: 'pointer', font: '600 13px system-ui' };

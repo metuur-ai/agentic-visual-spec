@@ -17,6 +17,7 @@ import { extname, isAbsolute, join } from 'node:path';
 import type { Connect, Plugin } from 'vite';
 import { type CommentDocStore, fileCommentStore, handleCommentsRequest } from './routes/comments';
 import { createApplyHub } from './routes/apply';
+import { MAX_UPLOAD_BYTES, saveUploadedAsset } from './routes/upload';
 import { currentPlugin } from './current-plugin';
 import { mdSurfaceStore } from './md-store';
 import { pickDirectoryNative } from './native-pick';
@@ -47,6 +48,18 @@ function sendJson(res: ServerResponse, status: number, json: unknown) {
   res.statusCode = status;
   res.setHeader('content-type', 'application/json');
   res.end(JSON.stringify(json));
+}
+
+/** Read a raw request body up to `limit` bytes; throws 'too-large' past it. */
+async function readRawBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > limit) throw new Error('too-large');
+    chunks.push(chunk as Buffer);
+  }
+  return Buffer.concat(chunks);
 }
 
 function middleware(fn: (req: IncomingMessage, query: Record<string, string>, pathname: string, body: Record<string, unknown>) => Promise<{ status: number; json: unknown }>): Connect.NextHandleFunction {
@@ -91,7 +104,7 @@ async function handleSource(store: SurfaceStore, method: string, pathname: strin
   return { status: 404, json: { error: `no route: ${method} /__vs/source${pathname}` } };
 }
 
-export type MarkdownOptions = { contentDir?: string; commentsFile?: string };
+export type MarkdownOptions = { contentDir?: string; commentsFile?: string; assetsDir?: string };
 
 function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
   let root = process.cwd();
@@ -183,6 +196,34 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         })();
       });
 
+      // Persist an image uploaded from the WYSIWYG toolbar (raw bytes, not JSON,
+      // so it bypasses the json `middleware` helper). Body: the file; query:
+      // ?name=<original filename>. Returns { path } relative to the specs root.
+      server.middlewares.use('/__vs/upload', (req, res, next) => {
+        void (async () => {
+          try {
+            if (req.method !== 'POST') return next();
+            const url = new URL(req.url ?? '', 'http://localhost');
+            const name = url.searchParams.get('name');
+            if (!name) return sendJson(res, 400, { error: 'missing name' });
+            let bytes: Buffer;
+            try {
+              bytes = await readRawBody(req, MAX_UPLOAD_BYTES);
+            } catch {
+              return sendJson(res, 413, { error: 'file too large' });
+            }
+            if (bytes.length === 0) return sendJson(res, 400, { error: 'empty upload' });
+            // A per-upload ?dir wins over the configured default, so the editor
+            // can target a folder chosen at insert time.
+            const dir = url.searchParams.get('dir') || opts.assetsDir;
+            const path = await saveUploadedAsset(specsRoot, name, bytes, req.headers['content-type'], dir);
+            sendJson(res, 200, { path });
+          } catch (err) {
+            sendJson(res, 500, { error: (err as Error).message });
+          }
+        })();
+      });
+
       server.middlewares.use('/__vs/source', middleware((req, query, pathname, body) =>
         handleSource(surfaces, req.method ?? 'GET', pathname, query, specsRoot, body)));
 
@@ -257,6 +298,7 @@ export function visualSpecMarkdown(opts: MarkdownOptions = {}): Plugin[] {
   const resolved = {
     contentDir: opts.contentDir ?? 'content',
     commentsFile: opts.commentsFile ?? 'visual-spec-comments.json',
+    assetsDir: opts.assetsDir ?? 'assets',
   };
   return [virtualSurfacesStubPlugin(), mdApiPlugin(resolved), currentPlugin()];
 }

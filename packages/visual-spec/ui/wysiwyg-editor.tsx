@@ -1,344 +1,536 @@
 /**
- * wysiwyg-editor.tsx — a Lexical rich-text editor over the .md buffer. Loads the
- * markdown into Lexical nodes, edits WYSIWYG, and exports back to markdown via
- * @lexical/markdown TRANSFORMERS so the file stays the source of truth.
+ * wysiwyg-editor.tsx — a rich-text editor over the .md buffer, built on Luthor's
+ * type-safe `ExtensiveEditor` preset (Lexical under the hood). Loads the markdown
+ * body once on mount and round-trips through Luthor's markdown bridge
+ * (`ref.getMarkdown()`), so the .md file stays the source of truth.
  *
- * Fidelity note: the round-trip is normalizing (Lexical rebuilds the markdown
- * from its node tree), so saving from here rewrites formatting. Tables / mermaid
- * fences / frontmatter aren't covered by the built-in transformers yet.
+ * Luthor's preset is *uncontrolled by design*: `defaultContent` is read once at
+ * mount, edits are observed via the DOM, and the current markdown is pulled
+ * imperatively through the ref. To adopt an EXTERNAL revision (file switch, save
+ * echo from the server) we remount by bumping a React `key`; our own exports are
+ * recognised and never trigger a remount.
+ *
+ * Fidelity note: the round-trip is normalizing (Luthor rebuilds the markdown from
+ * its node tree), so saving from here can rewrite formatting. Relative image srcs
+ * are absolutized to /__vs/raw for display and relativized back on export.
+ *
+ * Comments: select text and a floating "Comment" affordance opens an inline
+ * composer that files a range comment against this file via `onAddComment` —
+ * the same sidecar model used in view mode.
  */
-import { $createCodeNode, CodeNode } from '@lexical/code';
-import { $isLinkNode, LinkNode, TOGGLE_LINK_COMMAND } from '@lexical/link';
-import {
-  $isListNode,
-  INSERT_ORDERED_LIST_COMMAND,
-  INSERT_UNORDERED_LIST_COMMAND,
-  ListItemNode,
-  ListNode,
-  REMOVE_LIST_COMMAND,
-} from '@lexical/list';
-import { $convertFromMarkdownString, $convertToMarkdownString, TRANSFORMERS } from '@lexical/markdown';
-import { LexicalComposer } from '@lexical/react/LexicalComposer';
-import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext';
-import { ContentEditable } from '@lexical/react/LexicalContentEditable';
-import { LexicalErrorBoundary } from '@lexical/react/LexicalErrorBoundary';
-import { HistoryPlugin } from '@lexical/react/LexicalHistoryPlugin';
-import { LinkPlugin } from '@lexical/react/LexicalLinkPlugin';
-import { ListPlugin } from '@lexical/react/LexicalListPlugin';
-import { MarkdownShortcutPlugin } from '@lexical/react/LexicalMarkdownShortcutPlugin';
-import { OnChangePlugin } from '@lexical/react/LexicalOnChangePlugin';
-import { RichTextPlugin } from '@lexical/react/LexicalRichTextPlugin';
-import { $createHeadingNode, $createQuoteNode, $isHeadingNode, HeadingNode, QuoteNode } from '@lexical/rich-text';
-import { $setBlocksType } from '@lexical/selection';
-import { $getNearestNodeOfType, mergeRegister } from '@lexical/utils';
-import {
-  $createParagraphNode,
-  $getSelection,
-  $isRangeSelection,
-  CAN_REDO_COMMAND,
-  CAN_UNDO_COMMAND,
-  COMMAND_PRIORITY_LOW,
-  type EditorState,
-  FORMAT_ELEMENT_COMMAND,
-  FORMAT_TEXT_COMMAND,
-  REDO_COMMAND,
-  UNDO_COMMAND,
-} from 'lexical';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import './prism-global'; // must precede @lyfie/luthor — sets the global Prism it needs
+import { ExtensiveEditor, type ExtensiveEditorRef, headless } from '@lyfie/luthor';
+import '@lyfie/luthor/styles.css';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type TreeEntry, rawUrl, useTree } from './use-tree';
+import { WorkflowSelect, loadWorkflow } from './workflow-select';
 
-const THEME = {
-  paragraph: 'vs-lex-p',
-  quote: 'vs-lex-quote',
-  heading: { h1: 'vs-lex-h1', h2: 'vs-lex-h2', h3: 'vs-lex-h3', h4: 'vs-lex-h4', h5: 'vs-lex-h5', h6: 'vs-lex-h6' },
-  list: { ul: 'vs-lex-ul', ol: 'vs-lex-ol', listitem: 'vs-lex-li' },
-  link: 'vs-lex-link',
-  code: 'vs-lex-codeblock',
-  text: {
-    bold: 'vs-lex-bold',
-    italic: 'vs-lex-italic',
-    underline: 'vs-lex-underline',
-    strikethrough: 'vs-lex-strikethrough',
-    underlineStrikethrough: 'vs-lex-underline-strikethrough',
-    code: 'vs-lex-code',
-  },
+/** Remembered upload destination (relative to the spec root), shared across files. */
+const UPLOAD_DIR_KEY = 'vs:uploadDir';
+const loadUploadDir = () => localStorage.getItem(UPLOAD_DIR_KEY) || 'assets';
+
+/** Basename without extension — a reasonable default alt text for a picked image. */
+function altFromPath(p: string): string {
+  const base = p.slice(p.lastIndexOf('/') + 1);
+  const dot = base.lastIndexOf('.');
+  return dot > 0 ? base.slice(0, dot) : base;
+}
+
+/** A comment drafted from an editor text selection, handed to the host to file. */
+export type CommentDraft = {
+  comment: string;
+  workflow: string;
+  selectedContent: string; // verbatim highlighted text
+  snippet: string; // first line of the selection (<=160 chars)
+  endSnippet?: string; // last line, when the selection spans lines
+  heading: string | null; // nearest heading above the selection
 };
 
-const NODES = [HeadingNode, QuoteNode, ListNode, ListItemNode, CodeNode, LinkNode];
-
-/** Loads markdown into the editor whenever the incoming value diverges from our
- *  own last export — tagged history-merge so it neither fires onChange nor lands
- *  in the undo stack. */
-function LoadMarkdownPlugin({ value, lastExport, loaded }: { value: string; lastExport: React.MutableRefObject<string | null>; loaded: React.MutableRefObject<boolean> }) {
-  const [editor] = useLexicalComposerContext();
-  useEffect(() => {
-    if (value === lastExport.current) return;
-    lastExport.current = value;
-    editor.update(() => $convertFromMarkdownString(value, TRANSFORMERS), { tag: 'history-merge' });
-    loaded.current = true;
-  }, [editor, value, lastExport, loaded]);
-  return null;
+/** Rewrite the src of every markdown image via `map` (inline `![alt](src)`). */
+function mapImages(md: string, map: (src: string) => string): string {
+  return md.replace(/(!\[[^\]]*\]\()\s*([^)\s]+)([^)]*\))/g, (_m, pre, src, post) => `${pre}${map(src)}${post}`);
 }
 
-/** Block kinds we expose in the block-type dropdown; each maps to a transformer. */
-type BlockType = 'paragraph' | 'h1' | 'h2' | 'h3' | 'bullet' | 'number' | 'quote' | 'code';
-const BLOCK_LABELS: Record<BlockType, string> = {
-  paragraph: 'Paragraph',
-  h1: 'Heading 1',
-  h2: 'Heading 2',
-  h3: 'Heading 3',
-  bullet: 'Bulleted list',
-  number: 'Numbered list',
-  quote: 'Quote',
-  code: 'Code block',
-};
-
-/** The formatting toolbar — inline formats, block type, lists, links, alignment. */
-function Toolbar() {
-  const [editor] = useLexicalComposerContext();
-  const [canUndo, setCanUndo] = useState(false);
-  const [canRedo, setCanRedo] = useState(false);
-  const [fmt, setFmt] = useState({ bold: false, italic: false, underline: false, strikethrough: false, code: false, link: false });
-  const [block, setBlock] = useState<BlockType>('paragraph');
-
-  const sync = useCallback(() => {
-    const sel = $getSelection();
-    if (!$isRangeSelection(sel)) return;
-    setFmt({
-      bold: sel.hasFormat('bold'),
-      italic: sel.hasFormat('italic'),
-      underline: sel.hasFormat('underline'),
-      strikethrough: sel.hasFormat('strikethrough'),
-      code: sel.hasFormat('code'),
-      link: $isLinkNode(sel.anchor.getNode().getParent()) || $isLinkNode(sel.anchor.getNode()),
-    });
-    // Resolve the block type of the selection's top-level element.
-    const anchor = sel.anchor.getNode();
-    const element = anchor.getKey() === 'root' ? anchor : anchor.getTopLevelElementOrThrow();
-    if ($isListNode(element)) {
-      const list = $getNearestNodeOfType(anchor, ListNode);
-      setBlock(((list ?? element).getListType() === 'number' ? 'number' : 'bullet') as BlockType);
-    } else if ($isHeadingNode(element)) {
-      const tag = element.getTag();
-      setBlock((tag === 'h1' || tag === 'h2' || tag === 'h3' ? tag : 'paragraph') as BlockType);
-    } else {
-      const t = element.getType();
-      setBlock((t === 'quote' ? 'quote' : t === 'code' ? 'code' : 'paragraph') as BlockType);
-    }
-  }, []);
-
-  useEffect(
-    () =>
-      mergeRegister(
-        editor.registerUpdateListener(({ editorState }) => editorState.read(sync)),
-        editor.registerCommand(CAN_UNDO_COMMAND, (p: boolean) => (setCanUndo(p), false), COMMAND_PRIORITY_LOW),
-        editor.registerCommand(CAN_REDO_COMMAND, (p: boolean) => (setCanRedo(p), false), COMMAND_PRIORITY_LOW),
-      ),
-    [editor, sync],
-  );
-
-  const setBlockType = (next: BlockType) => {
-    if (next === block) return;
-    if (next === 'bullet') return void editor.dispatchCommand(INSERT_UNORDERED_LIST_COMMAND, undefined);
-    if (next === 'number') return void editor.dispatchCommand(INSERT_ORDERED_LIST_COMMAND, undefined);
-    // Leaving a list requires removing it before re-typing the block.
-    if (block === 'bullet' || block === 'number') editor.dispatchCommand(REMOVE_LIST_COMMAND, undefined);
-    editor.update(() => {
-      const sel = $getSelection();
-      if (!$isRangeSelection(sel)) return;
-      if (next === 'paragraph') $setBlocksType(sel, () => $createParagraphNode());
-      else if (next === 'quote') $setBlocksType(sel, () => $createQuoteNode());
-      else if (next === 'code') $setBlocksType(sel, () => $createCodeNode());
-      else $setBlocksType(sel, () => $createHeadingNode(next));
-    });
-  };
-
-  const toggleLink = () => {
-    if (fmt.link) return void editor.dispatchCommand(TOGGLE_LINK_COMMAND, null);
-    const url = window.prompt('Link URL:', 'https://');
-    if (url) editor.dispatchCommand(TOGGLE_LINK_COMMAND, url);
-  };
-
-  return (
-    <div style={bar}>
-      <Btn title="Undo (⌘Z)" disabled={!canUndo} onClick={() => editor.dispatchCommand(UNDO_COMMAND, undefined)}>
-        ↺
-      </Btn>
-      <Btn title="Redo (⌘⇧Z)" disabled={!canRedo} onClick={() => editor.dispatchCommand(REDO_COMMAND, undefined)}>
-        ↻
-      </Btn>
-      <Sep />
-      <select
-        aria-label="Block type"
-        value={block}
-        onChange={(e) => setBlockType(e.target.value as BlockType)}
-        onMouseDown={(e) => e.stopPropagation()}
-        style={blockSelect}
-      >
-        {(Object.keys(BLOCK_LABELS) as BlockType[]).map((b) => (
-          <option key={b} value={b}>
-            {BLOCK_LABELS[b]}
-          </option>
-        ))}
-      </select>
-      <Sep />
-      <Btn title="Bold (⌘B)" active={fmt.bold} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold')} style={{ fontWeight: 800 }}>
-        B
-      </Btn>
-      <Btn title="Italic (⌘I)" active={fmt.italic} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'italic')} style={{ fontStyle: 'italic', fontFamily: 'Georgia, serif' }}>
-        I
-      </Btn>
-      <Btn title="Underline (⌘U)" active={fmt.underline} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'underline')} style={{ textDecoration: 'underline' }}>
-        U
-      </Btn>
-      <Btn title="Strikethrough" active={fmt.strikethrough} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'strikethrough')} style={{ textDecoration: 'line-through' }}>
-        S
-      </Btn>
-      <Btn title="Inline code" active={fmt.code} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'code')} style={{ fontFamily: 'ui-monospace, monospace' }}>
-        {'</>'}
-      </Btn>
-      <Btn title="Link" active={fmt.link} onClick={toggleLink}>
-        🔗
-      </Btn>
-      <Sep />
-      <Btn title="Align left" onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'left')}>
-        ⇤
-      </Btn>
-      <Btn title="Align center" onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'center')}>
-        ↔
-      </Btn>
-      <Btn title="Align right" onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'right')}>
-        ⇥
-      </Btn>
-      <Btn title="Justify" onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'justify')}>
-        ☰
-      </Btn>
-    </div>
-  );
+/** Nearest heading at or above a node — the robust markdown anchor (mirrors CommentPanel). */
+function nearestHeading(node: Node, root: HTMLElement): string | null {
+  const anchor = (node.nodeType === Node.TEXT_NODE ? node.parentElement : (node as HTMLElement)) ?? root;
+  if (anchor instanceof HTMLElement && /^H[1-6]$/.test(anchor.tagName)) return anchor.textContent?.trim() ?? null;
+  const heads = Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6')) as HTMLElement[];
+  let best: string | null = null;
+  for (const h of heads) {
+    const precedes = (h.compareDocumentPosition(anchor) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    if (precedes) best = h.textContent?.trim() ?? best;
+    else break;
+  }
+  return best;
 }
 
-function Btn({ children, title, onClick, active, disabled, style }: { children: React.ReactNode; title: string; onClick: () => void; active?: boolean; disabled?: boolean; style?: React.CSSProperties }) {
-  return (
-    <button
-      type="button"
-      title={title}
-      disabled={disabled}
-      onMouseDown={(e) => e.preventDefault()} // keep editor selection
-      onClick={onClick}
-      style={{ ...toolBtn, ...(active ? toolBtnActive : null), ...(disabled ? { opacity: 0.35, cursor: 'default' } : null), ...style }}
-    >
-      {children}
-    </button>
-  );
+/** The live, non-collapsed selection inside `root`, or null. */
+function readSelection(root: HTMLElement): { text: string; rect: DOMRect; heading: string | null } | null {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+  const range = sel.getRangeAt(0);
+  if (!root.contains(range.commonAncestorContainer)) return null;
+  const text = sel.toString().trim();
+  if (!text) return null;
+  const rect = range.getBoundingClientRect();
+  if (!rect.width && !rect.height) return null;
+  return { text, rect, heading: nearestHeading(range.startContainer, root) };
 }
-
-const Sep = () => <span style={sep} />;
 
 export function WysiwygEditor({
   value,
   onChange,
   onSave,
+  resolveImageSrc = (s) => s,
+  toStoredImageSrc = (s) => s,
+  onAddComment,
 }: {
-  value: string;
+  value: string; // markdown body (frontmatter already split off by the host)
   onChange: (next: string) => void;
   onSave: () => void;
+  resolveImageSrc?: (src: string) => string; // relative → /__vs/raw absolute (display)
+  toStoredImageSrc?: (src: string) => string; // /__vs/raw absolute → relative (export)
+  onAddComment?: (draft: CommentDraft) => void | Promise<void>;
 }) {
-  // Sentinel (null) so the first mount always loads — even when the editor
-  // mounts with a buffer already populated (e.g. switching Source → Rich).
-  const lastExport = useRef<string | null>(null);
+  const api = useRef<ExtensiveEditorRef | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const loaded = useRef(false);
+  // Guards the export: Luthor renormalizes the DOM after a load, which the
+  // MutationObserver can't tell from a real edit. We only export once the user
+  // has actually interacted (typed, pasted, or clicked a toolbar control).
+  const interacted = useRef(false);
+  // While a native block drag is in flight, suspend exports: a re-render from a
+  // mid-drag onChange would cancel the browser's drag. We flush once on dragend.
+  const dragging = useRef(false);
+  // The markdown we and the host last agreed on — echo guard AND export baseline.
+  // Seeded with the incoming value so the first mount doesn't remount itself.
+  const lastSynced = useRef<string>(value);
+
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
   const onSaveRef = useRef(onSave);
   onSaveRef.current = onSave;
+  const toStoredRef = useRef(toStoredImageSrc);
+  toStoredRef.current = toStoredImageSrc;
+  const resolveRef = useRef(resolveImageSrc);
+  resolveRef.current = resolveImageSrc;
+  const onAddCommentRef = useRef(onAddComment);
+  onAddCommentRef.current = onAddComment;
 
-  const handleChange = useCallback((editorState: EditorState) => {
-    if (!loaded.current) return; // ignore pre-load fires
-    editorState.read(() => {
-      // Lexical omits the trailing newline; markdown files conventionally end
-      // with one, so normalize to avoid a spurious final-line diff on save.
-      const md = `${$convertToMarkdownString(TRANSFORMERS).replace(/\n+$/, '')}\n`;
-      if (md === lastExport.current) return;
-      lastExport.current = md;
-      onChangeRef.current(md);
-    });
+  // Remount only when an EXTERNAL value arrives (host adopted a fresh source);
+  // our own exports set `lastSynced` first, so they're ignored here.
+  const [gen, setGen] = useState(0);
+  const mountContent = useRef<string>(mapImages(value, resolveImageSrc));
+  useEffect(() => {
+    if (value === lastSynced.current) return; // our own echo — do not remount
+    lastSynced.current = value;
+    mountContent.current = mapImages(value, resolveRef.current);
+    loaded.current = false;
+    interacted.current = false;
+    setGen((g) => g + 1);
+  }, [value]);
+
+  // Pull the current markdown, relativize images, and push it to the host (once
+  // loaded, and only when it actually changed).
+  const pushMarkdown = useCallback(() => {
+    const a = api.current;
+    if (!a || !loaded.current || !interacted.current || dragging.current) return;
+    const md = `${mapImages(a.getMarkdown(), toStoredRef.current).replace(/\n+$/, '')}\n`;
+    if (md === lastSynced.current) return;
+    lastSynced.current = md;
+    onChangeRef.current(md);
   }, []);
 
-  const initialConfig = {
-    namespace: 'visual-spec',
-    theme: THEME,
-    nodes: NODES,
-    onError: (e: Error) => {
-      throw e;
-    },
-  };
+  // Observe edits: contentEditable `input` covers typing; a MutationObserver
+  // catches toolbar-driven formatting. Both are debounced into one export.
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    let t: number | undefined;
+    const schedule = () => {
+      window.clearTimeout(t);
+      t = window.setTimeout(pushMarkdown, 250);
+    };
+    const mark = () => {
+      // On the first interaction, snapshot the steady-state markdown *before* the
+      // edit lands. Load-time normalization has settled by now, so a no-op action
+      // (selecting text, arrow keys, clicking the comment pill) leaves getMarkdown
+      // equal to this baseline and never dirties the buffer; a real edit diverges.
+      if (!interacted.current) {
+        interacted.current = true;
+        const a = api.current;
+        if (a) {
+          try {
+            lastSynced.current = `${mapImages(a.getMarkdown(), toStoredRef.current).replace(/\n+$/, '')}\n`;
+          } catch {
+            /* keep the prior baseline */
+          }
+        }
+      }
+      schedule();
+    };
+    // A native block drag is a real edit, but exporting mid-drag would re-render
+    // and cancel it; hold exports until the drag ends, then flush once.
+    const onDragStart = () => {
+      interacted.current = true;
+      dragging.current = true;
+      window.clearTimeout(t);
+    };
+    const onDragEnd = () => {
+      dragging.current = false;
+      schedule();
+    };
+    const mo = new MutationObserver(schedule);
+    mo.observe(root, { subtree: true, childList: true, characterData: true, attributes: true });
+    // These are unambiguously user-driven; load-settling reflows fire none of them.
+    root.addEventListener('beforeinput', mark);
+    root.addEventListener('input', mark);
+    root.addEventListener('keydown', mark);
+    root.addEventListener('pointerdown', mark);
+    root.addEventListener('dragstart', onDragStart);
+    root.addEventListener('dragend', onDragEnd);
+    root.addEventListener('drop', onDragEnd);
+    return () => {
+      mo.disconnect();
+      root.removeEventListener('beforeinput', mark);
+      root.removeEventListener('input', mark);
+      root.removeEventListener('keydown', mark);
+      root.removeEventListener('pointerdown', mark);
+      root.removeEventListener('dragstart', onDragStart);
+      root.removeEventListener('dragend', onDragEnd);
+      root.removeEventListener('drop', onDragEnd);
+      window.clearTimeout(t);
+    };
+  }, [pushMarkdown]);
+
+  // Destination folder for uploads, chosen in the strip and remembered.
+  const [uploadDir, setUploadDir] = useState(loadUploadDir);
+  const uploadDirRef = useRef(uploadDir);
+  uploadDirRef.current = uploadDir;
+  const [pickerOpen, setPickerOpen] = useState(false);
+
+  // Upload an image chosen from the toolbar ("Upload File" / "Upload GIF"): POST
+  // the bytes to the server, which stores them under the chosen folder (the strip's
+  // "Upload to", default assets/), and return a /__vs/raw display URL. On save,
+  // `toStoredImageSrc` relativizes that URL against the .md file — same round-trip
+  // as any image.
+  const uploadImage = useCallback(async (file: File): Promise<string> => {
+    const dir = uploadDirRef.current.trim() || 'assets';
+    const res = await fetch(`/__vs/upload?name=${encodeURIComponent(file.name)}&dir=${encodeURIComponent(dir)}`, {
+      method: 'POST',
+      headers: { 'content-type': file.type || 'application/octet-stream' },
+      body: file,
+    });
+    if (!res.ok) throw new Error(`upload failed: ${res.status} ${await res.text()}`);
+    const { path } = (await res.json()) as { path: string };
+    return `/__vs/raw?path=${encodeURIComponent(path)}`;
+  }, []);
+
+  // Reference an image already in the workspace (no upload/copy). Luthor exposes
+  // no caret-insert API, so we append the markdown to the body and let the host
+  // remount — the image lands at the end for the user to drag into place.
+  const insertWorkspaceImage = useCallback((treePath: string) => {
+    const rel = toStoredRef.current(rawUrl(treePath)); // path relative to this .md
+    const md = `![${altFromPath(treePath)}](${rel})`;
+    const nextBody = `${value.replace(/\n+$/, '')}\n\n${md}\n`;
+    onChangeRef.current(nextBody);
+    setPickerOpen(false);
+  }, [value]);
+
+  // Cmd/Ctrl+S → save.
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        pushMarkdown(); // flush the latest before the host reads its buffer
+        onSaveRef.current();
+      }
+    };
+    root.addEventListener('keydown', onKey);
+    return () => root.removeEventListener('keydown', onKey);
+  }, [pushMarkdown]);
 
   return (
-    <div style={wrap}>
-      <LexicalComposer initialConfig={initialConfig}>
-        <Toolbar />
-        <div style={editArea}>
-          <RichTextPlugin
-            contentEditable={<ContentEditable className="vs-lex-content" style={contentEditable} aria-label="Markdown document" />}
-            placeholder={<div style={placeholder}>Start writing…</div>}
-            ErrorBoundary={LexicalErrorBoundary}
+    <>
+      <div style={imgStrip}>
+        <button type="button" onClick={() => setPickerOpen(true)} style={stripBtn} title="Insert an image already in the workspace">
+          🖼 From workspace
+        </button>
+        <span style={{ flex: 1 }} />
+        <label style={stripLabel} title="Folder new uploads are saved to, relative to the spec root">
+          Upload to
+          <input
+            value={uploadDir}
+            onChange={(e) => {
+              setUploadDir(e.target.value);
+              localStorage.setItem(UPLOAD_DIR_KEY, e.target.value);
+            }}
+            spellCheck={false}
+            style={stripInput}
+            placeholder="assets"
           />
+        </label>
+      </div>
+    <div style={wrap} ref={rootRef} className="vs-luthor">
+      <ExtensiveEditor
+        key={gen}
+        onReady={(methods) => {
+          api.current = methods;
+          // Load via the markdown bridge: parse markdown → Lexical JSON and inject
+          // it (defaultContent is not markdown-parsed on its own). Then, once the
+          // DOM has settled, adopt Luthor's canonical serialization as the export
+          // baseline so a mere load never looks like an edit (no spurious dirty).
+          try {
+            methods.injectJSON(JSON.stringify(headless.markdownToJSON(mountContent.current)));
+          } catch {
+            /* leave the editor empty on a parse failure */
+          }
+          requestAnimationFrame(() => {
+            try {
+              lastSynced.current = `${mapImages(methods.getMarkdown(), toStoredRef.current).replace(/\n+$/, '')}\n`;
+            } catch {
+              /* keep the seeded value */
+            }
+            loaded.current = true;
+          });
+        }}
+        showDefaultContent={false}
+        markdownSourceOfTruth
+        sourceMetadataMode="none"
+        defaultEditorView="visual"
+        isEditorViewTabsVisible={false}
+        toolbarPosition="top"
+        isToolbarEnabled
+        imageUploadHandler={uploadImage}
+        gifUploadHandler={uploadImage}
+        placeholder="Start writing…"
+      />
+      {onAddComment && <CommentLayer rootRef={rootRef} onAdd={(d) => onAddCommentRef.current?.(d)} />}
+    </div>
+      {pickerOpen && <WorkspaceImagePicker onPick={insertWorkspaceImage} onClose={() => setPickerOpen(false)} />}
+    </>
+  );
+}
+
+/**
+ * Modal listing every image in the workspace tree, searchable, so an existing
+ * file can be referenced without re-uploading. Picking one calls `onPick(path)`.
+ */
+function WorkspaceImagePicker({ onPick, onClose }: { onPick: (path: string) => void; onClose: () => void }) {
+  const { entries, loading } = useTree();
+  const [q, setQ] = useState('');
+  const images = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    return entries
+      .filter((e): e is TreeEntry => e.type === 'file' && e.kind === 'image')
+      .filter((e) => !needle || e.path.toLowerCase().includes(needle))
+      .sort((a, b) => a.path.localeCompare(b.path));
+  }, [entries, q]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div style={pickerBackdrop} onMouseDown={onClose}>
+      <div style={pickerCard} onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Insert workspace image">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+          <strong style={{ fontSize: 14 }}>Insert workspace image</strong>
+          <span style={{ flex: 1 }} />
+          <button type="button" onClick={onClose} style={pickerClose} aria-label="Close">✕</button>
         </div>
-        <HistoryPlugin />
-        <ListPlugin />
-        <LinkPlugin />
-        <MarkdownShortcutPlugin transformers={TRANSFORMERS} />
-        <OnChangePlugin onChange={handleChange} ignoreHistoryMergeTagChange ignoreSelectionChange />
-        <LoadMarkdownPlugin value={value} lastExport={lastExport} loaded={loaded} />
-        <SavePlugin onSave={() => onSaveRef.current()} />
-      </LexicalComposer>
-      <style>{LEX_CSS}</style>
+        <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter images…" style={pickerSearch} />
+        <div style={pickerGrid}>
+          {loading ? (
+            <div style={{ opacity: 0.6, padding: 16 }}>Loading…</div>
+          ) : images.length === 0 ? (
+            <div style={{ opacity: 0.6, padding: 16 }}>No images found in the workspace.</div>
+          ) : (
+            images.map((img) => (
+              <button key={img.path} type="button" onClick={() => onPick(img.path)} style={pickerItem} title={img.path}>
+                <img src={rawUrl(img.path)} alt="" style={pickerThumb} loading="lazy" />
+                <span style={pickerName}>{img.path}</span>
+              </button>
+            ))
+          )}
+        </div>
+      </div>
     </div>
   );
 }
 
-/** Cmd/Ctrl+S → save, without stealing the browser's default when unfocused. */
-function SavePlugin({ onSave }: { onSave: () => void }) {
-  const [editor] = useLexicalComposerContext();
+/**
+ * Selection-driven comment affordance: a floating "Comment" pill above the
+ * current selection, and an inline composer (workflow + instruction) that files
+ * a range comment against the file.
+ */
+function CommentLayer({ rootRef, onAdd }: { rootRef: React.RefObject<HTMLDivElement | null>; onAdd: (d: CommentDraft) => void }) {
+  const [pill, setPill] = useState<{ top: number; left: number } | null>(null);
+  const [draft, setDraft] = useState<
+    { top: number; left: number; selectedContent: string; snippet: string; endSnippet?: string; heading: string | null } | null
+  >(null);
+  const [text, setText] = useState('');
+  const [workflow, setWorkflow] = useState(loadWorkflow);
+
+  // Track the selection while the composer is closed.
   useEffect(() => {
-    const el = editor.getRootElement();
-    if (!el) return;
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
-        e.preventDefault();
-        onSave();
-      }
+    if (draft) return;
+    const root = rootRef.current;
+    if (!root) return;
+    let raf = 0;
+    const update = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const s = readSelection(root);
+        setPill(s ? { top: Math.max(8, s.rect.top - 40), left: s.rect.left + s.rect.width / 2 } : null);
+      });
     };
-    el.addEventListener('keydown', onKey);
-    return () => el.removeEventListener('keydown', onKey);
-  }, [editor, onSave]);
-  return null;
+    document.addEventListener('selectionchange', update);
+    return () => {
+      document.removeEventListener('selectionchange', update);
+      cancelAnimationFrame(raf);
+    };
+  }, [rootRef, draft]);
+
+  const openComposer = () => {
+    const root = rootRef.current;
+    if (!root) return;
+    const s = readSelection(root);
+    if (!s) return;
+    const lines = s.text.split('\n').map((l) => l.trim()).filter(Boolean);
+    // Keep the composer fully on-screen: below the selection when it fits, else
+    // above it; and never past the right edge.
+    const W = 300;
+    const H = 210;
+    const below = s.rect.bottom + 8;
+    const top = below + H <= window.innerHeight ? below : Math.max(12, s.rect.top - H - 8);
+    const left = Math.min(Math.max(12, s.rect.left), window.innerWidth - W - 12);
+    setDraft({
+      top,
+      left,
+      selectedContent: s.text,
+      snippet: (lines[0] ?? s.text).slice(0, 160),
+      endSnippet: lines.length > 1 ? lines[lines.length - 1]!.slice(0, 160) : undefined,
+      heading: s.heading,
+    });
+    setPill(null);
+    setText('');
+  };
+
+  const submit = () => {
+    if (!draft || !text.trim()) return;
+    onAdd({
+      comment: text.trim(),
+      workflow: workflow || 'visual-spec',
+      selectedContent: draft.selectedContent,
+      snippet: draft.snippet,
+      endSnippet: draft.endSnippet,
+      heading: draft.heading,
+    });
+    setDraft(null);
+    setText('');
+  };
+
+  return (
+    <>
+      {pill && !draft && (
+        <button
+          type="button"
+          onMouseDown={(e) => e.preventDefault()} // keep the selection alive
+          onClick={openComposer}
+          style={{ ...commentPill, top: pill.top, left: pill.left }}
+          title="Comment on the selected text"
+        >
+          <CommentIcon /> Comment
+        </button>
+      )}
+      {draft && (
+        <div style={{ ...composer, top: draft.top, left: draft.left }} onMouseDown={(e) => e.stopPropagation()}>
+          <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 6 }}>
+            commenting on <strong>{draft.heading ?? '(selection)'}</strong>
+          </div>
+          <WorkflowSelect value={workflow} onChange={setWorkflow} />
+          <textarea
+            autoFocus
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit();
+              if (e.key === 'Escape') setDraft(null);
+            }}
+            placeholder="Your comment (⌘/Ctrl+Enter)…"
+            style={composerTextarea}
+          />
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6, marginTop: 6 }}>
+            <button type="button" onClick={() => setDraft(null)} style={composerCancel}>
+              Cancel
+            </button>
+            <button type="button" onClick={submit} disabled={!text.trim()} style={{ ...composerAdd, opacity: text.trim() ? 1 : 0.5 }}>
+              Add comment
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
 }
 
-const wrap: React.CSSProperties = { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: 'white', overflow: 'hidden' };
-const bar: React.CSSProperties = { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 4, padding: '8px 12px', borderBottom: '1px solid #e5e7eb', background: '#fbfaff', flexShrink: 0 };
-const blockSelect: React.CSSProperties = { height: 30, padding: '0 6px', border: '1px solid #e5e7eb', borderRadius: 7, background: 'white', color: '#334155', cursor: 'pointer', font: '600 12.5px system-ui' };
-const editArea: React.CSSProperties = { flex: 1, minHeight: 0, overflow: 'auto', position: 'relative' };
-const contentEditable: React.CSSProperties = { outline: 'none', padding: '28px 48px 120px', maxWidth: 860, margin: '0 auto', minHeight: '100%', font: '15px/1.7 system-ui', color: '#1e293b' };
-const placeholder: React.CSSProperties = { position: 'absolute', top: 28, left: 48, color: '#cbd5e1', pointerEvents: 'none', font: '15px system-ui' };
-const toolBtn: React.CSSProperties = { minWidth: 30, height: 30, padding: '0 7px', border: 'none', borderRadius: 7, background: 'transparent', color: '#475569', cursor: 'pointer', font: '600 14px system-ui', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' };
-const toolBtnActive: React.CSSProperties = { background: '#ede9fe', color: '#6d28d9' };
-const sep: React.CSSProperties = { width: 1, height: 20, background: '#e5e7eb', margin: '0 6px' };
+function CommentIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+    </svg>
+  );
+}
 
-const LEX_CSS = `
-.vs-lex-content .vs-lex-p { margin: 0 0 12px; }
-.vs-lex-content .vs-lex-h1 { font: 700 26px/1.3 system-ui; margin: 20px 0 12px; }
-.vs-lex-content .vs-lex-h2 { font: 700 21px/1.3 system-ui; margin: 18px 0 10px; }
-.vs-lex-content .vs-lex-h3 { font: 700 17px/1.3 system-ui; margin: 16px 0 8px; }
-.vs-lex-content .vs-lex-quote { margin: 0 0 12px; padding: 4px 0 4px 14px; border-left: 3px solid #ddd6fe; color: #64748b; }
-.vs-lex-content .vs-lex-ul { margin: 0 0 12px; padding-left: 26px; list-style: disc; }
-.vs-lex-content .vs-lex-ol { margin: 0 0 12px; padding-left: 26px; list-style: decimal; }
-.vs-lex-content .vs-lex-li { margin: 2px 0; }
-.vs-lex-content .vs-lex-link { color: #4f46e5; text-decoration: underline; }
-.vs-lex-content .vs-lex-bold { font-weight: 700; }
-.vs-lex-content .vs-lex-italic { font-style: italic; }
-.vs-lex-content .vs-lex-underline { text-decoration: underline; }
-.vs-lex-content .vs-lex-strikethrough { text-decoration: line-through; }
-.vs-lex-content .vs-lex-underline-strikethrough { text-decoration: underline line-through; }
-.vs-lex-content .vs-lex-code { font-family: ui-monospace, monospace; background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
-.vs-lex-content .vs-lex-codeblock { display: block; font-family: ui-monospace, monospace; background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 8px; margin: 0 0 12px; white-space: pre-wrap; font-size: 13px; }
-`;
+const wrap: React.CSSProperties = { flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'white', overflow: 'hidden' };
+const imgStrip: React.CSSProperties = { flexShrink: 0, display: 'flex', alignItems: 'center', gap: 10, padding: '5px 12px', borderBottom: '1px solid #eef2f7', background: '#fbfaff' };
+const stripBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 10px', border: '1px solid #e5e7eb', borderRadius: 7, background: 'white', color: '#4f46e5', cursor: 'pointer', font: '600 12px system-ui' };
+const stripLabel: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, color: '#94a3b8', font: '600 11px system-ui', letterSpacing: '0.03em', textTransform: 'uppercase' };
+const stripInput: React.CSSProperties = { width: 130, padding: '3px 8px', border: '1px solid #d1d5db', borderRadius: 6, font: '12px ui-monospace, "SF Mono", monospace', color: '#334155', textTransform: 'none', letterSpacing: 0 };
+const pickerBackdrop: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 60, display: 'grid', placeItems: 'center', background: 'rgba(15,23,42,0.35)' };
+const pickerCard: React.CSSProperties = { width: 560, maxWidth: 'calc(100vw - 32px)', maxHeight: 'calc(100vh - 80px)', display: 'flex', flexDirection: 'column', padding: 16, borderRadius: 12, background: 'white', boxShadow: '0 20px 50px rgba(0,0,0,0.28)', font: 'system-ui' };
+const pickerClose: React.CSSProperties = { border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer', fontSize: 15 };
+const pickerSearch: React.CSSProperties = { width: '100%', boxSizing: 'border-box', padding: '7px 10px', border: '1px solid #d1d5db', borderRadius: 8, font: '13px system-ui', marginBottom: 12 };
+const pickerGrid: React.CSSProperties = { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 10, overflow: 'auto', padding: 2 };
+const pickerItem: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 6, padding: 8, border: '1px solid #e5e7eb', borderRadius: 10, background: 'white', cursor: 'pointer', textAlign: 'left' };
+const pickerThumb: React.CSSProperties = { width: '100%', height: 90, objectFit: 'contain', background: '#f8fafc', borderRadius: 6 };
+const pickerName: React.CSSProperties = { font: '11px ui-monospace, "SF Mono", monospace', color: '#475569', wordBreak: 'break-all', lineHeight: 1.3 };
+const commentPill: React.CSSProperties = {
+  position: 'fixed',
+  transform: 'translateX(-50%)',
+  zIndex: 40,
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 6,
+  padding: '5px 11px',
+  border: 'none',
+  borderRadius: 8,
+  background: '#111827',
+  color: 'white',
+  cursor: 'pointer',
+  font: '600 12px system-ui',
+  boxShadow: '0 4px 14px rgba(0,0,0,0.22)',
+};
+const composer: React.CSSProperties = {
+  position: 'fixed',
+  zIndex: 41,
+  width: 300,
+  maxWidth: 'calc(100vw - 24px)',
+  padding: 12,
+  border: '1px solid #e5e7eb',
+  borderRadius: 10,
+  background: 'white',
+  boxShadow: '0 10px 30px rgba(0,0,0,0.18)',
+  font: '13px system-ui',
+};
+const composerTextarea: React.CSSProperties = { width: '100%', boxSizing: 'border-box', height: 74, padding: '6px 8px', border: '1px solid #d1d5db', borderRadius: 6, font: 'inherit', resize: 'vertical' };
+const composerCancel: React.CSSProperties = { padding: '5px 12px', border: '1px solid #d1d5db', borderRadius: 6, background: 'white', color: '#475569', cursor: 'pointer', font: 'inherit' };
+const composerAdd: React.CSSProperties = { padding: '5px 12px', border: '1px solid #2563eb', borderRadius: 6, background: '#2563eb', color: 'white', cursor: 'pointer', font: 'inherit' };

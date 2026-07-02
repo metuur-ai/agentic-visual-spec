@@ -31,6 +31,7 @@ import {
   handleCommentsRequest,
 } from '../core/vite/routes/comments';
 import { createApplyHub } from '../core/vite/routes/apply';
+import { MAX_UPLOAD_BYTES, saveUploadedAsset } from '../core/vite/routes/upload';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -63,6 +64,18 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   for await (const chunk of req) chunks.push(chunk as Buffer);
   const raw = Buffer.concat(chunks).toString('utf8');
   return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+}
+
+/** Read a raw request body up to `limit` bytes; throws 'too-large' past it. */
+async function readRawBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > limit) throw new Error('too-large');
+    chunks.push(chunk as Buffer);
+  }
+  return Buffer.concat(chunks);
 }
 
 async function handleTree(store: TreeStore, method: string, pathname: string, query: Record<string, string>) {
@@ -120,6 +133,8 @@ export type ServeOptions = {
   uiDir: string;
   /** Where the sidecar comments JSON lives. Defaults to <contentDir>/visual-spec-comments.json. */
   commentsFile?: string;
+  /** Folder (relative to contentDir) where toolbar image uploads are saved. Defaults to "assets". */
+  assetsDir?: string;
   port: number;
   host?: string;
 };
@@ -215,6 +230,27 @@ export function createVisualSpecServer(opts: ServeOptions) {
           const body = method === 'PUT' ? await readJsonBody(req) : undefined;
           const r = await handleSource(surfaces, method, sub, query, specsRoot, body);
           return sendJson(res, r.status, r.json);
+        }
+
+        // Persist an image uploaded from the WYSIWYG toolbar. Body: raw file
+        // bytes; query: ?name=<original filename>. Returns { path } relative to
+        // the specs root (under assets/).
+        if (url.pathname === '/__vs/upload') {
+          if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' });
+          const name = url.searchParams.get('name');
+          if (!name) return sendJson(res, 400, { error: 'missing name' });
+          let bytes: Buffer;
+          try {
+            bytes = await readRawBody(req, MAX_UPLOAD_BYTES);
+          } catch {
+            return sendJson(res, 413, { error: 'file too large' });
+          }
+          if (bytes.length === 0) return sendJson(res, 400, { error: 'empty upload' });
+          // A per-upload ?dir wins over the configured default, so the editor
+          // can target a folder chosen at insert time.
+          const dir = url.searchParams.get('dir') || opts.assetsDir;
+          const path = await saveUploadedAsset(contentDir, name, bytes, req.headers['content-type'], dir);
+          return sendJson(res, 200, { path });
         }
 
         // Apply the open comments via `claude -p` — a shared job any browser can

@@ -43,8 +43,9 @@ async function serve(args: string[]) {
   const requestedPort = Number(flag(args, '--port') ?? 5180);
   const explicitPort = args.includes('--port');
   const noOpen = args.includes('--no-open');
+  const assetsDir = flag(args, '--assets-dir');
 
-  const { server, commentsPath } = createVisualSpecServer({ contentDir, uiDir: UI_DIR, port: requestedPort });
+  const { server, commentsPath } = createVisualSpecServer({ contentDir, uiDir: UI_DIR, port: requestedPort, assetsDir });
 
   server.on('listening', () => {
     // The real bound port — differs from requestedPort after a port-0 fallback.
@@ -121,9 +122,12 @@ async function main() {
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log(`visual-spec — browse a directory in the browser and comment on files, line ranges, and folders
 
-  visual-spec <dir> [--port 5180] [--no-open]   open the browser on a directory
+  visual-spec <dir> [--port 5180] [--no-open] [--assets-dir <dir>]   open the browser on a directory
   visual-spec init <dir> [--name <pkg>]         scaffold a new surface project
   visual-spec install-skills [--dest <dir>]     install the agent skills
+
+  --assets-dir <dir>  where toolbar image uploads are saved, relative to <dir>
+                      (default: assets). E.g. --assets-dir images or docs/img.
 
   Filtering: a .visualspecignore at the directory root is honored (gitignore
   syntax). .git/, node_modules/, and the comments sidecar are always hidden;
