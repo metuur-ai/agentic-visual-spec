@@ -7,9 +7,16 @@
  * from its node tree), so saving from here rewrites formatting. Tables / mermaid
  * fences / frontmatter aren't covered by the built-in transformers yet.
  */
-import { CodeNode } from '@lexical/code';
-import { LinkNode } from '@lexical/link';
-import { ListItemNode, ListNode } from '@lexical/list';
+import { $createCodeNode, CodeNode } from '@lexical/code';
+import { $isLinkNode, LinkNode, TOGGLE_LINK_COMMAND } from '@lexical/link';
+import {
+  $isListNode,
+  INSERT_ORDERED_LIST_COMMAND,
+  INSERT_UNORDERED_LIST_COMMAND,
+  ListItemNode,
+  ListNode,
+  REMOVE_LIST_COMMAND,
+} from '@lexical/list';
 import { $convertFromMarkdownString, $convertToMarkdownString, TRANSFORMERS } from '@lexical/markdown';
 import { LexicalComposer } from '@lexical/react/LexicalComposer';
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext';
@@ -21,9 +28,11 @@ import { ListPlugin } from '@lexical/react/LexicalListPlugin';
 import { MarkdownShortcutPlugin } from '@lexical/react/LexicalMarkdownShortcutPlugin';
 import { OnChangePlugin } from '@lexical/react/LexicalOnChangePlugin';
 import { RichTextPlugin } from '@lexical/react/LexicalRichTextPlugin';
-import { HeadingNode, QuoteNode } from '@lexical/rich-text';
-import { mergeRegister } from '@lexical/utils';
+import { $createHeadingNode, $createQuoteNode, $isHeadingNode, HeadingNode, QuoteNode } from '@lexical/rich-text';
+import { $setBlocksType } from '@lexical/selection';
+import { $getNearestNodeOfType, mergeRegister } from '@lexical/utils';
 import {
+  $createParagraphNode,
   $getSelection,
   $isRangeSelection,
   CAN_REDO_COMMAND,
@@ -70,22 +79,50 @@ function LoadMarkdownPlugin({ value, lastExport, loaded }: { value: string; last
   return null;
 }
 
-/** The formatting toolbar — mirrors the classic Lexical rich-text controls. */
+/** Block kinds we expose in the block-type dropdown; each maps to a transformer. */
+type BlockType = 'paragraph' | 'h1' | 'h2' | 'h3' | 'bullet' | 'number' | 'quote' | 'code';
+const BLOCK_LABELS: Record<BlockType, string> = {
+  paragraph: 'Paragraph',
+  h1: 'Heading 1',
+  h2: 'Heading 2',
+  h3: 'Heading 3',
+  bullet: 'Bulleted list',
+  number: 'Numbered list',
+  quote: 'Quote',
+  code: 'Code block',
+};
+
+/** The formatting toolbar — inline formats, block type, lists, links, alignment. */
 function Toolbar() {
   const [editor] = useLexicalComposerContext();
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
-  const [fmt, setFmt] = useState({ bold: false, italic: false, underline: false, strikethrough: false });
+  const [fmt, setFmt] = useState({ bold: false, italic: false, underline: false, strikethrough: false, code: false, link: false });
+  const [block, setBlock] = useState<BlockType>('paragraph');
 
   const sync = useCallback(() => {
     const sel = $getSelection();
-    if ($isRangeSelection(sel)) {
-      setFmt({
-        bold: sel.hasFormat('bold'),
-        italic: sel.hasFormat('italic'),
-        underline: sel.hasFormat('underline'),
-        strikethrough: sel.hasFormat('strikethrough'),
-      });
+    if (!$isRangeSelection(sel)) return;
+    setFmt({
+      bold: sel.hasFormat('bold'),
+      italic: sel.hasFormat('italic'),
+      underline: sel.hasFormat('underline'),
+      strikethrough: sel.hasFormat('strikethrough'),
+      code: sel.hasFormat('code'),
+      link: $isLinkNode(sel.anchor.getNode().getParent()) || $isLinkNode(sel.anchor.getNode()),
+    });
+    // Resolve the block type of the selection's top-level element.
+    const anchor = sel.anchor.getNode();
+    const element = anchor.getKey() === 'root' ? anchor : anchor.getTopLevelElementOrThrow();
+    if ($isListNode(element)) {
+      const list = $getNearestNodeOfType(anchor, ListNode);
+      setBlock(((list ?? element).getListType() === 'number' ? 'number' : 'bullet') as BlockType);
+    } else if ($isHeadingNode(element)) {
+      const tag = element.getTag();
+      setBlock((tag === 'h1' || tag === 'h2' || tag === 'h3' ? tag : 'paragraph') as BlockType);
+    } else {
+      const t = element.getType();
+      setBlock((t === 'quote' ? 'quote' : t === 'code' ? 'code' : 'paragraph') as BlockType);
     }
   }, []);
 
@@ -99,6 +136,28 @@ function Toolbar() {
     [editor, sync],
   );
 
+  const setBlockType = (next: BlockType) => {
+    if (next === block) return;
+    if (next === 'bullet') return void editor.dispatchCommand(INSERT_UNORDERED_LIST_COMMAND, undefined);
+    if (next === 'number') return void editor.dispatchCommand(INSERT_ORDERED_LIST_COMMAND, undefined);
+    // Leaving a list requires removing it before re-typing the block.
+    if (block === 'bullet' || block === 'number') editor.dispatchCommand(REMOVE_LIST_COMMAND, undefined);
+    editor.update(() => {
+      const sel = $getSelection();
+      if (!$isRangeSelection(sel)) return;
+      if (next === 'paragraph') $setBlocksType(sel, () => $createParagraphNode());
+      else if (next === 'quote') $setBlocksType(sel, () => $createQuoteNode());
+      else if (next === 'code') $setBlocksType(sel, () => $createCodeNode());
+      else $setBlocksType(sel, () => $createHeadingNode(next));
+    });
+  };
+
+  const toggleLink = () => {
+    if (fmt.link) return void editor.dispatchCommand(TOGGLE_LINK_COMMAND, null);
+    const url = window.prompt('Link URL:', 'https://');
+    if (url) editor.dispatchCommand(TOGGLE_LINK_COMMAND, url);
+  };
+
   return (
     <div style={bar}>
       <Btn title="Undo (⌘Z)" disabled={!canUndo} onClick={() => editor.dispatchCommand(UNDO_COMMAND, undefined)}>
@@ -107,6 +166,20 @@ function Toolbar() {
       <Btn title="Redo (⌘⇧Z)" disabled={!canRedo} onClick={() => editor.dispatchCommand(REDO_COMMAND, undefined)}>
         ↻
       </Btn>
+      <Sep />
+      <select
+        aria-label="Block type"
+        value={block}
+        onChange={(e) => setBlockType(e.target.value as BlockType)}
+        onMouseDown={(e) => e.stopPropagation()}
+        style={blockSelect}
+      >
+        {(Object.keys(BLOCK_LABELS) as BlockType[]).map((b) => (
+          <option key={b} value={b}>
+            {BLOCK_LABELS[b]}
+          </option>
+        ))}
+      </select>
       <Sep />
       <Btn title="Bold (⌘B)" active={fmt.bold} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'bold')} style={{ fontWeight: 800 }}>
         B
@@ -119,6 +192,12 @@ function Toolbar() {
       </Btn>
       <Btn title="Strikethrough" active={fmt.strikethrough} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'strikethrough')} style={{ textDecoration: 'line-through' }}>
         S
+      </Btn>
+      <Btn title="Inline code" active={fmt.code} onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, 'code')} style={{ fontFamily: 'ui-monospace, monospace' }}>
+        {'</>'}
+      </Btn>
+      <Btn title="Link" active={fmt.link} onClick={toggleLink}>
+        🔗
       </Btn>
       <Sep />
       <Btn title="Align left" onClick={() => editor.dispatchCommand(FORMAT_ELEMENT_COMMAND, 'left')}>
@@ -236,7 +315,8 @@ function SavePlugin({ onSave }: { onSave: () => void }) {
 }
 
 const wrap: React.CSSProperties = { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', background: 'white', overflow: 'hidden' };
-const bar: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 4, padding: '8px 12px', borderBottom: '1px solid #e5e7eb', background: '#fbfaff', flexShrink: 0 };
+const bar: React.CSSProperties = { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 4, padding: '8px 12px', borderBottom: '1px solid #e5e7eb', background: '#fbfaff', flexShrink: 0 };
+const blockSelect: React.CSSProperties = { height: 30, padding: '0 6px', border: '1px solid #e5e7eb', borderRadius: 7, background: 'white', color: '#334155', cursor: 'pointer', font: '600 12.5px system-ui' };
 const editArea: React.CSSProperties = { flex: 1, minHeight: 0, overflow: 'auto', position: 'relative' };
 const contentEditable: React.CSSProperties = { outline: 'none', padding: '28px 48px 120px', maxWidth: 860, margin: '0 auto', minHeight: '100%', font: '15px/1.7 system-ui', color: '#1e293b' };
 const placeholder: React.CSSProperties = { position: 'absolute', top: 28, left: 48, color: '#cbd5e1', pointerEvents: 'none', font: '15px system-ui' };
