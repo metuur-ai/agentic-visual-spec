@@ -8,6 +8,8 @@
  */
 import { createReadStream } from 'node:fs';
 import { readFile, readdir, stat } from 'node:fs/promises';
+// stat is still used by file()/resolve() for content gating; the tree walk no
+// longer stats every entry (size isn't shown in the UI).
 import { basename, extname, join, relative, resolve, sep } from 'node:path';
 import ignore, { type Ignore } from 'ignore';
 import { DEFAULT_IGNORE } from './default-ignore';
@@ -111,14 +113,25 @@ async function walk(dir: string, base: string, ig: Ignore, acc: TreeEntry[]): Pr
       acc.push({ path: rel, name: entry.name, type: 'dir' });
       await walk(abs, base, ig, acc);
     } else if (entry.isFile()) {
-      const { size } = await stat(abs);
-      acc.push({ path: rel, name: entry.name, type: 'file', kind: detectKind(entry.name), size });
+      // No per-file stat here: size isn't rendered anywhere, and stat()ing every
+      // file turned a large tree into thousands of syscalls per request. file()
+      // still stats on demand when a file is actually opened.
+      acc.push({ path: rel, name: entry.name, type: 'file', kind: detectKind(entry.name) });
     }
   }
 }
 
+/** How long a walked tree is reused before the next request re-walks (ms). */
+const TREE_CACHE_TTL_MS = 3000;
+
 export function treeStore(baseDir: string): TreeStore {
   const base = resolve(baseDir);
+
+  // A short-lived cache so a burst of tree fetches (the sidebar plus the image
+  // modal's folder + workspace pickers all mount at once) shares one walk
+  // instead of re-walking the whole directory per request. The store is recreated
+  // on a directory switch, so the cache is naturally scoped to one root.
+  let cache: { at: number; entries: TreeEntry[] } | null = null;
 
   /** Resolve a relative path and prove it stays under base. */
   const safe = (rel: string): string => {
@@ -130,10 +143,14 @@ export function treeStore(baseDir: string): TreeStore {
 
   return {
     async tree() {
+      const now = Date.now();
+      if (cache && now - cache.at < TREE_CACHE_TTL_MS) return cache.entries;
       const ig = await loadIgnore(base);
       const acc: TreeEntry[] = [];
       await walk(base, base, ig, acc);
-      return acc.sort((a, b) => a.path.localeCompare(b.path));
+      acc.sort((a, b) => a.path.localeCompare(b.path));
+      cache = { at: now, entries: acc };
+      return acc;
     },
 
     async file(path) {

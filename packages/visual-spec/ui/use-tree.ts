@@ -25,15 +25,45 @@ async function json<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// Shared, short-lived tree cache. The sidebar plus the image modal's folder and
+// workspace pickers all call useTree() at once; without this each mount fired its
+// own full /__vs/tree walk. Consumers within the TTL share a single in-flight (or
+// just-resolved) promise. Call invalidateTree() after anything that changes the
+// tree (e.g. an upload) so the next read re-fetches.
+const TREE_TTL_MS = 5000;
+let treeCache: { at: number; promise: Promise<TreeEntry[]> } | null = null;
+
+function fetchTree(): Promise<TreeEntry[]> {
+  const now = Date.now();
+  if (treeCache && now - treeCache.at < TREE_TTL_MS) return treeCache.promise;
+  const promise = fetch('/__vs/tree')
+    .then((r) => json<TreeEntry[]>(r))
+    .catch((err) => {
+      // Don't let a failed fetch poison the cache for the whole TTL.
+      if (treeCache?.promise === promise) treeCache = null;
+      throw err;
+    });
+  treeCache = { at: now, promise };
+  return promise;
+}
+
+/** Drop the cached tree so the next useTree() read re-walks the directory. */
+export function invalidateTree(): void {
+  treeCache = null;
+}
+
 export function useTree(): { entries: TreeEntry[]; loading: boolean } {
   const [entries, setEntries] = useState<TreeEntry[]>([]);
   const [loading, setLoading] = useState(true);
   useEffect(() => {
-    fetch('/__vs/tree')
-      .then((r) => json<TreeEntry[]>(r))
-      .then(setEntries)
-      .catch(() => setEntries([]))
-      .finally(() => setLoading(false));
+    let live = true;
+    fetchTree()
+      .then((e) => live && setEntries(e))
+      .catch(() => live && setEntries([]))
+      .finally(() => live && setLoading(false));
+    return () => {
+      live = false;
+    };
   }, []);
   return { entries, loading };
 }

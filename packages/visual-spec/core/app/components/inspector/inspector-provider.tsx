@@ -67,10 +67,14 @@ export function InspectorProvider({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => setSelection([]), [pageIndex, surfaceId]);
 
-  // Re-acquire any selected anchor whose node HMR replaced.
+  // Re-acquire any selected anchor whose node HMR replaced. The observer watches
+  // the whole body subtree, so coalesce bursts into one rescan per frame rather
+  // than re-running the anchor scan on every individual mutation.
   useEffect(() => {
     if (selection.length === 0) return;
-    const observer = new MutationObserver(() => {
+    let raf = 0;
+    const rescan = () => {
+      raf = 0;
       let changed = false;
       const next = selection.map((s) => {
         if (s.anchor.isConnected) return s;
@@ -79,9 +83,15 @@ export function InspectorProvider({
         return s;
       });
       if (changed) setSelection(next);
+    };
+    const observer = new MutationObserver(() => {
+      if (!raf) raf = requestAnimationFrame(rescan);
     });
     observer.observe(document.body, { childList: true, subtree: true });
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
   }, [selection]);
 
   const value = useMemo<InspectorContextValue>(

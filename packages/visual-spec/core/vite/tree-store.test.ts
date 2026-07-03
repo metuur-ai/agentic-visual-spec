@@ -52,12 +52,16 @@ describe('treeStore', () => {
     expect(paths.some((p) => p.startsWith('secret'))).toBe(false);
   });
 
-  it('tags each entry with type, kind, and size', async () => {
+  it('tags each entry with type and kind (size is fetched per-file, not walked)', async () => {
     const entries = await treeStore(base).tree();
     const app = entries.find((e) => e.path === 'src/app.ts')!;
     expect(app).toMatchObject({ type: 'file', kind: 'code' });
-    expect(app.size).toBeGreaterThan(0);
     expect(entries.find((e) => e.path === 'src')!.type).toBe('dir');
+  });
+
+  it('reports size when a file is opened', async () => {
+    const f = await treeStore(base).file('src/app.ts');
+    expect(f.size).toBeGreaterThan(0);
   });
 
   it('reads text content', async () => {
