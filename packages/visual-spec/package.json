@@ -54,7 +54,7 @@
     "@babel/parser": "^7.25.0",
     "@babel/traverse": "^7.25.0",
     "@babel/types": "^7.25.0",
-    "@lyfie/luthor": "^2.9.0",
+    "@lyfie/luthor": "2.9.0",
     "ignore": "^7.0.0"
   },
   "devDependencies": {

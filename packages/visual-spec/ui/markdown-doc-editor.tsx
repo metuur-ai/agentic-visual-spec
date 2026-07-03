@@ -8,6 +8,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useComments, useMarkdownSource } from '../core/app';
+import { ContentTitle } from './content-title';
 import { MarkdownSurface } from './markdown-surface';
 import { combineFrontmatter, splitFrontmatter } from './frontmatter';
 import { detectFidelityRisk } from './md-fidelity';
@@ -209,6 +210,7 @@ export function MarkdownDocEditor({
   return (
     <>
       <main style={editorPane}>
+        <ContentTitle path={path} />
         <SaveBar dirty={dirty} saving={saving} error={error} onDone={done} engine={engine} onEngineChange={setEngine} />
         {engine === 'wysiwyg' && risk.alignedTables && (
           <div style={riskBanner}>

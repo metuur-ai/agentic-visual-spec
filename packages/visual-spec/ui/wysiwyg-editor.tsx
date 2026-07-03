@@ -19,9 +19,10 @@
  * the same sidecar model used in view mode.
  */
 import './prism-global'; // must precede @lyfie/luthor — sets the global Prism it needs
-import { ExtensiveEditor, type ExtensiveEditorRef, headless } from '@lyfie/luthor';
+import { ExtensiveEditor, type ExtensiveEditorRef } from '@lyfie/luthor';
 import '@lyfie/luthor/styles.css';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { mapImages, markdownToInjectable, normalizeForStore } from './luthor-bridge';
 import { type TreeEntry, invalidateTree, rawUrl, useTree } from './use-tree';
 import { WorkflowSelect, loadWorkflow } from './workflow-select';
 
@@ -45,11 +46,6 @@ export type CommentDraft = {
   endSnippet?: string; // last line, when the selection spans lines
   heading: string | null; // nearest heading above the selection
 };
-
-/** Rewrite the src of every markdown image via `map` (inline `![alt](src)`). */
-function mapImages(md: string, map: (src: string) => string): string {
-  return md.replace(/(!\[[^\]]*\]\()\s*([^)\s]+)([^)]*\))/g, (_m, pre, src, post) => `${pre}${map(src)}${post}`);
-}
 
 /** Nearest heading at or above a node — the robust markdown anchor (mirrors CommentPanel). */
 function nearestHeading(node: Node, root: HTMLElement): string | null {
@@ -136,7 +132,7 @@ export function WysiwygEditor({
   const pushMarkdown = useCallback(() => {
     const a = api.current;
     if (!a || !loaded.current || !interacted.current || dragging.current) return;
-    const md = `${mapImages(a.getMarkdown(), toStoredRef.current).replace(/\n+$/, '')}\n`;
+    const md = normalizeForStore(a.getMarkdown(), toStoredRef.current);
     if (md === lastSynced.current) return;
     lastSynced.current = md;
     onChangeRef.current(md);
@@ -162,9 +158,9 @@ export function WysiwygEditor({
         const a = api.current;
         if (a) {
           try {
-            lastSynced.current = `${mapImages(a.getMarkdown(), toStoredRef.current).replace(/\n+$/, '')}\n`;
-          } catch {
-            /* keep the prior baseline */
+            lastSynced.current = normalizeForStore(a.getMarkdown(), toStoredRef.current);
+          } catch (err) {
+            console.warn('[visual-spec] could not snapshot edit baseline; keeping prior', err);
           }
         }
       }

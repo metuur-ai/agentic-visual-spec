@@ -5,6 +5,7 @@
  */
 import { InspectOverlay, SelectionReporter, useMarkdownSource } from '../core/app';
 import { CommentPanel } from './comment-panel';
+import { ContentTitle } from './content-title';
 import { MarkdownSurface } from './markdown-surface';
 import { toSurfaceId } from './md-path';
 
@@ -22,6 +23,7 @@ export function MarkdownEditor({
   return (
     <>
       <main style={{ flex: 1, minWidth: 0, position: 'relative', overflow: 'auto', background: '#f8fafc' }}>
+        <ContentTitle path={path} />
         <div style={{ maxWidth: 1200, margin: '0 auto', padding: '32px 56px 120px' }}>
           {loading ? <p style={{ opacity: 0.6 }}>Loading…</p> : <MarkdownSurface source={source} />}
         </div>
