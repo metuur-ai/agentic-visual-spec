@@ -100,6 +100,7 @@ function TreeItem({
   const pad = 8 + depth * 13;
   const active = node.path === current;
   const count = commentCounts?.get(node.path) ?? 0;
+  const [hover, setHover] = useState(false);
 
   if (node.type === 'file') {
     return (
@@ -122,20 +123,37 @@ function TreeItem({
   const open = forceOpen || expanded.has(node.path) || current.startsWith(`${node.path}/`);
   return (
     <li>
-      <button
-        type="button"
-        onClick={() => {
-          toggle(node.path);
-          onPick({ path: node.path, name: node.name, type: 'dir' });
-        }}
-        style={{ ...row, paddingLeft: pad, fontWeight: 600, color: active ? '#1d4ed8' : '#334155', ...(active ? rowActive : {}), ...(count ? rowCommented : {}) }}
+      {/* Folder row: clicking anywhere on it only expands/collapses — browsing the
+          tree never changes the main content (so an in-progress edit is preserved).
+          Opening a folder as content (to comment on it) is the separate ⤢ action. */}
+      <div
+        style={{ ...folderRow, ...(active ? rowActive : {}), ...(count ? rowCommented : {}) }}
+        onMouseEnter={() => setHover(true)}
+        onMouseLeave={() => setHover(false)}
       >
-        <span style={chevron}>{open ? '▾' : '▸'}</span>
-        <span style={folderGlyph}>{open ? '📂' : '📁'}</span>
-        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{node.name}</span>
+        <button
+          type="button"
+          onClick={() => toggle(node.path)}
+          title={`${node.path} — ${open ? 'collapse' : 'expand'}`}
+          style={{ ...folderToggle, paddingLeft: pad, color: active ? '#1d4ed8' : '#334155' }}
+        >
+          <span style={chevron}>{open ? '▾' : '▸'}</span>
+          <span style={folderGlyph}>{open ? '📂' : '📁'}</span>
+          <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{node.name}</span>
+        </button>
         {count > 0 && <span style={countBadge}>{count}</span>}
         {!open && count === 0 && hasDescendantComments && <span style={folderDot} title="Contains comments" />}
-      </button>
+        {(hover || active) && (
+          <button
+            type="button"
+            onClick={() => onPick({ path: node.path, name: node.name, type: 'dir' })}
+            title="Open this folder in the main panel (to comment on it)"
+            style={folderOpen}
+          >
+            ⤢
+          </button>
+        )}
+      </div>
       {open && (
         <ul style={listReset}>
           {node.children.map((child) => (
@@ -149,6 +167,9 @@ function TreeItem({
 
 const listReset: React.CSSProperties = { listStyle: 'none', margin: 0, padding: 0 };
 const row: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 4, width: '100%', textAlign: 'left', padding: '3px 6px', border: 'none', borderRadius: 4, background: 'transparent', cursor: 'pointer', fontSize: 12, fontFamily: 'ui-monospace, monospace', fontWeight: 400, color: '#475569', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
+const folderRow: React.CSSProperties = { display: 'flex', alignItems: 'center', width: '100%', paddingRight: 6, borderRadius: 4, overflow: 'hidden' };
+const folderToggle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 4, flex: 1, minWidth: 0, textAlign: 'left', padding: '3px 6px', border: 'none', background: 'transparent', cursor: 'pointer', fontSize: 12, fontFamily: 'ui-monospace, monospace', fontWeight: 600, color: '#334155', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
+const folderOpen: React.CSSProperties = { flexShrink: 0, marginLeft: 4, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 18, height: 18, padding: 0, border: 'none', borderRadius: 4, background: 'transparent', color: '#64748b', cursor: 'pointer', fontSize: 12 };
 const rowActive: React.CSSProperties = { background: '#eff6ff', color: '#1d4ed8', fontWeight: 600 };
 const rowCommented: React.CSSProperties = { background: '#fffbeb', color: '#92400e', fontWeight: 600, boxShadow: 'inset 2px 0 0 #d97706' };
 const countBadge: React.CSSProperties = { flexShrink: 0, marginLeft: 4, minWidth: 16, height: 16, padding: '0 5px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: 99, background: '#d97706', color: 'white', fontSize: 10, fontWeight: 700 };

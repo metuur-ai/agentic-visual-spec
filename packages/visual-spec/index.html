@@ -24,6 +24,32 @@
       .md table { border-collapse: collapse; }
       .md th, .md td { border: 1px solid #e2e8f0; padding: 6px 10px; font-size: 14px; }
       .md blockquote { border-left: 3px solid #cbd5e1; margin: 0; padding-left: 14px; color: #475569; }
+      /* Center standalone images in the rendered view; a lone markdown image is
+         wrapped as <p><img></p>, so :only-child targets it without disturbing
+         inline images (e.g. badge rows) that sit alongside text. */
+      /* Bound images to the pane AND to a fraction of the viewport height, so a
+         full-resolution photo (e.g. a 3024×4032 phone shot) can't dominate — it
+         scales down keeping aspect ratio instead of overflowing and painting over
+         the following blocks. max-height is the key part for tall portrait images. */
+      .md img { max-width: 100%; max-height: 70vh; height: auto; width: auto; }
+      .md p > img:only-child { display: block; margin: 14px auto; }
+      /* Same constraint inside the WYSIWYG editor (the comment in wysiwyg-editor.tsx
+         already assumed a max-width rule existed here). */
+      .vs-luthor img { max-width: 100%; max-height: 65vh; height: auto; width: auto; }
+      .vs-luthor p > img:only-child { display: block; margin: 14px auto; }
+
+      /* WYSIWYG editor scroll: Luthor's editor is built to grow (min-height + height:auto)
+         and let an ancestor scroll, but our host pane is fixed-height (overflow:hidden),
+         which clips tall content with no scrollbar. Neutralize Luthor's min-heights so the
+         editor fills the pane exactly; the grid shell caps `.luthor-richtext-container` to
+         the space below the (pinned) toolbar, so THAT is the element made scrollable — its
+         inner content-editable grows to full content height inside it. (min-height:500px
+         on the wrapper needs !important to override Luthor's own rule.) */
+      .vs-luthor { min-height: 0; }
+      .vs-luthor .luthor-editor,
+      .vs-luthor .luthor-editor-wrapper { min-height: 0 !important; height: 100%; }
+      .vs-luthor .luthor-editor-visual-shell { min-height: 0; }
+      .vs-luthor .luthor-richtext-container { min-height: 0; overflow-y: auto; }
     </style>
   </head>
   <body>

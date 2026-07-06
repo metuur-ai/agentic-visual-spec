@@ -40,7 +40,9 @@ export function App() {
   // Live dirty state + a success-returning save, reported up by the doc editor,
   // so switching to View can guard unsaved edits instead of dropping them.
   const editorState = useRef<{ dirty: boolean; save: () => Promise<boolean> }>({ dirty: false, save: async () => true });
-  const [confirmView, setConfirmView] = useState(false);
+  // A navigation deferred behind the unsaved-changes prompt: `run` performs it
+  // once the user resolves the dialog (Save/Discard); Cancel just clears it.
+  const [pending, setPending] = useState<{ run: () => void; primaryLabel: string; message: string } | null>(null);
   const onEditorState = useCallback((s: { dirty: boolean; save: () => Promise<boolean> }) => {
     editorState.current = s;
   }, []);
@@ -55,19 +57,38 @@ export function App() {
   const requestMode = useCallback(
     (next: ViewMode) => {
       if (next === 'view' && editorState.current.dirty) {
-        setConfirmView(true);
+        setPending({ run: exitToView, primaryLabel: 'Save & View', message: 'You have edits that aren’t saved yet. Save them before switching to View?' });
         return;
       }
       setMode(next);
     },
-    [],
+    [exitToView],
   );
 
-  // Selecting a different file always returns to View mode (Edit is per-file).
-  const pick = (e: TreeEntry) => {
-    setSelected(e);
-    exitToView();
-  };
+  // Selecting a different file/folder always returns to View mode (Edit is
+  // per-file). Perform the switch now.
+  const doPick = useCallback(
+    (e: TreeEntry) => {
+      setSelected(e);
+      exitToView();
+    },
+    [exitToView],
+  );
+
+  // Guarded pick: switching away from a file with unsaved edits prompts to Save
+  // or Discard first, instead of silently dropping the buffer. Re-picking the
+  // open file is a no-op so it never prompts.
+  const pick = useCallback(
+    (e: TreeEntry) => {
+      if (selected && e.path === selected.path && e.type === selected.type) return;
+      if (editorState.current.dirty) {
+        setPending({ run: () => doPick(e), primaryLabel: 'Save & Switch', message: 'You have edits that aren’t saved yet. Save them before opening another file?' });
+        return;
+      }
+      doPick(e);
+    },
+    [selected, doPick],
+  );
 
   // Jump to a path from the cart dropdown.
   const navigate = (path: string) => {
@@ -104,18 +125,22 @@ export function App() {
           </main>
         )}
       </div>
-      {confirmView && (
+      {pending && (
         <UnsavedDialog
-          onSaveAndView={async () => {
+          message={pending.message}
+          primaryLabel={pending.primaryLabel}
+          onSaveAndContinue={async () => {
             const ok = await editorState.current.save();
-            setConfirmView(false);
-            if (ok) exitToView();
+            const { run } = pending;
+            setPending(null);
+            if (ok) run(); // stay put on a failed save; the editor shows the error
           }}
           onDiscard={() => {
-            setConfirmView(false);
-            exitToView();
+            const { run } = pending;
+            setPending(null);
+            run();
           }}
-          onCancel={() => setConfirmView(false)}
+          onCancel={() => setPending(null)}
         />
       )}
     </>
@@ -134,8 +159,8 @@ export function App() {
   );
 }
 
-/** Guard shown when leaving Edit for View with unsaved changes. */
-function UnsavedDialog({ onSaveAndView, onDiscard, onCancel }: { onSaveAndView: () => void; onDiscard: () => void; onCancel: () => void }) {
+/** Guard shown when navigating away from Edit mode with unsaved changes. */
+function UnsavedDialog({ onSaveAndContinue, onDiscard, onCancel, message, primaryLabel }: { onSaveAndContinue: () => void; onDiscard: () => void; onCancel: () => void; message: string; primaryLabel: string }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onCancel();
@@ -147,11 +172,11 @@ function UnsavedDialog({ onSaveAndView, onDiscard, onCancel }: { onSaveAndView: 
     <div style={dialogBackdrop} onMouseDown={onCancel}>
       <div style={dialogCard} onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Unsaved changes">
         <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 6 }}>Unsaved changes</div>
-        <div style={{ fontSize: 13, color: '#475569', marginBottom: 16 }}>You have edits that aren’t saved yet. Save them before switching to View?</div>
+        <div style={{ fontSize: 13, color: '#475569', marginBottom: 16 }}>{message}</div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
           <button type="button" onClick={onDiscard} style={dialogDiscard}>Discard</button>
           <button type="button" onClick={onCancel} style={dialogCancel}>Cancel</button>
-          <button type="button" onClick={onSaveAndView} style={dialogPrimary} autoFocus>Save &amp; View</button>
+          <button type="button" onClick={onSaveAndContinue} style={dialogPrimary} autoFocus>{primaryLabel}</button>
         </div>
       </div>
     </div>

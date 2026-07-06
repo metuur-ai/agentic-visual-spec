@@ -14,9 +14,7 @@ produces a tarball of exactly what gets published (the `dist/` folder, per the
 | --- | --- | --- |
 | asdasd | asdasd | asdasd |
 
-<p align="center">
 ![IMG_2238.jpeg](assets/IMG_2238.jpeg)
-</p>
 
 ## 1. Build & package locally
 

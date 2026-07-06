@@ -159,8 +159,8 @@ export function WysiwygEditor({
         if (a) {
           try {
             lastSynced.current = normalizeForStore(a.getMarkdown(), toStoredRef.current);
-          } catch (err) {
-            console.warn('[visual-spec] could not snapshot edit baseline; keeping prior', err);
+          } catch {
+            /* keep the prior baseline */
           }
         }
       }
@@ -237,6 +237,10 @@ export function WysiwygEditor({
   // for the user to drag into place. `src` is the final markdown src (relative
   // path for workspace/upload, absolute for a URL).
   const insertImage = useCallback((src: string, alt: string) => {
+    // Plain markdown only — never raw HTML. Luthor's markdown bridge renders an
+    // `<div align="center">` wrapper as literal text and desyncs its node model when
+    // the user edits it; images are instead centered via CSS (see `.md img` /
+    // `.vs-luthor … img` in index.html), which works in both view and edit modes.
     const md = `![${alt}](${src})`;
     const nextBody = `${value.replace(/\n+$/, '')}\n\n${md}\n`;
     onChangeRef.current(nextBody);
@@ -292,13 +296,15 @@ export function WysiwygEditor({
           // DOM has settled, adopt Luthor's canonical serialization as the export
           // baseline so a mere load never looks like an edit (no spurious dirty).
           try {
-            methods.injectJSON(JSON.stringify(headless.markdownToJSON(mountContent.current)));
-          } catch {
-            /* leave the editor empty on a parse failure */
+            methods.injectJSON(markdownToInjectable(mountContent.current));
+          } catch (err) {
+            // A parse failure would silently strand the user in an empty editor over
+            // a non-empty file — surface it rather than swallow (data-loss shaped).
+            console.error('[visual-spec] failed to load markdown into the editor', err);
           }
           requestAnimationFrame(() => {
             try {
-              lastSynced.current = `${mapImages(methods.getMarkdown(), toStoredRef.current).replace(/\n+$/, '')}\n`;
+              lastSynced.current = normalizeForStore(methods.getMarkdown(), toStoredRef.current);
             } catch {
               /* keep the seeded value */
             }
@@ -510,6 +516,13 @@ function WorkspaceTab({ toRelative, onInsert }: { toRelative: (rawUrlStr: string
       .sort((a, b) => a.path.localeCompare(b.path));
   }, [entries, q]);
 
+  // Cap the rendered grid: loading="lazy" bounds network, not DOM node count, so an
+  // image-heavy workspace would otherwise mount thousands of nodes at once. Show the
+  // first N and nudge the user to filter for the rest.
+  const RENDER_CAP = 200;
+  const shown = images.slice(0, RENDER_CAP);
+  const hidden = images.length - shown.length;
+
   return (
     <div style={tabBody}>
       <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter images…" style={fieldInput} />
@@ -519,7 +532,7 @@ function WorkspaceTab({ toRelative, onInsert }: { toRelative: (rawUrlStr: string
         ) : images.length === 0 ? (
           <div style={{ opacity: 0.6, padding: 16 }}>No images found in the workspace.</div>
         ) : (
-          images.map((img) => (
+          shown.map((img) => (
             <button key={img.path} type="button" onClick={() => onInsert(toRelative(rawUrl(img.path)), altFromPath(img.path))} style={pickerItem} title={img.path}>
               <img src={rawUrl(img.path)} alt="" style={pickerThumb} loading="lazy" />
               <span style={pickerName}>{img.path}</span>
@@ -527,6 +540,11 @@ function WorkspaceTab({ toRelative, onInsert }: { toRelative: (rawUrlStr: string
           ))
         )}
       </div>
+      {hidden > 0 && (
+        <div style={{ opacity: 0.6, padding: '4px 2px', font: '12px system-ui' }}>
+          Showing {shown.length} of {images.length} images — refine the filter to see the rest.
+        </div>
+      )}
     </div>
   );
 }

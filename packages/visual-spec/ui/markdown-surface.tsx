@@ -1,5 +1,6 @@
 import { Fragment } from 'react';
 import Markdown, { type Components } from 'react-markdown';
+import rehypeRaw from 'rehype-raw';
 import remarkGfm from 'remark-gfm';
 import { splitFrontmatter } from './frontmatter';
 import { MermaidDiagram } from './mermaid-diagram';
@@ -92,7 +93,11 @@ export function MarkdownSurface({ source }: { source: string }) {
   return (
     <div data-inspector-root className="md">
       {inner != null && <FrontmatterBlock yaml={inner} />}
-      <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeVsLoc(lineOffset)]} components={components}>
+      {/* rehype-raw expands raw HTML (e.g. an editor-inserted `<div align="center">`
+          image wrapper) into real nodes; it runs before the vs-loc stamper so the
+          reconstructed tree still gets source positions. Plain markdown images render
+          natively, so files authored elsewhere are unaffected. */}
+      <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw, rehypeVsLoc(lineOffset)]} components={components}>
         {body}
       </Markdown>
     </div>
