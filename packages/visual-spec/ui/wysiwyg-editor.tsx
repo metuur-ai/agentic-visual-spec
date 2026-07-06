@@ -284,6 +284,93 @@ export function WysiwygEditor({
     };
   }, []);
 
+  // Luthor renders code block controls in a separate absolute overlay. When
+  // images above a code block finish loading, the code block moves in normal
+  // flow but the overlay can keep its stale coordinates and paint over the image.
+  // Keep the overlay tied to the actual code block rectangles inside our editor.
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+
+    let raf = 0;
+    let settleFrames = 0;
+    let aligning = false;
+    const observed = new Set<Element>();
+    const ro = new ResizeObserver(() => schedule(4));
+
+    const observe = (el: Element | null) => {
+      if (!el || observed.has(el)) return;
+      observed.add(el);
+      ro.observe(el);
+    };
+
+    const align = () => {
+      raf = 0;
+      const layer = root.querySelector<HTMLElement>('.luthor-codeblock-controls-layer');
+      const content = root.querySelector<HTMLElement>('.luthor-content-editable');
+      if (!layer || !content) return;
+
+      observe(layer);
+      observe(content);
+      content.querySelectorAll('img').forEach(observe);
+
+      const layerRect = layer.getBoundingClientRect();
+      const blocks = Array.from(content.querySelectorAll<HTMLElement>('.luthor-code-block--interactive'));
+      const controls = Array.from(layer.querySelectorAll<HTMLElement>('.luthor-codeblock-controls'));
+
+      blocks.forEach((block, i) => {
+        const control = controls[i];
+        if (!control) return;
+        observe(block);
+        const blockRect = block.getBoundingClientRect();
+        const controlHeight = control.offsetHeight || 42;
+        aligning = true;
+        control.style.top = `${blockRect.top - layerRect.top - controlHeight}px`;
+        control.style.left = `${blockRect.left - layerRect.left}px`;
+        control.style.width = `${blockRect.width}px`;
+        control.style.visibility = 'visible';
+        aligning = false;
+      });
+
+      for (const control of controls.slice(blocks.length)) control.style.visibility = 'hidden';
+
+      if (settleFrames > 0) {
+        settleFrames -= 1;
+        raf = requestAnimationFrame(align);
+      }
+    };
+
+    const schedule = (frames = 1) => {
+      settleFrames = Math.max(settleFrames, frames);
+      if (raf) return;
+      raf = requestAnimationFrame(align);
+    };
+    const scheduleSettle = () => schedule(4);
+
+    const mo = new MutationObserver(scheduleSettle);
+    const styleMo = new MutationObserver(() => {
+      if (!aligning) schedule(3);
+    });
+    mo.observe(root, { subtree: true, childList: true });
+    styleMo.observe(root, { subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+    // `load` doesn't bubble, but a capturing listener on the root catches it
+    // from descendant <img> elements that Lexical creates after markdown import.
+    root.addEventListener('load', scheduleSettle, true);
+    root.addEventListener('scroll', scheduleSettle, true);
+    window.addEventListener('resize', scheduleSettle);
+    schedule(10);
+
+    return () => {
+      mo.disconnect();
+      styleMo.disconnect();
+      ro.disconnect();
+      root.removeEventListener('load', scheduleSettle, true);
+      root.removeEventListener('scroll', scheduleSettle, true);
+      window.removeEventListener('resize', scheduleSettle);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, []);
+
   return (
     <>
     <div style={wrap} ref={rootRef} className="vs-luthor">
