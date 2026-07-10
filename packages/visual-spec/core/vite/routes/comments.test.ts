@@ -59,6 +59,19 @@ describe('handleCommentsRequest', () => {
     expect(all.comments[0]!.ts).toBe('T0');
   });
 
+  it('PATCH with result forwards result to setStatus and persists it (R-2.5)', async () => {
+    const store = memoryStore();
+    await handleCommentsRequest(store, 'POST', '/add', {}, { path: 'a.md', comment: 'fix this', id: 'c-aabbccdd' });
+
+    const patch = await handleCommentsRequest(store, 'PATCH', '/c-aabbccdd', {}, { status: 'applied', result: 'Added the fix' });
+    expect(patch.status).toBe(200);
+
+    const all = (await handleCommentsRequest(store, 'GET', '/all', {}, {})).json as CommentDoc;
+    const c = all.comments.find((x) => x.id === 'c-aabbccdd')!;
+    expect(c.status).toBe('applied');
+    expect(c.result).toBe('Added the fix');
+  });
+
   it('accepts a generic body: workflow tag, folder + range targets', async () => {
     const store = memoryStore();
     await handleCommentsRequest(store, 'POST', '/add', {}, {

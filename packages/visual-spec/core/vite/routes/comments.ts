@@ -119,7 +119,8 @@ export async function handleCommentsRequest(
     if (idMatch) {
       const id = idMatch[1]!;
       if (method === 'PATCH') {
-        await store.write(setStatus(await store.read(), id, body.status as CommentStatus));
+        const result = typeof body.result === 'string' ? body.result : undefined;
+        await store.write(setStatus(await store.read(), id, body.status as CommentStatus, result));
         return { status: 200, json: { ok: true } };
       }
       if (method === 'DELETE') {
