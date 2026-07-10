@@ -82,6 +82,21 @@ describe('comment-doc', () => {
     expect(doc.comments).toHaveLength(0);
   });
 
+  // R-2.4 — setStatus writes result atomically when provided
+  it('setStatus with result writes both status and result atomically (R-2.4)', () => {
+    let doc = addComment(parseDoc(null), rec({ id: 'c-r' }));
+    doc = setStatus(doc, 'c-r', 'applied', 'Added keyboard shortcut docs');
+    const c = doc.comments[0]!;
+    expect(c.status).toBe('applied');
+    expect(c.result).toBe('Added keyboard shortcut docs');
+  });
+
+  it('setStatus without result leaves existing result value untouched (R-2.4)', () => {
+    let doc = addComment(parseDoc(null), rec({ id: 'c-keep', status: 'applied', result: 'prior summary' }));
+    doc = setStatus(doc, 'c-keep', 'applied');
+    expect(doc.comments[0]!.result).toBe('prior summary');
+  });
+
   // R-2.1 / R-2.2 / R-2.3 — result field round-trip for new-shape and legacy records
   it('round-trips result field for new-shape records', () => {
     const withResult = rec({ id: 'c-res', status: 'applied', result: 'Added keyboard shortcut section' });

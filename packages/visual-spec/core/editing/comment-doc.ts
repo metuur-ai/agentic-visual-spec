@@ -113,10 +113,12 @@ export function removeComment(doc: CommentDoc, id: string): CommentDoc {
   return { ...doc, comments: doc.comments.filter((c) => c.id !== id) };
 }
 
-export function setStatus(doc: CommentDoc, id: string, status: CommentStatus): CommentDoc {
+export function setStatus(doc: CommentDoc, id: string, status: CommentStatus, result?: string): CommentDoc {
   return {
     ...doc,
-    comments: doc.comments.map((c) => (c.id === id ? { ...c, status } : c)),
+    comments: doc.comments.map((c) =>
+      c.id === id ? { ...c, status, ...(result !== undefined ? { result } : {}) } : c
+    ),
   };
 }
 
