@@ -37,6 +37,7 @@ export type CommentRecord = {
   spec?: string; // optional: normalized EARS sentence(s) for the agent
   status: CommentStatus;
   ts: string;
+  result?: string; // short summary of the resulting change, set when applied (R-2.1)
 };
 
 export type CommentDoc = { version: 1; comments: CommentRecord[] };
@@ -84,6 +85,7 @@ function upgrade(raw: unknown): CommentRecord {
     ...(rec.spec ? { spec: rec.spec as string } : {}),
     status: (rec.status as CommentStatus) ?? 'open',
     ts: String(rec.ts ?? ''),
+    ...(rec.result ? { result: rec.result as string } : {}), // R-2.2: preserve result in legacy branch
   };
 }
 

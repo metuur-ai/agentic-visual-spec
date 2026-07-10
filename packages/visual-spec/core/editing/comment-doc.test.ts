@@ -81,4 +81,56 @@ describe('comment-doc', () => {
     doc = removeComment(doc, 'c-x');
     expect(doc.comments).toHaveLength(0);
   });
+
+  // R-2.1 / R-2.2 / R-2.3 — result field round-trip for new-shape and legacy records
+  it('round-trips result field for new-shape records', () => {
+    const withResult = rec({ id: 'c-res', status: 'applied', result: 'Added keyboard shortcut section' });
+    const doc = addComment(parseDoc(null), withResult);
+    const [parsed] = parseDoc(serializeDoc(doc)).comments;
+    expect(parsed!.result).toBe('Added keyboard shortcut section');
+  });
+
+  it('new-shape record without result parses without error', () => {
+    const noResult = rec({ id: 'c-nores' });
+    const doc = addComment(parseDoc(null), noResult);
+    const [parsed] = parseDoc(serializeDoc(doc)).comments;
+    expect(parsed!.result).toBeUndefined();
+  });
+
+  it('legacy record with result field preserves it across upgrade (R-2.2)', () => {
+    const legacy = JSON.stringify({
+      version: 1,
+      comments: [
+        {
+          id: 'c-leg-res',
+          file: 'tasks/post-it-notes',
+          anchor: { heading: 'AC', line: 5, snippet: 'a note' },
+          comment: 'fix this',
+          status: 'applied',
+          result: 'Fixed the heading',
+          ts: '2026-06-20T00:00:00Z',
+        },
+      ],
+    });
+    const [c] = parseDoc(legacy).comments;
+    expect(c!.result).toBe('Fixed the heading');
+  });
+
+  it('legacy record without result parses without error (R-2.3)', () => {
+    const legacy = JSON.stringify({
+      version: 1,
+      comments: [
+        {
+          id: 'c-leg-nores',
+          file: 'tasks/notes',
+          anchor: { line: 1 },
+          comment: 'fix',
+          status: 'open',
+          ts: '2026-06-20T00:00:00Z',
+        },
+      ],
+    });
+    const [c] = parseDoc(legacy).comments;
+    expect(c!.result).toBeUndefined();
+  });
 });
