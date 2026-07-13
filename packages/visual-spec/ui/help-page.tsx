@@ -106,6 +106,11 @@ visual-spec ./my-project # …or any path`}</Pre>
                 comment collected so far, grouped by file.
               </li>
             </ol>
+            <p style={pMuted}>
+              Markdown renders fully, including <b>relative image paths</b> like <Code>![](images/diagram.png)</Code> —
+              they're resolved for display only, so the underlying <Code>.md</Code> keeps its original relative links and
+              stays portable to any plain markdown viewer.
+            </p>
           </Section>
 
           <Section n={4} heading="Hand the comments to your agent">
