@@ -12,35 +12,11 @@ import { ContentTitle } from './content-title';
 import { MarkdownSurface } from './markdown-surface';
 import { combineFrontmatter, splitFrontmatter } from './frontmatter';
 import { detectFidelityRisk } from './md-fidelity';
-import { toSurfaceId } from './md-path';
+import { makeImageResolver, normalizeRelPath, toSurfaceId } from './md-path';
 import { SourceEditor } from './source-editor';
 import { type CommentDraft, WysiwygEditor } from './wysiwyg-editor';
 
 export type EditorEngine = 'source' | 'wysiwyg';
-
-/** Normalize a relative path, collapsing `.`/`..` segments. */
-function normalizeRelPath(p: string): string {
-  const parts: string[] = [];
-  for (const seg of p.split('/')) {
-    if (seg === '' || seg === '.') continue;
-    if (seg === '..') parts.pop();
-    else parts.push(seg);
-  }
-  return parts.join('/');
-}
-
-/**
- * Build a resolver for markdown image srcs. Absolute URLs/data URIs pass through;
- * relative paths resolve against the file's directory and stream from /__vs/raw.
- */
-function makeImageResolver(filePath: string): (src: string) => string {
-  const dir = filePath.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/')) : '';
-  return (src: string) => {
-    if (/^(https?:|data:|blob:|\/\/)/i.test(src)) return src;
-    const joined = normalizeRelPath(dir ? `${dir}/${src}` : src);
-    return `/__vs/raw?path=${encodeURIComponent(joined)}`;
-  };
-}
 
 /**
  * Inverse of {@link makeImageResolver}: turn a /__vs/raw display URL back into a
@@ -244,7 +220,7 @@ export function MarkdownDocEditor({
           <div style={previewHead}>Preview</div>
           <div style={previewBody}>
             <div style={{ maxWidth: 900, margin: '0 auto' }}>
-              <MarkdownSurface source={value} />
+              <MarkdownSurface source={value} resolveImageSrc={resolveImageSrc} />
             </div>
           </div>
         </aside>

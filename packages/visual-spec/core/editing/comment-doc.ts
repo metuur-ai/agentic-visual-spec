@@ -141,3 +141,28 @@ export function openByWorkflow(doc: CommentDoc): Record<string, CommentRecord[]>
   }
   return out;
 }
+
+/**
+ * R-3.2 / R-3.3 / R-3.4 — applied comments for a path, sorted ts descending.
+ * Non-mutating (copies before sort).
+ */
+export function historyFor(comments: CommentRecord[], path: string): CommentRecord[] {
+  return comments
+    .filter((c) => c.target.path === path && c.status === 'applied')
+    .slice()
+    .sort((a, b) => (b.ts > a.ts ? 1 : b.ts < a.ts ? -1 : 0));
+}
+
+/**
+ * R-3.7 — human-readable anchor label for a comment.
+ * Priority: heading → line range → path fallback.
+ */
+export function anchorLabelOf(c: CommentRecord): string {
+  if (c.target.heading) return c.target.heading;
+  if (c.target.startLine != null) {
+    return c.target.endLine != null && c.target.endLine !== c.target.startLine
+      ? `L${c.target.startLine}–${c.target.endLine}`
+      : `L${c.target.startLine}`;
+  }
+  return c.target.path;
+}

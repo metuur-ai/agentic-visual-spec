@@ -13,7 +13,7 @@ export function buildApplyPrompt(open: CommentRecord[]): string {
   lines.push(`Apply ${open.length} review comment(s) I left in the visual-spec browser using the "apply-comments" skill.`);
   lines.push('');
   lines.push(
-    'Source of truth is visual-spec-comments.json. Take only status:"open" and GROUP BY workflow. For each comment, locate the target by SNIPPET (+ heading for markdown; the line number may have drifted, do not trust it blindly). For workflow "visual-spec", apply the change in place and keep the file well-formed; for any other workflow, hand the resolved comment to that workflow skill. Then set each handled comment\'s status to "applied" (audit trail — do not delete). Finish with a traceability table: id · workflow · target · what changed / handed off.',
+    'Source of truth is visual-spec-comments.json. Take only status:"open" and GROUP BY workflow. For each comment, locate the target by SNIPPET (+ heading for markdown; the line number may have drifted, do not trust it blindly). For workflow "visual-spec", apply the change in place and keep the file well-formed; for any other workflow, hand the resolved comment to that workflow skill. Then, in a SINGLE atomic edit per comment record, set status to "applied" AND write a concise non-empty result field (1–2 lines summarising what was applied or handed off) on the SAME record in the SAME edit — do not make a second pass. Preserve all other existing fields on the record and keep the output JSON valid. Finish with a traceability table: id · workflow · target · what changed / handed off.',
   );
   lines.push('');
   lines.push(`Comments (${open.length}):`);

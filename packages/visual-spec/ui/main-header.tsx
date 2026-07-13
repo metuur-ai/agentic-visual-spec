@@ -1,6 +1,8 @@
 import { type CommentRecord, buildApplyPrompt, useComments, useInspector, useSpecsRoot } from '../core/app';
 import { memo, useEffect, useReducer, useRef, useState } from 'react';
 import { HelpButton } from './help-page';
+import { CommentHistoryList } from './comment-history-list';
+import { toPath } from './md-path';
 
 function CommentIcon({ size = 14 }: { size?: number }) {
   return (
@@ -235,7 +237,7 @@ function ElapsedTimer({ startedAt, running }: { startedAt: number | null; runnin
 type ApplyView = 'closed' | 'scope' | 'activity';
 
 /** The Apply control: scope chooser → shared live activity feed + timer + cancel. */
-function ApplyButton({ open, file }: { open: CommentRecord[]; file: string }) {
+function ApplyButton({ open, file, onRunningChange }: { open: CommentRecord[]; file: string; onRunningChange?: (running: boolean) => void }) {
   const [state, dispatch] = useReducer(applyReduce, APPLY_INIT);
   const [view, setView] = useState<ApplyView>('closed');
   const feedRef = useRef<HTMLDivElement>(null);
@@ -278,6 +280,11 @@ function ApplyButton({ open, file }: { open: CommentRecord[]; file: string }) {
   }, []);
 
   const running = state.phase === 'running';
+
+  // Report run state up so the header can paint its full-width progress line.
+  useEffect(() => {
+    onRunningChange?.(running);
+  }, [running, onRunningChange]);
 
   // Stick the feed to the newest row.
   useEffect(() => {
@@ -600,6 +607,48 @@ function StatusDot({ phase }: { phase: ApplyPhase }) {
   );
 }
 
+/** Toggles a popover listing applied comments for the current document (read-only history). */
+function HistoryButton({ file, comments }: { file: string; comments: CommentRecord[] }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+
+  return (
+    <div ref={rootRef} style={{ position: 'relative' }}>
+      <button
+        type="button"
+        aria-label="History"
+        onClick={() => setOpen((v) => !v)}
+        title="Applied comment history for this document"
+        style={secondary}
+      >
+        History
+      </button>
+      {open && (
+        <div style={historyPop}>
+          <div style={applyPopHead}>
+            <span style={{ fontWeight: 700 }}>Applied history</span>
+            <button type="button" onClick={() => setOpen(false)} style={closeBtn} title="Close" aria-label="Close">
+              ✕
+            </button>
+          </div>
+          <div style={{ overflow: 'auto', maxHeight: 380 }}>
+            <CommentHistoryList path={toPath(file)} comments={comments} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** The inspector on/off toggle — only meaningful for markdown (needs InspectorProvider). */
 function InspectorToggle() {
   const { active, setActive } = useInspector();
@@ -652,6 +701,7 @@ export function MainHeader({
   const open = comments.filter((c) => c.status === 'open');
   const [copied, setCopied] = useState(false);
   const [showAll, setShowAll] = useState(false);
+  const [applying, setApplying] = useState(false);
   const cartRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -681,6 +731,7 @@ export function MainHeader({
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
         <HelpButton />
+        <HistoryButton file={file} comments={comments} />
         {isMarkdown && onModeChange && <ModeToggle mode={mode} onModeChange={onModeChange} />}
         {withInspector && mode === 'view' && <InspectorToggle />}
 
@@ -712,10 +763,25 @@ export function MainHeader({
           📋 Copy prompt
         </button>
 
-        <ApplyButton open={open} file={file} />
+        <ApplyButton open={open} file={file} onRunningChange={setApplying} />
       </div>
-      <style>{'@keyframes vs-pulse{0%,100%{opacity:1}50%{opacity:0.35}}'}</style>
+      {applying && <ApplyProgressLine />}
+      <style>{'@keyframes vs-pulse{0%,100%{opacity:1}50%{opacity:0.35}}@keyframes vs-apply-flow{0%{background-position:0% 0}100%{background-position:-200% 0}}'}</style>
     </header>
+  );
+}
+
+/**
+ * Indeterminate progress line pinned to the header's bottom edge, shown only while
+ * an apply run is in flight. A multi-stop colour gradient (2× width) slides its
+ * background-position left→right on a loop — reads as a colour band flowing across
+ * the header until "Applying comments" finishes.
+ */
+function ApplyProgressLine() {
+  return (
+    <div style={progressTrack} aria-hidden>
+      <div style={progressFlow} />
+    </div>
   );
 }
 
@@ -824,6 +890,7 @@ const startBtnActive: React.CSSProperties = { ...startBtn, border: '1px solid #2
 const secondary: React.CSSProperties = { padding: '7px 14px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#334155', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
 const applyBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 7, padding: '7px 14px', border: 'none', borderRadius: 8, background: '#7c3aed', color: 'white', cursor: 'pointer', font: '13px system-ui', fontWeight: 600, minWidth: 92, justifyContent: 'center' };
 const applyPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc(100% + 6px)', width: 440, maxWidth: '82vw', background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 16px 48px rgba(76,29,149,0.18)', zIndex: 41, overflow: 'hidden' };
+const historyPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc(100% + 6px)', width: 380, maxWidth: '82vw', background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 16px 48px rgba(76,29,149,0.18)', zIndex: 41, overflow: 'hidden' };
 const applyPopHead: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '9px 11px', borderBottom: '1px solid #f1f5f9', fontSize: 13, background: 'linear-gradient(180deg,#ffffff,#fbfaff)' };
 const rerunBtn: React.CSSProperties = { padding: '3px 9px', border: '1px solid #d1d5db', borderRadius: 6, background: 'white', color: '#475569', cursor: 'pointer', font: '12px system-ui', fontWeight: 600, flexShrink: 0 };
 const cancelBtn: React.CSSProperties = { padding: '3px 10px', border: '1px solid #fecaca', borderRadius: 6, background: '#fef2f2', color: '#dc2626', cursor: 'pointer', font: '12px system-ui', fontWeight: 700, flexShrink: 0 };
@@ -857,3 +924,11 @@ const allPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc
 const allTitle: React.CSSProperties = { fontSize: 12, opacity: 0.6, padding: '2px 4px 8px', borderBottom: '1px solid #f1f5f9', marginBottom: 4 };
 const allFile: React.CSSProperties = { display: 'block', width: '100%', textAlign: 'left', border: 'none', background: 'transparent', padding: '2px 4px', cursor: 'pointer', font: '12px ui-monospace, monospace', color: '#1d4ed8', fontWeight: 600 };
 const allItem: React.CSSProperties = { padding: '4px 4px 4px 10px', borderLeft: '2px solid #e5e7eb', margin: '4px 0 4px 4px', fontSize: 13, color: '#334155' };
+const progressTrack: React.CSSProperties = { position: 'absolute', left: 0, right: 0, bottom: -1, height: 3, overflow: 'hidden', zIndex: 61, pointerEvents: 'none' };
+const progressFlow: React.CSSProperties = {
+  height: '100%',
+  width: '100%',
+  backgroundImage: 'linear-gradient(90deg, #8b5cf6, #6366f1, #06b6d4, #10b981, #f59e0b, #ec4899, #8b5cf6)',
+  backgroundSize: '200% 100%',
+  animation: 'vs-apply-flow 1.6s linear infinite',
+};

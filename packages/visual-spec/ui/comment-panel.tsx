@@ -2,6 +2,7 @@ import { collectSection, headingBlockOf, useComments, useInspector } from '../co
 import { useState } from 'react';
 import { toPath } from './md-path';
 import { WorkflowSelect, loadWorkflow } from './workflow-select';
+import { CommentHistoryList, locate } from './comment-history-list';
 
 /** Nearest heading at or above the clicked element — the robust markdown anchor. */
 function nearestHeading(anchor: HTMLElement, root: HTMLElement): string | null {
@@ -16,6 +17,8 @@ function nearestHeading(anchor: HTMLElement, root: HTMLElement): string | null {
   return best?.textContent?.trim() ?? null;
 }
 
+type PanelTab = 'open' | 'history';
+
 export function CommentPanel({ file, width }: { file: string; width: number }) {
   const { active, selection, setSelection } = useInspector();
   const selected = selection[0] ?? null;
@@ -25,6 +28,7 @@ export function CommentPanel({ file, width }: { file: string; width: number }) {
   const comments = useComments(path);
   const [text, setText] = useState('');
   const [workflow, setWorkflow] = useState(loadWorkflow);
+  const [tab, setTab] = useState<PanelTab>('open');
 
   // When a single heading is selected, offer to grab everything under it.
   const root = selected ? (selected.anchor.closest('[data-inspector-root]') as HTMLElement | null) : null;
@@ -40,8 +44,13 @@ export function CommentPanel({ file, width }: { file: string; width: number }) {
       <aside style={{ ...panel, width }}>
         <Header />
         <SelectionHelp />
+        <TabBar tab={tab} onTab={setTab} />
         <p style={hint}>Press <kbd>I</kbd> to start commenting.</p>
-        <CommentList path={path} comments={comments} />
+        {tab === 'open' ? (
+          <CommentList path={path} comments={comments} />
+        ) : (
+          <CommentHistoryList path={path} comments={comments.comments} />
+        )}
       </aside>
     );
   }
@@ -75,42 +84,58 @@ export function CommentPanel({ file, width }: { file: string; width: number }) {
     <aside style={{ ...panel, width }}>
       <Header />
       <SelectionHelp />
-      {selected ? (
-        <div style={{ padding: 12 }}>
-          <div style={{ fontSize: 12, opacity: 0.6 }}>commenting on</div>
-          <div style={{ margin: '2px 0 10px' }}>
-            <strong>{heading ?? '(top of file)'}</strong>
-            <span style={{ opacity: 0.55 }}>
-              {isRange && last ? ` · lines ${selected.line}–${last.line} · ${selection.length} blocks` : ` · line ${selected.line}`}
-            </span>
-          </div>
-          {headingBlock && (
-            <button type="button" onClick={selectSection} style={sectionBtn} title="Extend the selection to every block under this heading">
-              ⤢ Select all content under this heading
-            </button>
+      <TabBar tab={tab} onTab={setTab} />
+      {tab === 'open' ? (
+        <>
+          {selected ? (
+            <div style={{ padding: 12 }}>
+              <div style={{ fontSize: 12, opacity: 0.6 }}>commenting on</div>
+              <div style={{ margin: '2px 0 10px' }}>
+                <strong>{heading ?? '(top of file)'}</strong>
+                <span style={{ opacity: 0.55 }}>
+                  {isRange && last ? ` · lines ${selected.line}–${last.line} · ${selection.length} blocks` : ` · line ${selected.line}`}
+                </span>
+              </div>
+              {headingBlock && (
+                <button type="button" onClick={selectSection} style={sectionBtn} title="Extend the selection to every block under this heading">
+                  ⤢ Select all content under this heading
+                </button>
+              )}
+              <WorkflowSelect value={workflow} onChange={setWorkflow} />
+              <textarea
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') void submit(); }}
+                placeholder="Your comment (⌘/Ctrl+Enter)…"
+                style={textarea}
+              />
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>
+                <button type="button" onClick={submit} style={btnPrimary}>Add comment</button>
+              </div>
+            </div>
+          ) : (
+            <p style={hint}>Click a block in the spec to comment on it.</p>
           )}
-          <WorkflowSelect value={workflow} onChange={setWorkflow} />
-          <textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') void submit(); }}
-            placeholder="Your comment (⌘/Ctrl+Enter)…"
-            style={textarea}
-          />
-          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>
-            <button type="button" onClick={submit} style={btnPrimary}>Add comment</button>
-          </div>
-        </div>
+          <CommentList path={path} comments={comments} />
+        </>
       ) : (
-        <p style={hint}>Click a block in the spec to comment on it.</p>
+        <CommentHistoryList path={path} comments={comments.comments} />
       )}
-      <CommentList path={path} comments={comments} />
     </aside>
   );
 }
 
 function Header() {
   return <header style={{ padding: 12, borderBottom: '1px solid #e5e7eb', fontWeight: 700 }}>Comments</header>;
+}
+
+function TabBar({ tab, onTab }: { tab: PanelTab; onTab: (t: PanelTab) => void }) {
+  return (
+    <div style={tabBarStyle}>
+      <button type="button" onClick={() => onTab('open')} style={tab === 'open' ? tabActive : tabInactive}>Open</button>
+      <button type="button" onClick={() => onTab('history')} style={tab === 'history' ? tabActive : tabInactive}>History</button>
+    </div>
+  );
 }
 
 /** Compact "how to select" guide, including selecting multiple sections at once. */
@@ -144,52 +169,6 @@ function InfoIcon() {
       <circle cx="12" cy="8" r="0.6" fill="currentColor" stroke="none" />
     </svg>
   );
-}
-
-/** Flash a set of blocks (scrolls the first into view), restoring their inline styles after. */
-function flash(els: HTMLElement[]) {
-  if (!els.length) return;
-  els[0]!.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  const prev = els.map((el) => el.style.cssText);
-  for (const el of els) {
-    el.style.transition = 'background-color 0.2s, box-shadow 0.2s';
-    el.style.backgroundColor = 'rgba(59,130,246,0.18)';
-    el.style.boxShadow = '0 0 0 4px rgba(59,130,246,0.18)';
-    el.style.borderRadius = '4px';
-  }
-  window.setTimeout(() => {
-    for (const el of els) {
-      el.style.backgroundColor = '';
-      el.style.boxShadow = '';
-    }
-    window.setTimeout(() => { els.forEach((el, i) => { el.style.cssText = prev[i]!; }); }, 250);
-  }, 1400);
-}
-
-/**
- * Scroll the markdown surface to the block(s) a comment was anchored to and flash them.
- * Resolves by source line (`data-vs-loc`), falling back to heading text; for a range,
- * flashes every top-level block from `line` through `endLine`.
- */
-function locate(target: { heading?: string | null; startLine?: number; endLine?: number }) {
-  const root = document.querySelector('[data-inspector-root]') as HTMLElement | null;
-  if (!root || target.startLine == null) return;
-  const line = target.startLine;
-  let el = root.querySelector(`[data-vs-loc^="${line}:"]`) as HTMLElement | null;
-  if (!el && target.heading) {
-    const heads = Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6')) as HTMLElement[];
-    el = heads.find((h) => h.textContent?.trim() === target.heading) ?? null;
-  }
-  if (!el) return;
-  const els = [el];
-  if (target.endLine && target.endLine > line) {
-    for (const kid of Array.from(root.children) as HTMLElement[]) {
-      const loc = kid.getAttribute('data-vs-loc');
-      const ln = loc ? Number(loc.split(':')[0]) : NaN;
-      if (ln > line && ln <= target.endLine) els.push(kid);
-    }
-  }
-  flash(els);
 }
 
 function CommentList({ path, comments }: { path: string; comments: ReturnType<typeof useComments> }) {
@@ -273,6 +252,10 @@ function LocateIcon() {
 }
 
 const panel: React.CSSProperties = { height: '100%', flexShrink: 0, boxSizing: 'border-box', borderLeft: '1px solid #e5e7eb', background: 'white', overflowY: 'auto', overflowX: 'hidden', font: '13px system-ui' };
+const tabBarStyle: React.CSSProperties = { display: 'flex', borderBottom: '1px solid #e5e7eb', background: '#f8fafc' };
+const tabBase: React.CSSProperties = { flex: 1, padding: '7px 0', border: 'none', background: 'transparent', cursor: 'pointer', font: '12px system-ui', fontWeight: 600, color: '#475569' };
+const tabActive: React.CSSProperties = { ...tabBase, borderBottom: '2px solid #2563eb', color: '#1d4ed8', background: 'white' };
+const tabInactive: React.CSSProperties = { ...tabBase, borderBottom: '2px solid transparent' };
 const hint: React.CSSProperties = { padding: 12, opacity: 0.6, fontSize: 13 };
 const helpBox: React.CSSProperties = { borderBottom: '1px solid #f1f5f9', background: '#f8fafc' };
 const helpToggle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '8px 12px', border: 'none', background: 'transparent', cursor: 'pointer', font: '12px system-ui', fontWeight: 600, color: '#475569' };

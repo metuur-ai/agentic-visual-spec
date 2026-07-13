@@ -177,6 +177,48 @@ describe('runApply', () => {
     await runApply({ cwd: '/tmp', comments: mem.store, spawnClaude: () => fakeChild([], 1, () => {}) }, (e) => events.push(e));
     expect(events.at(-1)).toEqual({ type: 'done', ok: false, applied: 0, appliedComments: [], exitCode: 1 });
   });
+
+  it('stamps a server-generated result for applied comments that lack one (R-1.5)', async () => {
+    // The "agent" flips c-1 to applied but does NOT write a result field.
+    const mem = memoryStore([rec('c-1')]);
+    const events: ApplyEvent[] = [];
+    await runApply(
+      {
+        cwd: '/tmp',
+        comments: mem.store,
+        now: () => 1000,
+        spawnClaude: () => fakeChild([], 0, () => mem.set([rec('c-1', 'applied')])),
+      },
+      (e) => events.push(e),
+    );
+
+    // The run must succeed.
+    expect(events.at(-1)).toMatchObject({ type: 'done', ok: true, applied: 1 });
+    // The store must now hold a non-empty result on c-1.
+    const stored = await mem.store.read();
+    const c1 = stored.comments.find((c) => c.id === 'c-1');
+    expect(c1?.result).toBeTruthy();
+  });
+
+  it('does not overwrite an existing result when the agent already set one', async () => {
+    const withResult: CommentRecord = { ...rec('c-1', 'applied'), result: 'Agent-written result.' };
+    const mem = memoryStore([{ id: 'c-1', ...rec('c-1'), status: 'open' }]);
+    const events: ApplyEvent[] = [];
+    await runApply(
+      {
+        cwd: '/tmp',
+        comments: mem.store,
+        now: () => 1000,
+        spawnClaude: () => fakeChild([], 0, () => mem.set([withResult])),
+      },
+      (e) => events.push(e),
+    );
+
+    expect(events.at(-1)).toMatchObject({ type: 'done', ok: true, applied: 1 });
+    const stored = await mem.store.read();
+    const c1 = stored.comments.find((c) => c.id === 'c-1');
+    expect(c1?.result).toBe('Agent-written result.');
+  });
 });
 
 describe('createApplyHub', () => {
