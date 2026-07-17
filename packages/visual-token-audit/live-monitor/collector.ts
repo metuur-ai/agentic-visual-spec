@@ -62,6 +62,7 @@ interface MonitorEvent {
   tools?: string[];
   skill?: string;
   command?: string; // v2: slash command detected in a prompt
+  rules?: string[]; // v2.4: rule files (.claude/rules/*.md) injected on a prompt line
   agent?: string; // v2: Task/Agent subagent_type
   sidechain?: boolean; // v2: line has isSidechain:true
   text?: string;
@@ -81,6 +82,7 @@ interface SessionAgg {
   tools: Record<string, number>;
   skills: Record<string, number>;
   commands: Record<string, number>; // v2
+  rules: Record<string, number>; // v2.4
   agents: Record<string, number>; // v2
 }
 
@@ -215,6 +217,25 @@ function detectCommand(text: string): string | undefined {
   const m = text.match(/^\s*(\/[a-zA-Z][\w:-]*)(?=\s|$)/);
   if (m) return m[1];
   return undefined;
+}
+
+// v2.4: detect rule files injected into a prompt turn. Claude Code rules live
+// in .claude/rules/*.md (project scope) or ~/.claude/rules/*.md (user scope)
+// and are auto-loaded into context like CLAUDE.md memory. No verified local
+// transcript sample yet, so match conservative path evidence only:
+// ".claude/rules/<name>.md" appearing in prompt/system-reminder content.
+function detectRules(text: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const re = /\.claude\/rules\/([\w.-]+(?:\/[\w.-]+)*\.md)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) && out.length < 32) {
+    if (!seen.has(m[1])) {
+      seen.add(m[1]);
+      out.push(m[1]);
+    }
+  }
+  return out;
 }
 
 // Collect auto-loading evidence strings from a user prompt: <system-reminder>
@@ -418,8 +439,15 @@ function parseLine(raw: string, slug: string, sub?: SubagentPath): ParseResult |
       // array of only text blocks → treat as prompt
       const command = detectCommand(joined);
       const reminders = detectReminders(joined);
+      const rules = detectRules(joined);
+      for (const r of rules) reminders.push(`rule:${r}`);
       return mk(
-        { ts, sessionId, project, kind: "prompt", ...(command ? { command } : {}), ...(text ? { text } : {}) },
+        {
+          ts, sessionId, project, kind: "prompt",
+          ...(command ? { command } : {}),
+          ...(rules.length ? { rules } : {}),
+          ...(text ? { text } : {}),
+        },
         { command, reminders },
       );
     }
@@ -428,8 +456,15 @@ function parseLine(raw: string, slug: string, sub?: SubagentPath): ParseResult |
       if (!s) return null; // skip empty
       const command = detectCommand(content);
       const reminders = detectReminders(content);
+      const rules = detectRules(content);
+      for (const r of rules) reminders.push(`rule:${r}`);
       return mk(
-        { ts, sessionId, project, kind: "prompt", ...(command ? { command } : {}), text: s },
+        {
+          ts, sessionId, project, kind: "prompt",
+          ...(command ? { command } : {}),
+          ...(rules.length ? { rules } : {}),
+          text: s,
+        },
         { command, reminders },
       );
     }
@@ -487,6 +522,7 @@ function updateAgg(ev: MonitorEvent) {
       tools: {},
       skills: {},
       commands: {},
+      rules: {},
       agents: {},
     };
     sessions.set(ev.sessionId, a);
@@ -507,6 +543,7 @@ function updateAgg(ev: MonitorEvent) {
   if (ev.tools) for (const t of ev.tools) a.tools[t] = (a.tools[t] ?? 0) + 1;
   if (ev.skill) a.skills[ev.skill] = (a.skills[ev.skill] ?? 0) + 1;
   if (ev.command) a.commands[ev.command] = (a.commands[ev.command] ?? 0) + 1;
+  if (ev.rules) for (const r of ev.rules) a.rules[r] = (a.rules[r] ?? 0) + 1;
   if (ev.agent) a.agents[ev.agent] = (a.agents[ev.agent] ?? 0) + 1;
 }
 
@@ -857,7 +894,7 @@ function bump(map: CountMap, key: string, by: number, usage?: Usage) {
 }
 
 interface AutoLoad {
-  type: "memory" | "skill" | "command" | "plugin" | "hook" | "mcp";
+  type: "memory" | "rule" | "skill" | "command" | "plugin" | "hook" | "mcp";
   name: string;
   evidence: string;
 }
@@ -878,6 +915,30 @@ interface TreeNode {
   children?: TreeNode[];
 }
 
+// v2.4: estimate a rule file's context load (tokens ≈ bytes/4) by statting it
+// under the session cwd (.claude/rules/) or user scope (~/.claude/rules/).
+// Best-effort: 0 when the file can't be found from this machine.
+const ruleSizeCache = new Map<string, number>();
+function ruleTokenEstimate(cwd: string | undefined, name: string): Usage | undefined {
+  const key = (cwd ?? "") + "|" + name;
+  let tok = ruleSizeCache.get(key);
+  if (tok === undefined) {
+    tok = 0;
+    const candidates = [
+      ...(cwd ? [join(cwd, ".claude", "rules", name)] : []),
+      join(homedir(), ".claude", "rules", name),
+    ];
+    for (const p of candidates) {
+      try {
+        tok = Math.round(statSync(p).size / 4);
+        break;
+      } catch {}
+    }
+    ruleSizeCache.set(key, tok);
+  }
+  return tok > 0 ? { input: tok, output: 0, cacheRead: 0, cacheWrite: 0 } : undefined;
+}
+
 // Classify a single reminder evidence string into an auto-load entry.
 function classifyReminder(ev: string): AutoLoad {
   // Structured prefixes emitted by our own harvesters take priority.
@@ -885,7 +946,13 @@ function classifyReminder(ev: string): AutoLoad {
   if (pm) return { type: "plugin", name: pm[1], evidence: ev };
   const hm = ev.match(/^hook:(\S+)\s*(.*)$/);
   if (hm) return { type: "hook", name: hm[2] ? `${hm[1]} ${hm[2]}` : hm[1], evidence: ev };
+  const rm = ev.match(/^rule:(\S+)/);
+  if (rm) return { type: "rule", name: rm[1], evidence: ev };
   const low = ev.toLowerCase();
+  if (low.includes(".claude/rules/")) {
+    const rp = ev.match(/\.claude\/rules\/([\w.-]+(?:\/[\w.-]+)*\.md)/);
+    return { type: "rule", name: rp ? rp[1] : "rule", evidence: ev };
+  }
   if (low.includes("claude.md") || low.includes("memory")) {
     const name = ev.includes("CLAUDE.md") ? "CLAUDE.md" : "memory";
     return { type: "memory", name, evidence: ev };
@@ -976,6 +1043,7 @@ function buildSessionDetail(sessionId: string): string | null {
   const tools: CountMap = {};
   const skills: CountMap = {};
   const commands: CountMap = {};
+  const rules: CountMap = {};
   const agents: CountMap = {};
   const mcp: CountMap = {};
 
@@ -997,6 +1065,12 @@ function buildSessionDetail(sessionId: string): string | null {
       const a = classifyReminder(ev);
       const k = a.type + "|" + a.name;
       if (!autoMap.has(k)) autoMap.set(k, a);
+      // v2.4: rules — count every injection; attribute the estimated context
+      // load (file size / 4) once per unique rule, mirroring skill/command maps.
+      if (a.type === "rule" && a.name !== "rule") {
+        const first = !(a.name in rules);
+        bump(rules, a.name, 1, first ? ruleTokenEstimate(agg.cwd, a.name) : undefined);
+      }
     }
 
     if (ln.kind === "prompt") {
@@ -1246,6 +1320,7 @@ function buildSessionDetail(sessionId: string): string | null {
     tools,
     skills,
     commands,
+    rules,
     agents,
     mcp,
     loading: { auto, invoked },
@@ -1866,6 +1941,7 @@ function buildStatsJSON(days: number): string {
   let cost = 0;
   const skills = new Map<string, StatEntity>();
   const commands = new Map<string, StatEntity>();
+  const rules = new Map<string, StatEntity>();
   const agents = new Map<string, StatEntity>();
   const models = new Map<string, { count: number; tokens: number }>();
   // Task tool_use id → agent entity, to attribute sub-agent transcript tokens
@@ -1996,6 +2072,7 @@ function buildStatsJSON(days: number): string {
       if (di !== undefined) dayPrompts[di]++;
       const command = detectCommand(ptext);
       if (command) bump(commands, command, sid, tsMs);
+      for (const r of detectRules(ptext)) bump(rules, r, sid, tsMs);
     }
 
     // Sub-agent transcript: link its token sum to the parent Task tool_use.
@@ -2033,6 +2110,7 @@ function buildStatsJSON(days: number): string {
 
   const skillsOut = entOut(skills);
   const commandsOut = entOut(commands);
+  const rulesOut = entOut(rules);
   const agentsOut = entOut(agents);
   const sum = (arr: Array<{ count: number }>) => arr.reduce((a, x) => a + x.count, 0);
 
@@ -2048,6 +2126,7 @@ function buildStatsJSON(days: number): string {
       agentRuns: sum(agentsOut),
       skillInvocations: sum(skillsOut),
       commandRuns: sum(commandsOut),
+      ruleLoads: sum(rulesOut),
     },
     byDay: dayKeys.map((date, i) => ({
       date,
@@ -2057,6 +2136,7 @@ function buildStatsJSON(days: number): string {
     })),
     skills: skillsOut,
     commands: commandsOut,
+    rules: rulesOut,
     agents: agentsOut,
     models: Array.from(models.entries())
       .map(([name, m]) => ({ name, count: m.count, tokens: m.tokens }))

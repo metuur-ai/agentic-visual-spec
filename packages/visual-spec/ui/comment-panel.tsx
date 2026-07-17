@@ -1,8 +1,9 @@
 import { collectSection, headingBlockOf, useComments, useInspector } from '../core/app';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { toPath } from './md-path';
 import { WorkflowSelect, loadWorkflow } from './workflow-select';
 import { CommentHistoryList, locate } from './comment-history-list';
+import { useActiveComment } from './active-comment';
 
 /** Nearest heading at or above the clicked element — the robust markdown anchor. */
 function nearestHeading(anchor: HTMLElement, root: HTMLElement): string | null {
@@ -175,13 +176,21 @@ function CommentList({ path, comments }: { path: string; comments: ReturnType<ty
   // Only open comments: once the apply-comments skill marks one "applied", it drops off the list.
   const mine = comments.comments.filter((c) => c.target.path === path && c.status === 'open');
   const [confirmId, setConfirmId] = useState<string | null>(null);
+  const { activeId } = useActiveComment();
+  const rows = useRef<Record<string, HTMLLIElement | null>>({});
+  // When an inline indicator activates a comment, scroll its row into view (R-2.2).
+  useEffect(() => {
+    if (activeId && rows.current[activeId]) {
+      rows.current[activeId]!.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }, [activeId]);
   if (!mine.length) return null;
   return (
     <div style={{ padding: 12, borderTop: '1px solid #e5e7eb' }}>
       <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 8 }}>{mine.length} open on this file</div>
       <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 8 }}>
         {mine.map((c) => (
-          <li key={c.id} style={card}>
+          <li key={c.id} ref={(el) => { rows.current[c.id] = el; }} style={{ ...card, ...(c.id === activeId ? cardActive : {}) }}>
             <div style={{ fontSize: 12, opacity: 0.6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {c.target.heading ?? '(top)'} · L{c.target.startLine}{c.target.endLine ? `–${c.target.endLine}` : ''}
             </div>
@@ -265,6 +274,7 @@ const sectionBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'c
 const textarea: React.CSSProperties = { width: '100%', height: 70, padding: '6px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: 'inherit', resize: 'vertical' };
 const btnPrimary: React.CSSProperties = { padding: '5px 12px', border: '1px solid #2563eb', borderRadius: 4, background: '#2563eb', color: 'white', cursor: 'pointer', font: 'inherit' };
 const card: React.CSSProperties = { border: '1px solid #f1f5f9', borderRadius: 8, padding: 8, overflowWrap: 'anywhere' };
+const cardActive: React.CSSProperties = { border: '1px solid #f59e0b', background: '#fffbeb', boxShadow: '0 0 0 2px rgba(245,158,11,0.25)' };
 const locateBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, width: 22, height: 22, padding: 0, border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer' };
 const delBtn: React.CSSProperties = { ...locateBtn, color: '#ef4444' };
 const confirmYes: React.CSSProperties = { padding: '2px 8px', border: '1px solid #ef4444', borderRadius: 4, background: '#ef4444', color: 'white', cursor: 'pointer', fontSize: 12 };

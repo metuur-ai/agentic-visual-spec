@@ -318,6 +318,7 @@ function applyEventToSession(ev) {
       tools:     {},
       skills:    {},
       commands:  {},
+      rules:     {},
       agents:    {},
     };
     sessions.set(ev.sessionId, agg);
@@ -344,6 +345,9 @@ function applyEventToSession(ev) {
   }
   if (ev.skill)   agg.skills[ev.skill]     = (agg.skills[ev.skill]     ?? 0) + 1;
   if (ev.command) agg.commands[ev.command] = (agg.commands[ev.command] ?? 0) + 1;
+  if (Array.isArray(ev.rules)) {
+    for (const r of ev.rules) agg.rules[r] = (agg.rules[r] ?? 0) + 1;
+  }
   if (ev.agent)   agg.agents[ev.agent]     = (agg.agents[ev.agent]     ?? 0) + 1;
 }
 
@@ -382,6 +386,7 @@ async function loadSnapshot() {
         tools:    s.tools    ?? {},
         skills:   s.skills   ?? {},
         commands: s.commands ?? {},
+        rules:    s.rules    ?? {},
         agents:   s.agents   ?? {},
       });
     }
@@ -790,6 +795,7 @@ function renderDetail(detail) {
     ['Tools',    detail.tools],
     ['Skills',   detail.skills],
     ['Commands', detail.commands],
+    ['Rules',    detail.rules],
     ['Agents',   detail.agents],
     ['MCP',      detail.mcp],
   ];

@@ -1,7 +1,7 @@
 /* observe.js — Session Observability UI (Preact + htm, no build step).
    Data: GET /api/snapshot (session picker), GET /api/observe/<id> (entity model, spec §2). */
 import { h, render } from '/vendor/preact.module.js';
-import { useState, useEffect, useMemo } from '/vendor/hooks.module.js';
+import { useState, useEffect, useMemo, useRef } from '/vendor/hooks.module.js';
 import htm from '/vendor/htm.module.js';
 
 const html = htm.bind(h);
@@ -11,9 +11,9 @@ const CAP_FALLBACK = 200000;
 const AUTOCOMPACT_BUF = 33000;
 const POLL_MS = 5000;
 const SNAPSHOT_POLL_MS = 30000;
-const KORDER = ['system', 'memory', 'skill', 'command', 'plugin', 'mcp', 'hook', 'tool', 'agent'];
-const COLOR = { tool: '#f97316', skill: '#d97706', command: '#7c3aed', plugin: '#0d9488', mcp: '#2563eb', agent: '#db2777', memory: '#ca8a04', system: '#6b7280', hook: '#dc2626' };
-const REG_TABS = [['skill', 'Skills'], ['command', 'Commands'], ['plugin', 'Plugins'], ['mcp', 'MCP'], ['tool', 'Tools'], ['agent', 'Agents'], ['memory', 'Memory'], ['hook', 'Hooks']];
+const KORDER = ['system', 'memory', 'rule', 'skill', 'command', 'plugin', 'mcp', 'hook', 'tool', 'agent'];
+const COLOR = { tool: '#f97316', skill: '#d97706', command: '#7c3aed', plugin: '#0d9488', mcp: '#2563eb', agent: '#db2777', memory: '#ca8a04', system: '#6b7280', hook: '#dc2626', rule: '#155e75' };
+const REG_TABS = [['skill', 'Skills'], ['command', 'Commands'], ['rule', 'Rules'], ['plugin', 'Plugins'], ['mcp', 'MCP'], ['tool', 'Tools'], ['agent', 'Agents'], ['memory', 'Memory'], ['hook', 'Hooks']];
 
 /* ============================ helpers ============================ */
 const fmt = n => { n = n || 0; return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : '' + Math.round(n); };
@@ -146,11 +146,36 @@ function registryRows(m, kind) {
 }
 
 /* ============================ components ============================ */
-function SessionPicker({ sessions, sid, setSid }) {
+const sessHref = id => '?session=' + encodeURIComponent(id);
+
+function SessionStrip({ sessions, sid, setSid }) {
   const [openP, setOpenP] = useState(false);
+  const [off, setOff] = useState(0);   // px scrolled into the strip
+  const [max, setMax] = useState(0);   // max scrollable px (0 = everything fits)
+  const wrapRef = useRef(null);
+  const trackRef = useRef(null);
   const now = Date.now();
   const isLive = s => now - Date.parse(s.lastTs) < LIVE_MS;
-  const cur = (sessions || []).find(s => s.sessionId === sid);
+  const all = (sessions || []).slice().sort((a, b) => String(b.lastTs).localeCompare(String(a.lastTs)));
+  const live = all.filter(isLive);
+  const past = all.filter(s => !isLive(s));
+  const cur = all.find(s => s.sessionId === sid);
+  const curPast = cur && !isLive(cur) ? cur : null;
+
+  /* measure overflow — on mount, resize, and whenever the card list changes */
+  useEffect(() => {
+    const m = () => {
+      const w = wrapRef.current, t = trackRef.current;
+      if (!w || !t) return;
+      setMax(Math.max(0, t.scrollWidth - w.clientWidth));
+    };
+    m();
+    window.addEventListener('resize', m);
+    return () => window.removeEventListener('resize', m);
+  }, [sessions && sessions.length]);
+  useEffect(() => { setOff(o => Math.min(o, max)); }, [max]);
+
+  /* dropdown close on outside click / Esc */
   useEffect(() => {
     if (!openP) return;
     const onDoc = e => { if (!e.target.closest('.picker')) setOpenP(false); };
@@ -159,30 +184,55 @@ function SessionPicker({ sessions, sid, setSid }) {
     document.addEventListener('keydown', onKey);
     return () => { document.removeEventListener('mousedown', onDoc); document.removeEventListener('keydown', onKey); };
   }, [openP]);
-  const list = (sessions || []).slice().sort((a, b) => (isLive(b) - isLive(a)) || String(b.lastTs).localeCompare(String(a.lastTs)));
-  const nLive = list.filter(isLive).length;
-  return html`<div class="picker">
-    <button class="pk-btn" onClick=${() => setOpenP(o => !o)} aria-haspopup="listbox" aria-expanded=${openP}>
-      ${cur
-        ? html`${isLive(cur) ? html`<span class="pk-dot"></span>` : html`<span class="pk-dot off"></span>`}
-          <span class="pk-p">${cur.project || '?'}</span>
-          <span class="pk-id">${String(cur.sessionId).slice(0, 8)}</span>
-          ${isLive(cur) ? html`<span class="pk-live">LIVE</span>` : null}`
-        : html`<span class="pk-p" style="font-weight:400;color:var(--faint)">${!sessions ? 'loading sessions…' : sessions.length === 0 ? 'no sessions yet' : 'pick a session'}</span>`}
-      <span class="pk-car">▾</span>
-    </button>
-    ${openP ? html`<div class="pk-pop" role="listbox">
-      <div class="pk-hd"><span>${list.length} session${list.length === 1 ? '' : 's'}</span><span>${nLive ? nLive + ' live' : 'none live'}</span></div>
-      ${list.length === 0 ? html`<div class="empty">no sessions observed yet</div> ` :
-      list.map(s => html`<div key=${s.sessionId} role="option" aria-selected=${s.sessionId === sid}
-        class="pk-row ${s.sessionId === sid ? 'sel' : ''}" onClick=${() => { setSid(s.sessionId); setOpenP(false); }}>
-        ${isLive(s) ? html`<span class="pk-dot"></span><span class="pk-live">LIVE</span>` : html`<span class="pk-dot off"></span>`}
-        <span class="pk-p">${s.project || '?'}</span>
-        <span class="pk-id">${String(s.sessionId).slice(0, 8)}</span>
-        <span class="pk-meta num">${s.prompts ? s.prompts + ' prompt' + (s.prompts === 1 ? '' : 's') + ' · ' : ''}${rel(s.lastTs)}</span>
-        <span class="pk-ck">${s.sessionId === sid ? '✓' : ''}</span>
-      </div>`)}
-    </div>` : null}
+
+  const step = () => Math.max(160, (wrapRef.current ? wrapRef.current.clientWidth : 400) - 90);
+  const nav = d => setOff(o => Math.max(0, Math.min(max, o + d * step())));
+  const pick = (e, id) => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return; // let new-tab gestures through
+    e.preventDefault();
+    setSid(id);
+    setOpenP(false);
+  };
+
+  const card = s => html`<a key=${s.sessionId} class="ss-card ${s.sessionId === sid ? 'sel' : ''}"
+    href=${sessHref(s.sessionId)} onClick=${e => pick(e, s.sessionId)}
+    aria-current=${s.sessionId === sid ? 'true' : 'false'} title=${(s.project || '?') + ' · ' + s.sessionId}>
+    <span class="pk-dot"></span>
+    <span class="ss-p">${s.project || '?'}</span>
+    <span class="pk-id">${String(s.sessionId).slice(0, 8)}</span>
+    <span class="ss-meta num">${rel(s.lastTs)}</span>
+  </a>`;
+
+  return html`<div class="sbar">
+    <span class="sbar-l">Live<span class="sbar-n num">${live.length}</span></span>
+    ${max > 0 ? html`<button class="ss-nav" onClick=${() => nav(-1)} disabled=${off <= 0} aria-label="previous sessions">‹</button>` : null}
+    <div class="ss-wrap" ref=${wrapRef}>
+      <div class="ss-track" ref=${trackRef} style="transform:translateX(-${off}px)">
+        ${live.length ? live.map(card)
+        : html`<span class="ss-empty">${!sessions ? 'loading sessions…' : 'no live sessions — pick a previous one'}</span>`}
+      </div>
+    </div>
+    ${max > 0 ? html`<button class="ss-nav" onClick=${() => nav(1)} disabled=${off >= max} aria-label="more sessions">›</button>` : null}
+    <div class="picker">
+      <button class="pk-btn ${curPast ? 'sel' : ''}" onClick=${() => setOpenP(o => !o)} aria-haspopup="listbox" aria-expanded=${openP} disabled=${past.length === 0}>
+        ${curPast
+        ? html`<span class="pk-dot off"></span><span class="pk-p">${curPast.project || '?'}</span><span class="pk-id">${String(curPast.sessionId).slice(0, 8)}</span>`
+        : html`<span class="pk-p" style="font-weight:500">Previous</span><span class="pk-id">${past.length}</span>`}
+        <span class="pk-car">▾</span>
+      </button>
+      ${openP ? html`<div class="pk-pop" role="listbox">
+        <div class="pk-hd"><span>${past.length} inactive session${past.length === 1 ? '' : 's'}</span><span>${live.length ? live.length + ' live' : 'none live'}</span></div>
+        ${past.length === 0 ? html`<div class="empty">no inactive sessions</div>` :
+        past.map(s => html`<a key=${s.sessionId} role="option" aria-selected=${s.sessionId === sid}
+          class="pk-row ${s.sessionId === sid ? 'sel' : ''}" href=${sessHref(s.sessionId)} onClick=${e => pick(e, s.sessionId)}>
+          <span class="pk-dot off"></span>
+          <span class="pk-p">${s.project || '?'}</span>
+          <span class="pk-id">${String(s.sessionId).slice(0, 8)}</span>
+          <span class="pk-meta num">${s.prompts ? s.prompts + ' prompt' + (s.prompts === 1 ? '' : 's') + ' · ' : ''}${rel(s.lastTs)}</span>
+          <span class="pk-ck">${s.sessionId === sid ? '✓' : ''}</span>
+        </a>`)}
+      </div>` : null}
+    </div>
   </div>`;
 }
 
@@ -388,15 +438,26 @@ function Timeline({ m, sel, onSel }) {
   m.walk(root, n => { const s = Date.parse(n.start); if (!isNaN(s)) end = Math.max(end, s + (n.dur || 0)); (n.dyn || []).forEach(d => { const a = Date.parse(d.at); if (!isNaN(a)) end = Math.max(end, a); }); });
   const span = Math.max(1, end - t0);
   const x = ts => Math.min(100, Math.max(0, (ts - t0) / span * 100));
-  const nEvents = sum(m.order, n => (n.dyn || []).length);
+  const R = m.rolls[root.id] || { tok: 0, cost: 0, agents: 0, tools: 0 };
+  let skillLoads = 0, cmdRuns = 0;
+  m.walk(root, n => (n.dyn || []).forEach(d => { if (d.k === 'skill') skillLoads++; if (d.k === 'command') cmdRuns++; }));
+  const chips = [
+    ['' + m.order.length, 'agents'],
+    ['' + R.tools, 'tool calls'],
+    ['' + skillLoads, 'skill loads'],
+    ['' + cmdRuns, 'commands'],
+    [fmt(R.tok), 'tokens'],
+    ['~' + money(R.cost), 'cost'],
+    [durFmt(span), 'wall time'],
+  ];
+  const ticks = [];
+  for (let i = 0; i <= 6; i++) ticks.push(clock(new Date(t0 + span * i / 6).toISOString()));
   return html`<section class="panel fade">
     <div class="ph"><span class="pt">Timeline</span><span class="psub">click a lane to drill in · hover a marker</span></div>
     <div class="tl-head">
-      <span class="tl-stat"><b>${durFmt(span)}</b> wall</span>
-      <span class="tl-stat"><b>${m.order.length}</b> lanes</span>
-      <span class="tl-stat"><b>${nEvents}</b> runtime events</span>
+      ${chips.map(([b, l]) => html`<span class="tl-stat"><b>${b}</b> ${l}</span>`)}
     </div>
-    <div class="axis"><span>${clock(root.start)}</span><span>+${durFmt(span / 2)}</span><span>${clock(new Date(end).toISOString())}</span></div>
+    <div class="axis">${ticks.map(t => html`<span>${t}</span>`)}</div>
     <div>${m.order.map(n => {
       const s = Date.parse(n.start);
       const left = isNaN(s) ? 0 : x(s);
@@ -405,15 +466,15 @@ function Timeline({ m, sel, onSel }) {
         <span class="lane-n ${sel === n.id ? 'sel' : ''}" onClick=${() => onSel(n.id)} title=${n.label || n.name}>${n.name}</span>
         <span class="track">
           <span class="span" style="left:${left}%;width:${Math.min(w, 100 - left)}%;background:${n.type === 'session' ? '#6b7280' : COLOR.agent}"
-            onMouseEnter=${e => showTip(e, n.label || n.name, `${clock(n.start)} · ${durFmt(n.dur || 0)} wall · ${fmt(n.selfTok)} self tok`)}
-            onMouseMove=${e => showTip(e, n.label || n.name, `${clock(n.start)} · ${durFmt(n.dur || 0)} wall · ${fmt(n.selfTok)} self tok`)}
+            onMouseEnter=${e => showTip(e, n.label || n.name, `${durFmt(n.dur || 0)} · ${fmt(n.selfTok)} tok · ${money(n.cost || 0)}`)}
+            onMouseMove=${e => showTip(e, n.label || n.name, `${durFmt(n.dur || 0)} · ${fmt(n.selfTok)} tok · ${money(n.cost || 0)}`)}
             onMouseLeave=${hideTip}></span>
           ${(n.dyn || []).map(d => {
             const a = Date.parse(d.at);
             if (isNaN(a)) return null;
             return html`<span class="mk ${d.k === 'skill' || d.k === 'command' ? 'd' : ''}" style="left:${x(a)}%;background:${COLOR[d.k] || '#999'}"
-              onMouseEnter=${e => showTip(e, `${(d.k || '?').toUpperCase()} · ${d.n}`, `triggered by ${d.by || '?'} at ${clock(d.at)} · +${fmt(d.tk)} tok`)}
-              onMouseMove=${e => showTip(e, `${(d.k || '?').toUpperCase()} · ${d.n}`, `triggered by ${d.by || '?'} at ${clock(d.at)} · +${fmt(d.tk)} tok`)}
+              onMouseEnter=${e => showTip(e, `${(d.k || '?').toUpperCase()} · ${d.n}`, `triggered by ${d.by || '?'} at ${clock(d.at)} · ${fmt(d.tk)} tok`)}
+              onMouseMove=${e => showTip(e, `${(d.k || '?').toUpperCase()} · ${d.n}`, `triggered by ${d.by || '?'} at ${clock(d.at)} · ${fmt(d.tk)} tok`)}
               onMouseLeave=${hideTip}></span>`;
           })}
         </span>
@@ -429,7 +490,7 @@ function Timeline({ m, sel, onSel }) {
 /* ============================ app ============================ */
 function App() {
   const [sessions, setSessions] = useState(null);
-  const [sid, setSid] = useState(null);
+  const [sid, setSid] = useState(() => { try { return new URLSearchParams(location.search).get('session'); } catch { return null; } });
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
   const [stale, setStale] = useState(false);
@@ -450,13 +511,19 @@ function App() {
         if (!alive) return;
         const ss = (j.sessions || []).slice().sort((a, b) => String(b.lastTs).localeCompare(String(a.lastTs)));
         setSessions(ss);
-        setSid(cur => cur || (ss[0] && ss[0].sessionId) || null);
+        setSid(cur => cur || (ss[0] && ss[0].sessionId) || null); // keep URL/user choice even if absent from this snapshot
       })
       .catch(e => { if (alive && !sessions) setErr(String(e.message || e)); });
     load();
     const t = setInterval(load, SNAPSHOT_POLL_MS);
     return () => { alive = false; clearInterval(t); };
   }, []);
+
+  /* keep the URL in sync so right-click → open in new tab / reload lands on the same session */
+  useEffect(() => {
+    if (!sid) return;
+    try { history.replaceState(null, '', sessHref(sid)); } catch { /* file:// etc. */ }
+  }, [sid]);
 
   /* observe poll — every 5s, re-fetch on session change */
   useEffect(() => {
@@ -490,11 +557,10 @@ function App() {
   const preTot = m ? sum(m.root.pre, p => p.tk) : 0;
   const w = m && m.waste ? m.waste : null;
 
-  const picker = html`<${SessionPicker} sessions=${sessions} sid=${sid} setSid=${setSid} />`;
+  const strip = html`<${SessionStrip} sessions=${sessions} sid=${sid} setSid=${setSid} />`;
 
   const top = html`<div class="top">
     <span class="logo">Session Observability</span>
-    ${picker}
     <span class="tstat"><span class="l">agents</span><span class="v num">${R ? R.agents : '—'}</span></span>
     <span class="tstat"><span class="l">tokens</span><span class="v num">${R ? fmt(R.tok) : '—'}</span></span>
     <span class="tstat"><span class="l">preloaded</span><span class="v num">${m ? fmt(preTot) : '—'}</span></span>
@@ -504,7 +570,7 @@ function App() {
   </div>`;
 
   if (!m) {
-    return html`${top}<div class="state">
+    return html`${top}${strip}<div class="state">
       ${err ? html`<div class="big-msg">Cannot load data</div><div>${err}</div><div style="margin-top:6px" class="mut">retrying every ${POLL_MS / 1000}s…</div>`
         : sessions && sessions.length === 0 ? html`<div class="big-msg">No sessions observed yet</div><div>Start a Claude Code session and this page will pick it up.</div>`
         : html`<div class="big-msg">Loading…</div><div class="mut">fetching ${sid ? '/api/observe/' + String(sid).slice(0, 8) + '…' : '/api/snapshot'}</div>`}
@@ -515,7 +581,7 @@ function App() {
   const isRoot = n === m.root;
   const path = []; { let c = n; while (c) { path.unshift(c); c = m.parentOf[c.id]; } }
 
-  return html`${top}
+  return html`${top}${strip}
   <div class="shell">
     <aside class="left">
       <div class="lh"><span>Execution tree</span><span>${m.order.length} nodes</span></div>

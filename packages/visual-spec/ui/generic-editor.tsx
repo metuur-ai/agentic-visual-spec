@@ -6,6 +6,8 @@ import { useEffect, useState } from 'react';
 import { CodeView, type LineSelection } from './code-view';
 import { GenericPanel } from './generic-panel';
 import { type FileKind, type TreeEntry, rawUrl, useFile } from './use-tree';
+import { ActiveCommentProvider } from './active-comment';
+import { IndicatorLayer } from './indicator-layer';
 
 export function GenericEditor({
   entry,
@@ -24,9 +26,10 @@ export function GenericEditor({
   useEffect(() => setSelection(null), [entry.path]);
 
   const content = file && 'content' in file ? file.content : undefined;
+  const showsCode = !isFolder && !loading && entry.kind !== 'image' && content != null;
 
   return (
-    <>
+    <ActiveCommentProvider>
       <main style={main}>
         <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 40px 120px' }}>
           <PathCrumb path={entry.path} kind={entry.kind} isFolder={isFolder} />
@@ -48,10 +51,11 @@ export function GenericEditor({
             />
           )}
         </div>
+        {showsCode && <IndicatorLayer path={entry.path} mode="code" />}
       </main>
       {splitter}
       <GenericPanel path={entry.path} type={entry.type} kind={entry.kind} selection={selection} content={content} width={commentWidth} />
-    </>
+    </ActiveCommentProvider>
   );
 }
 

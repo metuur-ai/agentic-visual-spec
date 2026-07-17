@@ -84,7 +84,7 @@ function Spark({ byDay, color }) {
 }
 
 /* ============================ ranked column ============================ */
-const COLK = { skill: '#92400e', cmd: '#6d28d9', agent: '#be185d' };
+const COLK = { skill: '#92400e', cmd: '#6d28d9', agent: '#be185d', rule: '#155e75' };
 function RankCol({ title, kind, items, delay }) {
   const max = Math.max(1, ...(items || []).map(i => i.count || 0));
   return html`<section class="panel col k-${kind} fade" style="animation-delay:${delay}ms">
@@ -151,7 +151,7 @@ function App() {
       <div class="hs"><div class="l">Total tokens</div><div class="n">${fmt(t.tokens)}</div><div class="d">${int(t.tokens)} across ${data.days || 14} days</div></div>
       <div class="hs"><div class="l">Cost</div><div class="n cost">${money(t.cost)}</div><div class="d">estimated from model pricing</div></div>
       <div class="hs"><div class="l">Sessions</div><div class="n">${int(t.sessions)}</div><div class="d">${int(t.prompts)} prompts · ${int(t.projects)} projects</div></div>
-      <div class="hs"><div class="l">Agent runs</div><div class="n">${int(t.agentRuns)}</div><div class="d">${int(t.skillInvocations)} skill · ${int(t.commandRuns)} command runs</div></div>
+      <div class="hs"><div class="l">Agent runs</div><div class="n">${int(t.agentRuns)}</div><div class="d">${int(t.skillInvocations)} skill · ${int(t.commandRuns)} command · ${int(t.ruleLoads)} rule loads</div></div>
     </div>
     <section class="panel fade" style="animation-delay:60ms">
       <div class="ph"><span class="pt">Daily tokens</span><span class="psub">14-day activity</span></div>
@@ -160,6 +160,7 @@ function App() {
     <div class="cols">
       <${RankCol} title="Skills" kind="skill" items=${data.skills} delay=${120} />
       <${RankCol} title="Commands" kind="cmd" items=${data.commands} delay=${180} />
+      <${RankCol} title="Rules" kind="rule" items=${data.rules} delay=${210} />
       <${RankCol} title="Agents" kind="agent" items=${data.agents} delay=${240} />
     </div>
     <section class="panel fade" style="animation-delay:300ms">

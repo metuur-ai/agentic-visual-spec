@@ -1,5 +1,6 @@
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { anchorLabelOf, historyFor } from '../core/editing/comment-doc';
+import { resolveMarkdownAnchors } from './anchor-resolver';
 
 /** Flash a set of blocks (scrolls the first into view), restoring their inline styles after. */
 export function flash(els: HTMLElement[]) {
@@ -26,24 +27,7 @@ export function flash(els: HTMLElement[]) {
  * Shared by CommentPanel and CommentHistoryList.
  */
 export function locate(target: { heading?: string | null; startLine?: number; endLine?: number }) {
-  const root = document.querySelector('[data-inspector-root]') as HTMLElement | null;
-  if (!root || target.startLine == null) return;
-  const line = target.startLine;
-  let el = root.querySelector(`[data-vs-loc^="${line}:"]`) as HTMLElement | null;
-  if (!el && target.heading) {
-    const heads = Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6')) as HTMLElement[];
-    el = heads.find((h) => h.textContent?.trim() === target.heading) ?? null;
-  }
-  if (!el) return;
-  const els = [el];
-  if (target.endLine && target.endLine > line) {
-    for (const kid of Array.from(root.children) as HTMLElement[]) {
-      const loc = kid.getAttribute('data-vs-loc');
-      const ln = loc ? Number(loc.split(':')[0]) : NaN;
-      if (ln > line && ln <= target.endLine) els.push(kid);
-    }
-  }
-  flash(els);
+  flash(resolveMarkdownAnchors(target));
 }
 
 const EMPTY_STATE = 'No applied comments yet.';
