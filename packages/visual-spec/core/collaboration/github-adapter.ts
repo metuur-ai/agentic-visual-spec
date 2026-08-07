@@ -32,6 +32,12 @@ export type GitRef = { ref: string; sha: string };
 /** A file read back from the Contents API, already decoded to utf-8. */
 export type FileContent = { path: string; sha: string; content: string };
 
+/**
+ * One entry of a Contents API *directory* listing. `type` is GitHub's own
+ * (`file`, `dir`, `symlink`, `submodule`), passed through rather than narrowed.
+ */
+export type DirectoryEntry = { name: string; path: string; sha: string; type: string };
+
 export type CommitFileInput = {
   /** Repo-relative posix path. */
   path: string;
@@ -99,6 +105,14 @@ export interface GitHubAdapter {
   createBranch(repo: RepoRef, branch: string, fromSha: string): Promise<GitRef>;
   /** Read a file from a ref. Resolves `null` when it does not exist (404). */
   getFile(repo: RepoRef, path: string, ref: string): Promise<FileContent | null>;
+  /**
+   * List a directory on a ref, via the same Contents API endpoint as `getFile` —
+   * GitHub returns an array instead of an object when `path` is a directory.
+   * Resolves `[]` for a missing directory (404) and for a `path` that is a file.
+   * Not recursive: the Git Trees API is the recursive option and is deliberately
+   * not used here, because a flat documents directory needs no tree walk.
+   */
+  listFiles(repo: RepoRef, path: string, ref: string): Promise<DirectoryEntry[]>;
   /** R-4.3 — commit file content via the Contents API. Never shells out to git. */
   commitFile(repo: RepoRef, input: CommitFileInput): Promise<CommitResult>;
   /** R-4.3 — open a Pull Request. */
@@ -201,6 +215,19 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
         return { path: str(raw.path, path), sha: str(raw.sha), content: Buffer.from(encoded, 'base64').toString('utf8') };
       } catch (err) {
         if (err instanceof GitHubError && err.status === 404) return null;
+        throw err;
+      }
+    },
+
+    async listFiles(repo, path, ref) {
+      const endpoint = `/repos/${repo.owner}/${repo.repo}/contents/${path}?ref=${ref}`;
+      try {
+        const raw = await call<Json[]>('listFiles', ['api', '--method', 'GET', '-H', ACCEPT, endpoint]);
+        // A file path answers with an object, not an array — nothing to list.
+        if (!Array.isArray(raw)) return [];
+        return raw.map((e) => ({ name: str(e.name), path: str(e.path), sha: str(e.sha), type: str(e.type) }));
+      } catch (err) {
+        if (err instanceof GitHubError && err.status === 404) return [];
         throw err;
       }
     },

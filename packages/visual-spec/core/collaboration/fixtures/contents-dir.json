@@ -1,0 +1,30 @@
+[
+  {
+    "name": "d-bbb.json",
+    "path": "documents/d-bbb.json",
+    "sha": "bb11cc22dd33ee44ff5566778899aabbccddeeff",
+    "size": 512,
+    "type": "file"
+  },
+  {
+    "name": "d-aaa.json",
+    "path": "documents/d-aaa.json",
+    "sha": "aa00bb11cc22dd33ee44ff5566778899aabbccdd",
+    "size": 480,
+    "type": "file"
+  },
+  {
+    "name": "README.md",
+    "path": "documents/README.md",
+    "sha": "cc22dd33ee44ff5566778899aabbccddeeff0011",
+    "size": 42,
+    "type": "file"
+  },
+  {
+    "name": "archive",
+    "path": "documents/archive",
+    "sha": "dd33ee44ff5566778899aabbccddeeff00112233",
+    "size": 0,
+    "type": "dir"
+  }
+]
