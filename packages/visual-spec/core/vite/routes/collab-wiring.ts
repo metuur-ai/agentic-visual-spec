@@ -14,12 +14,12 @@
  * poller, no bodies. The router still answers `GET /__vs/collab` with `not-configured`
  * because that path never needed any of them.
  *
- * WHAT IS STILL STUBBED. `bodies.open` is deliberately absent, so 7.2's honest
- * `notImplemented` stub keeps serving it:
- *   - `open` — task 11.x (R-11.2). It must export a factory
- *     `(input: OpenJobInput) => JobBody` and be added to the spread below, plus a
- *     `startPolling(input.documentId)` call once it has attached a PR, exactly as
- *     `create` does below.
+ * `open` (task 11.1, R-11.2) is wired below from `core/collaboration/open.ts`, in the
+ * same shape as `create`: it fetches the canonical JSON off the PR branch into the local
+ * store, then starts the poller, because a reviewer's document is PR-open from the moment
+ * it is opened and their comments arrive over the same sync path an author's do.
+ *
+ * NOTHING IS STUBBED HERE ANY MORE — every member of `CollabJobBodies` is supplied.
  *
  * `publish` (task 8.3) is wired below from `core/collaboration/publish.ts`. It takes no
  * poller and no lifecycle — it commits the client payload to the PR branch, verifies the
@@ -39,6 +39,7 @@ import {
   createLifecycle,
   createLifecycleBodies,
 } from '../../collaboration/lifecycle';
+import { createOpenBody } from '../../collaboration/open';
 import { createPublishBody } from '../../collaboration/publish';
 import type { ResolvedVisualSpecConfig } from '../../config';
 import type { CollabAuthorizer, CollabJobBodies } from './collab';
@@ -91,6 +92,7 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
   const adapter = createGitHubAdapter(options.exec ?? defaultExecGh);
   const onSync = options.onSync;
   const bodies = createLifecycleBodies({ adapter, ...(onSync ? { onSync } : {}) });
+  const openBody = createOpenBody({ adapter });
 
   // The poller re-reads `documents()` per call rather than closing over one store, so a
   // runtime "change directory" re-roots the next tick too — the same discipline the
@@ -117,6 +119,13 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
       // shutdown via `stopAllPolling`; per-document stops arrive with 11.x's close path.
       create: (input) => async (ctx) => {
         await bodies.create(input)(ctx);
+        lifecycle.startPolling(input.documentId);
+      },
+      // R-11.2 — the reviewer's entry point. The document reaches the local store here,
+      // which is what `GET /__vs/collab/:id` then serves; polling starts for the same
+      // reason it does after `create`, and stops with `stopAllPolling` on shutdown.
+      open: (input) => async (ctx) => {
+        await openBody(input)(ctx);
         lifecycle.startPolling(input.documentId);
       },
       sync: (input) => bodies.sync(input),

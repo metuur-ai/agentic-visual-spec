@@ -55,6 +55,13 @@ export type CreatePullRequestInput = { title: string; head: string; base: string
 
 export type PullRequest = { number: number; headSha: string; htmlUrl: string; state: string };
 
+/**
+ * A pull request as *read back*, which needs two fields creating one does not: `body`
+ * (task 11.1 parses the 5.1 trailer out of it) and `headBranch` (the branch the document
+ * lives on). Kept a superset of `PullRequest` so a detail is usable wherever one is.
+ */
+export type PullRequestDetail = PullRequest & { body: string; headBranch: string; baseBranch: string };
+
 export type MergeMethod = 'merge' | 'squash' | 'rebase';
 
 export type MergeResult = { merged: boolean; sha: string; message: string };
@@ -117,6 +124,14 @@ export interface GitHubAdapter {
   commitFile(repo: RepoRef, input: CommitFileInput): Promise<CommitResult>;
   /** R-4.3 — open a Pull Request. */
   createPullRequest(repo: RepoRef, input: CreatePullRequestInput): Promise<PullRequest>;
+  /** R-11.2 — read one Pull Request, body included. A read: no write scope needed. */
+  getPullRequest(repo: RepoRef, pullNumber: number): Promise<PullRequestDetail>;
+  /**
+   * R-11.2 — the open Pull Request whose head is `branch`, or `null` when there is
+   * none. How the `openCommandFor()` command (which names a branch, not a number)
+   * reaches the pull number the open path needs.
+   */
+  findOpenPullRequestForBranch(repo: RepoRef, branch: string): Promise<PullRequestDetail | null>;
   /** R-4.7 — merge a Pull Request. The publish flow deliberately does not call this. */
   mergePullRequest(repo: RepoRef, pullNumber: number, method?: MergeMethod): Promise<MergeResult>;
   /** R-4.4 / R-4.5 — every issue comment on the PR, across all pages. */
@@ -149,6 +164,20 @@ function classify(operation: string, res: { stdout: string; stderr: string }): G
   const code = errors.length > 0 ? str(errors[0]?.code) || undefined : undefined;
   const message = str(body.message) || res.stderr.trim() || 'gh api failed';
   return new GitHubError(operation, message, Number.isNaN(status) ? undefined : status, code);
+}
+
+function toPullRequestDetail(raw: Json): PullRequestDetail {
+  const head = raw.head as Json | undefined;
+  const base = raw.base as Json | undefined;
+  return {
+    number: num(raw.number),
+    headSha: str(head?.sha),
+    htmlUrl: str(raw.html_url),
+    state: str(raw.state),
+    body: str(raw.body),
+    headBranch: str(head?.ref),
+    baseBranch: str(base?.ref),
+  };
 }
 
 function toIssueComment(raw: Json): IssueComment {
@@ -261,6 +290,18 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
         htmlUrl: str(raw.html_url),
         state: str(raw.state),
       };
+    },
+
+    async getPullRequest(repo, pullNumber) {
+      const raw = await get('getPullRequest', `/repos/${repo.owner}/${repo.repo}/pulls/${pullNumber}`);
+      return toPullRequestDetail(raw);
+    },
+
+    async findOpenPullRequestForBranch(repo, branch) {
+      const endpoint = `/repos/${repo.owner}/${repo.repo}/pulls?state=open&head=${repo.owner}:${branch}`;
+      const raw = await call<Json[]>('findOpenPullRequestForBranch', ['api', '--method', 'GET', '-H', ACCEPT, endpoint]);
+      const first = Array.isArray(raw) ? raw[0] : undefined;
+      return first ? toPullRequestDetail(first) : null;
     },
 
     async mergePullRequest(repo, pullNumber, method = 'merge') {

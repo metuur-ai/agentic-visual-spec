@@ -5,6 +5,8 @@
  *   visual-spec <dir> [--port 5180] [--no-open]   start the browser on <dir> (default cmd)
  *   visual-spec init <dir> [--name <pkg>]         scaffold a new surface project
  *   visual-spec install-skills [--dest <dir>]     copy the agent skills (default ~/.claude/skills)
+ *   visual-spec collab open --repo o/r --branch b --document d
+ *                                                 open a collaboration document from its PR (R-11.2)
  *
  * Single self-contained binary: the engine (core) is bundled in, the UI ships
  * prebuilt as static assets, and the skills travel inside the package.
@@ -15,6 +17,8 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createGitHubAdapter } from '../core/collaboration/github-adapter';
+import { findPullNumberForBranch, parseOpenCommand } from '../core/collaboration/open';
 import { createVisualSpecServer } from './server';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -79,6 +83,80 @@ async function serve(args: string[]) {
   server.listen(requestedPort);
 }
 
+/**
+ * `visual-spec collab open --repo owner/name --branch <branch> --document <id>` — the
+ * command 8.2 prints into every collaboration PR body (`openCommandFor`), made real
+ * (R-11.2). It is a thin driver and holds no GitHub logic of its own: it resolves the
+ * branch to its open pull request through the 4.1 adapter, starts a server configured
+ * for that repository, and posts to its own `/__vs/collab/open` — the same route the UI
+ * uses, so there is one open path, not two.
+ *
+ * Read-only by construction (R-11.3): the resolve is a GET, and the open body behind the
+ * route performs only reads.
+ */
+async function collab(args: string[]) {
+  const [sub, ...rest] = args;
+  if (sub !== 'open') {
+    console.error('Usage: visual-spec collab open --repo <owner/name> --branch <branch> --document <id> [--pull <n>] [--dir <dir>]');
+    process.exit(1);
+  }
+  const parsed = parseOpenCommand(`--repo ${flag(rest, '--repo') ?? ''} --branch ${flag(rest, '--branch') ?? ''} --document ${flag(rest, '--document') ?? ''}`);
+  if (!parsed) {
+    console.error('Usage: visual-spec collab open --repo <owner/name> --branch <branch> --document <id> [--pull <n>] [--dir <dir>]');
+    process.exit(1);
+    return;
+  }
+  const { owner, repo, branch, documentId } = parsed;
+  const contentDir = resolve(process.cwd(), flag(rest, '--dir') ?? '.');
+
+  let pullNumber = Number(flag(rest, '--pull') ?? Number.NaN);
+  if (!Number.isSafeInteger(pullNumber) || pullNumber <= 0) {
+    const found = await findPullNumberForBranch(createGitHubAdapter(), { owner, repo }, branch).catch((err: Error) => {
+      console.error(`Could not reach ${owner}/${repo}: ${err.message}`);
+      process.exit(1);
+      return null;
+    });
+    if (found === null) {
+      console.error(`No open pull request for ${branch} in ${owner}/${repo}. Pass --pull <number> if it was closed or renamed.`);
+      process.exit(1);
+      return;
+    }
+    pullNumber = found;
+  }
+
+  const { server } = createVisualSpecServer({
+    contentDir,
+    uiDir: UI_DIR,
+    port: Number(flag(rest, '--port') ?? 5180),
+    config: { collaboration: { owner, repo } },
+  });
+  server.on('listening', () => {
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 5180;
+    const url = `http://localhost:${port}`;
+    void fetch(`${url}/__vs/collab/open`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ documentId, pullNumber }),
+    })
+      .then(async (res) => {
+        const json = (await res.json()) as { error?: string; message?: string };
+        if (!res.ok) {
+          // R-11.4 — the server already knows exactly what went wrong; print that.
+          console.error(`\n  Could not open ${owner}/${repo}#${pullNumber}: ${json.error ?? json.message ?? `HTTP ${res.status}`}\n`);
+          process.exit(1);
+        }
+        process.stdout.write(`\n  visual-spec\n  ➜  document: ${documentId} (${owner}/${repo}#${pullNumber})\n  ➜  open:     ${url}\n\n`);
+        if (!rest.includes('--no-open')) openBrowser(url);
+      })
+      .catch((err: Error) => {
+        console.error(`Could not open ${documentId}: ${err.message}`);
+        process.exit(1);
+      });
+  });
+  server.listen(Number(flag(rest, '--port') ?? 5180));
+}
+
 async function init(args: string[]) {
   const target = args.find((a) => !a.startsWith('-'));
   if (!target) {
@@ -117,6 +195,7 @@ async function installSkills(args: string[]) {
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
+  if (cmd === 'collab') return collab(rest);
   if (cmd === 'init') return init(rest);
   if (cmd === 'install-skills') return installSkills(rest);
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
@@ -125,6 +204,10 @@ async function main() {
   visual-spec <dir> [--port 5180] [--no-open] [--assets-dir <dir>]   open the browser on a directory
   visual-spec init <dir> [--name <pkg>]         scaffold a new surface project
   visual-spec install-skills [--dest <dir>]     install the agent skills
+  visual-spec collab open --repo <owner/name> --branch <branch> --document <id>
+                                                open a collaboration document from its
+                                                pull request (the command a PR body
+                                                prints). Read access is enough.
 
   --assets-dir <dir>  where toolbar image uploads are saved, relative to <dir>
                       (default: assets). E.g. --assets-dir images or docs/img.

@@ -1,0 +1,7 @@
+HTTP/2.0 200 OK
+Content-Type: application/json; charset=utf-8
+X-GitHub-Api-Version-Selected: 2022-11-28
+X-OAuth-Scopes: gist, read:org, repo
+X-Accepted-OAuth-Scopes:
+
+{"login":"reviewer-rita","id":77120,"type":"User","html_url":"https://github.com/reviewer-rita"}

@@ -246,12 +246,16 @@ describe('interval polling is wired by the host (R-8.6)', () => {
 });
 
 /* ================================================================== *
- * What is still stubbed — 8.3 (publish) and 11.x (open)
+ * A body that cannot do its work fails loudly — it never reports success.
+ *
+ * This described the stubs while 8.3 (publish) and 11.1 (open) were unbuilt. Both are
+ * wired now, so what is left is the same property for a *real* body handed a document
+ * it cannot act on: `publish` on a document with no PR branch. `open` moved to
+ * `collab-open.test.ts`, where its failures are asserted by cause (R-11.4).
  * ================================================================== */
-describe('the bodies 8.2 does not own stay honestly stubbed', () => {
+describe('a body that cannot do its work fails loudly', () => {
   for (const [what, method, path, body] of [
     ['publish (task 8.3)', 'POST', '/doc-1/publish', { json: { root: {} }, markdown: '# x' }],
-    ['open (task 11.x)', 'POST', '/open', { documentId: 'doc-1', pullNumber: 42 }],
   ] as const) {
     it(`${what} fails loudly and touches no GitHub endpoint`, async () => {
       const h = host({ responses: CREATE_OK });
@@ -370,7 +374,7 @@ describe('7.2 routes run the 8.3 publish body (integration)', () => {
 
     // The wiring supplies it now — before task 8.3 this key was absent and 7.2's
     // throwing `notImplemented` stub served the route.
-    expect(Object.keys(wiring.bodies).sort()).toEqual(['create', 'publish', 'sync']);
+    expect(Object.keys(wiring.bodies).sort()).toEqual(['create', 'open', 'publish', 'sync']);
 
     const router = createCollabRoutes({
       jobs,
