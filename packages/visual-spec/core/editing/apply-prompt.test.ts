@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CommentRecord } from './comment-doc';
-import { buildApplyPrompt } from './apply-prompt';
+import { PUBLISH_HANDOFF_PREFIX, buildApplyPrompt } from './apply-prompt';
 
 function rec(id: string): CommentRecord {
   return { id, workflow: 'visual-spec', target: { path: 'a.md', kind: 'file' }, comment: 'fix the title', status: 'open', ts: '' };
@@ -92,5 +92,16 @@ describe('buildApplyPrompt mode (R-5.10)', () => {
       expect(prompt).toContain('1 review comment');
       expect(prompt).toContain('fix the title');
     }
+  });
+
+  it('collab mode ends by handing back to a human instead of publishing', () => {
+    const prompt = buildApplyPrompt([collabRec('c-1', 'n-7')], { mode: 'collab', documentPath: 'documents/doc-1.json' });
+
+    expect(prompt).toContain(`${PUBLISH_HANDOFF_PREFIX}documents/doc-1.json`);
+    expect(prompt).toMatch(/MUST NOT attempt/);
+  });
+
+  it('local mode has no publish hand-back (R-10.1 — the shipped prompt is unchanged)', () => {
+    expect(buildApplyPrompt([rec('c-1')])).not.toContain(PUBLISH_HANDOFF_PREFIX);
   });
 });

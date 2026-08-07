@@ -42,11 +42,18 @@ import type { CommentRecord } from './comment-doc';
  */
 export type ApplyPromptOptions = { mode?: 'local' } | { mode: 'collab'; documentPath: string };
 
+/**
+ * R-5.10 — the collab hand-back. Publishing is human-initiated by design, so the
+ * agent's run ends by signalling readiness rather than acting. Exported so the
+ * prompt and its test cannot drift.
+ */
+export const PUBLISH_HANDOFF_PREFIX = 'READY TO PUBLISH: ';
+
 const LOCAL_INSTRUCTION =
   'Source of truth is visual-spec-comments.json. Take only status:"open" and GROUP BY workflow. For each comment, locate the target by SNIPPET (+ heading for markdown; the line number may have drifted, do not trust it blindly). For workflow "visual-spec", apply the change in place and keep the file well-formed; for any other workflow, hand the resolved comment to that workflow skill. Then, in a SINGLE atomic edit per comment record, set status to "applied" AND write a concise non-empty result field (1–2 lines summarising what was applied or handed off) on the SAME record in the SAME edit — do not make a second pass. Preserve all other existing fields on the record and keep the output JSON valid. Finish with a traceability table: id · workflow · target · what changed / handed off.';
 
 function collabInstruction(documentPath: string): string {
-  return `Source of truth is the review conversation listed below, NOT visual-spec-comments.json — that sidecar is a non-authoritative cache in this mode, so do not read it, do not edit it, and do not trust it anywhere it disagrees with this list. The one and only file you may edit is the canonical JSON document ${documentPath}; the generated Markdown is write-only output and MUST NOT be edited. Take only status:"open" and GROUP BY workflow. For each comment, locate the target by its nodeId in ${documentPath} — the nodeId identifies the node exactly, and there is no snippet or line-number fallback; a comment with no nodeId is document-level, so treat it as being about the document as a whole. For workflow "visual-spec", apply the change to that node in place and keep the output JSON valid; for any other workflow, hand the resolved comment to that workflow skill. Do not write status or result into any file — resolution is recorded on the conversation, not on disk. Finish with a traceability table: id · workflow · nodeId · what changed / handed off.`;
+  return `Source of truth is the review conversation listed below, NOT visual-spec-comments.json — that sidecar is a non-authoritative cache in this mode, so do not read it, do not edit it, and do not trust it anywhere it disagrees with this list. The one and only file you may edit is the canonical JSON document ${documentPath}; the generated Markdown is write-only output and MUST NOT be edited. Take only status:"open" and GROUP BY workflow. For each comment, locate the target by its nodeId in ${documentPath} — the nodeId identifies the node exactly, and there is no snippet or line-number fallback; a comment with no nodeId is document-level, so treat it as being about the document as a whole. For workflow "visual-spec", apply the change to that node in place and keep the output JSON valid; for any other workflow, hand the resolved comment to that workflow skill. Do not write status or result into any file — resolution is recorded on the conversation, not on disk. Finish with a traceability table: id · workflow · nodeId · what changed / handed off. You cannot publish and MUST NOT attempt to; publishing is initiated by a person. Once every comment is applied, end your reply with this exact final line and nothing after it: ${PUBLISH_HANDOFF_PREFIX}${documentPath}`;
 }
 
 /** The instruction + comment manifest an agent needs to apply the open comments. */
