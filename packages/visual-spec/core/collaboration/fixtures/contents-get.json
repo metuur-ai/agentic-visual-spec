@@ -1,0 +1,9 @@
+{
+  "name": "doc-1.json",
+  "path": "documents/doc-1.json",
+  "sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "size": 24,
+  "type": "file",
+  "encoding": "base64",
+  "content": "ewogICJkb2N1bWVudElkIjogImRvYy0xIgp9Cg==\n"
+}

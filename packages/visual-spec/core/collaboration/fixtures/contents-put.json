@@ -1,0 +1,13 @@
+{
+  "content": {
+    "name": "doc-1.json",
+    "path": "documents/doc-1.json",
+    "sha": "bb11cc22dd33ee44ff5566778899aabbccddeeff",
+    "type": "file"
+  },
+  "commit": {
+    "sha": "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432",
+    "message": "docs: update doc-1",
+    "html_url": "https://github.com/acme/docs/commit/9f8e7d6c5b4a39281706f5e4d3c2b1a098765432"
+  }
+}

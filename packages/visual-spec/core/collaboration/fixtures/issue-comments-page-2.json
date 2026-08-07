@@ -1,0 +1,18 @@
+[
+  {
+    "id": 800100,
+    "body": "This one was written on github.com and carries no trailer.",
+    "user": { "login": "reviewer-rita" },
+    "created_at": "2026-08-06T09:30:00Z",
+    "updated_at": "2026-08-06T09:30:00Z",
+    "html_url": "https://github.com/acme/docs/pull/42#issuecomment-800100"
+  },
+  {
+    "id": 800101,
+    "body": "Last one.\n\n<!-- visual-spec: documentId=doc-1 nodeId=n-2 -->",
+    "user": { "login": "author-alice" },
+    "created_at": "2026-08-06T09:31:00Z",
+    "updated_at": "2026-08-06T09:31:00Z",
+    "html_url": "https://github.com/acme/docs/pull/42#issuecomment-800101"
+  }
+]

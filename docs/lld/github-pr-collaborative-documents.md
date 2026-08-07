@@ -123,7 +123,7 @@ Two implementations: a local file-backed one (`documents/<documentId>.json`) and
 
 ### 4. GitHub execution layer
 
-All GitHub access is **server-side**, in the node process. Every operation goes through one adapter that delegates to the `gh` CLI (`gh api`, `gh api graphql`) or the GitHub MCP server. There is no hand-rolled HTTP or GraphQL client.
+All GitHub access is **server-side**, in the node process. Every operation goes through one adapter that delegates to the `gh` CLI (`gh api`) or the GitHub MCP server. There is no hand-rolled HTTP or GraphQL client.
 
 Protocol: **REST only**. List/create/update/delete issue comments, create PRs, branch and commit operations, merge. The GraphQL thread-resolution mutations (`resolveReviewThread` / `unresolveReviewThread`) are gone from the design along with review threads themselves — see §5. This removes the requirement that MCP expose GraphQL, and removes the second execution path from the adapter.
 

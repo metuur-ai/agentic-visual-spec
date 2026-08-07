@@ -91,11 +91,11 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
 
 ## Unit 4: GitHub adapter — Lane B (independent, start day 1)
 
-- [ ] 4.1 REST adapter with injectable executor (deps: none, est: ~4d)
+- [x] 4.1 REST adapter with injectable executor (deps: none, est: ~4d)
   - why: shelling out to `gh` avoids reimplementing auth, pagination and rate limiting, and lets the Claude CLI drive the same operations. The injectable executor is what makes any of it testable — mirror the `spawnClaude` seam at `core/vite/routes/apply.ts:158`.
   - acceptance: R-4.1 — single adapter over `gh`/MCP; R-4.2 — no bespoke HTTP/GraphQL client; R-4.3 — branch, commit, open PR; R-4.4 — list/create/update/delete **issue** comments; R-4.5 — paginate the full comment list; R-4.6 — REST only, no GraphQL dependency; R-4.7 — merge; R-4.8 / R-12.3 — injectable process-spawn or request executor, mirroring `spawnClaude`; R-4.9 — structured errors carrying no credential material.
   - verify: recorded `gh api` fixtures replayed through the executor. Commit via the Contents API only — a shell-out to `git commit` applies `.gitattributes` CRLF normalization and breaks publish verification permanently.
-  - landed:
+  - landed: `core/collaboration/github-adapter.ts`, `core/collaboration/github-executor.ts`, `core/collaboration/github-adapter.test.ts` (24 tests), `core/collaboration/fixtures/*.json` (11 recorded responses). Pagination is an explicit `page=` loop, not `Link`-following: the executor is buffered and exposes stdout only, so response headers are not observable. Suite 153 → 177.
 
 - [ ] 4.2 Credential + scope preflight (deps: 4.1, est: ~4h)
   - why: the real credential on a dev machine is a keyring OAuth token, not a PAT in an env var, and it may lack scopes. Today the first symptom would be a raw 403 mid-publish.

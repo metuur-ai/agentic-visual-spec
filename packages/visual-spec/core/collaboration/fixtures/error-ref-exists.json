@@ -1,0 +1,12 @@
+{
+  "message": "Reference already exists",
+  "errors": [
+    {
+      "resource": "Reference",
+      "code": "already_exists",
+      "field": "ref"
+    }
+  ],
+  "documentation_url": "https://docs.github.com/rest/git/refs#create-a-reference",
+  "status": "422"
+}
