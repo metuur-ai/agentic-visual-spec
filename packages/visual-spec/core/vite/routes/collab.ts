@@ -69,6 +69,13 @@ export type CollabAvailability =
       /** The authenticated GitHub login. Role classification is task 9.2. */
       login: string;
       scopes: readonly string[];
+      /**
+       * R-9.7 as a display hint, not a gate: `true` when the credential has write access
+       * to the repo, `false` when it does not, absent when GitHub could not be asked.
+       * The UI reads it to tell a reviewer their session is comment-only before they
+       * reach a publish control. Every author-only route is still authorized server-side.
+       */
+      canPublish?: boolean;
     }
   | {
       available: false;
@@ -192,10 +199,18 @@ export type AuthorizationVerdict = { ok: true } | { ok: false; status: number; e
  * that forgets to wire `createCollabAuthorizer` fails to compile rather than silently
  * serving every operation to everyone.
  */
-export type CollabAuthorizer = (
+export type CollabAuthorizer = ((
   op: CollabOperation,
   ctx: { documentId: string | null; login: string; repo: ResolvedCollaborationConfig },
-) => AuthorizationVerdict | Promise<AuthorizationVerdict>;
+) => AuthorizationVerdict | Promise<AuthorizationVerdict>) & {
+  /**
+   * The same write-access fact the verdicts are derived from, asked as a question so the
+   * availability snapshot can carry it (`canPublish`). `null` means "could not be
+   * determined" — never "allowed". Optional so a test or a local-mode host can pass a
+   * bare function; an absent probe simply leaves `canPublish` off the snapshot.
+   */
+  writeAccess?: (repo: ResolvedCollaborationConfig) => Promise<boolean | null>;
+};
 
 /* ------------------------------------------------------------------ *
  * Dependencies
@@ -419,7 +434,15 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
     try {
       /* GET /__vs/collab — R-7.8, the flag the UI renders (or hides) controls on. */
       if (method === 'GET' && (pathname === '' || pathname === '/')) {
-        return { status: 200, json: await availability() };
+        const state = await availability();
+        if (!state.available) return { status: 200, json: state };
+        // The publish hint (R-9.7) is added HERE and not inside `availability()`, which
+        // every gated route shares: a reviewer operation must not pay for — or depend on —
+        // a write-access probe (R-9.8). It reuses the authorizer's own permission cache,
+        // so it costs at most one `gh api` per repo per TTL. A refusal or an outage leaves
+        // the field off rather than guessing either way.
+        const write = (await authorize.writeAccess?.(state.repo)) ?? null;
+        return { status: 200, json: write === null ? state : { ...state, canPublish: write } };
       }
 
       /* POST /__vs/collab/start (R-8.5) */

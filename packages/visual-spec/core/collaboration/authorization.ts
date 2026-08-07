@@ -193,7 +193,7 @@ export function createCollabAuthorizer(options: CollabAuthorizerOptions): Collab
     return login;
   }
 
-  return async (op, ctx) => {
+  const authorizer: CollabAuthorizer = async (op, ctx) => {
     // R-9.8 — a reviewer-permitted operation costs nothing and asks nothing. This is
     // also why a network outage never blocks reading, syncing or commenting.
     if (OPERATION_POLICY[op] === 'any-role') return { ok: true };
@@ -223,4 +223,20 @@ export function createCollabAuthorizer(options: CollabAuthorizerOptions): Collab
       return deny(`${op} was refused: the collaboration role could not be determined (${(err as Error).message}).`);
     }
   };
+
+  /**
+   * The first half of R-9.7 asked as a question instead of a verdict, so the availability
+   * snapshot can tell a reviewer their session is comment-only before they look for a
+   * publish control. Shares `hasWriteAccess`'s cache, and answers `null` — never `false` —
+   * when GitHub could not be asked, so an outage reads as "unknown", not "reviewer".
+   */
+  authorizer.writeAccess = async (repo) => {
+    try {
+      return await hasWriteAccess(repo);
+    } catch {
+      return null;
+    }
+  };
+
+  return authorizer;
 }

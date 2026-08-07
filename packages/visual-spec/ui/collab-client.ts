@@ -44,7 +44,14 @@ const BASE = '/__vs/collab';
 
 /** The `CollabAvailability` shape `GET /__vs/collab` serves (`core/vite/routes/collab.ts`). */
 export type CollabAvailabilitySnapshot =
-  | { available: true; login: string; repo: { owner: string; repo: string; baseBranch?: string }; scopes?: readonly string[] }
+  | {
+      available: true;
+      login: string;
+      repo: { owner: string; repo: string; baseBranch?: string };
+      scopes?: readonly string[];
+      /** R-9.7 write access as a display hint. Absent = the server could not determine it. */
+      canPublish?: boolean;
+    }
   | { available: false; reason: string; message: string; missingScopes?: readonly string[] };
 
 /**

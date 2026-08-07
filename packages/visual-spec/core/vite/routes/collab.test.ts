@@ -166,6 +166,32 @@ describe('R-7.8 — collaboration availability', () => {
     expect(JSON.stringify(res.json)).not.toMatch(/token|ghp_|secret/i);
   });
 
+  /*
+   * R-9.7 as a display hint. The verdict path is unchanged and still authoritative; these
+   * three cover the only thing the snapshot may say: yes, no, or nothing at all.
+   */
+  it('carries canPublish when the authorizer can answer the write-access question', async () => {
+    const authorize: CollabAuthorizer = () => ({ ok: true });
+    authorize.writeAccess = async () => true;
+    const res = await call(router({ authorize }), 'GET', '');
+    expect(res.json).toMatchObject({ available: true, canPublish: true });
+  });
+
+  it('tells a reviewer their session is comment-only', async () => {
+    const authorize: CollabAuthorizer = () => ({ ok: true });
+    authorize.writeAccess = async () => false;
+    const res = await call(router({ authorize }), 'GET', '');
+    expect(res.json).toMatchObject({ available: true, canPublish: false });
+  });
+
+  it('omits canPublish rather than guessing when write access is undeterminable', async () => {
+    const authorize: CollabAuthorizer = () => ({ ok: true });
+    authorize.writeAccess = async () => null;
+    const res = await call(router({ authorize }), 'GET', '');
+    expect(res.json).toMatchObject({ available: true });
+    expect(res.json).not.toHaveProperty('canPublish');
+  });
+
   it('surfaces a preflight failure as unavailable, not as an error', async () => {
     const r = router({
       preflight: async () => ({ available: false, reason: 'missing_scope', message: 'needs "repo"', missingScopes: ['repo'] }),

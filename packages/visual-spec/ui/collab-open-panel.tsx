@@ -27,7 +27,14 @@ import { useEffect, useState } from 'react';
 
 /** The `CollabAvailability` shape `GET /__vs/collab` serves (`core/vite/routes/collab.ts`). */
 export type CollabAvailabilitySnapshot =
-  | { available: true; login: string; repo: { owner: string; repo: string }; scopes?: readonly string[] }
+  | {
+      available: true;
+      login: string;
+      repo: { owner: string; repo: string };
+      scopes?: readonly string[];
+      /** R-9.7 as a hint. Absent means the server could not determine it — say nothing. */
+      canPublish?: boolean;
+    }
   | { available: false; reason: string; message: string };
 
 export type CollabOpenPanelProps = {
@@ -130,6 +137,20 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
             ? `Signed in as ${availability.login} — comments you leave here are posted to ${availability.repo.owner}/${availability.repo.repo} as ${availability.login}.`
             : availability.message}
       </p>
+
+      {/*
+        R-9.7 — a reviewer's credential cannot publish, and the honest place to say so is
+        here, before they open anything. Rendered only for a definite `false`: absent
+        means the server could not determine write access, and guessing either way is
+        worse than silence.
+      */}
+      {availability?.available === true && availability.canPublish === false && (
+        <p data-vs-collab-role style={identity}>
+          This is a review-only session: your credential has no write access to{' '}
+          {availability.repo.owner}/{availability.repo.repo}, so you can comment and reply but not publish. Publishing
+          is the document author&apos;s to do.
+        </p>
+      )}
 
       <label style={row}>
         <span style={label}>Pull request</span>

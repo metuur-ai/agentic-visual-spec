@@ -555,3 +555,42 @@ describe('R-9.6 — comments are attributed to the acting account, never in the 
     expect(saved?.user).toBe('reviewer-rita');
   });
 });
+
+/*
+ * `writeAccess` is a display hint for the availability snapshot (R-9.7). It answers
+ * the repo-permission half of the author rule only, and it never speaks for the
+ * verdict — a `true` here still meets a `deny` at publish time if the PR has a
+ * different author. Its third answer, `null`, means "could not determine", and the
+ * UI must render nothing rather than guess.
+ */
+describe('writeAccess — the availability hint', () => {
+  it('reports true for a login with push permission', async () => {
+    const authorize = createCollabAuthorizer({ exec: asAuthor().exec, documents: () => memoryDocuments([document()]) });
+    expect(await authorize.writeAccess?.({ ...REPO })).toBe(true);
+  });
+
+  it('reports false for a read-only login', async () => {
+    const authorize = createCollabAuthorizer({ exec: asReviewer().exec, documents: () => memoryDocuments([document()]) });
+    expect(await authorize.writeAccess?.({ ...REPO })).toBe(false);
+  });
+
+  it('reports null — not false — when the permission cannot be read', async () => {
+    const exec: GhExecutor = async () => ({ stdout: '', stderr: 'HTTP 403', exitCode: 1 });
+    const authorize = createCollabAuthorizer({ exec, documents: () => memoryDocuments([document()]) });
+    expect(await authorize.writeAccess?.({ ...REPO })).toBeNull();
+  });
+
+  it('shares the permission cache with the verdict path, so the hint costs no extra probe', async () => {
+    const stub = asAuthor();
+    const authorize = createCollabAuthorizer({
+      exec: stub.exec,
+      documents: () => memoryDocuments([document()]),
+      permissionTtlMs: 60_000,
+      now: () => 1_000,
+    });
+    await authorize.writeAccess?.({ ...REPO });
+    await authorize('publish', { documentId: 'doc-1', login: 'octocat', repo: { ...REPO } });
+    // One permission read, then only the PR probe the verdict additionally needs.
+    expect(stub.endpoints).toEqual([REPO_ENDPOINT, PULL_ENDPOINT]);
+  });
+});
