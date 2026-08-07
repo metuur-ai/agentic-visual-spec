@@ -56,11 +56,44 @@ export type CreatePullRequestInput = { title: string; head: string; base: string
 export type PullRequest = { number: number; headSha: string; htmlUrl: string; state: string };
 
 /**
- * A pull request as *read back*, which needs two fields creating one does not: `body`
- * (task 11.1 parses the 5.1 trailer out of it) and `headBranch` (the branch the document
- * lives on). Kept a superset of `PullRequest` so a detail is usable wherever one is.
+ * A pull request as *read back*, carrying everything `GET /pulls/{n}` returns that
+ * creating one cannot: `body` (task 11.1 parses the 5.1 trailer out of it),
+ * `headBranch`/`baseBranch` (the branches the document and its target live on), and
+ * `merged` / `mergeable` (task 8.4 — how a PR closed or made unmergeable **on
+ * github.com** becomes observable to a poll; nothing else in this package can see an
+ * out-of-band change).
+ *
+ * Tasks 8.4 and 11.1 each introduced a read type independently. They are one type:
+ * a single `GET` returns all of these fields, so splitting them would mean two calls
+ * for one resource. `PullRequestStatus` is retained as an alias so 8.4's call sites
+ * read as intended. `mergeable` is `null` while GitHub is still computing the merge
+ * commit — a third answer, not a synonym for `false`.
  */
-export type PullRequestDetail = PullRequest & { body: string; headBranch: string; baseBranch: string };
+export type PullRequestDetail = PullRequest & {
+  body: string;
+  headBranch: string;
+  baseBranch: string;
+  merged: boolean;
+  mergeable: boolean | null;
+  /** GitHub's own word: `clean`, `dirty`, `blocked`, `unknown`, … Passed through. */
+  mergeableState: string;
+};
+
+/** Task 8.4's name for the same read-back shape. */
+export type PullRequestStatus = PullRequestDetail;
+
+/**
+ * `GET /compare/{base}...{head}` reduced to what a divergence check needs: the branch
+ * point and the paths that changed between it and `head` (R-8.22).
+ */
+export type BranchComparison = {
+  /** The merge base — i.e. the branch point. */
+  mergeBaseSha: string;
+  aheadBy: number;
+  behindBy: number;
+  /** Repo-relative paths changed between the merge base and `head`. */
+  files: string[];
+};
 
 export type MergeMethod = 'merge' | 'squash' | 'rebase';
 
@@ -110,6 +143,11 @@ export interface GitHubAdapter {
   getBranch(repo: RepoRef, branch: string): Promise<GitRef>;
   /** R-4.3 — create `refs/heads/<branch>` at `fromSha`. */
   createBranch(repo: RepoRef, branch: string, fromSha: string): Promise<GitRef>;
+  /**
+   * R-8.18 — delete `refs/heads/<branch>`. Resolves `false` when the ref was already
+   * gone (404 / 422), because "there is no orphan" is the outcome the caller wanted.
+   */
+  deleteBranch(repo: RepoRef, branch: string): Promise<boolean>;
   /** Read a file from a ref. Resolves `null` when it does not exist (404). */
   getFile(repo: RepoRef, path: string, ref: string): Promise<FileContent | null>;
   /**
@@ -124,7 +162,11 @@ export interface GitHubAdapter {
   commitFile(repo: RepoRef, input: CommitFileInput): Promise<CommitResult>;
   /** R-4.3 — open a Pull Request. */
   createPullRequest(repo: RepoRef, input: CreatePullRequestInput): Promise<PullRequest>;
-  /** R-11.2 — read one Pull Request, body included. A read: no write scope needed. */
+  /**
+   * R-11.2 / R-8.19 / R-8.20 — read one Pull Request back: body included (11.1 parses
+   * the trailer), and `merged`/`mergeable` included (8.4 observes out-of-band closes
+   * and conflicts). A read — no write scope needed.
+   */
   getPullRequest(repo: RepoRef, pullNumber: number): Promise<PullRequestDetail>;
   /**
    * R-11.2 — the open Pull Request whose head is `branch`, or `null` when there is
@@ -132,6 +174,12 @@ export interface GitHubAdapter {
    * reaches the pull number the open path needs.
    */
   findOpenPullRequestForBranch(repo: RepoRef, branch: string): Promise<PullRequestDetail | null>;
+  /**
+   * R-8.22 — `GET /compare/{base}...{head}`. Called as `compareCommits(repo, branch,
+   * baseBranch)`, `files` is exactly "what changed on the base branch since the branch
+   * point", which is the question R-8.22 asks.
+   */
+  compareCommits(repo: RepoRef, base: string, head: string): Promise<BranchComparison>;
   /** R-4.7 — merge a Pull Request. The publish flow deliberately does not call this. */
   mergePullRequest(repo: RepoRef, pullNumber: number, method?: MergeMethod): Promise<MergeResult>;
   /** R-4.4 / R-4.5 — every issue comment on the PR, across all pages. */
@@ -177,6 +225,10 @@ function toPullRequestDetail(raw: Json): PullRequestDetail {
     body: str(raw.body),
     headBranch: str(head?.ref),
     baseBranch: str(base?.ref),
+    merged: raw.merged === true,
+    // `null` means GitHub has not finished computing it — a third answer, kept.
+    mergeable: typeof raw.mergeable === 'boolean' ? raw.mergeable : null,
+    mergeableState: str(raw.mergeable_state, 'unknown'),
   };
 }
 
@@ -234,6 +286,25 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
         sha: fromSha,
       });
       return { ref: str(raw.ref), sha: str((raw.object as Json | undefined)?.sha) };
+    },
+
+    async deleteBranch(repo, branch) {
+      const endpoint = `/repos/${repo.owner}/${repo.repo}/git/refs/heads/${branch}`;
+      const res = await exec(['api', '--method', 'DELETE', '-H', ACCEPT, endpoint]);
+      if (res.exitCode === null) {
+        throw new GitHubError(
+          'deleteBranch',
+          `GitHub CLI could not be started: ${res.stderr.trim() || 'gh not found on PATH'}`,
+          undefined,
+          'executor_unavailable',
+        );
+      }
+      // 204 No Content — gh exits 0 with an empty body, so there is nothing to parse.
+      if (res.exitCode === 0) return true;
+      const err = classify('deleteBranch', res);
+      // Already gone is the outcome the caller asked for, not a failure (R-8.18).
+      if (err.status === 404 || err.status === 422) return false;
+      throw err;
     },
 
     async getFile(repo, path, ref) {
@@ -302,6 +373,17 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
       const raw = await call<Json[]>('findOpenPullRequestForBranch', ['api', '--method', 'GET', '-H', ACCEPT, endpoint]);
       const first = Array.isArray(raw) ? raw[0] : undefined;
       return first ? toPullRequestDetail(first) : null;
+    },
+
+    async compareCommits(repo, base, head) {
+      const raw = await get('compareCommits', `/repos/${repo.owner}/${repo.repo}/compare/${base}...${head}`);
+      const files = Array.isArray(raw.files) ? (raw.files as Json[]) : [];
+      return {
+        mergeBaseSha: str((raw.merge_base_commit as Json | undefined)?.sha),
+        aheadBy: typeof raw.ahead_by === 'number' ? raw.ahead_by : 0,
+        behindBy: typeof raw.behind_by === 'number' ? raw.behind_by : 0,
+        files: files.map((f) => str(f.filename)).filter((f) => f !== ''),
+      };
     },
 
     async mergePullRequest(repo, pullNumber, method = 'merge') {

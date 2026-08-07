@@ -30,6 +30,7 @@
  */
 import { createCollabAuthorizer } from '../../collaboration/authorization';
 import type { DocumentStore } from '../../collaboration/document-store';
+import { withOrphanCleanup, withPublishFailureStates } from '../../collaboration/failure-states';
 import { createGitHubAdapter } from '../../collaboration/github-adapter';
 import { type GhExecutor, defaultExecGh } from '../../collaboration/github-executor';
 import type { JobHubRegistry } from '../../collaboration/job-hub';
@@ -93,6 +94,7 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
   const onSync = options.onSync;
   const bodies = createLifecycleBodies({ adapter, ...(onSync ? { onSync } : {}) });
   const openBody = createOpenBody({ adapter });
+  const publish = createPublishBody({ adapter });
 
   // The poller re-reads `documents()` per call rather than closing over one store, so a
   // runtime "change directory" re-roots the next tick too — the same discipline the
@@ -117,8 +119,16 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
       // Polling begins the moment a document is PR-open, which is the only moment this
       // package can currently observe one reaching that state (R-8.6). It stops on
       // shutdown via `stopAllPolling`; per-document stops arrive with 11.x's close path.
+      // R-8.18 (task 8.4) — `withOrphanCleanup` deletes the branch a partial create left
+      // behind, on the way out of the failure. It adds no GitHub call to the success
+      // path, so create's shipped call sequence is unchanged.
       create: (input) => async (ctx) => {
-        await bodies.create(input)(ctx);
+        await withOrphanCleanup(bodies.create(input), {
+          adapter,
+          repo: input.repo,
+          store: input.store,
+          documentId: input.documentId,
+        })(ctx);
         lifecycle.startPolling(input.documentId);
       },
       // R-11.2 — the reviewer's entry point. The document reaches the local store here,
@@ -129,9 +139,18 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
         lifecycle.startPolling(input.documentId);
       },
       sync: (input) => bodies.sync(input),
-      // R-8.9 … R-8.14. No wrapper: publish neither starts nor stops the poller — the
-      // document stays PR-open on the branch until it is merged on github.com.
-      publish: createPublishBody({ adapter }),
+      // R-8.9 … R-8.14. Publish neither starts nor stops the poller — the document stays
+      // PR-open on the branch until it is merged on github.com. R-8.21 / R-8.22 (task
+      // 8.4) — `withPublishFailureStates` turns publish's typed errors into the distinct
+      // recorded states `verification-failed` / `base-diverged`. It performs no GitHub
+      // call of its own here: the pre-commit base-divergence read is opt-in and off.
+      publish: (input) =>
+        withPublishFailureStates(publish(input), {
+          adapter,
+          repo: input.repo,
+          store: input.store,
+          documentId: input.documentId,
+        }),
     },
     // R-9.7 … R-9.11. Same `documents()` thunk the poller uses, so a runtime re-root is
     // honoured on the next request too. It shares no cache with the routes: role state

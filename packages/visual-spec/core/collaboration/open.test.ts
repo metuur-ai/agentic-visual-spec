@@ -181,7 +181,18 @@ describe('R-11.1 — the PR body carries repo, branch and document', () => {
     const doc = makeDoc();
     const pr = JSON.parse(pullResponse(doc)) as { body: string; head: { ref: string } };
     const reference = readPullRequestReference(
-      { number: 42, headSha: 'sha', htmlUrl: '', state: 'open', body: pr.body, headBranch: pr.head.ref, baseBranch: 'main' },
+      {
+        number: 42,
+        headSha: 'sha',
+        htmlUrl: '',
+        state: 'open',
+        body: pr.body,
+        headBranch: pr.head.ref,
+        baseBranch: 'main',
+        merged: false,
+        mergeable: true,
+        mergeableState: 'clean',
+      },
       REPO_REF,
     );
     expect(reference).toEqual({

@@ -18,7 +18,8 @@
  * **Transition rules live elsewhere too.** `LifecycleState` is the typed vocabulary from
  * LLD §7's state diagram, and the hub *holds and reports* whatever state a job declares.
  * It does not enforce the gates — the Ready gate (R-8.15) and merge-time
- * re-verification (R-8.17) are task 8.4.
+ * re-verification (R-8.17) live in `core/collaboration/failure-states.ts` (task 8.4),
+ * which derives `ready` from GitHub on every ask rather than storing it.
  *
  * Node-reachable from the CLI: node builtin types only, no `@lyfie/luthor`, no react
  * (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
@@ -42,7 +43,39 @@ export type LifecycleState =
   | 'published'
   | 'merged'
   | 'closed'
+  // The three refinements of the diagram's single `Failed` node, added by task 8.4.
+  // They are separate strings because a client must be able to tell them apart from
+  // each other and from a generic failure without parsing an error message:
+  | 'conflicted' // R-8.20 — base moved, the PR cannot merge. No auto-resolution.
+  | 'verification-failed' // R-8.21 — the committed blob is not the payload bytes.
+  | 'base-diverged' // R-8.22 — base changed the target path since the branch point.
   | 'failed';
+
+/**
+ * A rejection from a body that has ALREADY declared, through `ctx.setState`, the state
+ * it wants recorded. The hub then leaves that state alone instead of replacing it with
+ * `failed`.
+ *
+ * Two kinds of outcome need this, and neither is "the job blew up":
+ *   - a refusal (R-8.15 / R-8.17 / R-8.20) — the job ran correctly and its answer is
+ *     "no". The document is still `pr-open` or `conflicted`, and saying `failed` would
+ *     invite a retry of something that will refuse again for the same good reason;
+ *   - a distinguished failure (R-8.21 / R-8.22) — `verification-failed` and
+ *     `base-diverged` exist precisely so a client can tell them apart, and collapsing
+ *     them into `failed` would erase that.
+ *
+ * It is opt-in per error rather than a list of "safe" states, because whether a
+ * declared state survives is a property of *why* the body threw, not of the state.
+ */
+export function markStateDecided<E>(err: E): E {
+  if (err && typeof err === 'object') Object.defineProperty(err, 'stateDecided', { value: true, enumerable: false });
+  return err;
+}
+
+/** True when `err` was marked (or declares) that it already recorded its state. */
+export function isStateDecided(err: unknown): boolean {
+  return (err as { stateDecided?: unknown } | null)?.stateDecided === true;
+}
 
 /** R-8.3 — every lifecycle transition that runs as a job. One entry per transition. */
 export type JobKind =
@@ -125,13 +158,14 @@ export interface JobContext {
  */
 export type JobBody = (ctx: JobContext) => Promise<void>;
 
-/** Argument to `start`. `idempotencyKey` is carried and reported but not yet acted on. */
+/** Argument to `start`. `idempotencyKey` de-duplicates a retry (R-8.23). */
 export type StartJobRequest = {
   kind: JobKind;
   run: JobBody;
   /**
-   * R-8.23 — reserved for task 8.4. Threaded through to `JobContext`, the `job-start`
-   * event and the snapshot so 8.4 can add de-duplication without a breaking change.
+   * R-8.23 — the token that makes a retry safe. Threaded through to `JobContext`, the
+   * `job-start` event and the snapshot, and consulted by `start` **before** the
+   * one-job-at-a-time check: see `IDEMPOTENCY_LIMIT` for the exact policy.
    */
   idempotencyKey?: string;
 };
@@ -157,6 +191,12 @@ export interface JobHubOptions {
    * and `job` in the snapshot are tracked separately from the log.
    */
   maxEvents?: number;
+  /**
+   * R-8.23 — how many idempotency keys one document remembers (default 64). An
+   * unbounded map is a leak: a long session retries with a fresh key every time, and
+   * nothing would ever remove the old ones. See `IDEMPOTENCY_LIMIT`.
+   */
+  maxIdempotencyKeys?: number;
   /** Injected clock. Defaults to `Date.now`. */
   now?: () => number;
 }
@@ -196,7 +236,48 @@ export interface JobHubRegistry {
 
 const DEFAULT_MAX_EVENTS = 500;
 
-function createDocumentJobHub(documentId: string, maxEvents: number, now: () => number): DocumentJobHub {
+/**
+ * R-8.23 — IDEMPOTENCY POLICY, in one place.
+ *
+ * WHAT A KEY MEANS. One key identifies one *logical* lifecycle request, not one HTTP
+ * call. A client that times out and retries sends the same key; the hub must then not
+ * run the body a second time, because create would open a second branch and a second
+ * PR, and publish would commit twice.
+ *
+ * WHAT A RETRY GETS BACK. The **original** job's result — the same `jobId`, plus
+ * `deduplicated: true` so the caller can tell. It never starts a second job:
+ *   - original still RUNNING → 200 with the original `jobId`. Not a 409: a retry is
+ *     not a conflicting second request, it is the same request arriving twice, and the
+ *     caller is already subscribed to the SSE stream that will carry the outcome.
+ *   - original SUCCEEDED → 200 with the original `jobId`, nothing re-run.
+ *   - original FAILED → the key is **released** and the body runs. LLD §7 has an
+ *     explicit `Failed --> PROpen : retry` edge; a key that pinned a failure forever
+ *     would make that edge unreachable, and there is nothing to duplicate — the work
+ *     did not land.
+ *
+ * LIFETIME AND EVICTION. Keys live in a per-document, insertion-ordered `Map` bounded
+ * at `maxIdempotencyKeys` (default 64); at the bound the **oldest** entry is dropped.
+ * They are also cleared by `dispose()`, so a closed document keeps nothing. There is no
+ * TTL: the clock is injected and a wall-clock expiry would make the same retry behave
+ * differently depending on how long the user's laptop was asleep. A count bound is
+ * enough because the failure mode being prevented is a double-click and a timeout
+ * retry, both of which arrive within a job or two — and 64 is far more than the handful
+ * of lifecycle jobs one document runs between opening and merging.
+ *
+ * WHAT THIS DOES NOT COVER. Two *different* keys for the same logical request still
+ * produce two jobs (the client must reuse the key), and a key is per-process — a server
+ * restart forgets it. Both are stated rather than papered over: the durable de-dupe for
+ * comments is the trailer `key` in `comment-projection.ts`, and for a branch it is the
+ * deterministic `branchNameFor` plus `create`'s own "already exists" handling.
+ */
+const IDEMPOTENCY_LIMIT = 64;
+
+function createDocumentJobHub(
+  documentId: string,
+  maxEvents: number,
+  maxIdempotencyKeys: number,
+  now: () => number,
+): DocumentJobHub {
   let state: LifecycleState = 'draft';
   let job: JobRecord | null = null;
   let running = false;
@@ -205,6 +286,17 @@ function createDocumentJobHub(documentId: string, maxEvents: number, now: () => 
   let droppedEvents = 0;
   let seq = 0;
   const subs = new Set<SseSink>();
+  /** R-8.23 — idempotency key → the job it started. Insertion-ordered, bounded. */
+  const byKey = new Map<string, JobRecord>();
+
+  const rememberKey = (key: string, record: JobRecord) => {
+    byKey.set(key, record);
+    while (byKey.size > maxIdempotencyKeys) {
+      const oldest = byKey.keys().next();
+      if (oldest.done) break;
+      byKey.delete(oldest.value);
+    }
+  };
 
   const snapshot = (): JobSnapshot => ({
     documentId,
@@ -244,6 +336,20 @@ function createDocumentJobHub(documentId: string, maxEvents: number, now: () => 
     },
 
     start({ kind, run, idempotencyKey }) {
+      // R-8.23 — consulted BEFORE the 409 branch, because a retry of the request that
+      // is still running is not a conflict; it is the same request arriving twice.
+      // A failed prior attempt releases the key so the retry can actually retry.
+      if (idempotencyKey) {
+        const prior = byKey.get(idempotencyKey);
+        if (prior && prior.ok !== false) {
+          return {
+            status: 200,
+            json: { ok: true, jobId: prior.jobId, kind: prior.kind, deduplicated: true, running: prior.finishedAt === null },
+          };
+        }
+        if (prior) byKey.delete(idempotencyKey);
+      }
+
       // One job per document at a time — a second request is REJECTED, not queued. A
       // queue would let a stale publish land after a sync that invalidated it, and the
       // caller cannot see what it is waiting behind. The client retries after `job-done`.
@@ -255,6 +361,7 @@ function createDocumentJobHub(documentId: string, maxEvents: number, now: () => 
       running = true;
       abort = new AbortController();
       job = { jobId, kind, startedAt, finishedAt: null, ok: null, ...(idempotencyKey ? { idempotencyKey } : {}) };
+      if (idempotencyKey) rememberKey(idempotencyKey, job);
       broadcast({ type: 'job-start', jobId, kind, startedAt, ...(idempotencyKey ? { idempotencyKey } : {}) });
 
       const ctx: JobContext = {
@@ -278,6 +385,9 @@ function createDocumentJobHub(documentId: string, maxEvents: number, now: () => 
         const cancelled = abort?.signal.aborted === true;
         abort = null;
         if (job) job = { ...job, finishedAt: now(), ok };
+        // Keep the remembered record current, so a retry sees the *outcome* and not the
+        // in-flight snapshot. `set` on an existing key preserves insertion order.
+        if (idempotencyKey && job) byKey.set(idempotencyKey, job);
         broadcast({
           type: 'job-done',
           jobId,
@@ -302,8 +412,9 @@ function createDocumentJobHub(documentId: string, maxEvents: number, now: () => 
         () => settle(true),
         (err: unknown) => {
           // The hub does not own transition rules, but an uncaught rejection is the one
-          // transition it must record honestly: the job did not complete.
-          state = 'failed';
+          // transition it must record honestly: the job did not complete — unless the
+          // body already decided the state itself (see `markStateDecided`).
+          if (!isStateDecided(err)) state = 'failed';
           broadcast({ type: 'job-error', jobId, kind, message: (err as Error)?.message ?? String(err), at: now() });
           settle(false);
         },
@@ -336,6 +447,7 @@ function createDocumentJobHub(documentId: string, maxEvents: number, now: () => 
       subs.clear();
       events = [];
       droppedEvents = 0;
+      byKey.clear();
     },
   };
 }
@@ -347,6 +459,7 @@ function createDocumentJobHub(documentId: string, maxEvents: number, now: () => 
  */
 export function createJobHubRegistry(options: JobHubOptions = {}): JobHubRegistry {
   const maxEvents = Math.max(1, options.maxEvents ?? DEFAULT_MAX_EVENTS);
+  const maxIdempotencyKeys = Math.max(1, options.maxIdempotencyKeys ?? IDEMPOTENCY_LIMIT);
   const now = options.now ?? Date.now;
   const hubs = new Map<string, DocumentJobHub>();
 
@@ -355,7 +468,7 @@ export function createJobHubRegistry(options: JobHubOptions = {}): JobHubRegistr
       if (!DOCUMENT_ID_RE.test(documentId)) throw new Error(`invalid documentId: ${documentId}`);
       let existing = hubs.get(documentId);
       if (!existing) {
-        existing = createDocumentJobHub(documentId, maxEvents, now);
+        existing = createDocumentJobHub(documentId, maxEvents, maxIdempotencyKeys, now);
         hubs.set(documentId, existing);
       }
       return existing;
