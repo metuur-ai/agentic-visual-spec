@@ -449,7 +449,13 @@ export function createRecoveryBodies(options: RecoveryBodyOptions): RecoveryJobB
      * the lifecycle) is recoverable by running this: it reads the durable signals and
      * declares what is actually true, so nothing is stranded in a state the system
      * cannot leave. R-8.19 in particular is *this* body: a PR closed on github.com is
-     * only ever observed here or by a poll, and both end at `closed`.
+     * only ever observed here — the poll does *not* see it. The `sync` body
+     * (`lifecycle.ts`) reads comments via `githubCommentStore().read()` and never calls
+     * `getPullRequest`, so no amount of polling will move a document to `closed`.
+     * `reconcile` is also wired to no route in either host today, so in practice
+     * nothing observes a closed PR at all. Both facts are tracked as U-4 in
+     * `docs/tasks/github-pr-collaborative-documents.md`; do not read this body as a
+     * live safety net until one of them is fixed.
      */
     reconcile: (input) => async (ctx) => {
       const { documentId, repo, store } = input;
