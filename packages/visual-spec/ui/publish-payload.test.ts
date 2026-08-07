@@ -120,11 +120,20 @@ describe('generatePublishPayload — dropped-node reporting', () => {
 
     const payload = generatePublishPayload(() => doc);
 
-    expect(payload.droppedNodes).toEqual([
-      { nodeId: 'c1', type: 'callout', path: [1], fallback: expect.stringContaining('callout') },
+    expect(payload.losses).toEqual([
+      {
+        source: 'node',
+        visibility: 'placeholder',
+        subject: 'callout',
+        reason: 'unsupported-node-type',
+        nodeId: 'c1',
+        path: [1],
+        fallback: expect.stringContaining('callout'),
+      },
     ]);
-    // Reported, not silently dropped: the placeholder is in the markdown too.
-    expect(payload.markdown).toContain(payload.droppedNodes[0].fallback);
+    // `placeholder` is a claim about the artifact, so check the artifact: the
+    // fallback the loss names is really in the markdown.
+    expect(payload.markdown).toContain(payload.losses[0].fallback);
   });
 
   it('omits nodeId when the dropped node carries none', () => {
@@ -135,14 +144,32 @@ describe('generatePublishPayload — dropped-node reporting', () => {
 
     const payload = generatePublishPayload(() => doc);
 
-    expect(payload.droppedNodes).toHaveLength(1);
-    expect(payload.droppedNodes[0]).not.toHaveProperty('nodeId');
+    expect(payload.losses).toHaveLength(1);
+    expect(payload.losses[0]).not.toHaveProperty('nodeId');
   });
 
   it('reports nothing for a fully representable document', () => {
     const payload = generatePublishPayload(() => docWithText('all representable'));
 
-    expect(payload.droppedNodes).toEqual([]);
+    expect(payload.losses).toEqual([]);
+  });
+
+  it('carries both loss sources on one channel, nodes before frontmatter', () => {
+    const doc = docWithText('body');
+    rootChildren(doc).push(calloutNode('c1'));
+
+    const payload = generatePublishPayload(() => doc, { title: 'kept', nested: { a: 1 } });
+
+    // A consumer asking "does this publish lose anything?" reads one array; the
+    // per-item `source`/`visibility` is what tells it how to phrase the warning.
+    expect(payload.losses.map((l) => [l.source, l.visibility, l.subject])).toEqual([
+      ['node', 'placeholder', 'callout'],
+      ['frontmatter', 'silent', 'nested'],
+    ]);
+    // And the two really are different in the artifact, which is the reason the
+    // distinction is on the type at all.
+    expect(payload.markdown).toContain(payload.losses[0].fallback);
+    expect(payload.markdown).not.toContain('nested');
   });
 
   it('is unaffected by the types whose nodeId does not survive serialization', () => {
@@ -157,7 +184,7 @@ describe('generatePublishPayload — dropped-node reporting', () => {
     const doc = headless.markdownToJSON('![alt](img.png)\n') as JsonDocument;
     const payload = generatePublishPayload(() => doc);
 
-    expect(payload.droppedNodes).toEqual([]);
+    expect(payload.losses).toEqual([]);
     expect(payload.markdown).toContain('![alt](img.png)');
   });
 });
@@ -187,7 +214,7 @@ describe('authored frontmatter (option B — scalars and arrays of scalars)', ()
     );
     // The Luthor envelope must not ride along on the back of this change.
     expect(payload.markdown).not.toContain('luthor:meta');
-    expect(payload.droppedFrontmatter).toEqual([]);
+    expect(payload.losses).toEqual([]);
   });
 
   it('orders `title` first, then alphabetically, so an unchanged republish is byte-identical', () => {
@@ -208,8 +235,19 @@ describe('authored frontmatter (option B — scalars and arrays of scalars)', ()
     });
 
     expect(block).toBe('---\ntitle: "kept"\n---\n\n');
-    expect(dropped.map((d) => d.key).sort()).toEqual(['empty', 'matrix', 'nested', 'notFinite']);
-    expect(dropped.every((d) => d.reason === 'unsupported-type')).toBe(true);
+    expect(dropped.map((d) => d.subject).sort()).toEqual(['empty', 'matrix', 'nested', 'notFinite']);
+    expect(
+      dropped.every(
+        (d) =>
+          d.source === 'frontmatter' &&
+          d.reason === 'unsupported-frontmatter-type' &&
+          // The distinction the merged channel exists to carry: a dropped key
+          // leaves no trace in the artifact, so nothing but this report can
+          // tell the author it happened.
+          d.visibility === 'silent' &&
+          d.fallback === undefined,
+      ),
+    ).toBe(true);
   });
 
   it('escapes strings that would otherwise break out of the block', () => {

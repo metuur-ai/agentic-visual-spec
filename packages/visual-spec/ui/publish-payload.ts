@@ -35,28 +35,31 @@ import type { DocumentFrontmatter, JsonDocument } from '../core/collaboration/do
 import { getSerializedNodeId } from './node-id-extension';
 
 /**
- * A node the published Markdown cannot represent. Reported, never silently
- * dropped, so the UI can warn before the publish (LLD §2). `path` is the
- * child-index route from `root`, matching `DocumentStore.resolveNode`.
+ * Something the published Markdown cannot represent. Reported, never silently
+ * dropped, so the UI can warn before the publish (LLD §2).
+ *
+ * One channel rather than one per source, because a consumer's question is
+ * "does this publish lose anything, and can the author see what?" — not "which
+ * subsystem lost it". `visibility` carries the part that actually changes what
+ * a consumer must say: a `placeholder` loss leaves a marker the reader will
+ * encounter in the artifact, a `silent` one leaves no trace at all and is the
+ * only kind that strictly requires a pre-publish warning.
  */
-export type DroppedNodeReport = {
+export type PublishLoss = {
+  source: 'node' | 'frontmatter';
+  visibility: 'placeholder' | 'silent';
+  /** Node type, or frontmatter key. */
+  subject: string;
+  reason: 'unsupported-node-type' | 'unsupported-frontmatter-type';
+  /**
+   * Child-index route from `root`, matching `DocumentStore.resolveNode`.
+   * Nodes only.
+   */
+  path?: readonly number[];
   /** `nodeId` if the node carries one — absent for the unserializable types. */
   nodeId?: string;
-  type: string;
-  path: readonly number[];
-  /** The placeholder text that takes the node's place in the Markdown. */
-  fallback: string;
-};
-
-/**
- * A frontmatter key the emitted YAML block cannot represent. Reported on the same
- * channel as `droppedNodes` so an author sees the loss before publishing, rather
- * than discovering it in the merged artifact.
- */
-export type DroppedFrontmatterReport = {
-  key: string;
-  /** Only cause today: the value is not a scalar or an array of scalars. */
-  reason: 'unsupported-type';
+  /** The text standing in for the loss. Only present when `placeholder`. */
+  fallback?: string;
 };
 
 /** What a publish request carries. Task 8.3 consumes this shape verbatim. */
@@ -65,10 +68,11 @@ export type PublishPayload = {
   json: JsonDocument;
   /** Derived from `json`, write-only (R-2.10). */
   markdown: string;
-  /** Nodes the Markdown drops. Empty when nothing is lost. */
-  droppedNodes: readonly DroppedNodeReport[];
-  /** Frontmatter keys the YAML block drops. Empty when nothing is lost. */
-  droppedFrontmatter: readonly DroppedFrontmatterReport[];
+  /**
+   * Everything this publish drops, in document order: nodes first, then
+   * frontmatter keys. Empty when nothing is lost.
+   */
+  losses: readonly PublishLoss[];
 };
 
 /**
@@ -165,9 +169,9 @@ function emitArray(value: readonly unknown[]): string | null {
  */
 export function serializeFrontmatter(frontmatter: DocumentFrontmatter): {
   block: string;
-  dropped: DroppedFrontmatterReport[];
+  dropped: PublishLoss[];
 } {
-  const dropped: DroppedFrontmatterReport[] = [];
+  const dropped: PublishLoss[] = [];
   const lines: string[] = [];
 
   const keys = Object.keys(frontmatter).sort((a, b) => {
@@ -188,7 +192,14 @@ export function serializeFrontmatter(frontmatter: DocumentFrontmatter): {
     if (asArray !== null) {
       lines.push(`${emitKey(key)}: ${asArray}`);
     } else {
-      dropped.push({ key, reason: 'unsupported-type' });
+      // Silent: unlike a dropped node, a dropped key leaves nothing behind in
+      // the artifact for a reader to notice.
+      dropped.push({
+        source: 'frontmatter',
+        visibility: 'silent',
+        subject: key,
+        reason: 'unsupported-frontmatter-type',
+      });
     }
   }
 
@@ -219,15 +230,20 @@ export function generatePublishPayload(
     mode: 'markdown',
     supportedNodeTypes: headless.MARKDOWN_SUPPORTED_NODE_TYPES,
   });
-  const droppedNodes: DroppedNodeReport[] = prepared.envelopes.map((envelope) => ({
-    ...(getSerializedNodeId(envelope.node) ? { nodeId: getSerializedNodeId(envelope.node) } : {}),
-    type: envelope.type,
+  const droppedNodes: PublishLoss[] = prepared.envelopes.map((envelope) => ({
+    source: 'node',
+    // The bridge substitutes `fallback` for every unrepresentable node, so this
+    // loss is always marked in the artifact.
+    visibility: 'placeholder',
+    subject: envelope.type,
+    reason: 'unsupported-node-type',
     path: envelope.path,
+    ...(getSerializedNodeId(envelope.node) ? { nodeId: getSerializedNodeId(envelope.node) } : {}),
     fallback: envelope.fallback,
   }));
 
   const { block, dropped: droppedFrontmatter } = serializeFrontmatter(frontmatter);
   const markdown = block + headless.jsonToMarkdown(json, { metadataMode: 'none' });
 
-  return { json, markdown, droppedNodes, droppedFrontmatter };
+  return { json, markdown, losses: [...droppedNodes, ...droppedFrontmatter] };
 }

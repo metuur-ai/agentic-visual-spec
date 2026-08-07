@@ -473,7 +473,7 @@ describe('publish payload comes from one read of live editor state (R-12.8)', ()
     const payload = withFrontmatter.handle.publish();
 
     expect(payload.markdown.startsWith('---\ntitle: "Fixture"\ntags: ["spec"]\n---\n\n')).toBe(true);
-    expect(payload.droppedFrontmatter).toEqual([]);
+    expect(payload.losses).toEqual([]);
     // The JSON artifact is unchanged by this — frontmatter lives in the envelope.
     expect(JSON.stringify(payload.json)).not.toContain('frontmatter');
   });
