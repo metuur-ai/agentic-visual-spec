@@ -19,6 +19,7 @@ import { checkRequest } from './request-guard';
 import { type CommentDocStore, fileCommentStore, handleCommentsRequest } from './routes/comments';
 import { createApplyHub } from './routes/apply';
 import { createCollabRoutes } from './routes/collab';
+import { createCollabWiring } from './routes/collab-wiring';
 import { createJobHubRegistry } from '../collaboration/job-hub';
 import { fsDocumentStore } from '../collaboration/document-store';
 import { type VisualSpecConfig, resolveConfig } from '../config';
@@ -282,10 +283,19 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       // Registered after the guard above, like every other `/__vs` handler (R-9.13).
       const collabConfig = resolveConfig(opts.config);
       const collabJobs = createJobHubRegistry();
+      // The 8.2 job bodies and the interval poller, built once in shared code so both
+      // hosts are identical (R-7.6). With no `collaboration` block this constructs no
+      // adapter at all and yields no bodies, so 7.2's honest stubs stay in place (R-9.19).
+      const collabWiring = createCollabWiring({
+        config: () => collabConfig,
+        documents: () => fsDocumentStore(specsRoot),
+        jobs: collabJobs,
+      });
       const collab = createCollabRoutes({
         jobs: collabJobs,
         config: () => collabConfig,
         documents: () => fsDocumentStore(specsRoot),
+        bodies: collabWiring.bodies,
       });
       server.middlewares.use('/__vs/collab', (req, res) => {
         void (async () => {
@@ -302,7 +312,11 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
           }
         })();
       });
-      server.httpServer?.on('close', () => collab.dispose());
+      // Stop every poller, abort every in-flight collaboration job and drop every hub.
+      server.httpServer?.on('close', () => {
+        collabWiring.stopAllPolling();
+        collab.dispose();
+      });
 
       // Live-reload: when a .md file under the specs dir changes (it may live
       // outside the Vite root), ping the client to refetch the surface/list.

@@ -2,7 +2,11 @@
  * lifecycle.ts — document creation and sync (R-8.5 … R-8.8, R-11.1).
  *
  * This module supplies **job bodies** to the 8.1 hub; it owns no event log, no
- * subscriber set and no lifecycle state of its own. A body is
+ * subscriber set and no lifecycle state of its own. The bodies are exported on their
+ * own as `createLifecycleBodies` — in the factory shape 7.2's `CollabJobBodies`
+ * declares — so the `/__vs/collab` routes and the interval poller run the *same* code
+ * rather than two implementations that drift. `createLifecycle` is a thin wrapper over
+ * them that binds one repo + store and owns the poller. A body is
  * `(ctx: JobContext) => Promise<void>`: resolve means success, reject means the hub
  * emits `job-error` and records `failed`. Every GitHub call goes through the 4.1
  * adapter, every comment read goes through the 5.1 projection — there is no second
@@ -206,93 +210,161 @@ function throwIfAborted(ctx: JobContext): void {
   if (ctx.signal.aborted) throw new Error(`${ctx.kind} cancelled for ${ctx.documentId}`);
 }
 
+/* ------------------------------------------------------------------ *
+ * The job bodies, standalone — the 7.2 seam
+ * ------------------------------------------------------------------ */
+
+/**
+ * What the `create` body needs. Deliberately a **subset** of 7.2's `CreateJobInput`
+ * (`core/vite/routes/collab.ts`), so `createLifecycleBodies` is assignable straight into
+ * `CollabDeps.bodies` and the route hands its own input through untouched.
+ */
+export type CreateBodyInput = {
+  documentId: string;
+  /** R-9.4 — owner / repo / base branch, supplied per call rather than per instance. */
+  repo: ResolvedCollaborationConfig;
+  store: DocumentStore;
+  /** Defaults to `branchNameFor(documentId)`. */
+  branch?: string;
+  /** Defaults to the document's resolved title. */
+  title?: string;
+};
+
+/** What the `sync` body needs. Also a subset of 7.2's `SyncJobInput`. */
+export type SyncBodyInput = {
+  documentId: string;
+  repo: ResolvedCollaborationConfig;
+  store: DocumentStore;
+  /** R-8.7 — reporting only. Defaults to `user`, which is what the HTTP route is. */
+  trigger?: SyncTrigger;
+};
+
+/**
+ * The bodies this module owns, in the factory shape 7.2's `CollabJobBodies` declares.
+ * `open` (R-11.2) and `publish` (R-8.9 …) are not here — see the module header of
+ * `core/vite/routes/collab-wiring.ts` for what each still needs.
+ */
+export type LifecycleJobBodies = {
+  create(input: CreateBodyInput): JobBody;
+  sync(input: SyncBodyInput): JobBody;
+};
+
+export type LifecycleBodyOptions = {
+  adapter: GitHubAdapter;
+  /** Called with every sync result, whatever the trigger. 5.3 plugs the cache in here. */
+  onSync?: (result: SyncResult) => void | Promise<void>;
+};
+
+/**
+ * The real GitHub work, as bare `JobBody` factories. Nothing here touches a hub, a
+ * poller or a route — `createLifecycle` below and the 7.2 routes are both just callers,
+ * so the two reach identical code (that is the whole point of the split).
+ */
+export function createLifecycleBodies(options: LifecycleBodyOptions): LifecycleJobBodies {
+  const { adapter, onSync } = options;
+
+  return {
+    /** R-8.5 — the `create` body. Every failure rejects; the hub records `failed`. */
+    create: (input) => async (ctx) => {
+      const { documentId, repo, store } = input;
+      const repoRef: RepoRef = { owner: repo.owner, repo: repo.repo };
+      const doc = (await store.read(documentId)) as BoundCollaborationDocument | null;
+      if (!doc) throw new Error(`no collaboration document: ${documentId}`);
+
+      const branch = input.branch ?? branchNameFor(documentId);
+      const title = input.title || resolveDocumentTitle(doc) || documentId;
+
+      ctx.log(`resolving ${repo.baseBranch}`, 'progress');
+      const base = await adapter.getBranch(repoRef, repo.baseBranch);
+      throwIfAborted(ctx);
+
+      ctx.log(`creating branch ${branch} at ${base.sha}`, 'progress');
+      await adapter.createBranch(repoRef, branch, base.sha);
+      // Durable orphan marker: branch known, no PR yet. See the header (R-8.18 / 8.4).
+      await store.write({ ...doc, github: { owner: repo.owner, repo: repo.repo, branch, resolved: false } });
+      throwIfAborted(ctx);
+
+      // Contents API only — a `git add` would normalize line endings and break the
+      // publish byte-verification permanently (LLD §7).
+      ctx.log(`committing ${doc.documentPath}`, 'progress');
+      await adapter.commitFile(repoRef, {
+        path: doc.documentPath,
+        content: serializeCollaborationDocument(doc),
+        message: `visual-spec: create ${documentId}`,
+        branch,
+      });
+      throwIfAborted(ctx);
+
+      ctx.log(`opening pull request against ${repo.baseBranch}`, 'progress');
+      const pr = await adapter.createPullRequest(repoRef, {
+        title,
+        head: branch,
+        base: repo.baseBranch,
+        body: buildPullRequestBody({ repo: repoRef, branch, documentId, documentPath: doc.documentPath, title }),
+      });
+
+      const github: GitHubBinding = {
+        owner: repo.owner,
+        repo: repo.repo,
+        branch,
+        pullNumber: pr.number,
+        headSha: pr.headSha,
+        resolved: false,
+      };
+      await store.write({ ...doc, github });
+
+      ctx.log(`pull request #${pr.number} open at ${pr.headSha} — ${pr.htmlUrl}`);
+      ctx.setState('pr-open');
+    },
+
+    /** The `sync` body. One implementation, shared by the poller and the HTTP route. */
+    sync: (input) => async (ctx) => {
+      const { documentId, repo, store } = input;
+      const trigger: SyncTrigger = input.trigger ?? 'user';
+      const repoRef: RepoRef = { owner: repo.owner, repo: repo.repo };
+      const doc = (await store.read(documentId)) as BoundCollaborationDocument | null;
+      if (!doc) throw new Error(`no collaboration document: ${documentId}`);
+      const pullNumber = doc.github?.pullNumber;
+      if (typeof pullNumber !== 'number') throw new Error(`no open pull request for ${documentId}`);
+
+      ctx.log(`sync (${trigger}) — reading comments on #${pullNumber}`, 'progress');
+      // R-5.1 — the one projection. Sync does not read GitHub comments any other way.
+      const comments = (await githubCommentStore({
+        adapter,
+        repo: repoRef,
+        pullNumber,
+        documentId,
+        documentPath: doc.documentPath,
+      }).read()).comments as ProjectedCommentRecord[];
+      throwIfAborted(ctx);
+
+      ctx.log(`sync (${trigger}) — ${comments.length} comment(s) on #${pullNumber}`);
+      // Sync persists nothing about the document itself — see the header.
+      await onSync?.({ documentId, pullNumber, trigger, comments, at: ctx.now() });
+    },
+  };
+}
+
 export function createLifecycle(options: LifecycleOptions): Lifecycle {
   const { adapter, repo, store, hubs, onSync } = options;
-  const repoRef: RepoRef = { owner: repo.owner, repo: repo.repo };
   const intervalMs = Math.max(1, options.syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS);
   const schedule = options.scheduler ?? defaultScheduler;
   const pollers = new Map<string, () => void>();
-
-  /** R-8.5 — the `create` body. Every failure rejects; the hub records `failed`. */
-  const createBody = (input: StartDocumentInput): JobBody => async (ctx) => {
-    const { documentId } = input;
-    const doc = (await store.read(documentId)) as BoundCollaborationDocument | null;
-    if (!doc) throw new Error(`no collaboration document: ${documentId}`);
-
-    const branch = input.branch ?? branchNameFor(documentId);
-    const title = input.title || resolveDocumentTitle(doc) || documentId;
-
-    ctx.log(`resolving ${repo.baseBranch}`, 'progress');
-    const base = await adapter.getBranch(repoRef, repo.baseBranch);
-    throwIfAborted(ctx);
-
-    ctx.log(`creating branch ${branch} at ${base.sha}`, 'progress');
-    await adapter.createBranch(repoRef, branch, base.sha);
-    // Durable orphan marker: branch known, no PR yet. See the header (R-8.18 / 8.4).
-    await store.write({ ...doc, github: { owner: repo.owner, repo: repo.repo, branch, resolved: false } });
-    throwIfAborted(ctx);
-
-    // Contents API only — a `git add` would normalize line endings and break the
-    // publish byte-verification permanently (LLD §7).
-    ctx.log(`committing ${doc.documentPath}`, 'progress');
-    await adapter.commitFile(repoRef, {
-      path: doc.documentPath,
-      content: serializeCollaborationDocument(doc),
-      message: `visual-spec: create ${documentId}`,
-      branch,
-    });
-    throwIfAborted(ctx);
-
-    ctx.log(`opening pull request against ${repo.baseBranch}`, 'progress');
-    const pr = await adapter.createPullRequest(repoRef, {
-      title,
-      head: branch,
-      base: repo.baseBranch,
-      body: buildPullRequestBody({ repo: repoRef, branch, documentId, documentPath: doc.documentPath, title }),
-    });
-
-    const github: GitHubBinding = {
-      owner: repo.owner,
-      repo: repo.repo,
-      branch,
-      pullNumber: pr.number,
-      headSha: pr.headSha,
-      resolved: false,
-    };
-    await store.write({ ...doc, github });
-
-    ctx.log(`pull request #${pr.number} open at ${pr.headSha} — ${pr.htmlUrl}`);
-    ctx.setState('pr-open');
-  };
-
-  /** The `sync` body. One implementation, reached only through `lifecycle.sync`. */
-  const syncBody = (documentId: string, trigger: SyncTrigger): JobBody => async (ctx) => {
-    const doc = (await store.read(documentId)) as BoundCollaborationDocument | null;
-    if (!doc) throw new Error(`no collaboration document: ${documentId}`);
-    const pullNumber = doc.github?.pullNumber;
-    if (typeof pullNumber !== 'number') throw new Error(`no open pull request for ${documentId}`);
-
-    ctx.log(`sync (${trigger}) — reading comments on #${pullNumber}`, 'progress');
-    // R-5.1 — the one projection. Sync does not read GitHub comments any other way.
-    const comments = (await githubCommentStore({
-      adapter,
-      repo: repoRef,
-      pullNumber,
-      documentId,
-      documentPath: doc.documentPath,
-    }).read()).comments as ProjectedCommentRecord[];
-    throwIfAborted(ctx);
-
-    ctx.log(`sync (${trigger}) — ${comments.length} comment(s) on #${pullNumber}`);
-    // Sync persists nothing about the document itself — see the header.
-    await onSync?.({ documentId, pullNumber, trigger, comments, at: ctx.now() });
-  };
+  // The same bodies the 7.2 routes run. `start` / `sync` below are thin wrappers that
+  // bind this instance's repo + store and hand the body to the hub.
+  const bodies = createLifecycleBodies({ adapter, ...(onSync ? { onSync } : {}) });
 
   const lifecycle: Lifecycle = {
     start(input) {
       return hubs.hub(input.documentId).start({
         kind: 'create',
-        run: createBody(input),
+        run: bodies.create({
+          documentId: input.documentId,
+          repo,
+          store,
+          ...(input.branch ? { branch: input.branch } : {}),
+          ...(input.title ? { title: input.title } : {}),
+        }),
         ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
       });
     },
@@ -301,7 +373,7 @@ export function createLifecycle(options: LifecycleOptions): Lifecycle {
       // The hub is also the overlap guard: it rejects a second job for a document with
       // 409, so a poll that fires while the previous one is still running is dropped
       // rather than queued. Polls cannot pile up behind a slow GitHub response.
-      return hubs.hub(documentId).start({ kind: 'sync', run: syncBody(documentId, trigger) });
+      return hubs.hub(documentId).start({ kind: 'sync', run: bodies.sync({ documentId, repo, store, trigger }) });
     },
 
     startPolling(documentId) {

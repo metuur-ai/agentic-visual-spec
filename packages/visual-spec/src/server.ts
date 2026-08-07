@@ -33,6 +33,7 @@ import {
 } from '../core/vite/routes/comments';
 import { createApplyHub } from '../core/vite/routes/apply';
 import { createCollabRoutes } from '../core/vite/routes/collab';
+import { createCollabWiring } from '../core/vite/routes/collab-wiring';
 import { createJobHubRegistry } from '../core/collaboration/job-hub';
 import { fsDocumentStore } from '../core/collaboration/document-store';
 import { type VisualSpecConfig, resolveConfig } from '../core/config';
@@ -167,10 +168,19 @@ export function createVisualSpecServer(opts: ServeOptions) {
   // (R-7.8 / R-9.19) — local mode is untouched (R-7.2).
   const collabConfig = resolveConfig(opts.config);
   const collabJobs = createJobHubRegistry();
+  // The 8.2 job bodies and the interval poller, built once in shared code so both hosts
+  // are identical (R-7.6). With no `collaboration` block this constructs no adapter at
+  // all and yields no bodies, so 7.2's honest stubs stay in place (R-9.19).
+  const collabWiring = createCollabWiring({
+    config: () => collabConfig,
+    documents: () => fsDocumentStore(contentDir),
+    jobs: collabJobs,
+  });
   const collab = createCollabRoutes({
     jobs: collabJobs,
     config: () => collabConfig,
     documents: () => fsDocumentStore(contentDir),
+    bodies: collabWiring.bodies,
   });
 
   /** Re-root every store at a new directory (comments follow to <dir>/…json). */
@@ -327,8 +337,11 @@ export function createVisualSpecServer(opts: ServeOptions) {
     })();
   });
 
-  // Abort every in-flight collaboration job and drop every hub on shutdown.
-  server.on('close', () => collab.dispose());
+  // Stop every poller, abort every in-flight collaboration job and drop every hub.
+  server.on('close', () => {
+    collabWiring.stopAllPolling();
+    collab.dispose();
+  });
 
   return { server, commentsPath };
 }
