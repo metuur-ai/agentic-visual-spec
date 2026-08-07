@@ -77,11 +77,17 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
   - verify: R-12.8 — test asserts both artifacts derive from the same document object via a single call. Explicitly **not** reusing `normalizeForStore(getMarkdown())` (`ui/wysiwyg-editor.tsx:135`), which reads live editor state and applies local-viewer image rewriting.
   - landed:
 
-- [ ] 2.4 Import-boundary lint for the collaboration path (deps: 2.3, est: ~2h)
+- [x] 2.4 Import-boundary lint for the collaboration path (deps: 2.3, est: ~2h)
   - why: `markdownToInjectable` does not throw on an id-less tree — it returns a structurally valid document with every `nodeId` gone. Silent identity loss is the worst failure mode in the design, so convention is not enough.
   - acceptance: R-2.13 — no collaboration module imports `markdownToInjectable()` or `canonicalizeMarkdown()`, asserted by a test.
   - verify: lint rule fails when a deliberate import is added to a collab module.
-  - landed:
+  - landed: `core/collaboration/import-boundary.test.ts` (new, 6 tests) + `core/import-graph.ts` (new). Suite 533 → 539 green, `tsc --noEmit` clean. Decisions:
+    1. **The collaboration path is enumerated by pattern, not by file list**, so a module added by a concurrent task is covered the moment it lands: `core/collaboration/*.tsx?`, `core/vite/routes/collab*.tsx?`, `ui/(node-id|publish|collab)*.tsx?`. The `ui/` boundary is a name prefix rather than a directory because the collaboration UI shares `ui/` with the local viewer, and the local viewer legitimately parses Markdown — `ui/wysiwyg-editor.tsx` imports `markdownToInjectable` on its load path and must keep doing so. A "guards against a vacuous pass" test pins four anchors that exist today, so a layout change that makes the patterns match nothing fails loudly instead of passing on an empty set.
+    2. **The 0.3 walker is shared, not duplicated.** `specifiersOf` / `resolveRelative` / the BFS moved verbatim out of `core/bundle-guard.test.ts` into `core/import-graph.ts`; bundle-guard's assertions are byte-identical, only its private helper changed. 0.3 asks "does this graph reach a forbidden *package*", 2.4 asks "does it reach a forbidden *binding*" — same traversal, different predicate.
+    3. **Forbidden by binding, not by module.** `mapImages` / `normalizeForStore` in `ui/luthor-bridge.ts` are pure string work and stay reachable; the banned names are `markdownToInjectable`, `canonicalizeMarkdown` and `markdownToJSON` (Luthor's primitive, added per LLD §2 "No-Markdown-read check"). Detection covers named imports *and* `.name(` call sites, closing the `import * as bridge` escape hatch.
+    4. Assertions compare a joined string rather than an array so the failure diff prints the offending chains in full instead of vitest's `[ …(6) ]` elision.
+  - proof (required, then reverted): a deliberate `import { markdownToInjectable } from '../../ui/luthor-bridge'` in `core/collaboration/document-protocol.ts` failed two of the six tests, naming every chain — e.g. `core/vite/routes/collab.ts → core/collaboration/document-protocol.ts: imports \`markdownToInjectable\` from '../../ui/luthor-bridge'` and the transitive `core/collaboration/job-hub.ts → core/collaboration/document-store.ts → core/collaboration/document-protocol.ts → ui/luthor-bridge.ts: calls \`.markdownToJSON()\``.
+  - finding: **nothing on the collaboration path reaches those bindings today.** `ui/wysiwyg-editor.tsx` is the only importer of `markdownToInjectable` in the package and is deliberately off the path; `canonicalizeMarkdown` has no importer outside `ui/luthor-bridge.test.ts`.
 
 ---
 
