@@ -172,24 +172,52 @@ describe('R-7.8 — collaboration availability', () => {
    */
   it('carries canPublish when the authorizer can answer the write-access question', async () => {
     const authorize: CollabAuthorizer = () => ({ ok: true });
-    authorize.writeAccess = async () => true;
+    authorize.writeAccess = async () => ({ write: true });
     const res = await call(router({ authorize }), 'GET', '');
     expect(res.json).toMatchObject({ available: true, canPublish: true });
+    expect(res.json).not.toHaveProperty('publishBlocked');
   });
 
   it('tells a reviewer their session is comment-only', async () => {
     const authorize: CollabAuthorizer = () => ({ ok: true });
-    authorize.writeAccess = async () => false;
+    authorize.writeAccess = async () => ({
+      write: false,
+      reason: 'no_write_access',
+      message: 'Your credential has no write access to acme/docs.',
+    });
     const res = await call(router({ authorize }), 'GET', '');
     expect(res.json).toMatchObject({ available: true, canPublish: false });
   });
 
+  /*
+   * R-12.5 — "no" has two causes and they need different words. A missing write grant is
+   * a role fact the reviewer can live with; a repo that cannot be found is a config error
+   * no later step explains, so the snapshot must carry the reason, not just the boolean.
+   */
+  it('names why publishing is blocked, distinguishing no grant from no repo', async () => {
+    const blocked = async (reason: 'no_write_access' | 'no_repo', message: string) => {
+      const authorize: CollabAuthorizer = () => ({ ok: true });
+      authorize.writeAccess = async () => ({ write: false as const, reason, message });
+      return (await call(router({ authorize }), 'GET', '')).json;
+    };
+
+    expect(await blocked('no_write_access', 'No write access to acme/docs.')).toMatchObject({
+      canPublish: false,
+      publishBlocked: { reason: 'no_write_access', message: 'No write access to acme/docs.' },
+    });
+    expect(await blocked('no_repo', 'acme/docs was not found.')).toMatchObject({
+      canPublish: false,
+      publishBlocked: { reason: 'no_repo', message: 'acme/docs was not found.' },
+    });
+  });
+
   it('omits canPublish rather than guessing when write access is undeterminable', async () => {
     const authorize: CollabAuthorizer = () => ({ ok: true });
-    authorize.writeAccess = async () => null;
+    authorize.writeAccess = async () => ({ write: null, reason: 'unknown' });
     const res = await call(router({ authorize }), 'GET', '');
     expect(res.json).toMatchObject({ available: true });
     expect(res.json).not.toHaveProperty('canPublish');
+    expect(res.json).not.toHaveProperty('publishBlocked');
   });
 
   it('surfaces a preflight failure as unavailable, not as an error', async () => {

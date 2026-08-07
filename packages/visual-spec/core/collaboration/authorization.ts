@@ -112,8 +112,23 @@ type Json = Record<string, unknown>;
 
 const deny = (error: string): AuthorizationVerdict => ({ ok: false, status: 403, error: scrubCredentials(error) });
 
-/** Raised internally when the role is undeterminable; never escapes this module. */
-class Undeterminable extends Error {}
+/**
+ * Raised internally when the role is undeterminable; never escapes this module.
+ * `status` carries GitHub's HTTP code when `gh` reported one, so a caller that cares
+ * about a *specific* refusal (R-12.5: a repo that is not there) can tell it apart from
+ * the outage case. Everything that reaches `authorize` still treats them alike.
+ */
+class Undeterminable extends Error {
+  constructor(message: string, readonly status: number | null = null) {
+    super(message);
+  }
+}
+
+/** `gh: Not Found (HTTP 404)` → 404. Null when `gh` said nothing parseable. */
+function statusFromGhError(detail: string): number | null {
+  const m = /\(HTTP (\d{3})\)/.exec(detail);
+  return m ? Number(m[1]) : null;
+}
 
 /**
  * One `gh api` GET. Throws `Undeterminable` for every failure mode there is — a failed
@@ -124,7 +139,7 @@ async function getJson(exec: GhExecutor, what: string, endpoint: string): Promis
   const res = await exec(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json', endpoint]);
   if (res.exitCode !== 0) {
     const detail = res.stderr.trim() || res.stdout.trim() || 'gh api failed';
-    throw new Undeterminable(`${what}: ${detail}`);
+    throw new Undeterminable(`${what}: ${detail}`, statusFromGhError(detail));
   }
   try {
     const parsed = JSON.parse(res.stdout) as unknown;
@@ -227,14 +242,36 @@ export function createCollabAuthorizer(options: CollabAuthorizerOptions): Collab
   /**
    * The first half of R-9.7 asked as a question instead of a verdict, so the availability
    * snapshot can tell a reviewer their session is comment-only before they look for a
-   * publish control. Shares `hasWriteAccess`'s cache, and answers `null` — never `false` —
-   * when GitHub could not be asked, so an outage reads as "unknown", not "reviewer".
+   * publish control. Shares `hasWriteAccess`'s cache.
+   *
+   * R-12.5 — three answers, not two. A 404 is the *repo* being wrong (a typo in
+   * `visual-spec.config.ts`, or a credential that cannot see it at all) and is worth
+   * saying out loud; every other failure is an outage and stays `null`, so it reads as
+   * "unknown" rather than demoting an author to reviewer on a network blip.
    */
   authorizer.writeAccess = async (repo) => {
     try {
-      return await hasWriteAccess(repo);
-    } catch {
-      return null;
+      const write = await hasWriteAccess(repo);
+      return write
+        ? { write: true }
+        : {
+            write: false,
+            reason: 'no_write_access',
+            message:
+              `You do not have write access to ${repo.owner}/${repo.repo}, so this is a review-only session. ` +
+              'You can comment and reply on any document; publishing needs write access.',
+          };
+    } catch (err) {
+      if (err instanceof Undeterminable && err.status === 404) {
+        return {
+          write: false,
+          reason: 'no_repo',
+          message:
+            `${repo.owner}/${repo.repo} was not found. Either the repository in visual-spec.config.ts is wrong, ` +
+            'or this credential cannot see it — check the owner and name, then run `gh auth status`.',
+        };
+      }
+      return { write: null, reason: 'unknown' };
     }
   };
 

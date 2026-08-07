@@ -34,6 +34,8 @@ export type CollabAvailabilitySnapshot =
       scopes?: readonly string[];
       /** R-9.7 as a hint. Absent means the server could not determine it — say nothing. */
       canPublish?: boolean;
+      /** R-12.5 — why, when `canPublish` is false. The server owns the wording. */
+      publishBlocked?: { reason: 'no_write_access' | 'no_repo'; message: string };
     }
   | { available: false; reason: string; message: string };
 
@@ -146,9 +148,14 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
       */}
       {availability?.available === true && availability.canPublish === false && (
         <p data-vs-collab-role style={identity}>
-          This is a review-only session: your credential has no write access to{' '}
-          {availability.repo.owner}/{availability.repo.repo}, so you can comment and reply but not publish. Publishing
-          is the document author&apos;s to do.
+          {/*
+            R-12.5 — the server distinguishes "no write grant" from "no such repo" and
+            owns the remediation wording, so render it verbatim when it is there. The
+            literal below is the pre-12.2 sentence, kept for a server that sends only
+            the boolean.
+          */}
+          {availability.publishBlocked?.message ??
+            `This is a review-only session: your credential has no write access to ${availability.repo.owner}/${availability.repo.repo}, so you can comment and reply but not publish. Publishing is the document author's to do.`}
         </p>
       )}
 

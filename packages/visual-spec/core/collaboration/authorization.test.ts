@@ -562,22 +562,40 @@ describe('R-9.6 — comments are attributed to the acting account, never in the 
  * verdict — a `true` here still meets a `deny` at publish time if the PR has a
  * different author. Its third answer, `null`, means "could not determine", and the
  * UI must render nothing rather than guess.
+ *
+ * R-12.5 — a `false` also carries which "no" it is, because a missing write grant and
+ * a repo that cannot be found need different words from the panel.
  */
 describe('writeAccess — the availability hint', () => {
   it('reports true for a login with push permission', async () => {
     const authorize = createCollabAuthorizer({ exec: asAuthor().exec, documents: () => memoryDocuments([document()]) });
-    expect(await authorize.writeAccess?.({ ...REPO })).toBe(true);
+    expect(await authorize.writeAccess?.({ ...REPO })).toEqual({ write: true });
   });
 
-  it('reports false for a read-only login', async () => {
+  it('reports false for a read-only login, naming the missing grant', async () => {
     const authorize = createCollabAuthorizer({ exec: asReviewer().exec, documents: () => memoryDocuments([document()]) });
-    expect(await authorize.writeAccess?.({ ...REPO })).toBe(false);
+    const verdict = await authorize.writeAccess?.({ ...REPO });
+    expect(verdict).toMatchObject({ write: false, reason: 'no_write_access' });
+    expect(verdict && 'message' in verdict && verdict.message).toContain(`${REPO.owner}/${REPO.repo}`);
+  });
+
+  /*
+   * A 404 is not an outage — it is the one "no" with a fix the author can act on, so it
+   * must not collapse into the undeterminable bucket where the panel says nothing.
+   */
+  it('reports a missing repository as its own blocked reason, not as undeterminable', async () => {
+    // `gh`'s real wording — the status is parsed out of the parenthesised code.
+    const exec: GhExecutor = async () => ({ stdout: '', stderr: 'gh: Not Found (HTTP 404)', exitCode: 1 });
+    const authorize = createCollabAuthorizer({ exec, documents: () => memoryDocuments([document()]) });
+    const verdict = await authorize.writeAccess?.({ ...REPO });
+    expect(verdict).toMatchObject({ write: false, reason: 'no_repo' });
+    expect(verdict && 'message' in verdict && verdict.message).toContain('visual-spec.config.ts');
   });
 
   it('reports null — not false — when the permission cannot be read', async () => {
-    const exec: GhExecutor = async () => ({ stdout: '', stderr: 'HTTP 403', exitCode: 1 });
+    const exec: GhExecutor = async () => ({ stdout: '', stderr: 'gh: Forbidden (HTTP 403)', exitCode: 1 });
     const authorize = createCollabAuthorizer({ exec, documents: () => memoryDocuments([document()]) });
-    expect(await authorize.writeAccess?.({ ...REPO })).toBeNull();
+    expect(await authorize.writeAccess?.({ ...REPO })).toEqual({ write: null, reason: 'unknown' });
   });
 
   it('shares the permission cache with the verdict path, so the hint costs no extra probe', async () => {

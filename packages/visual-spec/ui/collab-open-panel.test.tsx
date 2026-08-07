@@ -63,6 +63,32 @@ describe('R-11.5 — the reviewer sees their own GitHub identity', () => {
   });
 });
 
+describe('R-12.5 — a session that cannot publish says so, and says why', () => {
+  it('renders the server’s reason verbatim rather than a generic review-only line', async () => {
+    const message = 'acme/docs was not found. Check the repository name in your visual-spec config.';
+    const { impl } = fakeFetch(
+      { ok: true, status: 200, json: { ok: true } },
+      { ...AVAILABLE, canPublish: false, publishBlocked: { reason: 'no_repo', message } },
+    );
+    render(<CollabOpenPanel fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
+  });
+
+  it('falls back to the review-only sentence when the server sends only the boolean', async () => {
+    const { impl } = fakeFetch({ ok: true, status: 200, json: { ok: true } }, { ...AVAILABLE, canPublish: false });
+    render(<CollabOpenPanel fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(/review-only session/)).toBeTruthy());
+    expect(screen.getByText(/review-only session/).textContent).toContain('comment and reply but not publish');
+  });
+
+  it('says nothing at all when write access could not be determined', async () => {
+    const { impl } = fakeFetch({ ok: true, status: 200, json: { ok: true } });
+    render(<CollabOpenPanel fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
+    expect(screen.queryByText(/review-only session/)).toBeNull();
+  });
+});
+
 describe('R-11.2 — opening by pull request reference', () => {
   it('posts the parsed pull number and the document id', async () => {
     const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true, kind: 'sync' } });

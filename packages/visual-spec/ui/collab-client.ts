@@ -51,6 +51,12 @@ export type CollabAvailabilitySnapshot =
       scopes?: readonly string[];
       /** R-9.7 write access as a display hint. Absent = the server could not determine it. */
       canPublish?: boolean;
+      /**
+       * R-12.5 — present only alongside `canPublish: false`, naming *why* this session
+       * cannot publish so the author meets it on the first screen instead of at publish
+       * time. `no_repo` in particular is a config error no later step would explain.
+       */
+      publishBlocked?: { reason: 'no_write_access' | 'no_repo'; message: string };
     }
   | { available: false; reason: string; message: string; missingScopes?: readonly string[] };
 

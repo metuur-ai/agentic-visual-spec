@@ -199,17 +199,28 @@ export type AuthorizationVerdict = { ok: true } | { ok: false; status: number; e
  * that forgets to wire `createCollabAuthorizer` fails to compile rather than silently
  * serving every operation to everyone.
  */
+/**
+ * R-12.5 — the write probe's answer. Three outcomes, because "no" has two causes that
+ * need different words: the credential is fine but carries no write grant, or the
+ * repository itself could not be found. `write: null` is the outage case and must never
+ * be rendered as either.
+ */
+export type WriteAccessVerdict =
+  | { write: true }
+  | { write: false; reason: 'no_write_access' | 'no_repo'; message: string }
+  | { write: null; reason: 'unknown' };
+
 export type CollabAuthorizer = ((
   op: CollabOperation,
   ctx: { documentId: string | null; login: string; repo: ResolvedCollaborationConfig },
 ) => AuthorizationVerdict | Promise<AuthorizationVerdict>) & {
   /**
    * The same write-access fact the verdicts are derived from, asked as a question so the
-   * availability snapshot can carry it (`canPublish`). `null` means "could not be
-   * determined" — never "allowed". Optional so a test or a local-mode host can pass a
+   * availability snapshot can carry it (`canPublish`). A `write: null` verdict means "could
+   * not be determined" — never "allowed". Optional so a test or a local-mode host can pass a
    * bare function; an absent probe simply leaves `canPublish` off the snapshot.
    */
-  writeAccess?: (repo: ResolvedCollaborationConfig) => Promise<boolean | null>;
+  writeAccess?: (repo: ResolvedCollaborationConfig) => Promise<WriteAccessVerdict>;
 };
 
 /* ------------------------------------------------------------------ *
@@ -441,8 +452,20 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         // a write-access probe (R-9.8). It reuses the authorizer's own permission cache,
         // so it costs at most one `gh api` per repo per TTL. A refusal or an outage leaves
         // the field off rather than guessing either way.
-        const write = (await authorize.writeAccess?.(state.repo)) ?? null;
-        return { status: 200, json: write === null ? state : { ...state, canPublish: write } };
+        // R-12.5 — when the answer is "no", say which no. `publishBlocked` carries the
+        // remediation the author would otherwise only meet at publish time, or never at
+        // all in the `no_repo` case. The outage answer still leaves both fields off.
+        const verdict = (await authorize.writeAccess?.(state.repo)) ?? { write: null, reason: 'unknown' };
+        if (verdict.write === null) return { status: 200, json: state };
+        if (verdict.write) return { status: 200, json: { ...state, canPublish: true } };
+        return {
+          status: 200,
+          json: {
+            ...state,
+            canPublish: false,
+            publishBlocked: { reason: verdict.reason, message: verdict.message },
+          },
+        };
       }
 
       /* POST /__vs/collab/start (R-8.5) */
