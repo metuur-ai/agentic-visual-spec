@@ -32,6 +32,10 @@ import {
   handleCommentsRequest,
 } from '../core/vite/routes/comments';
 import { createApplyHub } from '../core/vite/routes/apply';
+import { createCollabRoutes } from '../core/vite/routes/collab';
+import { createJobHubRegistry } from '../core/collaboration/job-hub';
+import { fsDocumentStore } from '../core/collaboration/document-store';
+import { type VisualSpecConfig, resolveConfig } from '../core/config';
 import { MAX_UPLOAD_BYTES, saveUploadedAsset } from '../core/vite/routes/upload';
 
 const MIME: Record<string, string> = {
@@ -136,6 +140,8 @@ export type ServeOptions = {
   commentsFile?: string;
   /** Folder (relative to contentDir) where toolbar image uploads are saved. Defaults to "assets". */
   assetsDir?: string;
+  /** visual-spec.config.ts contents. Omitting `collaboration` keeps collaboration off (R-9.19). */
+  config?: VisualSpecConfig;
   port: number;
   host?: string;
 };
@@ -154,6 +160,18 @@ export function createVisualSpecServer(opts: ServeOptions) {
   // many SSE subscribers. The thunk reads the current (mutable) dir + store so a
   // runtime "change directory" re-roots the next run too.
   const applyHub = createApplyHub(() => ({ cwd: contentDir, comments }));
+  // Collaboration (R-7.1). One job registry per server, never module-level. The route
+  // layer is shared with the Vite host verbatim (R-7.6): both hosts do nothing but slice
+  // the prefix off the path and hand the request to `collab.handle`. With no
+  // `collaboration` block configured this stays inert and reports itself unavailable
+  // (R-7.8 / R-9.19) — local mode is untouched (R-7.2).
+  const collabConfig = resolveConfig(opts.config);
+  const collabJobs = createJobHubRegistry();
+  const collab = createCollabRoutes({
+    jobs: collabJobs,
+    config: () => collabConfig,
+    documents: () => fsDocumentStore(contentDir),
+  });
 
   /** Re-root every store at a new directory (comments follow to <dir>/…json). */
   const setRoot = (dir: string) => {
@@ -283,6 +301,17 @@ export function createVisualSpecServer(opts: ServeOptions) {
           return sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
         }
 
+        // Collaboration routes (R-7.1). Everything below `/__vs/collab` is decided by the
+        // shared router — no host-specific logic (R-7.6).
+        if (url.pathname === '/__vs/collab' || url.pathname.startsWith('/__vs/collab/')) {
+          const sub = url.pathname.slice('/__vs/collab'.length);
+          const query = Object.fromEntries(url.searchParams.entries());
+          const body = await readJsonBody(req);
+          const r = await collab.handle({ method, pathname: sub, query, body, sse: res });
+          if (r.streamed) return; // SSE: the hub already wrote the head and the sync frame
+          return sendJson(res, r.status, r.json);
+        }
+
         if (url.pathname === '/__vs/comments' || url.pathname.startsWith('/__vs/comments/')) {
           const sub = url.pathname.slice('/__vs/comments'.length);
           const query = Object.fromEntries(url.searchParams.entries());
@@ -297,6 +326,9 @@ export function createVisualSpecServer(opts: ServeOptions) {
       }
     })();
   });
+
+  // Abort every in-flight collaboration job and drop every hub on shutdown.
+  server.on('close', () => collab.dispose());
 
   return { server, commentsPath };
 }

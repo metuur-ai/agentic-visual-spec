@@ -18,6 +18,10 @@ import type { Connect, Plugin } from 'vite';
 import { checkRequest } from './request-guard';
 import { type CommentDocStore, fileCommentStore, handleCommentsRequest } from './routes/comments';
 import { createApplyHub } from './routes/apply';
+import { createCollabRoutes } from './routes/collab';
+import { createJobHubRegistry } from '../collaboration/job-hub';
+import { fsDocumentStore } from '../collaboration/document-store';
+import { type VisualSpecConfig, resolveConfig } from '../config';
 import { MAX_UPLOAD_BYTES, saveUploadedAsset } from './routes/upload';
 import { currentPlugin } from './current-plugin';
 import { mdSurfaceStore } from './md-store';
@@ -105,7 +109,13 @@ async function handleSource(store: SurfaceStore, method: string, pathname: strin
   return { status: 404, json: { error: `no route: ${method} /__vs/source${pathname}` } };
 }
 
-export type MarkdownOptions = { contentDir?: string; commentsFile?: string; assetsDir?: string };
+export type MarkdownOptions = {
+  contentDir?: string;
+  commentsFile?: string;
+  assetsDir?: string;
+  /** visual-spec.config.ts contents. Omitting `collaboration` keeps collaboration off (R-9.19). */
+  config?: VisualSpecConfig;
+};
 
 function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
   let root = process.cwd();
@@ -266,6 +276,34 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         return next();
       });
 
+      // Collaboration routes (R-7.1). Same registry discipline as the standalone host —
+      // one registry per server, created here and never at module level — and the same
+      // shared router, so neither host owns any collaboration logic of its own (R-7.6).
+      // Registered after the guard above, like every other `/__vs` handler (R-9.13).
+      const collabConfig = resolveConfig(opts.config);
+      const collabJobs = createJobHubRegistry();
+      const collab = createCollabRoutes({
+        jobs: collabJobs,
+        config: () => collabConfig,
+        documents: () => fsDocumentStore(specsRoot),
+      });
+      server.middlewares.use('/__vs/collab', (req, res) => {
+        void (async () => {
+          try {
+            const url = new URL(req.url ?? '', 'http://localhost');
+            const sub = url.pathname === '/' ? '' : url.pathname;
+            const query = Object.fromEntries(url.searchParams.entries());
+            const body = await readJsonBody(req);
+            const r = await collab.handle({ method: req.method ?? 'GET', pathname: sub, query, body, sse: res });
+            if (r.streamed) return; // SSE: the hub already wrote the head and the sync frame
+            sendJson(res, r.status, r.json);
+          } catch (err) {
+            sendJson(res, 500, { error: (err as Error).message });
+          }
+        })();
+      });
+      server.httpServer?.on('close', () => collab.dispose());
+
       // Live-reload: when a .md file under the specs dir changes (it may live
       // outside the Vite root), ping the client to refetch the surface/list.
       // `watchRoot` is updated by setRoot when the directory is switched.
@@ -311,6 +349,7 @@ export function visualSpecMarkdown(opts: MarkdownOptions = {}): Plugin[] {
     contentDir: opts.contentDir ?? 'content',
     commentsFile: opts.commentsFile ?? 'visual-spec-comments.json',
     assetsDir: opts.assetsDir ?? 'assets',
+    config: opts.config ?? {},
   };
   return [virtualSurfacesStubPlugin(), mdApiPlugin(resolved), currentPlugin()];
 }
