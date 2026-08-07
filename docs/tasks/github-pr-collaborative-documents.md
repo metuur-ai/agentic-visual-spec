@@ -71,11 +71,16 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
   - verify: property test over random edit scripts (insert/delete/move/edit) asserting id stability and version monotonicity.
   - landed:
 
-- [ ] 2.3 Publish payload generator (deps: 2.1, est: ~4h)
+- [x] 2.3 Publish payload generator (deps: 2.1, est: ~4h)
   - why: `json` and `markdown` must come from **one** object at **one** instant. The server treats the Markdown as opaque, so no server-side check can catch a client that serialized the two from different states — this invariant is the only thing preventing a silent mismatch.
   - acceptance: R-2.9 — uses `jsonToMarkdown(doc, { metadataMode: 'none' })`; R-2.10 — generated Markdown is write-only, never parsed back; R-2.11 — editor driven through `getJSON()`/`injectJSON()`, not a Markdown string buffer.
   - verify: R-12.8 — test asserts both artifacts derive from the same document object via a single call. Explicitly **not** reusing `normalizeForStore(getMarkdown())` (`ui/wysiwyg-editor.tsx:135`), which reads live editor state and applies local-viewer image rewriting.
-  - landed:
+  - landed: `ui/publish-payload.ts` (new) + `ui/publish-payload.test.ts` (new, 11 tests). Suite 533 → 544 green, `tsc --noEmit` clean. Exports `generatePublishPayload`, `PublishPayload`, `PublishDocumentSource`, `DroppedNodeReport`. Decisions:
+    1. **The function takes a reader, not a document, and calls it exactly once.** `generatePublishPayload(() => editorRef.current.getJSON())`. Taking a reader is what makes the single-instant invariant testable: the R-12.8 test rigs a source that returns a *different* document on every call, so a hypothetical second read of live editor state would surface as `markdown` describing a document `json` does not. A signature that took a document object could only ever assert "both fields exist".
+    2. **The one read is immediately detached** — `JSON.parse` for the `getJSON()` string, `structuredClone` for a document object — so an edit landing after the call reaches neither artifact. `markdown` is then always exactly `jsonToMarkdown(payload.json, { metadataMode: 'none' })`, which is verifiable after the fact.
+    3. **Dropped nodes are surfaced, not silently lost.** `prepareDocumentForBridge(json, { mode: 'markdown', supportedNodeTypes: MARKDOWN_SUPPORTED_NODE_TYPES })` is used for **detection only**: its envelopes become `payload.droppedNodes` (`{ nodeId?, type, path, fallback }`, `nodeId` read via `getSerializedNodeId` off the `$` key) and are never appended to the output. Verified empirically that the `$` key itself produces no envelopes, so `nodeId` never pollutes the report.
+    4. **`normalizeForStore(getMarkdown())` is not reused** for two independent reasons: it is a *second* read of live editor state (the divergence this task exists to prevent), and it rewrites image `src`s for the local viewer, which is meaningless in a published artifact.
+    5. **The three unserializable types are a non-issue here.** `image`, `iframe-embed` and `youtube-embed` lose their `nodeId` on export, but publishing never reads `nodeId`, and all three are in `MARKDOWN_SUPPORTED_NODE_TYPES` so they are never dropped. A test pins that membership.
 
 - [x] 2.4 Import-boundary lint for the collaboration path (deps: 2.3, est: ~2h)
   - why: `markdownToInjectable` does not throw on an id-less tree — it returns a structurally valid document with every `nodeId` gone. Silent identity loss is the worst failure mode in the design, so convention is not enough.
