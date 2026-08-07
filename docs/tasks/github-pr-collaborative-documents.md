@@ -165,11 +165,11 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
 
 ## Unit 8: Jobs, sync, publish — Lane C
 
-- [ ] 8.1 Per-document job hub registry (deps: 3.1, est: ~1w)
+- [x] 8.1 Per-document job hub registry (deps: 3.1, est: ~1w)
   - why: `createApplyHub` (`core/vite/routes/apply.ts:251`) is a module-level singleton — `let events`, `let running`, one `subs` Set — so one run at a time, globally. Collaboration needs concurrent per-document jobs. This is new code, not reuse.
   - acceptance: R-8.1 — registry keyed by `documentId`, no shared state; R-8.2 — SSE fan-out at `GET /__vs/collab/:id/events`; R-8.3 — jobs for create, commit, sync, re-resolve, publish; R-8.4 — late subscriber can recover current state.
   - verify: two documents running jobs concurrently without interference.
-  - landed:
+  - landed: `core/collaboration/job-hub.ts` + `job-hub.test.ts` (26 tests). `createJobHubRegistry({ maxEvents?, now? })` → `hub(documentId)` lazily creates a `DocumentJobHub` owning its own `state` / `job` / `events` / `subs` — nothing module-level, so two documents run jobs at the same instant with disjoint logs and subscribers (the isolation test asserts no `jobId` from one document appears in the other's frames). Job *bodies* are injected (`start({ kind, run, idempotencyKey? })` where `run: (ctx: JobContext) => Promise<void>`), so 8.2 / 8.3 supply real GitHub work without reshaping the hub; the seven `JobKind`s of R-8.3 are declared here. `LifecycleState` (the LLD §7 diagram) is declared here too and *held*, not enforced — the Ready gate and merge re-verification stay in 8.4; the only transition the hub owns is `failed` on an uncaught rejection. Decisions: a second job for a busy document is **rejected 409, never queued** (a queued publish could land after a sync that invalidated it, and the caller cannot see what it is behind); the event log is bounded at **500 frames**, dropping oldest and counting them in `droppedEvents`, which does not weaken R-8.4 because `state` / `running` / `job` are tracked outside the log; `dispose(documentId)` / `disposeAll()` abort the running job, end subscribers and drop the map entry. Bodies are invoked synchronously (as `runApply` is) so a start-then-cancel in one turn still reaches an abort listener. `SseSink` is a structural subset of `ServerResponse`, so 7.2 mounts `GET /__vs/collab/:id/events` → `hub(id).subscribe(res)` and `GET /__vs/collab/:id` → `hub(id).status()` with no HTTP in the unit tests. Suite 277 → 303.
 
 - [ ] 8.2 Document creation + sync (deps: 4.1, 8.1, est: ~3d)
   - why: sync must run through one entrypoint so a webhook receiver could later drive it unchanged.
