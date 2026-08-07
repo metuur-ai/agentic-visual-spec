@@ -15,11 +15,16 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
 
 ## Phase 0: De-risk and safety net
 
-- [ ] 0.1 jsdom test harness + `nodeId` identity contract (est: ~1d)
+- [x] 0.1 jsdom test harness + `nodeId` identity contract (est: ~1d)
   - why: the whole design rests on `nodeId` surviving a live editor. Probes proved Lexical honours `{replace, with, withKlass}` and that Luthor's provider flat-maps extension `getNodes()` into `initialConfig.nodes` — but nobody has mounted the real preset and typed into it. If this fails, Unit 2 needs a third design and the plan below is void.
   - acceptance: R-12.1 — a node created by a live editor mount retains its `nodeId` through `getJSON()` / `injectJSON()`.
   - verify: add `jsdom` + `@testing-library/react` as devDeps; mount `ExtensiveEditor` with a registered replacement node; type, split a block, merge two blocks, paste, reload from JSON; assert `nodeId` stable per surviving block.
-  - landed:
+  - landed: `packages/visual-spec/ui/node-identity.contract.test.tsx` (new, 13 tests), `packages/visual-spec/vitest.config.ts` (`.tsx` includes, `resolve.dedupe: ['lexical']`, inline luthor/lexical deps), `packages/visual-spec/package.json` (devDeps `jsdom`, `@testing-library/react`, `@testing-library/dom`). VERDICT: identity contract HOLDS, but **not via the LLD's mechanism** — see the test file header and the LLD §2 amendments below.
+  - findings that amend LLD §2 / EARS R-2.2, R-2.3:
+    1. **R-2.2 and R-2.3 are mutually exclusive on Lexical 0.40.** `LexicalNode`'s constructor calls `errorOnTypeKlassMismatch` and the node registry is keyed by type string, so a replacement subclass whose `getType()` returns `'paragraph'` throws on every construction; `exportNodeToJSON` additionally rejects an `exportJSON().type` that differs from `getType()`. Node replacement therefore forces a distinct serialized `type` and `MARKDOWN_SUPPORTED_NODE_TYPES` stops matching. This is NOT the missing-`withKlass` failure the LLD predicted (registration verified correct).
+    2. **Use Lexical NodeState instead** (`createState` / `$setState` / `$getState`, serialized under `$`). It carries `nodeId`, keeps `type: 'paragraph'`, needs no subclass, and round-trips through `importJSON` for free. Unit 2.1 should be re-scoped to this.
+    3. **`markdownSourceOfTruth` makes `getJSON()` lossy** — Luthor implements it as `markdownToJSON(getMarkdown())`, wiping every id. The collaboration mount must not set it (`ui/wysiwyg-editor.tsx:402` does today).
+    4. **`injectJSON` does not run node transforms** (`setEditorState` replaces the node map wholesale) and is deferred behind a 100ms `setTimeout`. R-2.8 backfill is load bearing on every load, not only for legacy documents.
 
 - [x] 0.2 Local-mode regression suite (est: ~4h)
   - why: Unit 10 is the "worse than not shipping" risk and nothing currently asserts local mode is unchanged. This has to exist *before* shared UI is touched, not after.
