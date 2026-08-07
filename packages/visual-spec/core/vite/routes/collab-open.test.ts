@@ -33,8 +33,11 @@ import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { IntervalScheduler } from '../../collaboration/lifecycle';
 import { buildPullRequestBody } from '../../collaboration/lifecycle';
 import type { ResolvedVisualSpecConfig } from '../../config';
-import { type CollabAvailability, type CollabRouteResult, createCollabRoutes } from './collab';
+import { type CollabAuthorizer, type CollabAvailability, type CollabRouteResult, createCollabRoutes } from './collab';
 import { createCollabWiring } from './collab-wiring';
+
+/** Test double. This suite is about the reviewer open path, not gating; the router requires one. */
+const TEST_ALLOW_ALL: CollabAuthorizer = () => ({ ok: true });
 
 const fixturesDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../collaboration/fixtures');
 const fixture = (name: string): string => readFileSync(resolve(fixturesDir, name), 'utf8');
@@ -157,6 +160,7 @@ function reviewerHost() {
     config: () => ENABLED,
     documents: () => documents,
     bodies: wiring.bodies,
+    authorize: TEST_ALLOW_ALL,
     // The real 4.2 preflight, driven by the reviewer's own `gh` — so `login` below is
     // resolved exactly as it is in production (R-11.5).
     preflight: (repo) => preflightCollaboration({ repo, exec: gh.exec, env: {} }),

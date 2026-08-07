@@ -26,8 +26,11 @@ import type { IntervalScheduler, SyncResult } from '../../collaboration/lifecycl
 import { readGitHubBinding } from '../../collaboration/lifecycle';
 import { gitBlobSha } from '../../collaboration/publish';
 import type { ResolvedVisualSpecConfig } from '../../config';
-import { type CollabRouteResult, createCollabRoutes } from './collab';
+import { type CollabAuthorizer, type CollabRouteResult, createCollabRoutes } from './collab';
 import { createCollabWiring } from './collab-wiring';
+
+/** Test double. This suite is about body wiring, not gating; the router requires one. */
+const TEST_ALLOW_ALL: CollabAuthorizer = () => ({ ok: true });
 
 const fixturesDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../collaboration/fixtures');
 const fixture = (name: string): string => readFileSync(resolve(fixturesDir, name), 'utf8');
@@ -154,6 +157,7 @@ function host(options: { config?: ResolvedVisualSpecConfig; responses?: Array<Pa
     documents: () => documents,
     preflight: async () => OK_PREFLIGHT,
     bodies: wiring.bodies,
+    authorize: TEST_ALLOW_ALL,
   });
   const call = (method: string, pathname: string, body: Record<string, unknown> = {}, sse?: SseSink): Promise<CollabRouteResult> =>
     router.handle({ method, pathname, query: {}, body, ...(sse ? { sse } : {}) });
@@ -286,7 +290,7 @@ describe('R-9.19 — collaboration unconfigured builds no adapter at all', () =>
     expect(Object.keys(wiring.bodies)).toEqual([]);
     expect(wiring.pollingDocumentIds()).toEqual([]);
 
-    const router = createCollabRoutes({ jobs, config: () => DISABLED, documents: () => documents, bodies: wiring.bodies });
+    const router = createCollabRoutes({ jobs, config: () => DISABLED, documents: () => documents, bodies: wiring.bodies, authorize: TEST_ALLOW_ALL });
     expect((await router.handle({ method: 'GET', pathname: '', query: {}, body: {} })).json).toMatchObject({
       available: false,
       reason: 'not-configured',
@@ -382,6 +386,7 @@ describe('7.2 routes run the 8.3 publish body (integration)', () => {
       documents: () => documents,
       preflight: async () => OK_PREFLIGHT,
       bodies: wiring.bodies,
+      authorize: TEST_ALLOW_ALL,
     });
     const s = sink();
     jobs.hub('doc-1').subscribe(s);

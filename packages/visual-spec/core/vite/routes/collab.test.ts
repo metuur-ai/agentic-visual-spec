@@ -26,8 +26,11 @@ import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { JobEvent, JobSync, SseSink } from '../../collaboration/job-hub';
 import type { ResolvedVisualSpecConfig } from '../../config';
 import type { CommentDoc, CommentRecord } from '../../editing/comment-doc';
-import { type CollabDeps, type CollabJobBodies, type CollabRouteResult, createCollabRoutes } from './collab';
+import { type CollabAuthorizer, type CollabDeps, type CollabJobBodies, type CollabRouteResult, createCollabRoutes } from './collab';
 import type { CommentDocStore } from './comments';
+
+/** Test double for the cases that are not about gating; individual tests override it. */
+const TEST_ALLOW_ALL: CollabAuthorizer = () => ({ ok: true });
 
 const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const src = (rel: string) => readFileSync(resolve(pkgRoot, rel), 'utf8');
@@ -132,6 +135,7 @@ function router(overrides: Partial<CollabDeps> = {}) {
     config: () => ENABLED,
     documents,
     preflight: async () => OK_PREFLIGHT,
+    authorize: TEST_ALLOW_ALL,
     ...overrides,
   });
 }

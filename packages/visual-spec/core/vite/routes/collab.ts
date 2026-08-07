@@ -173,14 +173,14 @@ export type AuthorizationVerdict = { ok: true } | { ok: false; status: number; e
  * TASK 9.2 PLUGS IN HERE. Every handler below calls `authorize(op, ctx)` after the
  * availability check and before it touches a store or starts a job, so author-only
  * gating (R-9.9) and the reviewer rejection (R-9.10) land in exactly one place with no
- * route changes. The default allows everything — role classification does not exist yet.
+ * route changes. There is no default: `authorize` is required on `CollabDeps`, so a host
+ * that forgets to wire `createCollabAuthorizer` fails to compile rather than silently
+ * serving every operation to everyone.
  */
 export type CollabAuthorizer = (
   op: CollabOperation,
   ctx: { documentId: string | null; login: string; repo: ResolvedCollaborationConfig },
 ) => AuthorizationVerdict | Promise<AuthorizationVerdict>;
-
-const ALLOW_ALL: CollabAuthorizer = () => ({ ok: true });
 
 /* ------------------------------------------------------------------ *
  * Dependencies
@@ -207,8 +207,8 @@ export type CollabDeps = {
   bodies?: Partial<CollabJobBodies>;
   /** Injectable so tests never exec `gh`. Memoized by the router. */
   preflight?: (repo: ResolvedCollaborationConfig) => Promise<CollaborationPreflight>;
-  /** Task 9.2. */
-  authorize?: CollabAuthorizer;
+  /** Task 9.2. Required: there is no permissive default, so a host cannot omit gating. */
+  authorize: CollabAuthorizer;
   now?: () => string;
 };
 
@@ -290,7 +290,7 @@ function defaultCommentStore(documentId: string, document: CollaborationDocument
 
 export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   const bodies: CollabJobBodies = { ...STUB_BODIES, ...deps.bodies };
-  const authorize = deps.authorize ?? ALLOW_ALL;
+  const authorize = deps.authorize;
   const now = deps.now ?? (() => new Date().toISOString());
   const runPreflight = deps.preflight ?? ((repo: ResolvedCollaborationConfig) => preflightCollaboration({ repo }));
 

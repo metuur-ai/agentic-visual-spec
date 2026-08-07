@@ -18,7 +18,11 @@ import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { ResolvedVisualSpecConfig } from '../../config';
 import type { CommentDoc, CommentRecord } from '../../editing/comment-doc';
 import { createCollabRoutes } from './collab';
+import type { CollabAuthorizer } from './collab';
 import type { CommentDocStore } from './comments';
+
+/** Test double. This suite is about anchor capture, not gating; the router requires one. */
+const TEST_ALLOW_ALL: CollabAuthorizer = () => ({ ok: true });
 
 const REPO = { owner: 'acme', repo: 'specs', baseBranch: 'main' } as const;
 const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO } };
@@ -92,6 +96,7 @@ function harness() {
     documents,
     commentStore: () => store,
     preflight: async () => OK_PREFLIGHT,
+    authorize: TEST_ALLOW_ALL,
     now: () => '2026-08-07T00:00:00.000Z',
   });
   return { routes, saved, dispose: () => routes.dispose() };
