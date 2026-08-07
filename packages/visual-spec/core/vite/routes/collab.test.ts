@@ -200,6 +200,41 @@ describe('R-7.8 — collaboration availability', () => {
     await call(r, 'GET', '');
     expect(preflight).toHaveBeenCalledTimes(1);
   });
+
+  it('never caches a failed preflight, so a transient failure does not pin every route to 503', async () => {
+    // `preflightCollaboration` *resolves* `unavailable(...)` rather than rejecting, and
+    // `classify` cannot tell a rate-limit 403 from a permissions 403 — so a single
+    // throttled probe used to 503 every gated route for the life of the process.
+    let fails = true;
+    const preflight = vi.fn(
+      async (): Promise<CollaborationPreflight> =>
+        fails ? { available: false, reason: 'missing_scope', message: 'needs "repo"', missingScopes: ['repo'] } : OK_PREFLIGHT,
+    );
+    const r = router({ preflight });
+
+    expect((await call(r, 'GET', '')).json).toMatchObject({ available: false, reason: 'missing_scope' });
+    expect((await call(r, 'GET', '')).json).toMatchObject({ available: false, reason: 'missing_scope' });
+    expect(preflight).toHaveBeenCalledTimes(2);
+
+    fails = false;
+    expect((await call(r, 'GET', '')).json).toMatchObject({ available: true, login: 'octocat' });
+    expect(preflight).toHaveBeenCalledTimes(3);
+  });
+
+  it('reuses a successful preflight within the TTL and re-probes once it expires', async () => {
+    const preflight = vi.fn(async () => OK_PREFLIGHT);
+    let ms = 1_000;
+    const r = router({ preflight, preflightTtlMs: 60_000, clock: () => ms });
+
+    await call(r, 'GET', '');
+    ms += 59_000;
+    await call(r, 'GET', '');
+    expect(preflight).toHaveBeenCalledTimes(1);
+
+    ms += 2_000;
+    await call(r, 'GET', '');
+    expect(preflight).toHaveBeenCalledTimes(2);
+  });
 });
 
 /* ================================================================== *

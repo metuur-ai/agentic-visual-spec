@@ -205,8 +205,12 @@ export type CollabDeps = {
   }) => Promise<CommentDocStore | null> | CommentDocStore | null;
   /** Tasks 8.2 / 8.3. Partial: anything missing uses the failing stub. */
   bodies?: Partial<CollabJobBodies>;
-  /** Injectable so tests never exec `gh`. Memoized by the router. */
+  /** Injectable so tests never exec `gh`. Memoized by the router, successes only. */
   preflight?: (repo: ResolvedCollaborationConfig) => Promise<CollaborationPreflight>;
+  /** How long a successful preflight may be reused. Mirrors `createCollabAuthorizer`. */
+  preflightTtlMs?: number;
+  /** Injectable numeric clock for the preflight TTL. `now` is a string clock, not usable here. */
+  clock?: () => number;
   /** Task 9.2. Required: there is no permissive default, so a host cannot omit gating. */
   authorize: CollabAuthorizer;
   now?: () => string;
@@ -288,35 +292,54 @@ function defaultCommentStore(documentId: string, document: CollaborationDocument
  * The router
  * ------------------------------------------------------------------ */
 
+const DEFAULT_PREFLIGHT_TTL_MS = 60_000;
+
 export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   const bodies: CollabJobBodies = { ...STUB_BODIES, ...deps.bodies };
   const authorize = deps.authorize;
   const now = deps.now ?? (() => new Date().toISOString());
   const runPreflight = deps.preflight ?? ((repo: ResolvedCollaborationConfig) => preflightCollaboration({ repo }));
+  const preflightTtl = deps.preflightTtlMs ?? DEFAULT_PREFLIGHT_TTL_MS;
+  const clock = deps.clock ?? (() => Date.now());
 
   // Memoized per repo identity: the preflight shells out to `gh`, and every mutating
-  // route consults it. Keyed by owner/repo/base so a runtime config change re-probes.
-  const cache = new Map<string, Promise<CollaborationPreflight>>();
+  // route consults it. Keyed by owner/repo/base, so a *repo* change re-probes — a
+  // credential change (token swap, `gh auth switch`) does not, because no credential is
+  // in scope here; that staleness is still open.
+  //
+  // Only successes are cached, and only until `expiresAt`, matching the invariant
+  // `collaboration/authorization.ts` already states: failures are never cached, in
+  // either direction, so a transient network error can neither pin a deny nor pin an
+  // allow. `preflightCollaboration` resolves `unavailable(...)` rather than rejecting,
+  // so caching it would 503 every gated route for the life of the process — and
+  // `github-adapter`'s `classify` cannot tell a rate-limit 403 from a permissions 403,
+  // so plain throttling was enough to poison it.
+  const cache = new Map<string, { snapshot: CollabAvailability; expiresAt: number }>();
 
   async function availability(): Promise<CollabAvailability> {
     const repo = deps.config().collaboration;
     if (!repo) return NOT_CONFIGURED;
     const key = `${repo.owner}/${repo.repo}#${repo.baseBranch}`;
-    let probe = cache.get(key);
-    if (!probe) {
-      probe = runPreflight(repo);
-      cache.set(key, probe);
+    const cached = cache.get(key);
+    if (cached && cached.expiresAt > clock()) return cached.snapshot;
+    const result = await runPreflight(repo);
+    if (!result.available) {
+      cache.delete(key);
+      return {
+        available: false,
+        reason: result.reason,
+        message: result.message,
+        missingScopes: result.missingScopes,
+      };
     }
-    const result = await probe;
-    if (result.available) {
-      return { available: true, repo: result.repo, login: result.login, scopes: result.scopes };
-    }
-    return {
-      available: false,
-      reason: result.reason,
-      message: result.message,
-      missingScopes: result.missingScopes,
+    const snapshot: CollabAvailability = {
+      available: true,
+      repo: result.repo,
+      login: result.login,
+      scopes: result.scopes,
     };
+    cache.set(key, { snapshot, expiresAt: clock() + preflightTtl });
+    return snapshot;
   }
 
   /**
