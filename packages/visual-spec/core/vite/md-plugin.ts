@@ -15,6 +15,7 @@ import { stat } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { extname, isAbsolute, join } from 'node:path';
 import type { Connect, Plugin } from 'vite';
+import { checkRequest } from './request-guard';
 import { type CommentDocStore, fileCommentStore, handleCommentsRequest } from './routes/comments';
 import { createApplyHub } from './routes/apply';
 import { MAX_UPLOAD_BYTES, saveUploadedAsset } from './routes/upload';
@@ -139,6 +140,17 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         server.watcher.add(specsRoot);
         console.log(`\n  visual-spec (dev) → switched directory: ${specsRoot}\n`);
       };
+
+      // Registered first, so every `/__vs` middleware below is behind it —
+      // registration order is the only ordering primitive Connect gives us, and a
+      // guard registered after a handler silently does nothing.
+      server.middlewares.use('/__vs', (req, res, next) => {
+        const verdict = checkRequest(req.headers);
+        if (verdict.ok) return next();
+        res.statusCode = 403;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ error: verdict.reason }));
+      });
 
       // Current directory + the native "change directory" picker (matches server.ts).
       server.middlewares.use('/__vs/dir', middleware(async (req, _query, pathname) => {

@@ -23,6 +23,7 @@ import { extname, join, normalize, resolve } from 'node:path';
 // shipped dist/cli.js carries this logic inline with no runtime dependency.
 import { mdSurfaceStore } from '../core/vite/md-store';
 import { pickDirectoryNative } from '../core/vite/native-pick';
+import { checkRequest } from '../core/vite/request-guard';
 import type { SurfaceStore } from '../core/vite/surface-store';
 import { type TreeStore, treeStore } from '../core/vite/tree-store';
 import {
@@ -170,6 +171,13 @@ export function createVisualSpecServer(opts: ServeOptions) {
       try {
         const url = new URL(req.url ?? '/', 'http://localhost');
         const method = req.method ?? 'GET';
+
+        // Refuse anything a browser issued for another origin before it can reach
+        // a handler — see core/vite/request-guard.ts for why this is not a token.
+        if (url.pathname.startsWith('/__vs/')) {
+          const verdict = checkRequest(req.headers);
+          if (!verdict.ok) return sendJson(res, 403, { error: verdict.reason });
+        }
 
         if (url.pathname === '/__vs/tree' || url.pathname.startsWith('/__vs/tree/')) {
           const sub = url.pathname.slice('/__vs/tree'.length);
