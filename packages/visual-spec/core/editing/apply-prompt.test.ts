@@ -28,3 +28,69 @@ describe('buildApplyPrompt', () => {
     expect(prompt).toMatch(/json.*valid|valid.*json/i);
   });
 });
+
+// ---------------------------------------------------------------------------
+// R-5.10 — the mode parameter (task 5.3)
+// ---------------------------------------------------------------------------
+
+const collabRec = (id: string, nodeId?: string): CommentRecord =>
+  ({ ...rec(id), ...(nodeId ? { collab: { documentId: 'doc-1', nodeId } } : {}) }) as CommentRecord;
+
+describe('buildApplyPrompt mode (R-5.10)', () => {
+  it('defaults to local — omitting options is byte-identical to passing local', () => {
+    const open = [rec('c-1'), rec('c-2')];
+    expect(buildApplyPrompt(open, {})).toBe(buildApplyPrompt(open));
+    expect(buildApplyPrompt(open, { mode: 'local' })).toBe(buildApplyPrompt(open));
+  });
+
+  it('local mode names the sidecar as source of truth', () => {
+    expect(buildApplyPrompt([rec('c-1')], { mode: 'local' })).toContain('Source of truth is visual-spec-comments.json.');
+  });
+
+  it('collab mode names the canonical JSON document as the edit target', () => {
+    const prompt = buildApplyPrompt([collabRec('c-1', 'n-7')], { mode: 'collab', documentPath: 'documents/doc-1.json' });
+
+    expect(prompt).toContain('the canonical JSON document documents/doc-1.json');
+    expect(prompt).not.toContain('Source of truth is visual-spec-comments.json.');
+  });
+
+  it('collab mode forbids editing the generated Markdown (R-2.10)', () => {
+    const prompt = buildApplyPrompt([collabRec('c-1', 'n-7')], { mode: 'collab', documentPath: 'documents/doc-1.json' });
+
+    expect(prompt).toContain('the generated Markdown is write-only output and MUST NOT be edited');
+  });
+
+  it('collab mode demotes the sidecar to a cache rather than truth (R-5.3 / R-5.9)', () => {
+    const prompt = buildApplyPrompt([collabRec('c-1', 'n-7')], { mode: 'collab', documentPath: 'documents/doc-1.json' });
+
+    expect(prompt).toContain('Source of truth is the review conversation listed below, NOT visual-spec-comments.json');
+    expect(prompt).toContain('non-authoritative cache in this mode, so do not read it, do not edit it');
+  });
+
+  it('collab mode locates by nodeId, and says so instead of by snippet', () => {
+    const withSnippet = { ...collabRec('c-1', 'n-7'), target: { path: 'a.md', kind: 'range' as const, startLine: 3, snippet: 'drifted' } };
+    const prompt = buildApplyPrompt([withSnippet as CommentRecord], { mode: 'collab', documentPath: 'documents/doc-1.json' });
+
+    expect(prompt).toContain('Node: n-7');
+    expect(prompt).toContain('there is no snippet or line-number fallback');
+    // The manifest must not offer the snippet/line data the instruction just disowned.
+    expect(prompt).not.toContain('Context: "drifted"');
+    expect(prompt).not.toContain('Where:');
+  });
+
+  it('collab mode marks a comment with no nodeId as document-level (R-5.7)', () => {
+    const prompt = buildApplyPrompt([collabRec('c-1')], { mode: 'collab', documentPath: 'documents/doc-1.json' });
+
+    expect(prompt).toContain('Node: (document-level — no nodeId)');
+  });
+
+  it('keeps the count header and comment text in both modes', () => {
+    for (const prompt of [
+      buildApplyPrompt([collabRec('c-1', 'n-7')]),
+      buildApplyPrompt([collabRec('c-1', 'n-7')], { mode: 'collab', documentPath: 'documents/doc-1.json' }),
+    ]) {
+      expect(prompt).toContain('1 review comment');
+      expect(prompt).toContain('fix the title');
+    }
+  });
+});

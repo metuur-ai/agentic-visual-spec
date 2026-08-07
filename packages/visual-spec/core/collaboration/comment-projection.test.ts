@@ -9,6 +9,7 @@ import {
   type ProjectedCommentRecord,
   commentsByNode,
   documentDiscussion,
+  findByIdempotencyKey,
   formatCommentBody,
   formatResolutionReply,
   formatTrailer,
@@ -562,5 +563,79 @@ describe('resolve/unresolve round-trip (R-5.12 / R-5.14)', () => {
       expect(endpointOf(call.args)).toMatch(/\/issues\//);
       expect(endpointOf(call.args)).not.toMatch(/\/pulls\/\d+\/comments/);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R-5.11 — idempotent comment creation (task 5.3)
+// ---------------------------------------------------------------------------
+
+/** GitHub's response to the create that the first attempt never saw. */
+const KEYED_CREATED = { stdout: fixture('idempotent-create.json') };
+/** The same comment, as it appears in a later `listIssueComments` page. */
+const KEYED_EXISTING = JSON.parse(fixture('idempotent-create.json')) as unknown;
+
+const KEY = 'req-abc123';
+const keyedRecord = (): CommentRecord =>
+  ({
+    id: 'local',
+    workflow: 'visual-spec',
+    target: { path: 'docs/spec.md', kind: 'file' },
+    comment: 'Tighten this paragraph.',
+    status: 'open',
+    ts: '',
+    collab: { nodeId: 'n-7', key: KEY },
+  }) as unknown as CommentRecord;
+
+describe('idempotent creation (R-5.11)', () => {
+  it('carries the key in the trailer of the created comment', async () => {
+    // The key is absent from the PR, so this is the FIRST attempt: list, then create.
+    const { store: s, calls } = store([LIST, KEYED_CREATED]);
+    const created = await s.addComment?.(keyedRecord());
+
+    expect(JSON.parse(calls[1]?.input ?? '{}')).toEqual({
+      body: 'Tighten this paragraph.\n\n<!-- visual-spec: documentId=doc-1 key=req-abc123 nodeId=n-7 -->',
+    });
+    expect((created as ProjectedCommentRecord).collab).toEqual({ documentId: 'doc-1', key: KEY, nodeId: 'n-7' });
+  });
+
+  it('a retry after a timeout returns the existing comment and creates NO duplicate', async () => {
+    // The first attempt's create landed on GitHub but the client timed out, so the
+    // retry's list already contains it. Only one response is queued: a second `gh`
+    // call would be the duplicate POST and would come back empty, failing the read.
+    const { store: s, calls } = store([listWith(KEYED_EXISTING)]);
+    const retried = await s.addComment?.(keyedRecord());
+
+    expect(calls).toHaveLength(1);
+    expect(endpointOf(calls[0]?.args ?? [])).toMatch(/\/repos\/acme\/docs\/issues\/42\/comments/);
+    expect(calls[0]?.input).toBeUndefined(); // a GET, not a POST
+    expect((retried as ProjectedCommentRecord).github.issueCommentId).toBe(900201);
+  });
+
+  it('converges on the earliest comment if a duplicate ever did slip through the race window', () => {
+    const dup = (id: number): ProjectedCommentRecord =>
+      projectIssueComment(
+        { id, body: `x\n\n<!-- visual-spec: key=${KEY} -->`, user: 'u', createdAt: '', updatedAt: '', htmlUrl: '' },
+        'docs/spec.md',
+      );
+    expect(findByIdempotencyKey([dup(900202), dup(900201)], KEY)?.github.issueCommentId).toBe(900201);
+    expect(findByIdempotencyKey([dup(900201)], 'other-key')).toBeNull();
+  });
+
+  it('a record with no key takes the original path — no extra list call (R-10.1 cost)', async () => {
+    const { store: s, calls } = store([KEYED_CREATED]);
+    await s.addComment?.({ ...keyedRecord(), collab: { nodeId: 'n-7' } } as unknown as CommentRecord);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.input).toBeDefined(); // straight to the POST
+    expect(JSON.parse(calls[0]?.input ?? '{}')).toEqual({
+      body: 'Tighten this paragraph.\n\n<!-- visual-spec: documentId=doc-1 nodeId=n-7 -->',
+    });
+  });
+
+  it('never reaches a review-comment endpoint, on either path (R-5.5)', async () => {
+    const { store: s, calls } = store([LIST, KEYED_CREATED]);
+    await s.addComment?.(keyedRecord());
+    for (const call of calls) expect(endpointOf(call.args)).not.toMatch(/\/pulls\/\d+\/comments/);
   });
 });

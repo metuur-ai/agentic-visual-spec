@@ -36,8 +36,9 @@
  *   change and without breaking older readers.
  *
  * Known keys today: `documentId` (always written), `nodeId` (omitted for
- * document-level comments), and the resolution pair `replyTo` + `resolved`
- * (task 5.2 — see "RESOLUTION" below). A comment with no trailer at all — anything
+ * document-level comments), the resolution pair `replyTo` + `resolved`
+ * (task 5.2 — see "RESOLUTION" below), and `key`, the idempotency key
+ * (task 5.3 — see "IDEMPOTENT CREATION" below). A comment with no trailer at all — anything
  * authored on github.com — is preserved and lands in the document-level bucket
  * (R-5.6 / R-5.7); nothing is ever discarded.
  *
@@ -296,6 +297,51 @@ export function formatResolutionReply(input: {
   });
 }
 
+// ---------------------------------------------------------------------------
+// IDEMPOTENT CREATION (task 5.3 — R-5.11)
+// ---------------------------------------------------------------------------
+//
+// `POST /issues/:n/comments` has no server-side idempotency: GitHub creates a new
+// comment on every request and offers no `Idempotency-Key` header to suppress the
+// second one. A create that times out is therefore ambiguous — the comment may
+// well exist — and a naive retry posts a duplicate that no reviewer can tell from
+// a deliberate second comment.
+//
+// So the key is carried in the body, in the 5.1 trailer, under `key` (reserved by
+// 5.1 for exactly this). The check is a read-before-write: list the PR's comments
+// and, if one already carries this key, return THAT comment instead of creating a
+// second one. The key must be supplied by the caller and must be STABLE across the
+// retries of one logical create — a key generated inside `addComment` would differ
+// on every attempt and dedupe nothing. When no key is supplied, behaviour is
+// exactly as before, including the absence of the extra list call.
+//
+// RACE WINDOW — this narrows the duplicate window, it does not close it. Between
+// the list response and the create request, another attempt's create can land;
+// the classic case is the timed-out first attempt whose write GitHub accepted
+// after the client gave up but before the retry's list ran. Two attempts running
+// concurrently can also both list-then-create. Closing this needs a compare-and-set
+// GitHub does not offer for issue comments, so a duplicate remains possible for
+// the duration of one list→create round trip. It is detectable after the fact —
+// two comments sharing a `key` — but not preventable here.
+
+/** The trailer key carrying the idempotency key (R-5.11). */
+export const IDEMPOTENCY_KEY = 'key';
+
+/**
+ * R-5.11 — the comment already carrying `key`, or `null`. Pure over the list handed
+ * in, so the caller decides where that list came from (GitHub, always, in practice).
+ * Ties go to the lowest GitHub id: if a duplicate did slip through the race window,
+ * every retry still converges on the same, earliest comment.
+ */
+export function findByIdempotencyKey(records: ProjectedCommentRecord[], key: string): ProjectedCommentRecord | null {
+  let found: ProjectedCommentRecord | null = null;
+  for (const record of records) {
+    if (record.collab?.[IDEMPOTENCY_KEY] !== key) continue;
+    if (!found || record.github.issueCommentId < found.github.issueCommentId) found = record;
+  }
+  return found;
+}
+
 export type GitHubCommentStoreOptions = {
   adapter: GitHubAdapter;
   repo: RepoRef;
@@ -307,7 +353,8 @@ export type GitHubCommentStoreOptions = {
   documentPath: string;
   /**
    * R-5.3 — optional non-authoritative mirror. It is written to, never read from;
-   * `read()` always goes to GitHub. Cache lifecycle proper is task 5.3.
+   * `read()` always goes to GitHub. Its lifecycle — and its deletion on merge
+   * (R-5.8) — lives in `cache-lifecycle.ts`.
    */
   cache?: CommentDocStore;
 };
@@ -361,8 +408,20 @@ export function githubCommentStore(options: GitHubCommentStoreOptions): GitHubCo
 
     /** R-5.4 — post an issue comment with a trailer and return the record carrying GitHub's id. */
     async addComment(record) {
-      const nodeId = (record as Partial<ProjectedCommentRecord>).collab?.nodeId;
-      const body = formatCommentBody(record.comment, { documentId, ...(nodeId ? { nodeId } : {}) });
+      const collab = (record as Partial<ProjectedCommentRecord>).collab;
+      const nodeId = collab?.nodeId;
+      const key = collab?.[IDEMPOTENCY_KEY];
+      if (key) {
+        // R-5.11 — read-before-write against GitHub. A retry of a create that already
+        // landed finds it here and returns it instead of posting a duplicate.
+        const existing = findByIdempotencyKey((await read()).comments as ProjectedCommentRecord[], key);
+        if (existing) return existing;
+      }
+      const body = formatCommentBody(record.comment, {
+        documentId,
+        ...(nodeId ? { nodeId } : {}),
+        ...(key ? { [IDEMPOTENCY_KEY]: key } : {}),
+      });
       // R-5.5 — issue comments only. The adapter has no review-comment method at all.
       const created = await adapter.createIssueComment(repo, pullNumber, body);
       return projectIssueComment(created, documentPath);
