@@ -177,6 +177,7 @@ export function createVisualSpecServer(opts: ServeOptions) {
     config: () => collabConfig,
     documents: () => withNodeIdentity(fsDocumentStore(contentDir)),
     jobs: collabJobs,
+    commentCachePath: () => commentsPath,
   });
   const collab = createCollabRoutes({
     jobs: collabJobs,

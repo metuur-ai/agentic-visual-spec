@@ -64,6 +64,7 @@
  * `@lyfie/luthor`, no react (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
  */
 import type { ResolvedCollaborationConfig } from '../config';
+import { mergeAndDropCommentCache } from './cache-lifecycle';
 import { type ProjectedCommentRecord, githubCommentStore } from './comment-projection';
 import type { GitHubBinding } from './document-protocol';
 import type { DocumentStore } from './document-store';
@@ -396,7 +397,16 @@ export type RecoveryBodyInput = {
 /** `merge` additionally chooses how (R-4.7). Defaults to a merge commit. */
 export type MergeBodyInput = RecoveryBodyInput & { method?: MergeMethod };
 
-export type RecoveryBodyOptions = { adapter: GitHubAdapter };
+export type RecoveryBodyOptions = {
+  adapter: GitHubAdapter;
+  /**
+   * R-5.8 — absolute path of the local comment cache, dropped when a merge actually
+   * merges. A thunk, not a value, for the same reason the document store is one: a
+   * runtime "change directory" must retire the *current* cache, not the one that existed
+   * when the bodies were built. Omit when the session runs without a cache.
+   */
+  commentCachePath?: () => string | undefined;
+};
 
 export type RecoveryJobBodies = {
   /** R-8.19 / R-8.20 / R-8.24 — re-derive the document's state from GitHub. */
@@ -441,7 +451,7 @@ async function readReadiness(
 }
 
 export function createRecoveryBodies(options: RecoveryBodyOptions): RecoveryJobBodies {
-  const { adapter } = options;
+  const { adapter, commentCachePath } = options;
 
   return {
     /**
@@ -554,7 +564,23 @@ export function createRecoveryBodies(options: RecoveryBodyOptions): RecoveryJobB
         throw new MergeRefusedError(documentId, 'base-conflict', `merge refused for ${documentId}: base conflict`);
       }
 
-      const result = await adapter.mergePullRequest(repoRef, binding.pullNumber, input.method);
+      // R-5.8 — the merge goes through `mergeAndDropCommentCache` so the cache is retired
+      // by the same act that merges, and only when the merge actually merged. The
+      // pre-merge conversation it returns is read from GitHub (R-5.9), never the cache.
+      const { merge: result, cacheDeleted } = await mergeAndDropCommentCache({
+        store: githubCommentStore({
+          adapter,
+          repo: repoRef,
+          pullNumber: binding.pullNumber,
+          documentId: doc.documentId,
+          documentPath: doc.documentPath,
+        }),
+        merge: () => adapter.mergePullRequest(repoRef, binding.pullNumber, input.method),
+        ...((): { cachePath?: string } => {
+          const cachePath = commentCachePath?.();
+          return cachePath ? { cachePath } : {};
+        })(),
+      });
       if (!result.merged) {
         // GitHub declined at the last moment — most often a base change between the
         // check above and this call. Conflicted, not failed, and still not resolved.
@@ -562,7 +588,7 @@ export function createRecoveryBodies(options: RecoveryBodyOptions): RecoveryJobB
         ctx.setState('conflicted');
         throw new MergeRefusedError(documentId, 'base-conflict', `merge declined for ${documentId}: ${result.message}`);
       }
-      ctx.log(`merged #${binding.pullNumber} at ${result.sha}`);
+      ctx.log(`merged #${binding.pullNumber} at ${result.sha}${cacheDeleted ? ' — local comment cache dropped' : ''}`);
       ctx.setState('merged');
     },
   };

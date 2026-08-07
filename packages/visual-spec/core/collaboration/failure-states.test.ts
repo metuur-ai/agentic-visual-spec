@@ -15,6 +15,10 @@
  * rather than in `github-adapter.test.ts` / `job-hub.test.ts`, so those two files stay
  * exactly as their own tasks left them.
  */
+import { existsSync } from 'node:fs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { ProjectedCommentRecord } from './comment-projection';
 import type { CollaborationDocument } from './document-protocol';
@@ -939,12 +943,13 @@ async function runPublish(options: FakeOptions & { checkBaseDivergence?: boolean
 }
 
 /** A merge under `options`, with everything else healthy. */
-async function runMerge(options: FakeOptions) {
+async function runMerge(options: FakeOptions, commentCachePath?: () => string | undefined) {
   const gh = fakeGitHub({ pull: { number: 42, state: 'open', merged: false, mergeable: true }, ...options });
   const adapter = createGitHubAdapter(gh.exec);
   const store = memoryStore(BOUND());
   const { hub, frames } = hubRig();
-  hub.start({ kind: 'merge', run: createRecoveryBodies({ adapter }).merge({ documentId: 'doc-1', repo, store }) });
+  const bodies = createRecoveryBodies({ adapter, ...(commentCachePath ? { commentCachePath } : {}) });
+  hub.start({ kind: 'merge', run: bodies.merge({ documentId: 'doc-1', repo, store }) });
   await settled();
   return { state: hub.snapshot().state, frames, gh, store, hub };
 }
@@ -1099,6 +1104,59 @@ describe('failure injection matrix (R-8.24)', () => {
 /* ================================================================== *
  * The three adapter methods 8.4 added
  * ================================================================== */
+
+describe('R-5.8 — the local comment cache is deleted when, and only when, the PR merges', () => {
+  /**
+   * These are the only tests that touch the disk, so they are the only ones whose job
+   * body suspends on real I/O — `settled()` drains microtasks and would return first.
+   */
+  const flushed = async (hub: { snapshot: () => { state: LifecycleState } }): Promise<LifecycleState> => {
+    for (let i = 0; i < 10; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+    return hub.snapshot().state;
+  };
+
+  /** A real file on disk: the point of the requirement is that the sidecar is gone. */
+  async function withCache(run: (path: () => string) => Promise<void>) {
+    const dir = await mkdtemp(join(tmpdir(), 'vs-cache-'));
+    const path = join(dir, 'visual-spec-comments.json');
+    await writeFile(path, '{"doc-1":[]}\n', 'utf8');
+    try {
+      await run(() => path);
+      return path;
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('deletes the cache after a successful merge', async () => {
+    let existsAfter = true;
+    const path = await withCache(async (cachePath) => {
+      const { hub } = await runMerge({ comments: [thread(700001), resolves(800001, 700001)] }, cachePath);
+      expect(await flushed(hub)).toBe('merged');
+      existsAfter = existsSync(cachePath());
+    });
+    expect(existsAfter).toBe(false);
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it('leaves the cache in place when the merge is refused — nothing merged, nothing to forget', async () => {
+    let existsAfter = false;
+    await withCache(async (cachePath) => {
+      const { state } = await runMerge({ pull: { number: 42, state: 'open', merged: false, mergeable: false } }, cachePath);
+      expect(state).toBe('conflicted');
+      existsAfter = existsSync(cachePath());
+    });
+    expect(existsAfter).toBe(true);
+  });
+
+  it('a merge with no cache on disk still merges — deletion is best-effort, not a gate', async () => {
+    const { hub } = await runMerge(
+      { comments: [thread(700001), resolves(800001, 700001)] },
+      () => join(tmpdir(), 'vs-cache-absent', 'nope.json'),
+    );
+    expect(await flushed(hub)).toBe('merged');
+  });
+});
 
 describe('adapter additions', () => {
   it('deleteBranch resolves false when the ref is already gone (R-8.18)', async () => {

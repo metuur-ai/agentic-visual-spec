@@ -295,6 +295,7 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         config: () => collabConfig,
         documents: () => withNodeIdentity(fsDocumentStore(specsRoot)),
         jobs: collabJobs,
+        commentCachePath: () => commentsPath,
       });
       const collab = createCollabRoutes({
         jobs: collabJobs,

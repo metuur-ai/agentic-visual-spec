@@ -54,6 +54,8 @@ export type CollabWiringOptions = {
   jobs: JobHubRegistry;
   /** Task 5.3 plugs the comment cache in here — one line, in both hosts. */
   onSync?: (result: SyncResult) => void | Promise<void>;
+  /** R-5.8 — the host's comment-cache path, read per call so a re-root is honoured. */
+  commentCachePath?: () => string | undefined;
   /** Injectable so tests never exec `gh`. Defaults to the real CLI. */
   exec?: GhExecutor;
   /** Injectable so tests never create a real timer. */
@@ -98,7 +100,10 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
   // 8.4's recovery bodies. Built here for the same reason the rest are: the module was
   // fully written and tested but had no caller, so `reconcile` and `markReady` answered
   // from the failing stub over HTTP.
-  const recovery = createRecoveryBodies({ adapter });
+  const recovery = createRecoveryBodies({
+    adapter,
+    ...(options.commentCachePath ? { commentCachePath: options.commentCachePath } : {}),
+  });
 
   // The poller re-reads `documents()` per call rather than closing over one store, so a
   // runtime "change directory" re-roots the next tick too — the same discipline the
