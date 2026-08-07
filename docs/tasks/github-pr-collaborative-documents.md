@@ -187,11 +187,16 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
   - verify: new dirty-detection tests written **before** the port; assert no false-dirty on selection change, arrow keys, or clicking a comment pill.
   - landed:
 
-- [ ] 7.5 Both hosts expose collaboration mode (deps: 7.2, est: ~2h)
+- [x] 7.5 Both hosts expose collaboration mode (deps: 7.2, est: ~2h)
   - why: shipping it in the shared UI + route layer is what keeps the two hosts from forking.
   - acceptance: R-7.6 — standalone CLI and Vite plugin both expose it with no host-specific code.
   - verify: smoke both hosts.
-  - landed:
+  - landed: satisfied structurally by 7.2 (`core/vite/routes/collab-wiring.ts` — neither host recognises a single collaboration sub-path; both call `createCollabWiring` + `createCollabRoutes` and delegate) and by 9.2/9.3/8.2a extending that same shared module. **Verified at runtime**, not only by source assertion, against two real servers — the built standalone CLI (`node dist/cli.js`) and the Vite dev host:
+    - `GET /__vs/collab` returns a byte-identical `CollabAvailability` from both: `{"available":false,"reason":"not-configured",…}` (R-7.6, R-7.8, R-9.19).
+    - Request guard live on both: `Sec-Fetch-Site: cross-site` → **403**, non-loopback `Host: evil.example` → **403**, absent `Sec-Fetch-Site` → **200** (R-9.13, R-9.14). `POST /__vs/collab/:id/publish` cross-site → **403** before reaching the route layer (R-9.16).
+    - Local mode unaffected: `/__vs/tree` and `/__vs/dir` → 200; a rendered markdown file carries **555** `data-vs-loc` and **0** `data-vs-node-id` / `data-vs-indicator-state` / `data-vs-orphan-list` — runtime proof of R-10.6 and of 7.3's claim that local mode takes an identical code path.
+    - No collaboration controls surfaced in the UI with no config present; the browser snapshot is identical to the pre-collaboration baseline (R-7.8).
+    - `npm run build` succeeds and `npm run check:bundle` passes with all collaboration code landed — `dist/cli.js`, `dist/vite/index.js`, `dist/index.js` carry no `react` / `react-dom` / `@lyfie/luthor` (R-12.6, R-3.3).
 
 ## Unit 6: Anchor resolution — Lane A
 
