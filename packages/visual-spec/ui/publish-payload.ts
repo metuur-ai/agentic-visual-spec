@@ -31,7 +31,7 @@
  * CLI or Vite-plugin host entrypoints.
  */
 import { headless } from '@lyfie/luthor';
-import type { JsonDocument } from '../core/collaboration/document-protocol';
+import type { DocumentFrontmatter, JsonDocument } from '../core/collaboration/document-protocol';
 import { getSerializedNodeId } from './node-id-extension';
 
 /**
@@ -48,6 +48,17 @@ export type DroppedNodeReport = {
   fallback: string;
 };
 
+/**
+ * A frontmatter key the emitted YAML block cannot represent. Reported on the same
+ * channel as `droppedNodes` so an author sees the loss before publishing, rather
+ * than discovering it in the merged artifact.
+ */
+export type DroppedFrontmatterReport = {
+  key: string;
+  /** Only cause today: the value is not a scalar or an array of scalars. */
+  reason: 'unsupported-type';
+};
+
 /** What a publish request carries. Task 8.3 consumes this shape verbatim. */
 export type PublishPayload = {
   /** The canonical document — the artifact of record. */
@@ -56,6 +67,8 @@ export type PublishPayload = {
   markdown: string;
   /** Nodes the Markdown drops. Empty when nothing is lost. */
   droppedNodes: readonly DroppedNodeReport[];
+  /** Frontmatter keys the YAML block drops. Empty when nothing is lost. */
+  droppedFrontmatter: readonly DroppedFrontmatterReport[];
 };
 
 /**
@@ -74,11 +87,97 @@ function snapshot(read: string | JsonDocument): JsonDocument {
   return parsed as JsonDocument;
 }
 
+type EmittableScalar = string | number | boolean;
+
+function isEmittableScalar(value: unknown): value is EmittableScalar {
+  if (typeof value === 'string' || typeof value === 'boolean') return true;
+  // `NaN`/`Infinity` have no YAML 1.1 spelling that round-trips across parsers.
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/**
+ * Double-quoted YAML. `JSON.stringify`'s escape set (`\"`, `\\`, `\n`, `\t`,
+ * `\uXXXX`) is a strict subset of YAML's double-quoted escape set, so this is
+ * safe for every string — including ones holding newlines or leading `#`.
+ */
+function emitScalar(value: EmittableScalar): string {
+  return typeof value === 'string' ? JSON.stringify(value) : String(value);
+}
+
+function emitKey(key: string): string {
+  return /^[A-Za-z_][A-Za-z0-9_-]*$/.test(key) ? key : JSON.stringify(key);
+}
+
+/** Flow-style array, or `null` if any element is not an emittable scalar. */
+function emitArray(value: readonly unknown[]): string | null {
+  const parts: string[] = [];
+  for (const item of value) {
+    if (!isEmittableScalar(item)) return null;
+    parts.push(emitScalar(item));
+  }
+  return `[${parts.join(', ')}]`;
+}
+
+/**
+ * Serialize authored frontmatter to a YAML block (option B — scalars and arrays
+ * of scalars only).
+ *
+ * This is deliberately *not* `metadataMode: 'preserve'`: that emits Luthor's own
+ * `luthor:meta` envelope, which R-2.9 exists to keep out of the artifact. Authored
+ * frontmatter lives on the collaboration envelope beside `doc`, so it is prepended
+ * here and the body stays envelope-free.
+ *
+ * Anything richer than a scalar (nested maps, arrays of arrays, `null`) is dropped
+ * and reported rather than approximated — a wrong value in a published artifact is
+ * worse than a visibly absent one. Key order is `title` first, then alphabetical,
+ * so re-publishing an unchanged document produces byte-identical output.
+ */
+export function serializeFrontmatter(frontmatter: DocumentFrontmatter): {
+  block: string;
+  dropped: DroppedFrontmatterReport[];
+} {
+  const dropped: DroppedFrontmatterReport[] = [];
+  const lines: string[] = [];
+
+  const keys = Object.keys(frontmatter).sort((a, b) => {
+    if (a === b) return 0;
+    if (a === 'title') return -1;
+    if (b === 'title') return 1;
+    return a < b ? -1 : 1;
+  });
+
+  for (const key of keys) {
+    const value = frontmatter[key];
+    if (value === undefined) continue;
+    if (isEmittableScalar(value)) {
+      lines.push(`${emitKey(key)}: ${emitScalar(value)}`);
+      continue;
+    }
+    const asArray = Array.isArray(value) ? emitArray(value) : null;
+    if (asArray !== null) {
+      lines.push(`${emitKey(key)}: ${asArray}`);
+    } else {
+      dropped.push({ key, reason: 'unsupported-type' });
+    }
+  }
+
+  // No emittable keys means no block at all — never a bare `---\n---`, which would
+  // put an empty frontmatter fence at the top of every artifact.
+  const block = lines.length === 0 ? '' : `---\n${lines.join('\n')}\n---\n\n`;
+  return { block, dropped };
+}
+
 /**
  * Build the publish payload. **Calls `readDocument` exactly once**; `json` and
  * `markdown` are both derived from that one snapshot (R-12.8).
+ *
+ * `frontmatter` comes from the collaboration envelope, which the reader cannot
+ * see — it is a sibling of `doc`, not part of the document JSON.
  */
-export function generatePublishPayload(readDocument: PublishDocumentSource): PublishPayload {
+export function generatePublishPayload(
+  readDocument: PublishDocumentSource,
+  frontmatter: DocumentFrontmatter = {},
+): PublishPayload {
   const json = snapshot(readDocument());
 
   // Detection only — `prepareDocumentForBridge` returns an envelope per node the
@@ -96,7 +195,8 @@ export function generatePublishPayload(readDocument: PublishDocumentSource): Pub
     fallback: envelope.fallback,
   }));
 
-  const markdown = headless.jsonToMarkdown(json, { metadataMode: 'none' });
+  const { block, dropped: droppedFrontmatter } = serializeFrontmatter(frontmatter);
+  const markdown = block + headless.jsonToMarkdown(json, { metadataMode: 'none' });
 
-  return { json, markdown, droppedNodes };
+  return { json, markdown, droppedNodes, droppedFrontmatter };
 }

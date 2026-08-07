@@ -466,4 +466,20 @@ describe('publish payload comes from one read of live editor state (R-12.8)', ()
     const children = (payload.json as unknown as { root: { children: SerializedBlock[] } }).root.children;
     expect(children.every((c) => Boolean(c.$?.nodeId))).toBe(true);
   });
+
+  it("carries the mounted document's frontmatter into the Markdown artifact", async () => {
+    const doc = makeDocument();
+    const withFrontmatter = await mount({ ...doc, frontmatter: { title: 'Fixture', tags: ['spec'] } });
+    const payload = withFrontmatter.handle.publish();
+
+    expect(payload.markdown.startsWith('---\ntitle: "Fixture"\ntags: ["spec"]\n---\n\n')).toBe(true);
+    expect(payload.droppedFrontmatter).toEqual([]);
+    // The JSON artifact is unchanged by this — frontmatter lives in the envelope.
+    expect(JSON.stringify(payload.json)).not.toContain('frontmatter');
+  });
+
+  it('emits no frontmatter fence for a document that has none', () => {
+    // `rec` is mounted from `makeDocument()`, whose frontmatter is `{}`.
+    expect(rec.handle.publish().markdown.startsWith('---')).toBe(false);
+  });
 });

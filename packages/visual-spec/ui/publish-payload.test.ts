@@ -11,7 +11,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { headless } from '@lyfie/luthor';
 import { NODE_ID_UNSERIALIZABLE_TYPES } from './node-id-extension';
-import { generatePublishPayload } from './publish-payload';
+import { generatePublishPayload, serializeFrontmatter } from './publish-payload';
 import type { JsonDocument } from '../core/collaboration/document-protocol';
 
 /** A one-paragraph document whose single block carries `text` and a `nodeId`. */
@@ -159,5 +159,73 @@ describe('generatePublishPayload — dropped-node reporting', () => {
 
     expect(payload.droppedNodes).toEqual([]);
     expect(payload.markdown).toContain('![alt](img.png)');
+  });
+});
+
+describe('authored frontmatter (option B — scalars and arrays of scalars)', () => {
+  it('emits no fence at all when there is no emittable frontmatter', () => {
+    // The failure this guards: a bare `---\n---` at the top of every artifact that
+    // happens to have no frontmatter. Absence must produce absence.
+    for (const frontmatter of [{}, undefined, { nested: { a: 1 } }]) {
+      const payload = generatePublishPayload(() => docWithText('body'), frontmatter);
+      expect(payload.markdown.startsWith('---')).toBe(false);
+      expect(payload.markdown).toBe(headless.jsonToMarkdown(payload.json, { metadataMode: 'none' }));
+    }
+  });
+
+  it('prepends a fenced block and leaves the body envelope-free (R-2.9)', () => {
+    const payload = generatePublishPayload(() => docWithText('body'), {
+      title: 'My doc',
+      draft: true,
+      order: 3,
+      tags: ['a', 'b'],
+    });
+
+    expect(payload.markdown).toBe(
+      '---\ntitle: "My doc"\ndraft: true\norder: 3\ntags: ["a", "b"]\n---\n\n' +
+        headless.jsonToMarkdown(payload.json, { metadataMode: 'none' }),
+    );
+    // The Luthor envelope must not ride along on the back of this change.
+    expect(payload.markdown).not.toContain('luthor:meta');
+    expect(payload.droppedFrontmatter).toEqual([]);
+  });
+
+  it('orders `title` first, then alphabetically, so an unchanged republish is byte-identical', () => {
+    const a = serializeFrontmatter({ zeta: 1, alpha: 2, title: 't' }).block;
+    const b = serializeFrontmatter({ alpha: 2, title: 't', zeta: 1 }).block;
+
+    expect(a).toBe(b);
+    expect(a).toBe('---\ntitle: "t"\nalpha: 2\nzeta: 1\n---\n\n');
+  });
+
+  it('reports non-scalar values instead of approximating them', () => {
+    const { block, dropped } = serializeFrontmatter({
+      title: 'kept',
+      nested: { a: 1 },
+      matrix: [[1]],
+      empty: null,
+      notFinite: Number.POSITIVE_INFINITY,
+    });
+
+    expect(block).toBe('---\ntitle: "kept"\n---\n\n');
+    expect(dropped.map((d) => d.key).sort()).toEqual(['empty', 'matrix', 'nested', 'notFinite']);
+    expect(dropped.every((d) => d.reason === 'unsupported-type')).toBe(true);
+  });
+
+  it('escapes strings that would otherwise break out of the block', () => {
+    // A value holding `\n---\n` is the corruption case: unquoted, it would close the
+    // fence early and turn the rest of the frontmatter into document body.
+    const { block } = serializeFrontmatter({
+      title: 'line\n---\nstill title',
+      hash: '# not a comment',
+      quote: 'he said "hi"',
+      'odd key': 'quoted',
+    });
+
+    expect(block).toBe(
+      '---\ntitle: "line\\n---\\nstill title"\nhash: "# not a comment"\n"odd key": "quoted"\nquote: "he said \\"hi\\""\n---\n\n',
+    );
+    // Exactly two fence lines — the value did not open a third.
+    expect(block.split('\n').filter((l) => l === '---')).toHaveLength(2);
   });
 });

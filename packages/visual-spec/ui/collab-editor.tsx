@@ -217,7 +217,14 @@ export function CollabEditor({
           onEditorReadyRef.current?.({
             editor,
             readDocument,
-            publish: () => generatePublishPayload(() => api.current?.getJSON() ?? ''),
+            publish: () =>
+              generatePublishPayload(
+                () => api.current?.getJSON() ?? '',
+                // Read through the ref, not the captured prop: this closure is
+                // built once, and frontmatter belongs to the document the caller
+                // holds now, not the one mounted at initialize time.
+                sourceRef.current.frontmatter,
+              ),
             isDirty: () => dirty.current,
             markClean: () => {
               const signature = liveSignature();
