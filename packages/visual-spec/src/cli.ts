@@ -18,7 +18,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createGitHubAdapter } from '../core/collaboration/github-adapter';
-import { findPullNumberForBranch, parseOpenCommand } from '../core/collaboration/open';
+import { classifyBranchLookupFailure, findPullNumberForBranch, parseOpenCommand } from '../core/collaboration/open';
 import { createVisualSpecServer } from './server';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -112,7 +112,7 @@ async function collab(args: string[]) {
   let pullNumber = Number(flag(rest, '--pull') ?? Number.NaN);
   if (!Number.isSafeInteger(pullNumber) || pullNumber <= 0) {
     const found = await findPullNumberForBranch(createGitHubAdapter(), { owner, repo }, branch).catch((err: Error) => {
-      console.error(`Could not reach ${owner}/${repo}: ${err.message}`);
+      console.error(classifyBranchLookupFailure(err, { owner, repo }, branch).message);
       process.exit(1);
       return null;
     });

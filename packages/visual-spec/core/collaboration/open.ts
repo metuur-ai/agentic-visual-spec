@@ -114,10 +114,11 @@ const slug = (repo: RepoRef, pullNumber: number): string => `${repo.owner}/${rep
 
 /**
  * Map an adapter failure onto the taxonomy above. The status is the only thing worth
- * branching on: `gh` has already normalized everything else into `GitHubError`.
+ * branching on: `gh` has already normalized everything else into `GitHubError`. `where` is
+ * the human-readable location to name in the message — callers build it (`slug()` for the
+ * PR path, `classifyBranchLookupFailure` for the branch-lookup path).
  */
-function classifyOpenFailure(err: unknown, repo: RepoRef, pullNumber: number): OpenDocumentError {
-  const where = slug(repo, pullNumber);
+function classifyOpenFailure(err: unknown, repo: RepoRef, where: string): OpenDocumentError {
   if (!(err instanceof GitHubError)) {
     return new OpenDocumentError('open_failed', `cannot open ${where}: ${(err as Error)?.message ?? String(err)}`);
   }
@@ -150,6 +151,15 @@ function classifyOpenFailure(err: unknown, repo: RepoRef, pullNumber: number): O
     );
   }
   return new OpenDocumentError('open_failed', `cannot open ${where}: ${err.message}`, err);
+}
+
+/**
+ * The branch-lookup path's equivalent of `classifyOpenFailure` — the CLI's first GitHub
+ * call, made before a pull number even exists (`findPullNumberForBranch`). Same taxonomy,
+ * same remediation text, just a location string naming the repo and branch instead of a PR.
+ */
+export function classifyBranchLookupFailure(err: unknown, repo: RepoRef, branch: string): OpenDocumentError {
+  return classifyOpenFailure(err, repo, `${repo.owner}/${repo.repo}@${branch}`);
 }
 
 /**
@@ -227,7 +237,7 @@ export function createOpenBody(options: OpenBodyOptions): (input: OpenBodyInput)
     try {
       pr = await adapter.getPullRequest(repoRef, pullNumber);
     } catch (err) {
-      throw classifyOpenFailure(err, repoRef, pullNumber);
+      throw classifyOpenFailure(err, repoRef, where);
     }
 
     const reference = readPullRequestReference(pr, repoRef);
@@ -264,7 +274,7 @@ export function createOpenBody(options: OpenBodyOptions): (input: OpenBodyInput)
         reference.branch,
       );
     } catch (err) {
-      throw classifyOpenFailure(err, repoRef, pullNumber);
+      throw classifyOpenFailure(err, repoRef, where);
     }
     if (!file) {
       throw new OpenDocumentError(

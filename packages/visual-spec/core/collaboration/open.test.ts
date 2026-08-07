@@ -19,6 +19,7 @@ import { buildPullRequestBody, openCommandFor } from './lifecycle';
 import {
   OpenDocumentError,
   type OpenFailureReason,
+  classifyBranchLookupFailure,
   createOpenBody,
   findPullNumberForBranch,
   parseOpenCommand,
@@ -288,6 +289,38 @@ describe('R-11.2 — opening by pull request reference', () => {
   it('answers null for a branch with no open pull request', async () => {
     const { exec } = recorder([{ stdout: '[]' }]);
     await expect(findPullNumberForBranch(createGitHubAdapter(exec), REPO_REF, BRANCH)).resolves.toBeNull();
+  });
+});
+
+/* ================================================================== *
+ * classifyBranchLookupFailure — the CLI's first-ever GitHub call, before a
+ * pull number exists (src/cli.ts's `collab open`).
+ * ================================================================== */
+describe('classifyBranchLookupFailure — remediation for the branch-lookup path', () => {
+  const ghFailure = (status: number, message: string): Partial<GhResult> => ({
+    stdout: JSON.stringify({ message, status: String(status) }),
+    stderr: `gh: ${message} (HTTP ${status})`,
+    exitCode: 1,
+  });
+
+  it('reports an unrunnable gh as executor_unavailable, naming the branch, with the install/auth remediation', async () => {
+    const { exec } = recorder([{ stdout: '', stderr: 'spawn gh ENOENT', exitCode: null }]);
+    const err = await findPullNumberForBranch(createGitHubAdapter(exec), REPO_REF, BRANCH).catch((e) => e);
+    const classified = classifyBranchLookupFailure(err, REPO_REF, BRANCH);
+    expect(classified.reason).toBe('executor_unavailable');
+    expect(classified.message).toBe(
+      `cannot open acme/docs@${BRANCH}: the GitHub CLI could not be started — install \`gh\` and run \`gh auth login\` (read access is enough).`,
+    );
+  });
+
+  it('reports a rejected credential as no_credential, naming the branch, with the gh auth login remediation', async () => {
+    const { exec } = recorder([ghFailure(401, 'Bad credentials')]);
+    const err = await findPullNumberForBranch(createGitHubAdapter(exec), REPO_REF, BRANCH).catch((e) => e);
+    const classified = classifyBranchLookupFailure(err, REPO_REF, BRANCH);
+    expect(classified.reason).toBe('no_credential');
+    expect(classified.message).toBe(
+      `cannot open acme/docs@${BRANCH}: GitHub rejected the credential (HTTP 401) — run \`gh auth login\` (read access is enough).`,
+    );
   });
 });
 
