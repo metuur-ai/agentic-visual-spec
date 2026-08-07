@@ -99,6 +99,7 @@ function Probe({ client, factory, documentId = 'doc-1' }: { client: CollabClient
   return (
     <div>
       <span data-testid="title">{state.document?.title ?? '—'}</span>
+      <span data-testid="pull">{state.document?.github?.pullNumber ?? '—'}</span>
       <span data-testid="state">{state.snapshot?.state ?? '—'}</span>
       <span data-testid="running">{String(state.running)}</span>
       <span data-testid="events">{state.snapshot?.events.length ?? -1}</span>
@@ -359,5 +360,89 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
     render(<Wire />);
     await waitFor(() => expect(deps).not.toBeNull());
     expect(deps!.document.documentId).toBe('doc-1');
+  });
+});
+
+describe('re-reading what a finished job changed', () => {
+  /** The scenario the whole feature exists for: someone else comments on github.com. */
+  it('renders a comment that only arrives because the hub polled GitHub', async () => {
+    const stream = fakeStream();
+    const comments = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, value: [] as CommentRecord[] })
+      .mockResolvedValue({ ok: true, value: [comment('c-9', 'from the reviewer')] });
+    render(<Probe client={stubClient({ comments } as unknown as Partial<CollabClient>)} factory={stream.factory} />);
+    await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('—'));
+
+    // What the poller emits when it finds a new comment on the PR.
+    stream.push({ type: 'job-done', jobId: 'doc-1-1', kind: 'sync', ok: true, state: 'draft', finishedAt: 20 });
+
+    await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-9:from the reviewer:open'));
+  });
+
+  it('leaves the document alone on a poll, so a tick cannot re-render under a typing author', async () => {
+    const stream = fakeStream();
+    const client = stubClient();
+    render(<Probe client={client} factory={stream.factory} />);
+    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('1'));
+    expect(client.document).toHaveBeenCalledTimes(1);
+
+    stream.push({ type: 'job-done', jobId: 'doc-1-1', kind: 'sync', ok: true, state: 'draft', finishedAt: 20 });
+    await waitFor(() => expect(client.comments).toHaveBeenCalledTimes(2));
+
+    expect(client.document).toHaveBeenCalledTimes(1);
+    expect(client.status).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-reads identity after create, which is how a PR number first reaches the title bar', async () => {
+    const stream = fakeStream();
+    const status = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, value: STATUS })
+      .mockResolvedValue({
+        ok: true,
+        value: { ...STATUS, document: { ...STATUS.document, github: { owner: 'o', repo: 'r', pullNumber: 12 } } },
+      });
+    const client = stubClient({ status } as unknown as Partial<CollabClient>);
+    render(<Probe client={client} factory={stream.factory} />);
+    await waitFor(() => expect(screen.getByTestId('pull').textContent).toBe('—'));
+
+    stream.push({ type: 'job-done', jobId: 'doc-1-1', kind: 'create', ok: true, state: 'draft', finishedAt: 20 });
+
+    await waitFor(() => expect(screen.getByTestId('pull').textContent).toBe('12'));
+    expect(client.document).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not re-read after a job that failed — there is nothing new to read', async () => {
+    const stream = fakeStream();
+    const client = stubClient();
+    render(<Probe client={client} factory={stream.factory} />);
+    await waitFor(() => expect(screen.getByTestId('title').textContent).toBe('Spec'));
+
+    stream.push({ type: 'job-done', jobId: 'doc-1-1', kind: 'publish', ok: false, state: 'draft', finishedAt: 20 });
+    stream.push({ type: 'job-start', jobId: 'doc-1-2', kind: 'sync', startedAt: 30 });
+    await waitFor(() => expect(screen.getByTestId('running').textContent).toBe('true'));
+
+    expect(client.comments).toHaveBeenCalledTimes(1);
+    expect(client.document).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the last good screen when a background re-read fails', async () => {
+    const stream = fakeStream();
+    const client = stubClient({
+      document: vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, value: DOCUMENT })
+        .mockResolvedValue({ ok: false, kind: 'network', message: 'connection reset' }),
+    } as unknown as Partial<CollabClient>);
+    render(<Probe client={client} factory={stream.factory} />);
+    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('1'));
+
+    stream.push({ type: 'job-done', jobId: 'doc-1-1', kind: 'publish', ok: true, state: 'published', finishedAt: 20 });
+    await waitFor(() => expect(client.document).toHaveBeenCalledTimes(2));
+
+    // `error` would blank the document view; the document itself is still rendered.
+    expect(screen.getByTestId('error').textContent).toBe('—');
+    expect(screen.getByTestId('nodes').textContent).toBe('1');
   });
 });
