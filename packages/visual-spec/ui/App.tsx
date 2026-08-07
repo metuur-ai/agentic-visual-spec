@@ -1,5 +1,6 @@
 import { InspectorProvider, useComments } from '../core/app';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { CollabApp } from './collab-app';
 import { FileTree } from './file-tree';
 import { GenericEditor } from './generic-editor';
 import { BrandHeader, MainHeader, type ViewMode } from './main-header';
@@ -17,6 +18,10 @@ export function App() {
   const { entries, loading } = useTree();
   const [selected, setSelected] = useState<TreeEntry | null>(null);
   const [mode, setMode] = useState<ViewMode>('view');
+  // A collaboration document has no local-file entry (ui/use-tree.ts enumerates the
+  // file tree only), so it cannot be reached through `selected`/`pick()`. It is a
+  // genuinely separate top-level route that swaps the whole shell instead.
+  const [collabOpen, setCollabOpen] = useState(false);
   const [width, setWidth] = useState<number>(() => {
     const saved = Number(localStorage.getItem('vs:sidebarWidth'));
     return saved >= MIN_W && saved <= MAX_W ? saved : 280;
@@ -109,7 +114,7 @@ export function App() {
         <BrandHeader />
       )}
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-        <Sidebar entries={entries} current={current} loading={loading} onPick={pick} width={width} />
+        <Sidebar entries={entries} current={current} loading={loading} onPick={pick} width={width} onOpenCollab={() => setCollabOpen(true)} />
         <Splitter onResize={resize} />
         {selected ? (
           editing ? (
@@ -145,6 +150,14 @@ export function App() {
       )}
     </>
   );
+
+  if (collabOpen) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+        <CollabApp onExit={() => setCollabOpen(false)} />
+      </div>
+    );
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -220,7 +233,21 @@ function Splitter({ onResize, fromRight = false }: { onResize: (w: number) => vo
   );
 }
 
-function Sidebar({ entries, current, loading, onPick, width }: { entries: TreeEntry[]; current: string; loading: boolean; onPick: (e: TreeEntry) => void; width: number }) {
+function Sidebar({
+  entries,
+  current,
+  loading,
+  onPick,
+  width,
+  onOpenCollab,
+}: {
+  entries: TreeEntry[];
+  current: string;
+  loading: boolean;
+  onPick: (e: TreeEntry) => void;
+  width: number;
+  onOpenCollab: () => void;
+}) {
   const [q, setQ] = useState('');
   const { comments } = useComments(); // all → to flag which paths have open comments
   const commentCounts = useMemo(() => {
@@ -244,7 +271,7 @@ function Sidebar({ entries, current, loading, onPick, width }: { entries: TreeEn
       <div style={{ padding: 8, flex: 1, overflow: 'auto' }}>
         {loading ? <div style={{ opacity: 0.6, padding: 8 }}>Loading…</div> : <FileTree entries={entries} current={current} filter={q} onPick={onPick} commentCounts={commentCounts} />}
       </div>
-      <SidebarFooter />
+      <SidebarFooter onOpenCollab={onOpenCollab} />
     </nav>
   );
 }
@@ -252,9 +279,12 @@ function Sidebar({ entries, current, loading, onPick, width }: { entries: TreeEn
 declare const __APP_VERSION__: string;
 
 /** A gentle, muted footer pinned to the bottom of the sidebar. */
-function SidebarFooter() {
+function SidebarFooter({ onOpenCollab }: { onOpenCollab: () => void }) {
   return (
     <footer style={footer}>
+      <button type="button" onClick={onOpenCollab} style={collabLink}>
+        Review a pull request…
+      </button>
       <div>© 2026 Visual Specs v{__APP_VERSION__}</div>
       <div style={{ marginTop: 2 }}>
         Made with <span style={{ color: '#ef4444' }}>❤</span> by{' '}
@@ -271,6 +301,7 @@ function SidebarFooter() {
 const sidebar: React.CSSProperties = { height: '100%', flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid #e5e7eb', background: 'white', overflow: 'hidden', font: '13px system-ui' };
 const footer: React.CSSProperties = { flexShrink: 0, padding: '10px 12px', borderTop: '1px solid #f1f5f9', background: '#fbfaff', font: '11px system-ui', color: '#94a3b8', lineHeight: 1.5 };
 const footerLink: React.CSSProperties = { color: '#a78bca', textDecoration: 'none', fontWeight: 600 };
+const collabLink: React.CSSProperties = { display: 'block', width: '100%', textAlign: 'left', padding: 0, marginBottom: 6, border: 'none', background: 'transparent', color: '#7c3aed', font: '600 11px system-ui', cursor: 'pointer' };
 const splitter: React.CSSProperties = { width: 6, flexShrink: 0, cursor: 'col-resize', background: 'transparent', transition: 'background 120ms', marginLeft: -3, zIndex: 5 };
 const filter: React.CSSProperties = { width: '100%', padding: '5px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: 'inherit' };
 const dialogBackdrop: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 100, display: 'grid', placeItems: 'center', background: 'rgba(15,23,42,0.35)' };
