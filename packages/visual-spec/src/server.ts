@@ -23,6 +23,7 @@ import { extname, join, normalize, resolve } from 'node:path';
 // shipped dist/cli.js carries this logic inline with no runtime dependency.
 import { mdSurfaceStore } from '../core/vite/md-store';
 import { pickDirectoryNative } from '../core/vite/native-pick';
+import { GUARD_NOT_RUN, attestGuardRan, guardRan } from '../core/vite/guard-attestation';
 import { checkRequest } from '../core/vite/request-guard';
 import type { SurfaceStore } from '../core/vite/surface-store';
 import { type TreeStore, treeStore } from '../core/vite/tree-store';
@@ -206,6 +207,7 @@ export function createVisualSpecServer(opts: ServeOptions) {
         if (url.pathname.startsWith('/__vs/')) {
           const verdict = checkRequest(req.headers);
           if (!verdict.ok) return sendJson(res, 403, { error: verdict.reason });
+          attestGuardRan(req.headers);
         }
 
         if (url.pathname === '/__vs/tree' || url.pathname.startsWith('/__vs/tree/')) {
@@ -315,6 +317,9 @@ export function createVisualSpecServer(opts: ServeOptions) {
         // Collaboration routes (R-7.1). Everything below `/__vs/collab` is decided by the
         // shared router — no host-specific logic (R-7.6).
         if (url.pathname === '/__vs/collab' || url.pathname.startsWith('/__vs/collab/')) {
+          // R-9.16: publish commits client bytes to a remote repo, so the dispatch
+          // refuses outright unless the guard above provably ran on this request.
+          if (!guardRan(req.headers)) return sendJson(res, 500, { error: GUARD_NOT_RUN });
           const sub = url.pathname.slice('/__vs/collab'.length);
           const query = Object.fromEntries(url.searchParams.entries());
           const body = await readJsonBody(req);

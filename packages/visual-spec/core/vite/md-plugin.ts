@@ -15,6 +15,7 @@ import { stat } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { extname, isAbsolute, join } from 'node:path';
 import type { Connect, Plugin } from 'vite';
+import { GUARD_NOT_RUN, attestGuardRan, guardRan } from './guard-attestation';
 import { checkRequest } from './request-guard';
 import { type CommentDocStore, fileCommentStore, handleCommentsRequest } from './routes/comments';
 import { createApplyHub } from './routes/apply';
@@ -158,7 +159,10 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       // guard registered after a handler silently does nothing.
       server.middlewares.use('/__vs', (req, res, next) => {
         const verdict = checkRequest(req.headers);
-        if (verdict.ok) return next();
+        if (verdict.ok) {
+          attestGuardRan(req.headers);
+          return next();
+        }
         res.statusCode = 403;
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify({ error: verdict.reason }));
@@ -301,6 +305,9 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       server.middlewares.use('/__vs/collab', (req, res) => {
         void (async () => {
           try {
+            // R-9.16: publish commits client bytes to a remote repo, so the dispatch
+            // refuses outright unless the guard above provably ran on this request.
+            if (!guardRan(req.headers)) return sendJson(res, 500, { error: GUARD_NOT_RUN });
             const url = new URL(req.url ?? '', 'http://localhost');
             const sub = url.pathname === '/' ? '' : url.pathname;
             const query = Object.fromEntries(url.searchParams.entries());
