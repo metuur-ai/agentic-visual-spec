@@ -97,11 +97,11 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
   - verify: recorded `gh api` fixtures replayed through the executor. Commit via the Contents API only — a shell-out to `git commit` applies `.gitattributes` CRLF normalization and breaks publish verification permanently.
   - landed: `core/collaboration/github-adapter.ts`, `core/collaboration/github-executor.ts`, `core/collaboration/github-adapter.test.ts` (24 tests), `core/collaboration/fixtures/*.json` (11 recorded responses). Pagination is an explicit `page=` loop, not `Link`-following: the executor is buffered and exposes stdout only, so response headers are not observable. Suite 153 → 177.
 
-- [ ] 4.2 Credential + scope preflight (deps: 4.1, est: ~4h)
+- [x] 4.2 Credential + scope preflight (deps: 4.1, est: ~4h)
   - why: the real credential on a dev machine is a keyring OAuth token, not a PAT in an env var, and it may lack scopes. Today the first symptom would be a raw 403 mid-publish.
   - acceptance: R-9.1 — read credential server-side from env or `gh` auth state; R-9.2 — credential never reaches the browser, a response body, an SSE event, or the client bundle; R-9.3 — credential never written to logs, job status, or error messages; R-9.4 — accepts owner/repo/base-branch configuration; R-9.12 — verify required scopes on enable and name the specific missing scope; R-4.10 — unavailable execution path reported as unavailable, with no partially-functional fallback; R-9.19 — no credential ⇒ collaboration disabled, local mode unaffected.
   - verify: simulate missing scope and assert the message names it.
-  - landed:
+  - landed: `core/collaboration/credentials.ts` (`preflightCollaboration`), `core/collaboration/credentials.test.ts` (17 tests), `core/collaboration/fixtures/user-inclusive-*.txt` (3 recorded responses), plus `collaboration` owner/repo/baseBranch config in `core/config.ts`. Scopes and identity come from one `gh api -i /user` call: `-i` puts `X-OAuth-Scopes` on stdout as machine-readable text, which the buffered executor can see, whereas `gh auth status` prints a human-formatted table whose stream and wording have moved across `gh` releases and which cannot resolve the identity in the same call. The module never reads a token *value* — env vars are probed for presence only — so the success shape carries identity + scopes + availability and no secret. Suite 263 → 280.
 
 ## Unit 5: Comment projection — Lane B
 
