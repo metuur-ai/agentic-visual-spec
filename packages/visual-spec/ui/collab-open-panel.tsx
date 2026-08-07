@@ -69,7 +69,15 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
         if (live) setAvailability(snapshot);
       })
       .catch((err: unknown) => {
-        if (live) setAvailability({ available: false, reason: 'preflight_failed', message: (err as Error).message });
+        // The request never reached the server, so this is not a preflight verdict
+        // and must not borrow one: `message` is the only field rendered, and a bare
+        // "Failed to fetch" would sit where `gh` remediation text goes.
+        if (live)
+          setAvailability({
+            available: false,
+            reason: 'request_failed',
+            message: `Could not reach the visual-spec server to check your GitHub identity. Confirm it is still running, then reload. (${(err as Error).message})`,
+          });
       });
     return () => {
       live = false;

@@ -136,6 +136,14 @@ export class GitHubError extends Error {
 /** GitHub caps `per_page` at 100; the page loop stops on the first short page. */
 const PER_PAGE = 100;
 
+/**
+ * Hard stop for the page loop. The normal exit is a short page; this exists so a
+ * server that never returns one cannot spin forever. 100 pages is 10,000 comments
+ * on one pull request — far past any real review, so hitting it means the exit
+ * condition is broken, and a truncated read would be worse than a loud failure.
+ */
+const MAX_PAGES = 100;
+
 const ACCEPT = 'Accept: application/vnd.github+json';
 
 export interface GitHubAdapter {
@@ -396,13 +404,18 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
     async listIssueComments(repo, pullNumber) {
       const out: IssueComment[] = [];
       // Explicit page loop — the buffered executor cannot see `Link` headers.
-      for (let page = 1; ; page += 1) {
+      for (let page = 1; page <= MAX_PAGES; page += 1) {
         const endpoint = `/repos/${repo.owner}/${repo.repo}/issues/${pullNumber}/comments?per_page=${PER_PAGE}&page=${page}`;
         const raw = await call<Json[]>('listIssueComments', ['api', '--method', 'GET', '-H', ACCEPT, endpoint]);
         const items = Array.isArray(raw) ? raw : [];
         for (const item of items) out.push(toIssueComment(item));
         if (items.length < PER_PAGE) return out;
       }
+      // Fail rather than return a silently truncated comment list: callers resolve
+      // and reply against this, so a missing page reads as a deleted comment.
+      throw new Error(
+        `listIssueComments: pull ${pullNumber} did not terminate within ${MAX_PAGES} pages of ${PER_PAGE}`,
+      );
     },
 
     async createIssueComment(repo, pullNumber, body) {

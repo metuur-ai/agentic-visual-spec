@@ -13,7 +13,8 @@
  * WHAT "THE COLLABORATION PATH" MEANS HERE — enumerated by `COLLABORATION_PATH`, not by
  * a file list, so a module added by a concurrent task is covered the moment it lands:
  *
- *   1. `core/collaboration/**`            — the whole layer, by definition.
+ *   1. `core/collaboration/**`            — the whole layer, by definition, and
+ *      recursively: a module parked in a subdirectory is still on the path.
  *   2. `core/vite/routes/collab*.ts`      — the route family that serves it (R-7.1).
  *   3. `ui/{node-id,publish,collab}*.tsx?` — the browser-side modules that own document
  *      identity and the publish payload. The `ui/` boundary is drawn by name prefix
@@ -37,7 +38,7 @@ const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 /** Package-relative patterns defining the collaboration path. Order is cosmetic. */
 const COLLABORATION_PATH: RegExp[] = [
-  /^core\/collaboration\/[^/]+\.tsx?$/,
+  /^core\/collaboration\/.+\.tsx?$/,
   /^core\/vite\/routes\/collab[^/]*\.tsx?$/,
   /^ui\/(node-id|publish|collab)[^/]*\.tsx?$/,
 ];

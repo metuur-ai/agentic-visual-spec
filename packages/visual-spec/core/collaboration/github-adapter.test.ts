@@ -216,6 +216,17 @@ describe('createGitHubAdapter — pagination (R-4.5)', () => {
     expect(calls).toHaveLength(1);
     expect(comments).toHaveLength(2);
   });
+
+  it('throws rather than looping forever when a short page never arrives', async () => {
+    // Every page is full, so the normal exit condition never fires. The loop must
+    // stop on its own and fail loudly — a truncated list would read as deleted
+    // comments to the resolve/reply path.
+    const fullPage = fixture('issue-comments-page-1.json');
+    const { exec, calls } = recorder(Array.from({ length: 200 }, () => ({ stdout: fullPage })));
+
+    await expect(createGitHubAdapter(exec).listIssueComments(repo, 42)).rejects.toThrow(/did not terminate within 100 pages/);
+    expect(calls).toHaveLength(100);
+  });
 });
 
 describe('createGitHubAdapter — merge (R-4.7)', () => {
