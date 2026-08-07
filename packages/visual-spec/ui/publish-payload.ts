@@ -96,16 +96,47 @@ function isEmittableScalar(value: unknown): value is EmittableScalar {
 }
 
 /**
- * Double-quoted YAML. `JSON.stringify`'s escape set (`\"`, `\\`, `\n`, `\t`,
- * `\uXXXX`) is a strict subset of YAML's double-quoted escape set, so this is
- * safe for every string — including ones holding newlines or leading `#`.
+ * `JSON.stringify` escapes C0 (U+0000–U+001F) but emits DEL and C1
+ * (U+007F–U+009F) raw. YAML forbids those inside a double-quoted scalar: a raw
+ * U+0091 makes the *whole block* unparseable, and U+0085 (NEL) is a line break
+ * that silently folds to a space. Neither is exotic — U+0091/U+0092 are what
+ * mojibaked Windows-1252 curly quotes decode to, so a pasted title reaches this.
  */
-function emitScalar(value: EmittableScalar): string {
-  return typeof value === 'string' ? JSON.stringify(value) : String(value);
+function escapeString(value: string): string {
+  // JSON.stringify escapes C0 as \uXXXX (valid YAML), but leaves DEL, the C1 block
+  // and the line/paragraph separators raw. YAML forbids the first two outright and
+  // reads U+0085/2028/2029 as line breaks, which silently rewrites the value.
+  return JSON.stringify(value).replace(/[\u007f-\u009f\u2028\u2029]/g, (c) => {
+    const code = c.codePointAt(0)!;
+    return code <= 0xff
+      ? `\\x${code.toString(16).padStart(2, '0')}`
+      : `\\u${code.toString(16).padStart(4, '0')}`;
+  });
 }
 
+function emitScalar(value: EmittableScalar): string {
+  if (typeof value === 'string') return escapeString(value);
+  // YAML 1.1 requires a `.` in the mantissa; bare `1e+21` resolves as a string.
+  const text = String(value);
+  return typeof value === 'number' && /e/i.test(text) && !text.includes('.')
+    ? text.replace(/e/i, '.0e')
+    : text;
+}
+
+/**
+ * YAML 1.1 resolves these *unquoted* words to booleans/null, so a bare `on:` key
+ * comes back as `True`. Values are immune (always quoted); keys are not.
+ */
+const YAML_RESERVED_WORDS = new Set([
+  'y', 'n', 'yes', 'no', 'true', 'false', 'on', 'off', 'null', '~',
+]);
+
 function emitKey(key: string): string {
-  return /^[A-Za-z_][A-Za-z0-9_-]*$/.test(key) ? key : JSON.stringify(key);
+  const bare =
+    /^[A-Za-z_][A-Za-z0-9_-]*$/.test(key) &&
+    !YAML_RESERVED_WORDS.has(key.toLowerCase()) &&
+    key !== '__proto__'; // quoted so the artifact can't read as a prototype write
+  return bare ? key : escapeString(key);
 }
 
 /** Flow-style array, or `null` if any element is not an emittable scalar. */

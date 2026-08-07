@@ -228,4 +228,45 @@ describe('authored frontmatter (option B — scalars and arrays of scalars)', ()
     // Exactly two fence lines — the value did not open a third.
     expect(block.split('\n').filter((l) => l === '---')).toHaveLength(2);
   });
+
+  it('escapes control and separator characters YAML cannot carry in a quoted scalar', () => {
+    // JSON.stringify leaves these raw. C0/DEL/C1 make the block unparseable; U+0085
+    // is read as a line break, which silently rewrites the value.
+    const { block } = serializeFrontmatter({
+      del: 'a\u007fb',
+      c1: 'a\u0091b',
+      nel: 'a\u0085b',
+      sep: 'a\u2028b',
+    });
+
+    expect(block).toContain('del: "a\\x7fb"');
+    expect(block).toContain('c1: "a\\x91b"');
+    expect(block).toContain('nel: "a\\x85b"');
+    expect(block).toContain('sep: "a\\u2028b"');
+    // No raw character from the forbidden set survived into the artifact.
+    expect(/[\u007f\u0080-\u009f\u2028\u2029]/.test(block)).toBe(false);
+  });
+
+  it('normalizes exponent notation so YAML 1.1 still reads it as a number', () => {
+    // Bare `1e+21` has no `.` in the mantissa, so a YAML 1.1 resolver reads it back
+    // as a *string* — the same round-trip hazard NaN/Infinity are excluded for.
+    const { block, dropped } = serializeFrontmatter({ big: 1e21, small: 1e-7, fine: 1.5 });
+
+    expect(block).toContain('big: 1.0e+21');
+    expect(block).toContain('small: 1.0e-7');
+    expect(block).toContain('fine: 1.5');
+    expect(dropped).toEqual([]);
+  });
+
+  it('quotes keys that YAML 1.1 or JS would reinterpret', () => {
+    // `__proto__` must come from JSON.parse — an object literal would set the
+    // prototype instead of creating the key, which is the whole hazard.
+    const parsed = JSON.parse('{"__proto__":"x","on":"x","no":"x","y":"x"}');
+    const { block } = serializeFrontmatter(parsed);
+
+    expect(block).toContain('"on": "x"');
+    expect(block).toContain('"no": "x"');
+    expect(block).toContain('"y": "x"');
+    expect(block).toContain('"__proto__": "x"');
+  });
 });
