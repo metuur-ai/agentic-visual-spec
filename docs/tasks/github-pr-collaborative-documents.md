@@ -21,17 +21,17 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
   - verify: add `jsdom` + `@testing-library/react` as devDeps; mount `ExtensiveEditor` with a registered replacement node; type, split a block, merge two blocks, paste, reload from JSON; assert `nodeId` stable per surviving block.
   - landed:
 
-- [ ] 0.2 Local-mode regression suite (est: ~4h)
+- [x] 0.2 Local-mode regression suite (est: ~4h)
   - why: Unit 10 is the "worse than not shipping" risk and nothing currently asserts local mode is unchanged. This has to exist *before* shared UI is touched, not after.
   - acceptance: R-12.5 — regression suite pinning local-mode comment resolution; R-10.1 through R-10.6 — browsing, viewing, commenting, apply, and legacy `{file, anchor}` upgrade all behave as today with no collaboration config present.
   - verify: suite passes on `main` before any collaboration code lands, and stays green at every subsequent story.
-  - landed:
+  - landed: `core/editing/local-mode.regression.test.ts` — 70 characterization tests covering R-10.1..R-10.6 + R-12.5 (browsing, source/markdown surface, `/__vs/comments` add/edit/delete, sidecar on-disk format, apply-prompt, `resolveMarkdownAnchors` degraded cases, legacy `{file, anchor}` upgrade, GitHub-free assertions, and an inventory of the pre-existing guards). Tests only, no production change. Suite 153 → 223 green. Quirks pinned deliberately (not fixed): PATCH with no `status` blanks the field; `kind:"file"` + `startLine` drops the line; `selection:"range"` writes an empty `endSnippet`; the heading fallback in `resolveMarkdownAnchors` sweeps siblings using the stale `startLine`; the legacy upgrader appends `.md` to any extension.
 
-- [ ] 0.3 Bundle guard — no React in Node-reachable output (est: ~2h)
+- [x] 0.3 Bundle guard — no React in Node-reachable output (est: ~2h)
   - why: `@lyfie/luthor-headless` bundled by esbuild inlines `react-dom/server`, producing a 3.8 MB artifact that throws `Dynamic require of "react-dom/server.node.js"` at import. A single stray import from `core/` ships a broken binary.
   - acceptance: R-12.6 — every Node-reachable bundled entrypoint (CLI and Vite plugin host) contains no `react`/`react-dom` references; R-3.3 — no module reachable from the CLI entrypoint imports Luthor.
   - verify: build, then grep `dist/cli.js` and the Vite host bundle for `react`; add `@lyfie/luthor*` to `tsup.config.ts` `external`; assert the check fails when a deliberate import is added.
-  - landed:
+  - landed: three layers. (1) STATIC — `core/bundle-guard.test.ts` walks the TS import graph from `src/cli.ts`, `core/vite/index.ts`, `core/index.ts` and asserts none reaches `react`/`react-dom`/`@lyfie/luthor`; runs in `npm test`. (2) BUILD — `build.mjs` installs an esbuild `forbid-browser-deps` `onResolve` plugin that *rejects* (does not externalize) those specifiers, so the CLI fails to build rather than deferring to a runtime require; `tsup.config.ts` externalizes `/^@lyfie\/luthor/`. (3) OUTPUT — `npm run check:bundle` (`check-bundle.mjs`) greps `dist/cli.js`, `dist/vite/index.js`, `dist/index.js` plus their tsup chunks; run it after `npm run build` (`dist/ui/**` is deliberately excluded — the browser bundle should contain react). Proof: a deliberate `import '@lyfie/luthor'` in `src/server.ts` + `core/vite/md-plugin.ts` failed all three, then was removed. Baseline had no leak — `dist/cli.js` was and remains 58,235 bytes with 0 react/luthor hits.
 
 ---
 
@@ -39,11 +39,11 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
 
 ## Unit 1: Collaboration protocol model
 
-- [ ] 1.1 Add `core/collaboration/document-protocol.ts` (deps: 0.1, est: ~4h)
+- [x] 1.1 Add `core/collaboration/document-protocol.ts` (deps: 0.1, est: ~4h)
   - why: every later layer needs one typed vocabulary for document, node, anchor and GitHub identity. Inventing these per call-site is how the layers drift.
   - acceptance: R-1.1 — new module, separate from `core/editing/comment-doc.ts`; R-1.2 — document carries `documentId`, `documentPath`, `title`, `frontmatter`, `nodes[]` with frontmatter on the envelope not inside `JsonDocument`; R-1.3 — node carries `id`/`type`/`version`/`content`; R-1.4 — anchor carries `nodeId`, `nodeVersion`, `github`; R-1.5 — GitHub binding carries `owner`, `repo`, `branch`, `pullNumber`, `headSha`, `issueCommentId`, `replyToId`, `resolved`; R-1.6 — collaborative target carries `documentId` + `nodeId`.
   - verify: type-level tests; assert `CommentTarget` is byte-identical to today (R-1.7); assert unknown fields survive a read/write round-trip (R-1.8).
-  - landed:
+  - landed: `packages/visual-spec/core/collaboration/document-protocol.ts` + `document-protocol.test.ts` (12 tests). Types only plus `parseCollaborationDocument` / `serializeCollaborationDocument` (R-1.8) and `resolveDocumentTitle`. No runtime imports — `JsonDocument` is a local structural `{ root }` type, so nothing on the CLI path pulls in Luthor or react (R-3.3 / R-12.6). Title precedence decided: `frontmatter.title` wins; the envelope `title` is a derived cache refreshed on write (LLD Open Questions updated).
 
 ## Unit 2: Owned node layer
 

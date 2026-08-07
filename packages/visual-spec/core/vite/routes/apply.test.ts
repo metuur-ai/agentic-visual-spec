@@ -202,7 +202,7 @@ describe('runApply', () => {
 
   it('does not overwrite an existing result when the agent already set one', async () => {
     const withResult: CommentRecord = { ...rec('c-1', 'applied'), result: 'Agent-written result.' };
-    const mem = memoryStore([{ id: 'c-1', ...rec('c-1'), status: 'open' }]);
+    const mem = memoryStore([{ ...rec('c-1'), status: 'open' }]);
     const events: ApplyEvent[] = [];
     await runApply(
       {

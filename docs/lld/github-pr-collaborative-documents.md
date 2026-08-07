@@ -340,7 +340,7 @@ No blocking questions remain. The two that were blocking are now decided: resolu
 
 **Non-blocking.**
 
-- Whether `title` on the collaboration document or `frontmatter.title` wins when both are present.
+- ~~Whether `title` on the collaboration document or `frontmatter.title` wins when both are present.~~ **Decided (task 1.1):** `frontmatter.title` wins when present. The envelope `title` is a derived cache, refreshed on write from `frontmatter.title` when that exists. Frontmatter is authored content that gets published into the Markdown artifact, so letting the envelope override it would let the UI disagree with the published document. Encoded as `resolveDocumentTitle()` in `core/collaboration/document-protocol.ts`; `serializeCollaborationDocument()` refreshes the cache.
 - Whether publish should be allowed to proceed when the client's `markdownSha` disagrees with a server-side recomputation, in the event an in-repo emitter is ever added.
 - Whether `bridgeFlavor` should be `"github"` for PR artifacts and `"luthor"` for the in-app render, or one flavor everywhere to keep the round-trip byte-stable.
 - Whether `gh` is a hard prerequisite or GitHub MCP is the required path, given the standalone CLI cannot assume a configured `gh`.
