@@ -493,6 +493,135 @@ describe('R-7.1 / R-7.5 — comment routes', () => {
   });
 });
 
+/* ================================================================== *
+ * R-7.3 / R-7.4 / R-5.7 / R-6.5 — the two read routes the UI mounts on
+ * ================================================================== */
+describe('GET /:id/document — the whole CollaborationDocument (R-7.3 / R-7.4)', () => {
+  it('serves the full document, not the `GET /:id` summary', async () => {
+    const node = { id: 'n-1', type: 'paragraph', version: 3, content: 'a claim' };
+    const doc = document({ frontmatter: { status: 'draft' }, nodes: [node] });
+    const r = router({ documents: () => memoryDocuments([doc]) });
+    const res = await call(r, 'GET', '/doc-1/document');
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual(doc);
+    // The four fields `GET /:id` projects are not the whole story — these are the ones
+    // it drops, and the reason this route exists.
+    const body = res.json as CollaborationDocument;
+    expect(body.doc).toEqual({ root: {} });
+    expect(body.nodes).toEqual([node]);
+    expect(body.frontmatter).toEqual({ status: 'draft' });
+  });
+
+  it('leaves `GET /:id` a summary — the SSE `sync` frame body must not grow', async () => {
+    const res = await call(router(), 'GET', '/doc-1');
+    expect(Object.keys((res.json as { document: object }).document).sort()).toEqual([
+      'documentId',
+      'documentPath',
+      'github',
+      'title',
+    ]);
+  });
+
+  it('404s an unknown document, like its siblings', async () => {
+    expect((await call(router(), 'GET', '/doc-nope/document')).status).toBe(404);
+  });
+
+  it('503s with the availability snapshot when collaboration is off (R-7.8)', async () => {
+    const res = await call(router({ config: () => DISABLED }), 'GET', '/doc-1/document');
+    expect(res.status).toBe(503);
+    expect(res.json).toMatchObject({ available: false, reason: 'not-configured' });
+  });
+
+  it('is gated on `read` and answers the authorizer’s own verdict (R-9.8)', async () => {
+    const seen: string[] = [];
+    const deny: CollabAuthorizer = (op) => {
+      seen.push(op);
+      return { ok: false, status: 403, error: 'nope' };
+    };
+    const res = await call(router({ authorize: deny }), 'GET', '/doc-1/document');
+    expect(seen).toEqual(['read']);
+    expect(res).toEqual({ status: 403, json: { error: 'nope' } });
+  });
+});
+
+describe('GET /:id/comments — the conversation (R-5.7 / R-6.5)', () => {
+  const withComments = (seed: CommentRecord[] = []) => {
+    const mem = memoryComments(seed);
+    return { mem, r: router({ commentStore: () => mem.store }) };
+  };
+
+  it('round-trips what POST wrote: the records come back whole, in order', async () => {
+    const { r } = withComments();
+    await call(r, 'POST', '/doc-1/comments', { comment: 'tighten this', nodeId: 'n-7' });
+    await call(r, 'POST', '/doc-1/comments', { comment: 'overall: good' });
+    await call(r, 'POST', '/doc-1/comments/c-00000001/reply', { comment: 'done' });
+
+    const res = await call(r, 'GET', '/doc-1/comments');
+    expect(res.status).toBe(200);
+    const listed = res.json as (CommentRecord & { collab?: Record<string, string> })[];
+    expect(listed.map((c) => c.id)).toEqual(['c-00000001', 'c-00000002', 'c-00000003']);
+    expect(listed.map((c) => c.comment)).toEqual(['tighten this', 'overall: good', 'done']);
+    // R-7.5 — the anchor survives the read, which is the whole point for the panel.
+    expect(listed[0]!.collab).toEqual({ nodeId: 'n-7' });
+    // R-5.7 — the node-less comment is present, not discarded.
+    expect(listed[1]!.collab).toBeUndefined();
+    expect(listed[2]!.collab).toEqual({ replyTo: 'c-00000001', nodeId: 'n-7' });
+    expect(listed[0]!.target).toEqual({ path: 'docs/spec.md', kind: 'file' });
+  });
+
+  it('reflects a PATCH, so the panel and the store never disagree', async () => {
+    const { r } = withComments();
+    await call(r, 'POST', '/doc-1/comments', { comment: 'tighten this' });
+    await call(r, 'PATCH', '/doc-1/comments/c-00000001', { status: 'applied', result: 'fixed' });
+    const listed = (await call(r, 'GET', '/doc-1/comments')).json as CommentRecord[];
+    expect(listed).toHaveLength(1);
+    expect(listed[0]!.status).toBe('applied');
+  });
+
+  it('answers an empty list, not a 404, when nothing has been said yet', async () => {
+    const { r } = withComments();
+    const res = await call(r, 'GET', '/doc-1/comments');
+    expect(res).toEqual({ status: 200, json: [] });
+  });
+
+  it('404s an unknown document', async () => {
+    const { r } = withComments();
+    expect((await call(r, 'GET', '/doc-nope/comments')).status).toBe(404);
+  });
+
+  it('409s when the document has no pull request yet, like the POST route', async () => {
+    const r = router({ documents: () => memoryDocuments([document({ github: undefined })]) });
+    expect((await call(r, 'GET', '/doc-1/comments')).status).toBe(409);
+  });
+
+  it('503s when collaboration is off (R-7.8)', async () => {
+    const res = await call(router({ config: () => DISABLED }), 'GET', '/doc-1/comments');
+    expect(res.status).toBe(503);
+    expect(res.json).toMatchObject({ available: false });
+  });
+
+  it('is gated on `read` and answers the authorizer’s own verdict (R-9.8)', async () => {
+    const seen: string[] = [];
+    const deny: CollabAuthorizer = (op) => {
+      seen.push(op);
+      return { ok: false, status: 401, error: 'who are you' };
+    };
+    const { mem } = withComments();
+    const r = router({ commentStore: () => mem.store, authorize: deny });
+    const res = await call(r, 'GET', '/doc-1/comments');
+    expect(seen).toEqual(['read']);
+    expect(res).toEqual({ status: 401, json: { error: 'who are you' } });
+  });
+
+  it('gates before it reads — a denied request never touches the store', async () => {
+    const mem = memoryComments();
+    const commentStore = vi.fn(async () => mem.store);
+    const r = router({ commentStore, authorize: () => ({ ok: false, status: 403, error: 'nope' }) });
+    await call(r, 'GET', '/doc-1/comments');
+    expect(commentStore).not.toHaveBeenCalled();
+  });
+});
+
 describe('unmatched routes', () => {
   it('404s an unknown path and an unsupported method', async () => {
     const r = router();

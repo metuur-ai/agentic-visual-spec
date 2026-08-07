@@ -478,6 +478,41 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         };
       }
 
+      /*
+       * GET /__vs/collab/:id/document — R-7.3 / R-7.4. The canonical JSON the document
+       * view stamps `data-vs-node-id` / `data-vs-node-version` from, and the anchor
+       * resolver (R-6.1) looks `nodeId` up in. Deliberately NOT folded into `GET /:id`:
+       * that body is also the SSE `sync` frame (`JobSync = { type:'sync' } & JobSnapshot`,
+       * `collaboration/job-hub.ts`), so widening it would push the whole document down
+       * the stream on every job transition. Served from our own store, so the browser
+       * still issues no GitHub call (R-7.7).
+       */
+      if (method === 'GET' && tail === '/document') {
+        const gated = await gate('read', documentId);
+        if (!gated.ok) return gated.result;
+        const loaded = await load(documentId);
+        if (!loaded.ok) return loaded.result;
+        return { status: 200, json: loaded.document };
+      }
+
+      /*
+       * GET /__vs/collab/:id/comments — R-5.7 / R-6.5, the conversation the
+       * document-level discussion view presents (orphaned and node-less comments
+       * included; this route filters nothing). Read through the same `commentsFor`
+       * store the POST/PATCH routes write through, so GitHub stays the system of record
+       * (R-5.2) and the read stays server-side (R-7.7). Gated and authorized exactly as
+       * its siblings are — `read` is `any-role` (R-9.8), so a reviewer may list.
+       */
+      if (method === 'GET' && tail === '/comments') {
+        const gated = await gate('read', documentId);
+        if (!gated.ok) return gated.result;
+        const loaded = await load(documentId);
+        if (!loaded.ok) return loaded.result;
+        const store = await commentsFor(documentId, loaded.document, gated.repo);
+        if (!store.ok) return store.result;
+        return { status: 200, json: (await store.store.read()).comments };
+      }
+
       /* GET /__vs/collab/:id/events — R-8.2 SSE. `subscribe` writes the head itself. */
       if (method === 'GET' && tail === '/events') {
         if (!req.sse) return bad('events requires a streaming response');
