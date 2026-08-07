@@ -350,6 +350,7 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
           document: state.fullDocument,
           comments: state.comments,
           add: state.addComment,
+          reply: state.replyToComment,
           remove: state.removeComment,
         };
       }

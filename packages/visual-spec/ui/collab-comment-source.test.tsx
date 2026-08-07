@@ -136,7 +136,7 @@ describe('R-6.2 … R-6.5 — indicators are placed by resolveCollabAnchor', () 
     const comments = [comment('c-orphan', { nodeId: 'n-gone', text: 'A paragraph that was deleted.' }, 'still relevant')];
     render(
       <InspectorProvider surfaceId="docs/spec.md" pageIndex={0}>
-        <CommentPanel width={320} source={collabCommentPanelSource({ document: doc, comments, add: async () => {}, remove: async () => {} })} />
+        <CommentPanel width={320} source={collabCommentPanelSource({ document: doc, comments, add: async () => {}, reply: async () => {}, remove: async () => {} })} />
       </InspectorProvider>,
     );
     const card = document.querySelector('[data-vs-orphan="c-orphan"]')!;
@@ -210,7 +210,7 @@ function SelectBlock({ selector }: { selector: string }) {
 }
 
 function mountPanel(doc: CollaborationDocument, selector: string, add = vi.fn(async () => {})) {
-  const source = collabCommentPanelSource({ document: doc, comments: [], add, remove: async () => {} });
+  const source = collabCommentPanelSource({ document: doc, comments: [], add, reply: async () => {}, remove: async () => {} });
   render(
     <InspectorProvider surfaceId="docs/spec.md" pageIndex={0}>
       <CollabDocumentView document={doc} />
@@ -243,7 +243,7 @@ describe('R-7.3/R-7.5 — a block with no durable identity offers no comment aff
     const doc = fixture();
     const { source } = mountPanel(doc, '[data-vs-uncommentable]');
     const add = vi.fn(async () => {});
-    const guarded = collabCommentPanelSource({ document: doc, comments: [], add, remove: async () => {} });
+    const guarded = collabCommentPanelSource({ document: doc, comments: [], add, reply: async () => {}, remove: async () => {} });
     const el = document.querySelector('[data-vs-uncommentable]') as HTMLElement;
     await guarded.create([{ line: 1, column: 0, anchor: el }], 'hello', 'visual-spec');
     expect(add).not.toHaveBeenCalled();
@@ -253,7 +253,7 @@ describe('R-7.3/R-7.5 — a block with no durable identity offers no comment aff
   it('R-7.5 — creating on an identified block persists against its nodeId', async () => {
     const doc = fixture();
     const add = vi.fn(async () => {});
-    const source = collabCommentPanelSource({ document: doc, comments: [], add, remove: async () => {} });
+    const source = collabCommentPanelSource({ document: doc, comments: [], add, reply: async () => {}, remove: async () => {} });
     render(<CollabDocumentView document={doc} />);
     const el = document.querySelector('[data-vs-node-id="n-2"]') as HTMLElement;
     await source.create([{ line: 1, column: 0, anchor: el }], 'hello', 'visual-spec');

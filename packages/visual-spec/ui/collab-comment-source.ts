@@ -149,6 +149,15 @@ export type CollabCommentSourceDeps = {
   comments: CommentRecord[];
   /** R-7.5 — persist against `nodeId`. Goes to `POST /__vs/collab/:id/comments`. */
   add: (input: { nodeId: string; comment: string; workflow: string }) => Promise<void>;
+  /**
+   * R-9.8 — post a threaded reply. Goes to `POST /__vs/collab/:id/comments/:cid/reply`.
+   */
+  reply: (id: string, text: string) => Promise<void>;
+  /**
+   * Marks the comment applied. Named `remove` because that is the `CommentPanelSource`
+   * seam it fills — it takes the comment off the open list — but nothing is deleted:
+   * GitHub keeps the thread (R-5.2), so the panel is told to say "Resolve".
+   */
   remove: (id: string) => Promise<void>;
   /** Where the document is rendered. Defaults to the whole document. */
   root?: ParentNode | null;
@@ -163,11 +172,16 @@ export function collabCommentPanelSource(deps: CollabCommentSourceDeps): Comment
     const flag = group.resolution.state === 'outdated' ? ' · outdated' : '';
     for (const c of group.comments) labels.set(c.id, `${text || group.nodeId}${flag}`);
   }
+  const orphans = collabOrphans(doc, deps.comments);
+  const orphaned = new Set(orphans.map((o) => o.comment.id));
   return {
     path: doc.documentPath,
-    comments: deps.comments,
+    // Orphans have their own section (R-5.6); listing them twice would double-render them.
+    comments: deps.comments.filter((c) => !orphaned.has(c.id)),
     remove: deps.remove,
-    orphans: collabOrphans(doc, deps.comments),
+    reply: deps.reply,
+    removeVerb: { action: 'Resolve', confirm: 'Resolve?' },
+    orphans,
     supportsSections: false,
     label: (c) => labels.get(c.id) ?? '(document)',
     locate: (c) => {

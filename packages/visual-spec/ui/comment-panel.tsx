@@ -64,6 +64,20 @@ export type CommentPanelSource = {
   orphans: { comment: CommentRecord; targetText: string }[];
   /** Whether "select everything under this heading" applies (local markdown only). */
   supportsSections?: boolean;
+  /**
+   * R-9.8 — post a threaded reply. Collaboration only: a GitHub issue comment can
+   * carry replies, a local sidecar comment cannot, so local mode leaves this unset
+   * and the row renders no reply affordance.
+   */
+  reply?: (id: string, text: string) => Promise<void>;
+  /**
+   * What `remove` actually does, for the row's label and confirm copy. Local mode
+   * deletes the sidecar record, so the default reads "Delete". Collaboration has no
+   * delete route — GitHub is the system of record (R-5.2) and `remove` marks the
+   * comment applied — so calling that button "Delete" would name an act the system
+   * never performs.
+   */
+  removeVerb?: { action: string; confirm: string };
 };
 
 export function CommentPanel({ file, width, source }: { file?: string; width: number; source?: CommentPanelSource }) {
@@ -293,6 +307,10 @@ function CommentList({ source }: { source: CommentPanelSource }) {
   // Only open comments: once the apply-comments skill marks one "applied", it drops off the list.
   const mine = source.comments.filter((c) => c.status === 'open');
   const [confirmId, setConfirmId] = useState<string | null>(null);
+  const [replyId, setReplyId] = useState<string | null>(null);
+  const [replyText, setReplyText] = useState('');
+  const [replyBusy, setReplyBusy] = useState(false);
+  const verb = source.removeVerb ?? { action: 'Delete', confirm: 'Delete?' };
   const { activeId } = useActiveComment();
   const rows = useRef<Record<string, HTMLLIElement | null>>({});
   // When an inline indicator activates a comment, scroll its row into view (R-2.2).
@@ -322,9 +340,20 @@ function CommentList({ source }: { source: CommentPanelSource }) {
               >
                 <LocateIcon />
               </button>
+              {source.reply && (
+                <button
+                  type="button"
+                  onClick={() => { setReplyId(replyId === c.id ? null : c.id); setReplyText(''); }}
+                  title="Reply to this comment"
+                  aria-label="Reply"
+                  style={locateBtn}
+                >
+                  Reply
+                </button>
+              )}
               {confirmId === c.id ? (
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ fontSize: 12, color: '#475569' }}>Delete?</span>
+                  <span style={{ fontSize: 12, color: '#475569' }}>{verb.confirm}</span>
                   <button
                     type="button"
                     onClick={() => { void source.remove(c.id); setConfirmId(null); }}
@@ -338,14 +367,42 @@ function CommentList({ source }: { source: CommentPanelSource }) {
                 <button
                   type="button"
                   onClick={() => setConfirmId(c.id)}
-                  title="Delete comment"
-                  aria-label="Delete comment"
+                  title={`${verb.action} comment`}
+                  aria-label={`${verb.action} comment`}
                   style={delBtn}
                 >
                   <TrashIcon />
                 </button>
               )}
             </div>
+            {source.reply && replyId === c.id && (
+              <div style={{ display: 'grid', gap: 6, marginTop: 6 }}>
+                <textarea
+                  value={replyText}
+                  onChange={(e) => setReplyText(e.target.value)}
+                  placeholder="Reply…"
+                  rows={2}
+                  style={{ font: 'inherit', padding: 6, border: '1px solid #cbd5e1', borderRadius: 6, resize: 'vertical' }}
+                />
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
+                  <button type="button" onClick={() => setReplyId(null)} style={confirmNo}>Cancel</button>
+                  <button
+                    type="button"
+                    disabled={!replyText.trim() || replyBusy}
+                    onClick={() => {
+                      setReplyBusy(true);
+                      void source
+                        .reply!(c.id, replyText.trim())
+                        .then(() => { setReplyId(null); setReplyText(''); })
+                        .finally(() => setReplyBusy(false));
+                    }}
+                    style={confirmYes}
+                  >
+                    {replyBusy ? 'Posting…' : 'Post reply'}
+                  </button>
+                </div>
+              </div>
+            )}
           </li>
         ))}
       </ul>

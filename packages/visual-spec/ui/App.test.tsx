@@ -123,7 +123,7 @@ describe('the collaboration UI is mounted from App.tsx (task U-1)', () => {
     await screen.findByText(/Signed in as reviewer-rita/);
   });
 
-  it('opens a document from a PR reference and renders it read-only with its existing comments', async () => {
+  it('opens a document from a PR reference and renders it read-only beside the real comment panel', async () => {
     render(<App />);
 
     fireEvent.click(await screen.findByText('Review a pull request…'));
@@ -135,22 +135,25 @@ describe('the collaboration UI is mounted from App.tsx (task U-1)', () => {
     fireEvent.change(screen.getByPlaceholderText('doc-1'), { target: { value: 'doc-1' } });
     fireEvent.click(screen.getByText('Open'));
 
-    // The canonical JSON renders, identity attributes stamped (R-7.3).
-    const paragraph = await screen.findByText('First paragraph.');
-    expect(paragraph.closest('[data-vs-node-id="n-1"]')).toBeTruthy();
-    expect(paragraph.closest('[data-vs-document-id="doc-1"]')).toBeTruthy();
+    // The canonical JSON renders, identity attributes stamped (R-7.3). The text also
+    // appears in the panel as the anchored comment's quoted target, so the document
+    // copy is the one carrying the identity attributes.
+    const rendered = await screen.findAllByText('First paragraph.');
+    const paragraph = rendered.find((el) => el.closest('[data-vs-node-id="n-1"]'));
+    expect(paragraph).toBeTruthy();
+    expect(paragraph!.closest('[data-vs-document-id="doc-1"]')).toBeTruthy();
 
-    // Its existing comments are listed — anchored and orphaned alike — with no
-    // compose form anywhere (comment creation is out of scope for this task).
+    // Its existing comments are listed — anchored and orphaned alike — and the real
+    // panel is mounted, so the reviewer can also write one (U-1 round trip).
     await screen.findByText('needs a citation');
     expect(screen.getByText(/this block used to say something else/)).toBeTruthy();
     expect(screen.getByText(/the paragraph that got deleted/)).toBeTruthy();
-    expect(screen.queryByPlaceholderText(/Your comment/)).toBeNull();
-    expect(screen.queryByText('Add comment')).toBeNull();
+    expect(screen.getAllByLabelText('Reply').length).toBeGreaterThan(0);
+    expect(screen.getAllByLabelText('Resolve comment').length).toBeGreaterThan(0);
 
     // The route swap is reversible.
     fireEvent.click(screen.getByText('← Files'));
     await waitFor(() => expect(screen.getByText(/Select a file or folder/)).toBeTruthy());
-    expect(screen.queryByText('First paragraph.')).toBeNull();
+    expect(screen.queryAllByText('First paragraph.')).toHaveLength(0);
   });
 });
