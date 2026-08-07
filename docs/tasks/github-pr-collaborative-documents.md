@@ -52,10 +52,11 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
 
 ## Unit 2: Owned node layer
 
-- [ ] 2.1 Owned block node classes carrying `nodeId` (deps: 0.1, 1.1, est: ~1w)
-  - why: serialized Lexical nodes have no stable key, and `getJSON()` emits only what the class declares. Node replacement is the only interception point that covers nodes created *inside* the editor — on Enter, on paste, on list toggle.
-  - acceptance: R-2.2 — `nodeId` carried via `{replace, with, withKlass}` registration, not a structural path or sidecar map; R-2.3 — `getType()` returns the **base** type string so `MARKDOWN_SUPPORTED_NODE_TYPES` and the transformers keep matching; R-2.4 — every editor-created node gets a document-unique `nodeId`; R-2.5 — `nodeId` survives `exportJSON()`/`importJSON()`.
-  - verify: extend the 0.1 harness across every block type in `MARKDOWN_SUPPORTED_NODE_TYPES` (R-12.2). Watch for the failure mode where a replacement without `withKlass` throws `Create node Type paragraph … does not match registered node ParagraphNode`.
+- [ ] 2.1 NodeState-based `nodeId` + per-class transforms (deps: 0.1, 1.1, est: ~1w)
+  - **RE-SCOPED after task 0.1.** The original title was "Owned block node classes carrying `nodeId`". Task 0.1 proved node replacement cannot keep the base `getType()` on Lexical 0.40, so R-2.2 now mandates Lexical's NodeState API instead. See the amended R-2.2 note in the EARS spec and the superseded-mechanism note in LLD §2.
+  - why: serialized Lexical nodes have no stable key. A node transform registered per concrete class is the interception point that covers nodes created *inside* the editor — on Enter, on paste, on list toggle — and NodeState is the only carrier that survives serialization without changing the node's `type`.
+  - acceptance: R-2.2 — `nodeId` carried via `createState`/`$setState`/`$getState`, assigned by `registerNodeTransform` per concrete class, not a structural path or sidecar map; R-2.3 — the serialized `type` stays the base string so `MARKDOWN_SUPPORTED_NODE_TYPES` and the transformers keep matching (free under NodeState); R-2.4 — every editor-created node gets a document-unique `nodeId`; R-2.5 — `nodeId` survives `exportJSON()`/`importJSON()`.
+  - verify: extend the 0.1 harness (`ui/node-identity.contract.test.tsx`) across every block type in `MARKDOWN_SUPPORTED_NODE_TYPES` (R-12.2). Note `registerNodeTransform` rejects abstract bases like `ElementNode` — one call per concrete class.
   - landed:
 
 - [ ] 2.2 Version bump + backfill (deps: 2.1, est: ~3h)

@@ -26,13 +26,15 @@
 | ID | EARS statement |
 | --- | --- |
 | R-2.1 | THE SYSTEM SHALL persist the canonical collaboration document as a Luthor `JsonDocument` from `@lyfie/luthor` and SHALL NOT define a bespoke node schema. |
-| R-2.2 | THE SYSTEM SHALL carry `nodeId` on the node itself by registering replacement node classes through Lexical's `{ replace, with, withKlass }` node-replacement mechanism, and SHALL NOT key identity to a structural path or a sidecar map. |
-| R-2.3 | THE replacement node classes SHALL return the same `getType()` string as the base classes they replace, so that Markdown transformers, `MARKDOWN_SUPPORTED_NODE_TYPES`, and toolbar behaviour continue to match. |
+| R-2.2 | THE SYSTEM SHALL carry `nodeId` on the node itself using Lexical's **NodeState** API (`createState` / `$setState` / `$getState`), assigned by a per-class `registerNodeTransform`, and SHALL NOT key identity to a structural path or a sidecar map. *(Amended after task 0.1. The original text mandated node replacement via `{ replace, with, withKlass }`; that is incompatible with R-2.3 on Lexical 0.40 — see the note below.)* |
+| R-2.3 | THE serialized node type SHALL remain the base type string (`'paragraph'`, `'heading'`, …), so that Markdown transformers, `MARKDOWN_SUPPORTED_NODE_TYPES`, and toolbar behaviour continue to match. |
+
+> **Why R-2.2 changed.** Task 0.1 mounted the real `ExtensiveEditor` preset and proved the original mechanism cannot satisfy R-2.3. `LexicalNode`'s constructor calls `errorOnTypeKlassMismatch` and the node registry is keyed by type string, so a replacement subclass whose `getType()` returns `'paragraph'` resolves to the registered `ParagraphNode` and every construction throws. The registration itself was verified correct at runtime, so this is not the missing-`withKlass` failure the LLD predicted. `exportNodeToJSON` independently rejects any node whose `exportJSON().type` differs from its `getType()`, so the subclass cannot serialize under the base type either. Node replacement can carry identity only by owning a distinct type such as `'vs-paragraph'`, which forfeits R-2.3. NodeState carries `nodeId` with no subclass, keeps `type: 'paragraph'`, serializes under the `$` key, and is restored by `importJSON` for every node class with no extra code.
 | R-2.4 | WHEN a node is created by the editor, THE SYSTEM SHALL assign it a `nodeId` that is unique within the document. |
 | R-2.5 | WHEN a node is serialized and deserialized through `exportJSON()` / `importJSON()`, THE SYSTEM SHALL preserve its `nodeId` unchanged. |
 | R-2.6 | WHEN a node's content changes, THE SYSTEM SHALL increment that node's `version` and SHALL NOT change its `nodeId`. |
 | R-2.7 | WHEN a node's content is unchanged, THE SYSTEM SHALL NOT increment its `version`. |
-| R-2.8 | WHEN loading a document authored before node ownership existed, THE SYSTEM SHALL backfill missing `nodeId` values on first write and SHALL record that the document was backfilled. |
+| R-2.8 | WHEN loading a document, THE SYSTEM SHALL backfill any missing `nodeId` values and SHALL record that the document was backfilled. *(Amended after task 0.1: `injectJSON()` swaps the node map wholesale and does not run node transforms, so backfill runs on **every** load, not only for documents authored before node ownership existed.)* |
 | R-2.9 | WHEN the client generates Markdown for publication, THE SYSTEM SHALL use `headless.jsonToMarkdown(doc, { metadataMode: 'none' })`, so the published artifact carries no metadata envelopes. |
 | R-2.10 | THE SYSTEM SHALL treat generated Markdown as write-only and SHALL NOT parse it back to reconstruct a collaboration document. |
 | R-2.11 | THE structured editor SHALL be driven through `ExtensiveEditorRef.getJSON()` / `injectJSON()` rather than through a Markdown string buffer. |
@@ -211,7 +213,7 @@
 | ID | EARS statement |
 | --- | --- |
 | R-12.1 | THE SYSTEM SHALL include an automated test asserting that a node created by a live editor mount retains its `nodeId` through `getJSON()` and `injectJSON()`. |
-| R-12.2 | THE SYSTEM SHALL include an automated test asserting that every type in `MARKDOWN_SUPPORTED_NODE_TYPES` is matched by the replacement node classes. |
+| R-12.2 | THE SYSTEM SHALL include an automated test asserting that every block type in `MARKDOWN_SUPPORTED_NODE_TYPES` is covered by a `nodeId`-assigning node transform. *(Amended after task 0.1, following R-2.2.)* |
 | R-12.3 | THE GitHub execution layer SHALL accept an injectable process-spawn or request executor, mirroring the injectable `spawnClaude` seam in the apply flow, so that its behaviour can be tested against recorded responses. |
 | R-12.4 | THE SYSTEM SHALL include a test asserting that publishing a document with no unsupported nodes produces Markdown identical to the previously published output for the same input. |
 | R-12.5 | THE SYSTEM SHALL include a regression suite asserting that local-mode comment resolution behaviour is unchanged by the collaboration feature. |

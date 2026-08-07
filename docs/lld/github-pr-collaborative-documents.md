@@ -78,7 +78,43 @@ The canonical form is the Luthor `JsonDocument` (`{ root }`) from `@lyfie/luthor
 
 **Markdown is derived, not canonical.** Because the JSON on the branch is the artifact of record, nothing ever needs to reconstruct a document from Markdown. This removes the entire round-trip class of failures — and it also removes the need for metadata envelopes, which existed only to make the return trip lossless. Envelopes are keyed by structural `path: number[]`, so they cannot survive an insertion above the node they describe; they were never a viable identity mechanism.
 
-#### `nodeId` lives on the node, via owned node classes
+#### `nodeId` lives on the node, via Lexical NodeState
+
+> **Superseded by task 0.1.** The subsection below was written before anyone mounted the real preset. Task 0.1 did, and disproved it: **node replacement and a preserved base `getType()` are mutually exclusive on Lexical 0.40** (shipped by Luthor 2.9). `LexicalNode`'s constructor calls `errorOnTypeKlassMismatch` (`lexical/Lexical.dev.mjs:3388`) against a registry keyed by type string, so a subclass registered under `'paragraph'` resolves to `ParagraphNode` and every construction throws. The registration was verified correct at runtime (`klass=ParagraphNode`, `replaceWithKlass=IdParagraphNode`), so the "missing `withKlass`" diagnosis below is **wrong**. `exportNodeToJSON` (`:9806`) separately rejects a node whose `exportJSON().type` differs from its `getType()`.
+>
+> **The mechanism is Lexical's NodeState API.** It carries `nodeId` with no subclass at all, keeps `type: 'paragraph'`, serializes under the `$` key, and is restored by `importJSON` for every node class automatically:
+>
+> ```ts
+> const nodeIdState = createState('nodeId', {
+>   parse: (v: unknown) => (typeof v === 'string' ? v : ''),
+> });
+>
+> headless.createExtension({
+>   name: 'vs-node-id',
+>   initialize: (editor: LexicalEditor) => {
+>     const assign = (node: ElementNode) => {
+>       if (!$getState(node, nodeIdState)) $setState(node, nodeIdState, nextNodeId());
+>     };
+>     const off = [
+>       editor.registerNodeTransform(ParagraphNode, assign),
+>       editor.registerNodeTransform(HeadingNode, assign),
+>       editor.registerNodeTransform(QuoteNode, assign),
+>     ];
+>     return () => off.forEach((fn) => fn());
+>   },
+> });
+> ```
+>
+> `registerNodeTransform` rejects abstract bases like `ElementNode`, so it needs one call per concrete class.
+>
+> Two further facts task 0.1 established, both load-bearing elsewhere:
+>
+> - **`markdownSourceOfTruth` makes `getJSON()` lossy.** Luthor implements it as `markdownToJSON(getMarkdown())`, so the returned JSON is re-parsed from Markdown and every `nodeId` is gone. `ui/wysiwyg-editor.tsx:402` sets this flag today; the collaboration mount must not (Unit 7.4).
+> - **`injectJSON()` does not run node transforms** — `setEditorState` swaps the node map wholesale — so backfill is mandatory on every load, not just for legacy documents (R-2.8). It is also deferred behind a 100 ms `setTimeout`, and `onReady`, not the `ref`, is the real hand-off point.
+>
+> The original text follows for the record.
+
+#### `nodeId` lives on the node, via owned node classes (superseded)
 
 Serialized Lexical nodes carry `type`, `version`, `format`, and children but **no stable key or id**, and `getJSON()` emits only what the node class declares. An extra property cannot simply be written onto a serialized `paragraph`: `injectJSON()` dispatches on the registered class for that type and will reject or discard an unknown field.
 
