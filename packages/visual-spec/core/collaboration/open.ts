@@ -76,6 +76,8 @@ export type OpenFailureReason =
   | 'no_credential'
   /** `gh` could not be executed at all (R-4.10). */
   | 'executor_unavailable'
+  /** GitHub throttled this credential (403/429 rate limit) — transient, retry later. */
+  | 'rate_limited'
   /** The PR body carries no visual-spec trailer — it is somebody else's pull request. */
   | 'not_collaboration_document'
   /** The PR is a collaboration document, but not the one that was asked for. */
@@ -113,6 +115,19 @@ export type PullRequestDocumentReference = {
 const slug = (repo: RepoRef, pullNumber: number): string => `${repo.owner}/${repo.repo}#${pullNumber}`;
 
 /**
+ * A throttled request and a forbidden one both arrive as 403, and the executor is
+ * buffered and header-blind — `Retry-After` and `X-RateLimit-Remaining` never reach us.
+ * GitHub's body message is therefore the only signal, and it is stable across the three
+ * shapes it uses: primary limit, secondary limit, and the older abuse-detection wording.
+ * 429 is included because GitHub has started returning it for the secondary limit.
+ */
+function isRateLimit(err: GitHubError): boolean {
+  if (err.status === 429) return true;
+  if (err.status !== 403) return false;
+  return /\brate limit\b|\babuse detection\b/i.test(err.message);
+}
+
+/**
  * Map an adapter failure onto the taxonomy above. The status is the only thing worth
  * branching on: `gh` has already normalized everything else into `GitHubError`. `where` is
  * the human-readable location to name in the message — callers build it (`slug()` for the
@@ -133,6 +148,13 @@ function classifyOpenFailure(err: unknown, repo: RepoRef, where: string): OpenDo
     return new OpenDocumentError(
       'no_credential',
       `cannot open ${where}: GitHub rejected the credential (HTTP 401) — run \`gh auth login\` (read access is enough).`,
+      err,
+    );
+  }
+  if (isRateLimit(err)) {
+    return new OpenDocumentError(
+      'rate_limited',
+      `cannot open ${where}: GitHub is throttling this credential — wait and try again (the access itself is fine).`,
       err,
     );
   }

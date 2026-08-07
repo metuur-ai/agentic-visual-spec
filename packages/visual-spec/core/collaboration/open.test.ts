@@ -362,6 +362,26 @@ describe('R-11.4 — specific causes, never a generic failure', () => {
     );
   });
 
+  it('separates a throttled 403 from a forbidden one — the permanent verdict is not reported for a transient limit', async () => {
+    const r = await run([ghFailure(403, 'API rate limit exceeded for user ID 1234.')]);
+    expect(reasonOf(r.err)).toBe('rate_limited');
+    expect((r.err as Error).message).toBe(
+      'cannot open acme/docs#42: GitHub is throttling this credential — wait and try again (the access itself is fine).',
+    );
+  });
+
+  it('reads the secondary limit and the abuse-detection wording as the same throttle', async () => {
+    const secondary = await run([ghFailure(403, 'You have exceeded a secondary rate limit. Please wait a few minutes.')]);
+    expect(reasonOf(secondary.err)).toBe('rate_limited');
+    const abuse = await run([ghFailure(403, 'You have triggered an abuse detection mechanism.')]);
+    expect(reasonOf(abuse.err)).toBe('rate_limited');
+  });
+
+  it('reads a 429 as a throttle whatever the message says', async () => {
+    const r = await run([ghFailure(429, 'Too Many Requests')]);
+    expect(reasonOf(r.err)).toBe('rate_limited');
+  });
+
   it('reports a rejected credential as no_credential, not as missing access', async () => {
     const r = await run([ghFailure(401, 'Bad credentials')]);
     expect(reasonOf(r.err)).toBe('no_credential');
