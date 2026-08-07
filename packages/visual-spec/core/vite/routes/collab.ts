@@ -31,7 +31,7 @@
  */
 import type { ResolvedCollaborationConfig, ResolvedVisualSpecConfig } from '../../config';
 import { COLLAB_TARGET_TEXT_KEY, captureTargetText, collabNodeVersion } from '../../collaboration/anchor-resolution';
-import { type CollaborationPreflight, preflightCollaboration } from '../../collaboration/credentials';
+import { type CollaborationPreflight, credentialFingerprint, preflightCollaboration } from '../../collaboration/credentials';
 import { githubCommentStore } from '../../collaboration/comment-projection';
 import { createGitHubAdapter } from '../../collaboration/github-adapter';
 import type { GitHubBinding } from '../../collaboration/document-protocol';
@@ -211,6 +211,11 @@ export type CollabDeps = {
   preflightTtlMs?: number;
   /** Injectable numeric clock for the preflight TTL. `now` is a string clock, not usable here. */
   clock?: () => number;
+  /**
+   * Env the credential fingerprint is derived from; defaults to `process.env`. Injectable
+   * so a test can simulate a token swap without mutating the real environment.
+   */
+  env?: Record<string, string | undefined>;
   /** Task 9.2. Required: there is no permissive default, so a host cannot omit gating. */
   authorize: CollabAuthorizer;
   now?: () => string;
@@ -302,10 +307,12 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   const preflightTtl = deps.preflightTtlMs ?? DEFAULT_PREFLIGHT_TTL_MS;
   const clock = deps.clock ?? (() => Date.now());
 
-  // Memoized per repo identity: the preflight shells out to `gh`, and every mutating
-  // route consults it. Keyed by owner/repo/base, so a *repo* change re-probes — a
-  // credential change (token swap, `gh auth switch`) does not, because no credential is
-  // in scope here; that staleness is still open.
+  // Memoized per repo *and* credential identity: the preflight shells out to `gh`, and
+  // every mutating route consults it. Keyed by owner/repo/base plus
+  // `credentialFingerprint`, so both a repo change and an env token swap re-probe.
+  // A `gh auth switch` still does not — it rewrites `gh`'s config, not the environment,
+  // so it fingerprints identically and stays invisible until the entry expires. The TTL
+  // is the bound for that case; see the note on `credentialFingerprint`.
   //
   // Only successes are cached, and only until `expiresAt`, matching the invariant
   // `collaboration/authorization.ts` already states: failures are never cached, in
@@ -319,7 +326,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   async function availability(): Promise<CollabAvailability> {
     const repo = deps.config().collaboration;
     if (!repo) return NOT_CONFIGURED;
-    const key = `${repo.owner}/${repo.repo}#${repo.baseBranch}`;
+    const key = `${repo.owner}/${repo.repo}#${repo.baseBranch}@${credentialFingerprint(deps.env)}`;
     const cached = cache.get(key);
     if (cached && cached.expiresAt > clock()) return cached.snapshot;
     const result = await runPreflight(repo);

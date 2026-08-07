@@ -235,6 +235,27 @@ describe('R-7.8 — collaboration availability', () => {
     await call(r, 'GET', '');
     expect(preflight).toHaveBeenCalledTimes(2);
   });
+
+  it('re-probes immediately when the env credential changes, without waiting for the TTL', async () => {
+    // U-6: keyed on owner/repo#base alone, a token swap kept resolving the *previous*
+    // login out of the cache for the life of the entry. The clock never moves here.
+    const preflight = vi.fn(async () => OK_PREFLIGHT);
+    const env: Record<string, string | undefined> = { GH_TOKEN: 'token-one' };
+    const r = router({ preflight, preflightTtlMs: 60_000, clock: () => 1_000, env });
+
+    await call(r, 'GET', '');
+    await call(r, 'GET', '');
+    expect(preflight).toHaveBeenCalledTimes(1);
+
+    env.GH_TOKEN = 'token-two';
+    await call(r, 'GET', '');
+    expect(preflight).toHaveBeenCalledTimes(2);
+
+    // And the first credential's entry is still keyed separately, not clobbered.
+    env.GH_TOKEN = 'token-one';
+    await call(r, 'GET', '');
+    expect(preflight).toHaveBeenCalledTimes(2);
+  });
 });
 
 /* ================================================================== *

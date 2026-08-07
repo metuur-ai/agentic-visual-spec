@@ -2,10 +2,14 @@
  * credentials.ts — the collaboration preflight (R-9.1 / R-9.2 / R-9.3 / R-9.4 /
  * R-9.12 / R-9.19 / R-4.10).
  *
- * THIS MODULE NEVER READS A TOKEN VALUE. `GH_TOKEN` / `GITHUB_TOKEN` are probed
- * for *presence* only, so the secret is never loaded into a variable, never
- * returned to a caller, and therefore cannot be serialized into a response body,
- * an SSE frame or the client bundle (R-9.2). On a dev machine the real credential
+ * NO TOKEN VALUE LEAVES THIS MODULE, AND ONLY ONE FUNCTION READS ONE.
+ * `GH_TOKEN` / `GITHUB_TOKEN` are probed for *presence* only everywhere except
+ * `credentialFingerprint`, which reads the value, hashes it immediately, and
+ * returns only the digest. The plaintext is never stored in module state, never
+ * returned to a caller, and never logged, so it still cannot be serialized into
+ * a response body, an SSE frame or the client bundle (R-9.2). The digest is
+ * truncated SHA-256 and is safe to hold: it is used solely as a cache key, and
+ * is not a credential — it cannot authenticate anything. On a dev machine the real credential
  * is usually a keyring OAuth token that has no env var at all — that case is
  * handled identically, because the credential is only ever exercised by `gh`
  * itself through the `GhExecutor` seam (`defaultExecGh` passes `process.env`
@@ -23,6 +27,8 @@
  * `core/` is Node-reachable from the CLI, so this module imports only node
  * builtins and sibling core modules — no Luthor, no react.
  */
+import { createHash } from 'node:crypto';
+
 import type { ResolvedCollaborationConfig } from '../config';
 import { type GhExecutor, defaultExecGh, scrubCredentials } from './github-executor';
 
@@ -72,12 +78,36 @@ export type PreflightOptions = {
   requiredScopes?: readonly string[];
   /** R-4.8 / R-12.3 — injectable; tests replay recorded `gh` output. */
   exec?: GhExecutor;
-  /** Probed for key *presence* only; values are never read. */
+  /** Probed for key *presence* only by the preflight itself; values are never read here. */
   env?: Record<string, string | undefined>;
 };
 
 /** Env vars `gh` honours as an explicit credential override. */
 const TOKEN_ENV_KEYS = ['GH_TOKEN', 'GITHUB_TOKEN'] as const;
+
+/**
+ * A non-reversible identity for whichever credential `gh` will use, for cache keying
+ * only (task 9.x / U-6). Callers memoize preflight results; without this, a key built
+ * from `owner/repo#base` alone lets a credential swap keep resolving the *previous*
+ * login out of the cache for the life of the entry.
+ *
+ * THIS IS THE ONLY PLACE A TOKEN VALUE IS READ. It is hashed on the spot and the
+ * plaintext is never bound beyond this function's scope. Callers receive a digest.
+ *
+ * KNOWN GAP: this closes the *environment* half only. `gh auth switch` rewrites `gh`'s
+ * own config file and touches no env var, so it produces an identical fingerprint and
+ * a swap is still invisible until the entry expires. Observing that reliably means
+ * shelling out to `gh` — which is the preflight itself, so caching it would be
+ * self-defeating. The TTL is the bound for that case, deliberately.
+ */
+export function credentialFingerprint(env: Record<string, string | undefined> = process.env): string {
+  for (const key of TOKEN_ENV_KEYS) {
+    const value = env[key];
+    if (value) return `${key}:${createHash('sha256').update(value).digest('hex').slice(0, 16)}`;
+  }
+  // No env override: `gh`'s own auth state governs, and it is opaque from here.
+  return 'gh-auth-state';
+}
 
 /** The default role scope: pushing a branch and reading the PR both need `repo`. */
 const DEFAULT_REQUIRED_SCOPES = ['repo'] as const;

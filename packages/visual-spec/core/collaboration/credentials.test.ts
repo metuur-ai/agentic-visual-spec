@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { resolveConfig } from '../config';
-import { preflightCollaboration } from './credentials';
+import { credentialFingerprint, preflightCollaboration } from './credentials';
 import type { GhExecutor, GhResult } from './github-executor';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -230,5 +230,38 @@ describe('preflightCollaboration — no credential disables collaboration (R-9.1
 
     // Local mode's own config resolution is untouched by collaboration being off.
     expect(resolveConfig({ surfacesDir: 'surfaces' })).toEqual({ surfacesDir: 'surfaces', collaboration: null });
+  });
+});
+
+/* ================================================================== *
+ * U-6 — credential fingerprint (cache keying only)
+ * ================================================================== */
+describe('U-6 — credentialFingerprint', () => {
+  const SECRET = 'ghp_averyrealsecrettokenvalue0000000000';
+
+  it('never returns the plaintext, in whole or in part', () => {
+    const fp = credentialFingerprint({ GH_TOKEN: SECRET });
+    // The whole point of the invariant carve-out: the digest must not be a leak.
+    expect(fp).not.toContain(SECRET);
+    expect(fp).not.toContain(SECRET.slice(4));
+    expect(fp).not.toContain('ghp_');
+    expect(fp).toMatch(/^GH_TOKEN:[0-9a-f]{16}$/);
+  });
+
+  it('is stable for one credential and different for another', () => {
+    expect(credentialFingerprint({ GH_TOKEN: SECRET })).toBe(credentialFingerprint({ GH_TOKEN: SECRET }));
+    expect(credentialFingerprint({ GH_TOKEN: SECRET })).not.toBe(credentialFingerprint({ GH_TOKEN: `${SECRET}x` }));
+  });
+
+  it('distinguishes which env var supplied the credential, and falls back to gh auth state', () => {
+    // Same value under a different key is still a different `gh` resolution order.
+    expect(credentialFingerprint({ GH_TOKEN: SECRET })).not.toBe(credentialFingerprint({ GITHUB_TOKEN: SECRET }));
+    expect(credentialFingerprint({ GH_TOKEN: SECRET, GITHUB_TOKEN: 'other' })).toBe(credentialFingerprint({ GH_TOKEN: SECRET }));
+    expect(credentialFingerprint({})).toBe('gh-auth-state');
+  });
+
+  it('KNOWN GAP — a gh auth switch is invisible, because it touches no env var', () => {
+    // Documented, not a bug to fix here: the TTL is the only bound for this case.
+    expect(credentialFingerprint({})).toBe(credentialFingerprint({}));
   });
 });
