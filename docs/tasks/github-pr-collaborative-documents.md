@@ -77,11 +77,11 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
 
 ## Unit 3: Document store — Lane C
 
-- [ ] 3.1 `DocumentStore` interface + local implementation (deps: 1.1, est: ~3d)
+- [x] 3.1 `DocumentStore` interface + local implementation (deps: 1.1, est: ~3d)
   - why: structured JSON does not fit `SurfaceStore`, whose read/write/list contract assumes text. Keeping Markdown *out* of this interface is deliberate — generation happens in the browser, so the server never needs a serializer.
   - acceptance: R-2.1 — canonical document persisted as a Luthor `JsonDocument`, no bespoke node schema; R-3.1 — read/write/list; R-3.2 — **does not** render or generate Markdown; R-3.4 — resolve `nodeId` → JSON location; R-3.5 — local file-backed impl at `documents/<documentId>.json`; R-3.7 — collaboration JSON never routed through `SurfaceStore`; R-3.8 — unresolved `nodeId` reported, not thrown.
   - verify: unit tests; assert the interface has no Markdown surface.
-  - landed:
+  - landed: `core/collaboration/document-store.ts`, `core/collaboration/document-store.test.ts` (14 tests). `read()` resolves `null` for an absent document, mirroring `GitHubAdapter.getFile`, so 3.2 maps cleanly. `resolveNode` returns a discriminated `NodeResolution` — `{ found: false }` or `{ found: true, path, node }` — where `path` is the child-index route from `doc.root` (R-3.4); the pure `resolveNodeIn(doc, nodeId)` is exported for 6.1 so anchor resolution needs no re-read. Persistence goes through 1.1's `parseCollaborationDocument` / `serializeCollaborationDocument`, so unknown fields survive the store (R-2.1 / R-1.8). Suite 263 → 277.
 
 - [ ] 3.2 GitHub-backed `DocumentStore` (deps: 3.1, 4.1, est: ~4d)
   - why: the same operations mapped onto a PR branch, so the routes are backend-agnostic.
