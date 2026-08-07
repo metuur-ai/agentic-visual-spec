@@ -84,14 +84,26 @@ export interface DocumentStore {
  * R-3.4 — the pure lookup behind `DocumentStore.resolveNode`, exported for callers that
  * already hold a document (anchor resolution, task 6.1) and should not pay a re-read.
  *
- * Nodes are matched on `id`, the field name the protocol's `CollaborationNode` uses.
- * `nodeId` is accepted as an alias because that is the name the Lexical replacement
- * classes register it under (R-2.2), and both spellings reach the persisted JSON.
+ * Serialized Lexical nodes carry the id under the NodeState `$` key —
+ * `{"type":"paragraph", …, "$":{"nodeId":"…"}}` — which is where task 2.1's
+ * extension writes it (R-2.2). That is the authoritative spelling and is checked
+ * first. The `ui/` side reads it via `getSerializedNodeId()`; `core/` inlines the
+ * same read rather than importing it, because anything under `ui/` pulls in Luthor
+ * and this module is Node-reachable from the CLI (R-3.3, enforced by the bundle guard).
+ *
+ * A bare `id` / `nodeId` field is also accepted, because the protocol's
+ * `CollaborationNode` (task 1.1) uses `id` for the flattened node list on the
+ * envelope, which is a different shape from the Lexical tree under `doc.root`.
  */
 export function resolveNodeIn(doc: CollaborationDocument, nodeId: string): NodeResolution {
   if (!nodeId) return { found: false };
 
   const idOf = (n: Record<string, unknown>): string | null => {
+    const state = n.$;
+    if (state && typeof state === 'object' && !Array.isArray(state)) {
+      const stateId = (state as Record<string, unknown>).nodeId;
+      if (typeof stateId === 'string' && stateId) return stateId;
+    }
     const id = n.id ?? n.nodeId;
     return typeof id === 'string' ? id : null;
   };

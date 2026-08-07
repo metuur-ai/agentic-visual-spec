@@ -164,3 +164,50 @@ describe('DocumentStore', () => {
     expect(back?.documentId).toBe('d-manual');
   });
 });
+
+/**
+ * Seam guard: task 2.1 writes `nodeId` under the NodeState `$` key, not on a bare
+ * `id`/`nodeId` field. `resolveNode` originally matched only the bare fields, so a
+ * real editor-produced document resolved nothing. Pins the `$` read so the gap
+ * cannot silently reopen.
+ */
+describe('resolveNodeIn — NodeState `$` key (task 2.1 seam)', () => {
+  const withState = (): CollaborationDocument =>
+    ({
+        documentId: 'doc-1',
+        documentPath: 'docs/a.md',
+        title: 'A',
+        frontmatter: {},
+        nodes: [],
+        doc: {
+          root: {
+            type: 'root',
+            children: [
+              { type: 'paragraph', version: 1, $: { nodeId: 'n-alpha' }, children: [] },
+              {
+                type: 'quote',
+                version: 1,
+                $: { nodeId: 'n-beta' },
+                children: [{ type: 'paragraph', version: 1, $: { nodeId: 'n-gamma' }, children: [] }],
+              },
+            ],
+          },
+        },
+    }) as unknown as CollaborationDocument;
+
+  it('resolves an id carried under `$`, the shape a real editor emits', () => {
+    const r = resolveNodeIn(withState(), 'n-alpha');
+    expect(r.found).toBe(true);
+    if (r.found) expect(r.path).toEqual([0]);
+  });
+
+  it('resolves a nested id carried under `$`', () => {
+    const r = resolveNodeIn(withState(), 'n-gamma');
+    expect(r.found).toBe(true);
+    if (r.found) expect(r.path).toEqual([1, 0]);
+  });
+
+  it('still reports an unknown id as unresolved rather than throwing', () => {
+    expect(resolveNodeIn(withState(), 'n-missing')).toEqual({ found: false });
+  });
+});
