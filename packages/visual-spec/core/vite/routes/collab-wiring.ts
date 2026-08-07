@@ -14,14 +14,16 @@
  * poller, no bodies. The router still answers `GET /__vs/collab` with `not-configured`
  * because that path never needed any of them.
  *
- * WHAT IS STILL STUBBED. `bodies.open` and `bodies.publish` are deliberately absent, so
- * 7.2's honest `notImplemented` stub keeps serving them:
- *   - `publish` — task 8.3. It must export a factory
- *     `(input: PublishJobInput) => JobBody` and be added to the spread below; the route
- *     already hands it `json`, `markdown`, `repo`, `store` and the document.
- *   - `open` — task 11.x (R-11.2). Same contract with `(input: OpenJobInput) => JobBody`,
- *     plus a `startPolling(input.documentId)` call once it has attached a PR, exactly as
+ * WHAT IS STILL STUBBED. `bodies.open` is deliberately absent, so 7.2's honest
+ * `notImplemented` stub keeps serving it:
+ *   - `open` — task 11.x (R-11.2). It must export a factory
+ *     `(input: OpenJobInput) => JobBody` and be added to the spread below, plus a
+ *     `startPolling(input.documentId)` call once it has attached a PR, exactly as
  *     `create` does below.
+ *
+ * `publish` (task 8.3) is wired below from `core/collaboration/publish.ts`. It takes no
+ * poller and no lifecycle — it commits the client payload to the PR branch, verifies the
+ * committed blobs, and stops. It deliberately never merges (LLD §7).
  *
  * Node-reachable from the CLI: node builtins and sibling core modules only — no
  * `@lyfie/luthor`, no react (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
@@ -36,6 +38,7 @@ import {
   createLifecycle,
   createLifecycleBodies,
 } from '../../collaboration/lifecycle';
+import { createPublishBody } from '../../collaboration/publish';
 import type { ResolvedVisualSpecConfig } from '../../config';
 import type { CollabJobBodies } from './collab';
 
@@ -106,6 +109,9 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
         lifecycle.startPolling(input.documentId);
       },
       sync: (input) => bodies.sync(input),
+      // R-8.9 … R-8.14. No wrapper: publish neither starts nor stops the poller — the
+      // document stays PR-open on the branch until it is merged on github.com.
+      publish: createPublishBody({ adapter }),
     },
     stopAllPolling: () => lifecycle.stopAllPolling(),
     pollingDocumentIds: () => lifecycle.pollingDocumentIds(),

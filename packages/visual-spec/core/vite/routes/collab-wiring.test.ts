@@ -24,6 +24,7 @@ import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { JobEvent, JobSync, SseSink } from '../../collaboration/job-hub';
 import type { IntervalScheduler, SyncResult } from '../../collaboration/lifecycle';
 import { readGitHubBinding } from '../../collaboration/lifecycle';
+import { gitBlobSha } from '../../collaboration/publish';
 import type { ResolvedVisualSpecConfig } from '../../config';
 import { type CollabRouteResult, createCollabRoutes } from './collab';
 import { createCollabWiring } from './collab-wiring';
@@ -323,4 +324,84 @@ describe('both hosts decorate the document store with withNodeIdentity (task 2.2
       expect(src).toMatch(/documents:\s*\(\)\s*=>\s*withNodeIdentity\(fsDocumentStore\(/);
     });
   }
+});
+
+/* ================================================================== *
+ * Task 8.3 — `publish` is wired, so the route no longer runs a stub
+ * ================================================================== */
+describe('7.2 routes run the 8.3 publish body (integration)', () => {
+  /**
+   * A stateful replay of the two Contents API endpoints publish uses, so the read-back
+   * verification sees the bytes the write actually stored. The positional `recorder`
+   * above cannot do that — verification compares against content it does not know yet.
+   */
+  function contentsReplay(seed: Record<string, string> = {}) {
+    const files = new Map(Object.entries(seed));
+    const calls: Array<{ args: string[]; input?: string }> = [];
+    const exec: GhExecutor = async (args, input) => {
+      calls.push(input === undefined ? { args } : { args, input });
+      const endpoint = endpointOf(args);
+      const method = args[args.indexOf('--method') + 1];
+      const hit = /^\/repos\/[^/]+\/[^/]+\/contents\/(.+?)(?:\?ref=.+)?$/.exec(endpoint);
+      const ok = (json: unknown): GhResult => ({ stdout: JSON.stringify(json), stderr: '', exitCode: 0 });
+      if (!hit) return { stdout: JSON.stringify({ message: 'Not Found', status: '404' }), stderr: '', exitCode: 1 };
+      const path = hit[1] as string;
+      if (method === 'PUT') {
+        const written = Buffer.from((JSON.parse(input ?? '{}') as { content: string }).content, 'base64').toString('utf8');
+        files.set(path, written);
+        return ok({ content: { path, sha: gitBlobSha(written) }, commit: { sha: 'c0ffee' } });
+      }
+      const stored = files.get(path);
+      if (stored === undefined) return { stdout: JSON.stringify({ message: 'Not Found', status: '404' }), stderr: '', exitCode: 1 };
+      return ok({ path, sha: gitBlobSha(stored), content: Buffer.from(stored, 'utf8').toString('base64') });
+    };
+    return { exec, calls, files };
+  }
+
+  it('POST /:id/publish commits the payload to the branch and verifies it, with no merge', async () => {
+    const doc: CollaborationDocument & { github: Record<string, unknown> } = {
+      ...makeDoc(),
+      github: { owner: 'acme', repo: 'docs', branch: 'visual-spec/doc-1', pullNumber: 42, resolved: false },
+    };
+    const documents = memoryDocuments([doc]);
+    const jobs = createJobHubRegistry();
+    const gh = contentsReplay({ 'documents/doc-1.json': '{"documentId":"doc-1"}\n' });
+    const wiring = createCollabWiring({ config: () => ENABLED, documents: () => documents, jobs, exec: gh.exec });
+
+    // The wiring supplies it now — before task 8.3 this key was absent and 7.2's
+    // throwing `notImplemented` stub served the route.
+    expect(Object.keys(wiring.bodies).sort()).toEqual(['create', 'publish', 'sync']);
+
+    const router = createCollabRoutes({
+      jobs,
+      config: () => ENABLED,
+      documents: () => documents,
+      preflight: async () => OK_PREFLIGHT,
+      bodies: wiring.bodies,
+    });
+    const s = sink();
+    jobs.hub('doc-1').subscribe(s);
+    const res = await router.handle({
+      method: 'POST',
+      pathname: '/doc-1/publish',
+      query: {},
+      body: { json: doc.doc, markdown: '# Onboarding guide\n' },
+    });
+    expect(res.status).toBe(200);
+    await settled();
+
+    expect(gh.calls.map((c) => endpointOf(c.args))).toEqual([
+      '/repos/acme/docs/contents/documents/doc-1.json?ref=visual-spec/doc-1',
+      '/repos/acme/docs/contents/documents/doc-1.json',
+      '/repos/acme/docs/contents/documents/doc-1.md?ref=visual-spec/doc-1',
+      '/repos/acme/docs/contents/documents/doc-1.md',
+      '/repos/acme/docs/contents/documents/doc-1.json?ref=visual-spec/doc-1',
+      '/repos/acme/docs/contents/documents/doc-1.md?ref=visual-spec/doc-1',
+    ]);
+    expect(gh.files.get('documents/doc-1.md')).toBe('# Onboarding guide\n');
+    expect(jobs.hub('doc-1').snapshot().state).toBe('published');
+    // R-8.10 — publish stops at `published`; merge happens on github.com.
+    expect(gh.calls.some((c) => endpointOf(c.args).includes('/merge'))).toBe(false);
+    expect(s.frames.find((f) => f.type === 'job-done')).toMatchObject({ ok: true, state: 'published' });
+  });
 });
