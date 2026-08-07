@@ -1,5 +1,21 @@
+/**
+ * comment-panel.tsx — the commenting sidebar.
+ *
+ * **Anchor source (task 7.3, R-7.4).** The panel shell — header, selection help,
+ * tabs, compose form, open list, history — is one component, `Panel`. What it is
+ * commenting *on* is a `CommentPanelSource`: which comments belong here, how the
+ * current inspector selection is described, what creating a comment does, and
+ * which comments have lost their target. Local mode's source is built by
+ * `localCommentSource` from `useComments(path)` and reproduces exactly what this
+ * file did before — same hook, same filter (`target.path === path`), same
+ * heading/line labels, same `add` payload. Collaboration supplies a source keyed
+ * on `nodeId` (`ui/collab-comment-source.ts`) and reuses this same panel rather
+ * than forking it.
+ */
 import { collectSection, headingBlockOf, useComments, useInspector } from '../core/app';
-import { useEffect, useRef, useState } from 'react';
+import type { SelectedTarget } from '../core/app';
+import type { CommentRecord } from '../core/editing/comment-doc';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { toPath } from './md-path';
 import { WorkflowSelect, loadWorkflow } from './workflow-select';
 import { CommentHistoryList, locate } from './comment-history-list';
@@ -20,20 +36,99 @@ function nearestHeading(anchor: HTMLElement, root: HTMLElement): string | null {
 
 type PanelTab = 'open' | 'history';
 
-export function CommentPanel({ file, width }: { file: string; width: number }) {
-  const { active, selection, setSelection } = useInspector();
-  const selected = selection[0] ?? null;
-  const last = selection[selection.length - 1] ?? null;
-  const isRange = selection.length > 1;
+/** How the current selection reads, or why it cannot be commented on at all. */
+export type SelectionDescription = { title: string; detail: string } | { uncommentable: string };
+
+/**
+ * What the panel is commenting on. Everything path- or line-specific lives behind
+ * this, so the shell below is identical for both modes.
+ */
+export type CommentPanelSource = {
+  /** Surface key for the history list. */
+  path: string;
+  /** Every comment on this surface, already filtered to it. */
+  comments: CommentRecord[];
+  remove: (id: string) => Promise<void>;
+  /**
+   * Describe the current selection. Returning `{ uncommentable }` withdraws the
+   * compose form — a block with no durable identity (`data-vs-uncommentable`,
+   * task 7.1) can never carry an anchor, so offering to comment on it would
+   * promise something the store cannot keep.
+   */
+  describe: (selection: SelectedTarget[]) => SelectionDescription;
+  create: (selection: SelectedTarget[], text: string, workflow: string) => Promise<void>;
+  /** Row label in the open list. */
+  label: (c: CommentRecord) => string;
+  locate: (c: CommentRecord) => void;
+  /** R-6.5 — comments whose target is gone, shown document-level with what they remember. */
+  orphans: { comment: CommentRecord; targetText: string }[];
+  /** Whether "select everything under this heading" applies (local markdown only). */
+  supportsSections?: boolean;
+};
+
+export function CommentPanel({ file, width, source }: { file?: string; width: number; source?: CommentPanelSource }) {
+  return source ? <Panel width={width} source={source} /> : <LocalCommentPanel file={file ?? ''} width={width} />;
+}
+
+/** The local source: the sidecar comments for one path, keyed by line + heading. */
+function LocalCommentPanel({ file, width }: { file: string; width: number }) {
   const path = toPath(file);
   const comments = useComments(path);
+  const source = useMemo<CommentPanelSource>(
+    () => ({
+      path,
+      comments: comments.comments.filter((c) => c.target.path === path),
+      remove: (id) => comments.remove(id),
+      supportsSections: true,
+      orphans: [],
+      label: (c) => `${c.target.heading ?? '(top)'} · L${c.target.startLine}${c.target.endLine ? `–${c.target.endLine}` : ''}`,
+      locate: (c) => locate(c.target),
+      describe: (selection) => {
+        const selected = selection[0]!;
+        const last = selection[selection.length - 1]!;
+        const isRange = selection.length > 1;
+        const root = (selected.anchor.closest('[data-inspector-root]') as HTMLElement) ?? document.body;
+        return {
+          title: nearestHeading(selected.anchor, root) ?? '(top of file)',
+          detail: isRange
+            ? ` · lines ${selected.line}–${last.line} · ${selection.length} blocks`
+            : ` · line ${selected.line}`,
+        };
+      },
+      create: async (selection, text, workflow) => {
+        const selected = selection[0]!;
+        const last = selection[selection.length - 1]!;
+        const isRange = selection.length > 1;
+        const root = (selected.anchor.closest('[data-inspector-root]') as HTMLElement) ?? document.body;
+        await comments.add({
+          path,
+          kind: 'range',
+          workflow: workflow || 'visual-spec',
+          heading: nearestHeading(selected.anchor, root),
+          startLine: selected.line,
+          snippet: (selected.anchor.textContent ?? '').trim().slice(0, 160),
+          comment: text,
+          ...(isRange ? { endLine: last.line, endSnippet: (last.anchor.textContent ?? '').trim().slice(0, 160) } : {}),
+        });
+      },
+    }),
+    [path, comments],
+  );
+  return <Panel width={width} source={source} />;
+}
+
+function Panel({ width, source }: { width: number; source: CommentPanelSource }) {
+  const { active, selection, setSelection } = useInspector();
+  const selected = selection[0] ?? null;
+  const isRange = selection.length > 1;
+  const path = source.path;
   const [text, setText] = useState('');
   const [workflow, setWorkflow] = useState(loadWorkflow);
   const [tab, setTab] = useState<PanelTab>('open');
 
   // When a single heading is selected, offer to grab everything under it.
   const root = selected ? (selected.anchor.closest('[data-inspector-root]') as HTMLElement | null) : null;
-  const headingBlock = selected && root && !isRange ? headingBlockOf(root, selected.anchor) : null;
+  const headingBlock = source.supportsSections && selected && root && !isRange ? headingBlockOf(root, selected.anchor) : null;
   const selectSection = () => {
     if (!root || !headingBlock) return;
     const section = collectSection(root, headingBlock);
@@ -48,36 +143,23 @@ export function CommentPanel({ file, width }: { file: string; width: number }) {
         <TabBar tab={tab} onTab={setTab} />
         <p style={hint}>Press <kbd>I</kbd> to start commenting.</p>
         {tab === 'open' ? (
-          <CommentList path={path} comments={comments} />
+          <>
+            <OrphanList orphans={source.orphans} />
+            <CommentList source={source} />
+          </>
         ) : (
-          <CommentHistoryList path={path} comments={comments.comments} />
+          <CommentHistoryList path={path} comments={source.comments} />
         )}
       </aside>
     );
   }
 
-  const heading = selected
-    ? nearestHeading(selected.anchor, (selected.anchor.closest('[data-inspector-root]') as HTMLElement) ?? document.body)
-    : null;
+  const described = selected ? source.describe(selection) : null;
+  const uncommentable = described && 'uncommentable' in described ? described.uncommentable : null;
 
   const submit = async () => {
-    if (!selected || !text.trim()) return;
-    const root = (selected.anchor.closest('[data-inspector-root]') as HTMLElement) ?? document.body;
-    await comments.add({
-      path,
-      kind: 'range',
-      workflow: workflow || 'visual-spec',
-      heading: nearestHeading(selected.anchor, root),
-      startLine: selected.line,
-      snippet: (selected.anchor.textContent ?? '').trim().slice(0, 160),
-      comment: text.trim(),
-      ...(isRange && last
-        ? {
-            endLine: last.line,
-            endSnippet: (last.anchor.textContent ?? '').trim().slice(0, 160),
-          }
-        : {}),
-    });
+    if (!selected || uncommentable || !text.trim()) return;
+    await source.create(selection, text.trim(), workflow);
     setText('');
   };
 
@@ -88,41 +170,76 @@ export function CommentPanel({ file, width }: { file: string; width: number }) {
       <TabBar tab={tab} onTab={setTab} />
       {tab === 'open' ? (
         <>
-          {selected ? (
+          {described ? (
             <div style={{ padding: 12 }}>
               <div style={{ fontSize: 12, opacity: 0.6 }}>commenting on</div>
-              <div style={{ margin: '2px 0 10px' }}>
-                <strong>{heading ?? '(top of file)'}</strong>
-                <span style={{ opacity: 0.55 }}>
-                  {isRange && last ? ` · lines ${selected.line}–${last.line} · ${selection.length} blocks` : ` · line ${selected.line}`}
-                </span>
-              </div>
-              {headingBlock && (
-                <button type="button" onClick={selectSection} style={sectionBtn} title="Extend the selection to every block under this heading">
-                  ⤢ Select all content under this heading
-                </button>
+              {'uncommentable' in described ? (
+                <p style={notCommentable} data-vs-uncommentable-notice>
+                  This block cannot carry a comment — {described.uncommentable}.
+                </p>
+              ) : (
+                <>
+                  <div style={{ margin: '2px 0 10px' }}>
+                    <strong>{described.title}</strong>
+                    <span style={{ opacity: 0.55 }}>{described.detail}</span>
+                  </div>
+                  {headingBlock && (
+                    <button type="button" onClick={selectSection} style={sectionBtn} title="Extend the selection to every block under this heading">
+                      ⤢ Select all content under this heading
+                    </button>
+                  )}
+                  <WorkflowSelect value={workflow} onChange={setWorkflow} />
+                  <textarea
+                    value={text}
+                    onChange={(e) => setText(e.target.value)}
+                    onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') void submit(); }}
+                    placeholder="Your comment (⌘/Ctrl+Enter)…"
+                    style={textarea}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>
+                    <button type="button" onClick={submit} style={btnPrimary}>Add comment</button>
+                  </div>
+                </>
               )}
-              <WorkflowSelect value={workflow} onChange={setWorkflow} />
-              <textarea
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') void submit(); }}
-                placeholder="Your comment (⌘/Ctrl+Enter)…"
-                style={textarea}
-              />
-              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>
-                <button type="button" onClick={submit} style={btnPrimary}>Add comment</button>
-              </div>
             </div>
           ) : (
             <p style={hint}>Click a block in the spec to comment on it.</p>
           )}
-          <CommentList path={path} comments={comments} />
+          <OrphanList orphans={source.orphans} />
+          <CommentList source={source} />
         </>
       ) : (
-        <CommentHistoryList path={path} comments={comments.comments} />
+        <CommentHistoryList path={path} comments={source.comments} />
       )}
     </aside>
+  );
+}
+
+/**
+ * R-6.5 — comments whose block is no longer in the document. They are never
+ * discarded and never pinned to a nearby block; they live here, at document level,
+ * with an explicit marker and the last-known text of what they were about.
+ * Local mode has no orphans, so this renders nothing there.
+ */
+function OrphanList({ orphans }: { orphans: { comment: CommentRecord; targetText: string }[] }) {
+  if (!orphans.length) return null;
+  return (
+    <div style={{ padding: 12, borderTop: '1px solid #e5e7eb' }} data-vs-orphan-list>
+      <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 8 }}>
+        {orphans.length} orphaned — the block they pointed at is gone
+      </div>
+      <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 8 }}>
+        {orphans.map(({ comment, targetText }) => (
+          <li key={comment.id} style={orphanCard} data-vs-orphan={comment.id}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: '#b45309', letterSpacing: 0.3 }}>ORPHANED</div>
+            <div style={{ fontSize: 12, opacity: 0.6, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {targetText ? `“${targetText}”` : 'no last-known text'}
+            </div>
+            <div style={{ margin: '2px 0' }}>{comment.comment}</div>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
@@ -172,9 +289,9 @@ function InfoIcon() {
   );
 }
 
-function CommentList({ path, comments }: { path: string; comments: ReturnType<typeof useComments> }) {
+function CommentList({ source }: { source: CommentPanelSource }) {
   // Only open comments: once the apply-comments skill marks one "applied", it drops off the list.
-  const mine = comments.comments.filter((c) => c.target.path === path && c.status === 'open');
+  const mine = source.comments.filter((c) => c.status === 'open');
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const { activeId } = useActiveComment();
   const rows = useRef<Record<string, HTMLLIElement | null>>({});
@@ -192,13 +309,13 @@ function CommentList({ path, comments }: { path: string; comments: ReturnType<ty
         {mine.map((c) => (
           <li key={c.id} ref={(el) => { rows.current[c.id] = el; }} style={{ ...card, ...(c.id === activeId ? cardActive : {}) }}>
             <div style={{ fontSize: 12, opacity: 0.6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {c.target.heading ?? '(top)'} · L{c.target.startLine}{c.target.endLine ? `–${c.target.endLine}` : ''}
+              {source.label(c)}
             </div>
             <div style={{ margin: '2px 0' }}>{c.comment}</div>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4 }}>
               <button
                 type="button"
-                onClick={() => locate(c.target)}
+                onClick={() => source.locate(c)}
                 title="Show where this comment was added in the file"
                 aria-label="Show in file"
                 style={locateBtn}
@@ -210,7 +327,7 @@ function CommentList({ path, comments }: { path: string; comments: ReturnType<ty
                   <span style={{ fontSize: 12, color: '#475569' }}>Delete?</span>
                   <button
                     type="button"
-                    onClick={() => { void comments.remove(c.id); setConfirmId(null); }}
+                    onClick={() => { void source.remove(c.id); setConfirmId(null); }}
                     style={confirmYes}
                   >
                     Yes
@@ -278,4 +395,6 @@ const cardActive: React.CSSProperties = { border: '1px solid #f59e0b', backgroun
 const locateBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, width: 22, height: 22, padding: 0, border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer' };
 const delBtn: React.CSSProperties = { ...locateBtn, color: '#ef4444' };
 const confirmYes: React.CSSProperties = { padding: '2px 8px', border: '1px solid #ef4444', borderRadius: 4, background: '#ef4444', color: 'white', cursor: 'pointer', fontSize: 12 };
+const notCommentable: React.CSSProperties = { margin: '2px 0 0', padding: 8, border: '1px dashed #cbd5e1', borderRadius: 6, background: '#f8fafc', color: '#64748b', fontSize: 12.5 };
+const orphanCard: React.CSSProperties = { ...card, border: '1px dashed #f59e0b', background: '#fffbeb' };
 const confirmNo: React.CSSProperties = { padding: '2px 8px', border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#475569', cursor: 'pointer', fontSize: 12 };

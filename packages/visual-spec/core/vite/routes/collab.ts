@@ -30,6 +30,7 @@
  * `@lyfie/luthor`, no react (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
  */
 import type { ResolvedCollaborationConfig, ResolvedVisualSpecConfig } from '../../config';
+import { COLLAB_TARGET_TEXT_KEY, captureTargetText, collabNodeVersion } from '../../collaboration/anchor-resolution';
 import { type CollaborationPreflight, preflightCollaboration } from '../../collaboration/credentials';
 import { githubCommentStore } from '../../collaboration/comment-projection';
 import { createGitHubAdapter } from '../../collaboration/github-adapter';
@@ -507,7 +508,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         const store = await commentsFor(documentId, loaded.document, gated.repo);
         if (!store.ok) return store.result;
         const saved = await store.store.addComment(
-          commentRecord(loaded.document.documentPath, text, now(), nodeId ? { nodeId } : {}),
+          commentRecord(loaded.document.documentPath, text, now(), nodeId ? anchorFields(loaded.document, nodeId) : {}),
         );
         return { status: 200, json: { ok: true, id: saved.id, comment: saved } };
       }
@@ -571,6 +572,32 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
     dispose() {
       deps.jobs.disposeAll();
     },
+  };
+}
+
+/**
+ * R-6.5 / R-7.5 — the anchor a new collaborative comment is born with.
+ *
+ * `nodeId` is the primary identity. The other two are captured **here, at creation
+ * time, and nowhere else**, because after the fact they are unrecoverable:
+ *
+ *   `text`        the block's text as it reads now (`captureTargetText`). Once the node
+ *                 is deleted the `nodes` projection entry goes with it, and the trailer
+ *                 is the only part of the comment that survives a GitHub round-trip —
+ *                 so an orphan with no captured text can never say what it was about.
+ *   `nodeVersion` the version the comment was authored against. Without it R-6.3 has
+ *                 nothing to compare and every comment resolves `exact` forever.
+ *
+ * Both are omitted rather than faked when the document cannot supply them — a fabricated
+ * version would flag comments outdated for edits nobody made.
+ */
+function anchorFields(document: CollaborationDocument, nodeId: string): Record<string, string> {
+  const targetText = captureTargetText(document, nodeId);
+  const version = collabNodeVersion(document, nodeId);
+  return {
+    nodeId,
+    ...(targetText ? { [COLLAB_TARGET_TEXT_KEY]: targetText } : {}),
+    ...(version !== null ? { nodeVersion: String(version) } : {}),
   };
 }
 

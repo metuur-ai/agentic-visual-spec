@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
@@ -5,7 +6,13 @@ export default defineConfig({
   // keeps the package-local symlink path for one and the pnpm store path for the
   // other, producing two module instances — and Lexical then rejects every node
   // class with "does not subclass LexicalNode". Dedupe pins one instance.
-  resolve: { dedupe: ['lexical'] },
+  resolve: {
+    dedupe: ['lexical'],
+    // The Vite plugin generates `virtual:visual-spec/surfaces` at dev time; under
+    // vitest there is no plugin, so any jsdom test mounting a component that reaches
+    // the `core/app` barrel cannot resolve it. Test-only stub.
+    alias: { 'virtual:visual-spec/surfaces': fileURLToPath(new URL('./ui/fixtures/virtual-surfaces.ts', import.meta.url)) },
+  },
   test: {
     globals: true,
     // .tsx tests opt into jsdom per-file with a `// @vitest-environment jsdom`
