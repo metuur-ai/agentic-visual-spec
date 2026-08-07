@@ -36,6 +36,7 @@ import { createCollabRoutes } from '../core/vite/routes/collab';
 import { createCollabWiring } from '../core/vite/routes/collab-wiring';
 import { createJobHubRegistry } from '../core/collaboration/job-hub';
 import { fsDocumentStore } from '../core/collaboration/document-store';
+import { withNodeIdentity } from '../core/collaboration/node-identity';
 import { type VisualSpecConfig, resolveConfig } from '../core/config';
 import { MAX_UPLOAD_BYTES, saveUploadedAsset } from '../core/vite/routes/upload';
 
@@ -173,13 +174,13 @@ export function createVisualSpecServer(opts: ServeOptions) {
   // all and yields no bodies, so 7.2's honest stubs stay in place (R-9.19).
   const collabWiring = createCollabWiring({
     config: () => collabConfig,
-    documents: () => fsDocumentStore(contentDir),
+    documents: () => withNodeIdentity(fsDocumentStore(contentDir)),
     jobs: collabJobs,
   });
   const collab = createCollabRoutes({
     jobs: collabJobs,
     config: () => collabConfig,
-    documents: () => fsDocumentStore(contentDir),
+    documents: () => withNodeIdentity(fsDocumentStore(contentDir)),
     bodies: collabWiring.bodies,
   });
 

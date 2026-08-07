@@ -298,3 +298,29 @@ describe('R-9.19 — collaboration unconfigured builds no adapter at all', () =>
     wiring.stopAllPolling(); // a no-op, and safe to call on shutdown regardless
   });
 });
+
+/**
+ * Seam guard (task 2.2): `withNodeIdentity` is a decorator, and 2.2 landed it
+ * opt-in with no caller — so backfill and version bumping silently did not run.
+ * Both hosts must decorate the store they hand to the collaboration routes.
+ */
+describe('both hosts decorate the document store with withNodeIdentity (task 2.2 seam)', () => {
+  const hostSource = (rel: string): string => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    return readFileSync(resolve(here, rel), 'utf8');
+  };
+
+  for (const [label, rel] of [
+    ['src/server.ts', '../../../src/server.ts'],
+    ['core/vite/md-plugin.ts', '../md-plugin.ts'],
+  ] as const) {
+    it(`${label} wraps fsDocumentStore in withNodeIdentity`, () => {
+      const src = hostSource(rel);
+      expect(src).toContain('withNodeIdentity');
+      // Every store handed to the collab layer must be decorated — a bare
+      // fsDocumentStore(...) reaching `documents:` is the regression.
+      expect(src).not.toMatch(/documents:\s*\(\)\s*=>\s*fsDocumentStore\(/);
+      expect(src).toMatch(/documents:\s*\(\)\s*=>\s*withNodeIdentity\(fsDocumentStore\(/);
+    });
+  }
+});

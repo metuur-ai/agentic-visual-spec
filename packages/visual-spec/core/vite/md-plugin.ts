@@ -22,6 +22,7 @@ import { createCollabRoutes } from './routes/collab';
 import { createCollabWiring } from './routes/collab-wiring';
 import { createJobHubRegistry } from '../collaboration/job-hub';
 import { fsDocumentStore } from '../collaboration/document-store';
+import { withNodeIdentity } from '../collaboration/node-identity';
 import { type VisualSpecConfig, resolveConfig } from '../config';
 import { MAX_UPLOAD_BYTES, saveUploadedAsset } from './routes/upload';
 import { currentPlugin } from './current-plugin';
@@ -288,13 +289,13 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       // adapter at all and yields no bodies, so 7.2's honest stubs stay in place (R-9.19).
       const collabWiring = createCollabWiring({
         config: () => collabConfig,
-        documents: () => fsDocumentStore(specsRoot),
+        documents: () => withNodeIdentity(fsDocumentStore(specsRoot)),
         jobs: collabJobs,
       });
       const collab = createCollabRoutes({
         jobs: collabJobs,
         config: () => collabConfig,
-        documents: () => fsDocumentStore(specsRoot),
+        documents: () => withNodeIdentity(fsDocumentStore(specsRoot)),
         bodies: collabWiring.bodies,
       });
       server.middlewares.use('/__vs/collab', (req, res) => {
