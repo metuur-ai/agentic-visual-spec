@@ -301,6 +301,7 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         config: () => collabConfig,
         documents: () => withNodeIdentity(fsDocumentStore(specsRoot)),
         bodies: collabWiring.bodies,
+        authorize: collabWiring.authorize,
       });
       server.middlewares.use('/__vs/collab', (req, res) => {
         void (async () => {

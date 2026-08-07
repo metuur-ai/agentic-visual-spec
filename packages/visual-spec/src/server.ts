@@ -183,6 +183,7 @@ export function createVisualSpecServer(opts: ServeOptions) {
     config: () => collabConfig,
     documents: () => withNodeIdentity(fsDocumentStore(contentDir)),
     bodies: collabWiring.bodies,
+    authorize: collabWiring.authorize,
   });
 
   /** Re-root every store at a new directory (comments follow to <dir>/…json). */

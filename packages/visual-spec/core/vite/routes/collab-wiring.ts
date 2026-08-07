@@ -28,6 +28,7 @@
  * Node-reachable from the CLI: node builtins and sibling core modules only — no
  * `@lyfie/luthor`, no react (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
  */
+import { createCollabAuthorizer } from '../../collaboration/authorization';
 import type { DocumentStore } from '../../collaboration/document-store';
 import { createGitHubAdapter } from '../../collaboration/github-adapter';
 import { type GhExecutor, defaultExecGh } from '../../collaboration/github-executor';
@@ -40,7 +41,7 @@ import {
 } from '../../collaboration/lifecycle';
 import { createPublishBody } from '../../collaboration/publish';
 import type { ResolvedVisualSpecConfig } from '../../config';
-import type { CollabJobBodies } from './collab';
+import type { CollabAuthorizer, CollabJobBodies } from './collab';
 
 export type CollabWiringOptions = {
   /** Read once, at construction: the adapter is per-repo, not per-request. */
@@ -60,6 +61,11 @@ export type CollabWiringOptions = {
 export type CollabWiring = {
   /** Hand straight to `createCollabRoutes({ bodies })`. `{}` when collaboration is off. */
   bodies: Partial<CollabJobBodies>;
+  /**
+   * Task 9.2 — hand straight to `createCollabRoutes({ authorize })`. Author-only
+   * enforcement (R-9.9 / R-9.10) for both hosts, built here so neither owns any of it.
+   */
+  authorize: CollabAuthorizer;
   /** Call on server shutdown, alongside `collab.dispose()`. */
   stopAllPolling(): void;
   /** Documents currently being polled, sorted. Empty when collaboration is off. */
@@ -68,6 +74,11 @@ export type CollabWiring = {
 
 const NOT_CONFIGURED: CollabWiring = {
   bodies: {},
+  // Unreachable in practice — with no configuration every GitHub-touching route answers
+  // 503 from the availability gate, which runs ahead of the authorizer. Denying anyway
+  // so the "collaboration off" wiring is fail-closed by construction rather than by
+  // depending on the order of two checks in another module.
+  authorize: (op) => ({ ok: false, status: 403, error: `${op} is unavailable: collaboration is not configured.` }),
   stopAllPolling() {},
   pollingDocumentIds: () => [],
 };
@@ -113,6 +124,13 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
       // document stays PR-open on the branch until it is merged on github.com.
       publish: createPublishBody({ adapter }),
     },
+    // R-9.7 … R-9.11. Same `documents()` thunk the poller uses, so a runtime re-root is
+    // honoured on the next request too. It shares no cache with the routes: role state
+    // is its own, with its own invalidation (see `authorization.ts`).
+    authorize: createCollabAuthorizer({
+      documents: () => store,
+      ...(options.exec ? { exec: options.exec } : {}),
+    }),
     stopAllPolling: () => lifecycle.stopAllPolling(),
     pollingDocumentIds: () => lifecycle.pollingDocumentIds(),
   };
