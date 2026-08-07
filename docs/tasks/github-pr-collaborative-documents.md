@@ -284,7 +284,7 @@ Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance ID
   - why: every story starts from "the author already has a repo, a branch, and write credentials." Reviewer onboarding earned Unit 11 because someone flagged it; this got nothing because it was invisible. Same failure shape as 11.1 — a first-run problem that only surfaces late.
   - acceptance: R-12.5 — every unmet prerequisite is named with its literal remediation command, extending the `gh_missing` / `unauthenticated` / `missing_scope` split at `credentials.ts:39-47` to cover no-write-access and no-repo; R-12.6 — one documented sequence from a clean machine to a first published document, with no step inferred by the reader.
   - verify: a machine with no `gh`, then an unauthenticated `gh`, then a read-only one, each produces a distinct message naming the next command.
-  - note: O-8's drive-by reviewer resolves to the same classification. Whichever bucket that lands on is what this snapshot has to report, so settle O-8 before wording 12.2.
+  - note: O-8 is settled (see Notes → Settled) — two buckets, no third role, no code change. The wording this unit owes is "commenting needs no repo access; publishing needs write."
 
 ---
 
@@ -315,11 +315,14 @@ U-5 (`droppedNodes` computed and discarded) was **withdrawn**: dropping is the s
 
 ### Open — re-verified 2026-08-07 after the mount work
 
-Three items. None of them is code that exists and doesn't run — that class is now empty, and `ui/reachability.test.ts` fails if it comes back. What is left is one thing only a real repository can prove, and two gaps in the written product.
+Two items. None of them is code that exists and doesn't run — that class is now empty, and `ui/reachability.test.ts` fails if it comes back. What is left is one thing only a real repository can prove, and one gap in the written product.
 
 - **O-6 — the two-credential path has never run.** `authorization.test.ts` is 34 cases of fixture-swapped permission responses. Single-writer is enforced *by GitHub permissions rather than by convention*, so that enforcement is currently an assertion in a fixture. One recorded manual run against a real repo, with the real 403 body fed back into `repo-read-only.json`, closes it.
-- **O-8 — the drive-by reviewer is unspecified.** 9.2 classifies from write access; on a public repo a commenter with no repo access can still post issue comments. Either require collaborator-with-read and say so in onboarding, or add a third role bucket. Today it resolves by accident.
 - **O-9 — author first-run onboarding is assumed.** Every story starts from "the author already has a repo, a branch, and write credentials." Reviewer onboarding got a unit because someone flagged it; this got nothing because it was invisible. It has one concrete defect underneath it, not just missing prose: **the author's role is not in the availability snapshot.** `CollabAvailabilitySnapshot` (`ui/collab-client.ts:46-48`) carries `login`, `repo` and `scopes` — no write-access bit. The write check runs inside `authorize` at the operation (`authorization.ts:203`), so an author with a read-only credential opens the editor, writes a document, and is refused at publish with "available to the document author only … Comment and reply instead." The message is correct and actionable; it arrives after the work. Surfacing the already-computed `hasWriteAccess(repo)` on the snapshot moves that discovery to the first screen. Same call, same cache — the preflight already talks to the same API. Scheduled as Unit 12, the defect as 12.1.
+
+### Settled — decisions taken, so they are not reopened
+
+- **O-8 — the drive-by reviewer: two buckets, not three. No code change.** 9.2 classifies from write access, and that binary *is* the role model: write ⇒ author, no write ⇒ comment-and-reply. A drive-by commenter on a public repo has no repo access and lands in the second bucket, which is where they belong — every author-only route is authorized server-side by `hasWriteAccess`, and issue comments genuinely need no repo access, so the accidental resolution and the intended one are the same resolution. Rejected: a third role bucket (it would have to be derived from something GitHub does not report — "read access" on a public repo is indistinguishable from none), and requiring collaborator-with-read (it would break the public-repo review case the product wants). What was actually missing was wording, not classification: the snapshot says *review-only session* to anyone without write, and onboarding must state that commenting needs no repo access while publishing needs write. That sentence is 12.2's to write.
 
 ### Corrections — claims from the previous revision that did not survive checking
 
