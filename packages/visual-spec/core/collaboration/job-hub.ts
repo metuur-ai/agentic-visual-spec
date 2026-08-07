@@ -85,6 +85,8 @@ export type JobKind =
   | 'remap' // re-resolve comment anchors after document edits
   | 'resolve' // resolve / unresolve a thread via the reply-marker convention
   | 'publish' // commit the client's final Markdown, then verify it (R-8.9 … R-8.14)
+  | 'reconcile' // re-derive lifecycle state from GitHub, cleaning an orphan branch (R-8.18)
+  | 'ready' // re-derive readiness from GitHub and record `ready` (R-8.15)
   | 'merge'; // merge the PR — deliberately NOT part of publish (LLD §7)
 
 /** Category of a streamed log row — drives icon + styling, as `ApplyLogKind` does. */

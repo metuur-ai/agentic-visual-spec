@@ -30,7 +30,7 @@
  */
 import { createCollabAuthorizer } from '../../collaboration/authorization';
 import type { DocumentStore } from '../../collaboration/document-store';
-import { withOrphanCleanup, withPublishFailureStates } from '../../collaboration/failure-states';
+import { createRecoveryBodies, withOrphanCleanup, withPublishFailureStates } from '../../collaboration/failure-states';
 import { createGitHubAdapter } from '../../collaboration/github-adapter';
 import { type GhExecutor, defaultExecGh } from '../../collaboration/github-executor';
 import type { JobHubRegistry } from '../../collaboration/job-hub';
@@ -95,6 +95,10 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
   const bodies = createLifecycleBodies({ adapter, ...(onSync ? { onSync } : {}) });
   const openBody = createOpenBody({ adapter });
   const publish = createPublishBody({ adapter });
+  // 8.4's recovery bodies. Built here for the same reason the rest are: the module was
+  // fully written and tested but had no caller, so `reconcile` and `markReady` answered
+  // from the failing stub over HTTP.
+  const recovery = createRecoveryBodies({ adapter });
 
   // The poller re-reads `documents()` per call rather than closing over one store, so a
   // runtime "change directory" re-roots the next tick too — the same discipline the
@@ -164,6 +168,12 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
           store: input.store,
           documentId: input.documentId,
         }),
+      // R-8.18 / R-8.15 (task 8.4). Both re-read GitHub inside the body and record the
+      // state they derive; nothing here pre-computes or caches either answer.
+      reconcile: (input) => recovery.reconcile(input),
+      markReady: (input) => recovery.markReady(input),
+      // `merge` stays unwired on purpose: SC-1 ends the flow at "published to the
+      // branch" and the HLD is explicit that merging happens on github.com.
     },
     // R-9.7 … R-9.11. Same `documents()` thunk the poller uses, so a runtime re-root is
     // honoured on the next request too. It shares no cache with the routes: role state

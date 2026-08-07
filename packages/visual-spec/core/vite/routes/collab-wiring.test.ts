@@ -502,8 +502,9 @@ describe('7.2 routes run the 8.3 publish body (integration)', () => {
     const wiring = createCollabWiring({ config: () => ENABLED, documents: () => documents, jobs, exec: gh.exec });
 
     // The wiring supplies it now — before task 8.3 this key was absent and 7.2's
-    // throwing `notImplemented` stub served the route.
-    expect(Object.keys(wiring.bodies).sort()).toEqual(['create', 'open', 'publish', 'sync']);
+    // throwing `notImplemented` stub served the route. `merge` stays absent by
+    // design: SC-1 ends at "published to the branch"; merging happens on github.com.
+    expect(Object.keys(wiring.bodies).sort()).toEqual(['create', 'markReady', 'open', 'publish', 'reconcile', 'sync']);
 
     const router = createCollabRoutes({
       jobs,
@@ -531,6 +532,9 @@ describe('7.2 routes run the 8.3 publish body (integration)', () => {
       '/repos/acme/docs/contents/documents/doc-1.md',
       '/repos/acme/docs/contents/documents/doc-1.json?ref=visual-spec/doc-1',
       '/repos/acme/docs/contents/documents/doc-1.md?ref=visual-spec/doc-1',
+      // O-2 — publish also ensures `.gitattributes` on the branch after verifying.
+      '/repos/acme/docs/contents/.gitattributes?ref=visual-spec/doc-1',
+      '/repos/acme/docs/contents/.gitattributes',
     ]);
     expect(gh.files.get('documents/doc-1.md')).toBe('# Onboarding guide\n');
     expect(jobs.hub('doc-1').snapshot().state).toBe('published');

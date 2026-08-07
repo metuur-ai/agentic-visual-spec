@@ -74,7 +74,9 @@ export type CollabRole = 'author' | 'reviewer';
  * `comment` / `reply` / `edit-comment` are R-9.8 verbatim; GitHub separately refuses to
  * let anyone edit a comment they do not own.
  *
- * `create` and `publish` are the two that commit (R-9.9). Edit, mark-ready and merge
+ * `create` and `publish` are the two that commit (R-9.9). `reconcile` may delete the
+ * orphan branch a partial create left behind and `mark-ready` records the author's
+ * declaration that the document is done, so both are author-only too. Edit and merge
  * have no route in this family yet — merge is deliberately not part of publish (LLD §7).
  */
 export const OPERATION_POLICY: Record<CollabOperation, 'any-role' | 'author-only'> = {
@@ -86,6 +88,8 @@ export const OPERATION_POLICY: Record<CollabOperation, 'any-role' | 'author-only
   'edit-comment': 'any-role',
   create: 'author-only',
   publish: 'author-only',
+  reconcile: 'author-only',
+  'mark-ready': 'author-only',
 };
 
 export type CollabAuthorizerOptions = {

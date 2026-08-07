@@ -1082,7 +1082,9 @@ describe('failure injection matrix (R-8.24)', () => {
     await settled();
     hub.start({ kind: 'publish', run: body(), idempotencyKey: 'k-pub' });
     await settled();
-    expect(gh.endpoints().filter((e) => e.startsWith('PUT /repos/acme/docs/contents/'))).toHaveLength(2);
+    // The dedup (R-8.23) means the body runs once: two document artifacts (json +
+    // markdown) plus O-2's `.gitattributes` entry, three PUTs total.
+    expect(gh.endpoints().filter((e) => e.startsWith('PUT /repos/acme/docs/contents/'))).toHaveLength(3);
   });
 
   it('names the four failure states, and every row reconciles to a state derived from GitHub', () => {

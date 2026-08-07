@@ -216,6 +216,17 @@ const TABLE: Row[] = [
     reviewer: 'denied',
     route: { method: 'POST', path: '/doc-1/publish', body: { json: { root: {} }, markdown: '# Spec' } },
   },
+  // R-8.18 / R-8.15 — recovery is the author's own repair of their own document.
+  {
+    op: 'reconcile',
+    reviewer: 'denied',
+    route: { method: 'POST', path: '/doc-1/reconcile', body: {} },
+  },
+  {
+    op: 'mark-ready',
+    reviewer: 'denied',
+    route: { method: 'POST', path: '/doc-1/ready', body: {} },
+  },
 ];
 
 describe('OPERATION_POLICY covers every operation exactly once', () => {

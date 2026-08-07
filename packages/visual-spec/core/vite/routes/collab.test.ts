@@ -182,6 +182,8 @@ describe('R-7.8 — collaboration availability', () => {
       ['POST', '/open', { documentId: 'doc-1', pullNumber: 7 }],
       ['POST', '/doc-1/sync', {}],
       ['POST', '/doc-1/publish', { json: {}, markdown: '# x' }],
+      ['POST', '/doc-1/reconcile', {}],
+      ['POST', '/doc-1/ready', {}],
       ['POST', '/doc-1/comments', { comment: 'hi' }],
       ['POST', '/doc-1/comments/c-00000001/reply', { comment: 'hi' }],
       ['PATCH', '/doc-1/comments/c-00000001', { comment: 'hi' }],
@@ -359,6 +361,47 @@ describe('R-7.1 / R-8.6 / R-8.7 — POST /:id/sync', () => {
     expect(res.status).toBe(200);
     expect(res.json).toMatchObject({ kind: 'sync' });
     expect(sync.mock.calls[0]![0]).toMatchObject({ documentId: 'doc-1', document: { documentPath: 'docs/spec.md' } });
+  });
+});
+
+describe('R-8.18 / R-8.15 — the 8.4 recovery routes', () => {
+  it('starts a reconcile job for the addressed document', async () => {
+    const reconcile = vi.fn<CollabJobBodies['reconcile']>(() => async () => {});
+    const res = await call(router({ bodies: { reconcile } }), 'POST', '/doc-1/reconcile', {});
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({ kind: 'reconcile' });
+    expect(reconcile.mock.calls[0]![0]).toMatchObject({ documentId: 'doc-1', repo: { ...REPO } });
+  });
+
+  it('starts a ready job for the addressed document', async () => {
+    const markReady = vi.fn<CollabJobBodies['markReady']>(() => async () => {});
+    const res = await call(router({ bodies: { markReady } }), 'POST', '/doc-1/ready', {});
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({ kind: 'ready' });
+    expect(markReady.mock.calls[0]![0]).toMatchObject({ documentId: 'doc-1', repo: { ...REPO } });
+  });
+
+  it('both are author-only: a refusing authorizer is honoured before the body runs', async () => {
+    const reconcile = vi.fn<CollabJobBodies['reconcile']>(() => async () => {});
+    const markReady = vi.fn<CollabJobBodies['markReady']>(() => async () => {});
+    const r = router({
+      bodies: { reconcile, markReady },
+      authorize: (op) =>
+        op === 'reconcile' || op === 'mark-ready' ? { ok: false, status: 403, error: 'author-only operation' } : { ok: true },
+    });
+    expect((await call(r, 'POST', '/doc-1/reconcile', {})).status).toBe(403);
+    expect((await call(r, 'POST', '/doc-1/ready', {})).status).toBe(403);
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(markReady).not.toHaveBeenCalled();
+  });
+
+  it('answers 503 with the availability payload when collaboration is off', async () => {
+    const r = router({ config: () => DISABLED });
+    for (const path of ['/doc-1/reconcile', '/doc-1/ready']) {
+      const res = await call(r, 'POST', path, {});
+      expect(res.status, path).toBe(503);
+      expect(res.json).toMatchObject({ available: false, reason: 'not-configured' });
+    }
   });
 });
 
@@ -669,7 +712,14 @@ describe('role-enforcement seam (task 9.2)', () => {
     const mem = memoryComments();
     const r = router({
       commentStore: () => mem.store,
-      bodies: { create: () => async () => {}, open: () => async () => {}, sync: () => async () => {}, publish: () => async () => {} },
+      bodies: {
+        create: () => async () => {},
+        open: () => async () => {},
+        sync: () => async () => {},
+        publish: () => async () => {},
+        reconcile: () => async () => {},
+        markReady: () => async () => {},
+      },
       authorize: (op, ctx) => {
         seen.push(`${op}:${ctx.documentId}`);
         return { ok: true };
@@ -680,7 +730,17 @@ describe('role-enforcement seam (task 9.2)', () => {
     await call(r, 'POST', '/doc-1/sync');
     await call(r, 'POST', '/doc-1/publish', { json: {}, markdown: '' });
     await call(r, 'POST', '/doc-1/comments', { comment: 'x' });
-    expect(seen).toEqual(['create:doc-2', 'open:doc-3', 'sync:doc-1', 'publish:doc-1', 'comment:doc-1']);
+    await call(r, 'POST', '/doc-1/reconcile', {});
+    await call(r, 'POST', '/doc-1/ready', {});
+    expect(seen).toEqual([
+      'create:doc-2',
+      'open:doc-3',
+      'sync:doc-1',
+      'publish:doc-1',
+      'comment:doc-1',
+      'reconcile:doc-1',
+      'mark-ready:doc-1',
+    ]);
   });
 });
 

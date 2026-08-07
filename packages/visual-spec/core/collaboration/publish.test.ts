@@ -208,8 +208,14 @@ describe('R-8.10 — commit then verify', () => {
     const { gh, body, doc } = rig();
     await runBody(body);
 
+    // O-2 — after verification, publish also ensures `.gitattributes` on the same
+    // branch (see the "O-2" describe block below); that PUT/GET is the third entry.
     const puts = gh.calls.filter((c) => methodOf(c.args) === 'PUT').map((c) => endpointOf(c.args));
-    expect(puts).toEqual([`/repos/acme/docs/contents/${doc.documentPath}`, `/repos/acme/docs/contents/documents/doc-1.md`]);
+    expect(puts).toEqual([
+      `/repos/acme/docs/contents/${doc.documentPath}`,
+      `/repos/acme/docs/contents/documents/doc-1.md`,
+      `/repos/acme/docs/contents/.gitattributes`,
+    ]);
 
     // Every PUT names the PR branch, never the base.
     for (const call of gh.calls.filter((c) => methodOf(c.args) === 'PUT')) {
@@ -217,13 +223,15 @@ describe('R-8.10 — commit then verify', () => {
     }
     expect(gh.calls.some((c) => endpointOf(c.args).includes(`ref=${repo.baseBranch}`))).toBe(false);
 
-    // Read-before-write for the sha, then read-back to verify: two GETs per artifact.
+    // Read-before-write for the sha, then read-back to verify: two GETs per artifact,
+    // plus the `.gitattributes` read-before-write for O-2.
     const gets = gh.calls.filter((c) => methodOf(c.args) === 'GET').map((c) => endpointOf(c.args));
     expect(gets).toEqual([
       `/repos/acme/docs/contents/documents/doc-1.json?ref=${BRANCH}`,
       `/repos/acme/docs/contents/documents/doc-1.md?ref=${BRANCH}`,
       `/repos/acme/docs/contents/documents/doc-1.json?ref=${BRANCH}`,
       `/repos/acme/docs/contents/documents/doc-1.md?ref=${BRANCH}`,
+      `/repos/acme/docs/contents/.gitattributes?ref=${BRANCH}`,
     ]);
   });
 
@@ -561,5 +569,69 @@ describe('R-8.14 — publish completes after the client disconnects', () => {
     const { states } = await runBody(body, { signal: aborted.signal });
     expect(states).toEqual(['publishing', 'verifying', 'published']);
     expect(gh.files.get('documents/doc-1.md')).toBe(MARKDOWN);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * O-2 — `.gitattributes` collapses the JSON diff on github.com
+ * ------------------------------------------------------------------ */
+
+describe('O-2 — .gitattributes marks the document path linguist-generated', () => {
+  it('adds the entry on the PR branch, on top of the two document commits', async () => {
+    const { gh, body, doc } = rig();
+    await runBody(body);
+    expect(gh.files.get('.gitattributes')).toBe(`${doc.documentPath} linguist-generated=true -diff\n`);
+  });
+
+  it('publishing the same document twice makes no second `.gitattributes` commit', async () => {
+    const doc = makeDoc();
+    const gh = fakeGh({ files: { [doc.documentPath]: '{"documentId":"doc-1"}\n' } });
+    const adapter = createGitHubAdapter(gh.exec);
+    const store = memoryStore(doc);
+
+    const run = () =>
+      runBody(
+        createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, document: doc, json: doc.doc, markdown: MARKDOWN }),
+      );
+
+    await run();
+    const attributesPuts = () =>
+      gh.calls.filter((c) => methodOf(c.args) === 'PUT' && endpointOf(c.args).includes('.gitattributes'));
+    expect(attributesPuts()).toHaveLength(1);
+
+    await run();
+    expect(attributesPuts()).toHaveLength(1);
+    expect(gh.files.get('.gitattributes')).toBe(`${doc.documentPath} linguist-generated=true -diff\n`);
+  });
+
+  it('never fails the publish when the `.gitattributes` write itself fails', async () => {
+    const doc = makeDoc();
+    const base = fakeGh({ files: { [doc.documentPath]: '{"documentId":"doc-1"}\n' } });
+    // Every call goes through the recorded fake except a PUT to `.gitattributes`,
+    // which fails as e.g. a permissions error or a concurrent-write conflict would.
+    const flaky: GhExecutor = async (args, input) => {
+      const endpoint = endpointOf(args);
+      if (methodOf(args) === 'PUT' && endpoint.endsWith('/contents/.gitattributes')) {
+        return { stdout: JSON.stringify({ message: 'Conflict', status: '409' }), stderr: '', exitCode: 1 };
+      }
+      return base.exec(args, input);
+    };
+    const adapter = createGitHubAdapter(flaky);
+    const store = memoryStore(doc);
+    const publishBody = createPublishBody({ adapter })({
+      documentId: 'doc-1',
+      repo,
+      store,
+      document: doc,
+      json: doc.doc,
+      markdown: MARKDOWN,
+    });
+
+    const { states, logs } = await runBody(publishBody);
+    // The publish itself still reaches `published` — the document and markdown are
+    // committed and verified — even though the presentation nicety failed.
+    expect(states).toEqual(['publishing', 'verifying', 'published']);
+    expect(base.files.has('.gitattributes')).toBe(false);
+    expect(logs.some((l) => l.includes('gitattributes') && l.includes('Conflict'))).toBe(true);
   });
 });

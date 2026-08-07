@@ -131,6 +131,17 @@ export type CollabJobBodies = {
   open(input: OpenJobInput): JobBody;
   sync(input: SyncJobInput): JobBody;
   publish(input: PublishJobInput): JobBody;
+  /** R-8.18 — re-derive state from GitHub; cleans up a partial create's orphan branch. */
+  reconcile(input: RecoveryJobInput): JobBody;
+  /** R-8.15 — re-derive readiness from GitHub and record it. Never trusts held state. */
+  markReady(input: RecoveryJobInput): JobBody;
+};
+
+/** What both recovery bodies need. Mirrors 8.4's `RecoveryBodyInput`. */
+export type RecoveryJobInput = {
+  documentId: string;
+  repo: ResolvedCollaborationConfig;
+  store: DocumentStore;
 };
 
 /**
@@ -150,6 +161,8 @@ const STUB_BODIES: CollabJobBodies = {
   open: () => notImplemented('collab open', '8.2'),
   sync: () => notImplemented('collab sync', '8.2'),
   publish: () => notImplemented('collab publish', '8.3'),
+  reconcile: () => notImplemented('collab reconcile', '8.4'),
+  markReady: () => notImplemented('collab mark-ready', '8.4'),
 };
 
 /* ------------------------------------------------------------------ *
@@ -165,7 +178,9 @@ export type CollabOperation =
   | 'comment'
   | 'reply'
   | 'edit-comment'
-  | 'publish';
+  | 'publish'
+  | 'reconcile'
+  | 'mark-ready';
 
 export type AuthorizationVerdict = { ok: true } | { ok: false; status: number; error: string };
 
@@ -535,6 +550,39 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
             store: deps.documents(),
             ...(idempotencyKey ? { idempotencyKey } : {}),
           }),
+        });
+      }
+
+      /*
+       * POST /__vs/collab/:id/reconcile — R-8.18. The recovery entrypoint for a document
+       * whose local state and GitHub disagree, including the partial create that left a
+       * branch with no Pull Request behind it. It re-derives state from GitHub and may
+       * delete that orphan branch, so it is author-only.
+       */
+      if (method === 'POST' && tail === '/reconcile') {
+        const gated = await gate('reconcile', documentId);
+        if (!gated.ok) return gated.result;
+        const idempotencyKey = optionalKey(body);
+        return deps.jobs.hub(documentId).start({
+          kind: 'reconcile',
+          idempotencyKey,
+          run: bodies.reconcile({ documentId, repo: gated.repo, store: deps.documents() }),
+        });
+      }
+
+      /*
+       * POST /__vs/collab/:id/ready — R-8.15. Readiness is re-derived from GitHub inside
+       * the body; neither this route nor the hub's held state is consulted, which is
+       * exactly what the requirement forbids trusting.
+       */
+      if (method === 'POST' && tail === '/ready') {
+        const gated = await gate('mark-ready', documentId);
+        if (!gated.ok) return gated.result;
+        const idempotencyKey = optionalKey(body);
+        return deps.jobs.hub(documentId).start({
+          kind: 'ready',
+          idempotencyKey,
+          run: bodies.markReady({ documentId, repo: gated.repo, store: deps.documents() }),
         });
       }
 

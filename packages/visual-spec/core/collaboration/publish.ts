@@ -105,6 +105,7 @@ import type { ResolvedCollaborationConfig } from '../config';
 import type { CollaborationDocument, JsonDocument } from './document-protocol';
 import { serializeCollaborationDocument } from './document-protocol';
 import type { DocumentStore } from './document-store';
+import { ensureLinguistGeneratedEntry } from './gitattributes';
 import type { GitHubAdapter, RepoRef } from './github-adapter';
 import type { JobBody } from './job-hub';
 import type { BoundCollaborationDocument } from './lifecycle';
@@ -249,6 +250,11 @@ export function createPublishBody(options: PublishBodyOptions): (input: PublishB
       }
       ctx.log(`verified ${artifact.label} at ${artifact.path} — blob ${expectedSha}`, 'progress');
     }
+
+    // O-2 — best effort, never allowed to fail the publish (see gitattributes.ts).
+    // Runs after verification, on the same PR head branch the artifacts just landed
+    // on, so a reviewer opening the PR sees the JSON diff already collapsed.
+    await ensureLinguistGeneratedEntry({ adapter, repo: repoRef, branch, documentPath: doc.documentPath, log: ctx.log });
 
     // R-8.13 — the Markdown is on the branch and readable by the same `getFile` the
     // verification step just used, so an agent can build the PR summary and changelog.
