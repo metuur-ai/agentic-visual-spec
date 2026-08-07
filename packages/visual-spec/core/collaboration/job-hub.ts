@@ -201,6 +201,15 @@ export interface JobHubOptions {
   now?: () => number;
 }
 
+/**
+ * R-8.6 — notified whenever a document's SSE subscriber count *changes*, with the new
+ * count. The hub reports the fact and takes no view of it; 7.2 is what decides that the
+ * fact means "start / stop the interval poller". Repeats are suppressed: a re-`subscribe`
+ * of a sink already attached, or a second `close` for one already gone, changes no count
+ * and notifies nobody.
+ */
+export type WatcherListener = (documentId: string, count: number) => void;
+
 /** One document's job hub. Owns its state, log, subscribers and running job. */
 export interface DocumentJobHub {
   readonly documentId: string;
@@ -232,6 +241,13 @@ export interface JobHubRegistry {
   dispose(documentId: string): void;
   /** Dispose every hub. Call on server shutdown. */
   disposeAll(): void;
+  /**
+   * R-8.6 — register the one listener notified when any document's subscriber count
+   * changes. A single slot rather than a set: there is exactly one consumer (7.2's
+   * poller wiring), and a set would invite a second owner of the same decision. Read
+   * through at notify time, so hubs created before *and* after the call are covered.
+   */
+  onWatchersChanged(listener: WatcherListener): void;
 }
 
 const DEFAULT_MAX_EVENTS = 500;
@@ -277,6 +293,7 @@ function createDocumentJobHub(
   maxEvents: number,
   maxIdempotencyKeys: number,
   now: () => number,
+  notifyWatchers: (count: number) => void,
 ): DocumentJobHub {
   let state: LifecycleState = 'draft';
   let job: JobRecord | null = null;
@@ -331,8 +348,16 @@ function createDocumentJobHub(
         'x-accel-buffering': 'no',
       });
       frame(sink, { type: 'sync', ...snapshot() });
+      const before = subs.size;
       subs.add(sink);
-      sink.on('close', () => subs.delete(sink));
+      // `Set.add` of a sink already attached is a no-op, and `Set.delete` of one already
+      // gone answers false — so both guards below fire the listener only on a real
+      // change. A tab that double-subscribes cannot start two pollers, and a sink whose
+      // `close` runs twice cannot stop the poller out from under a live subscriber.
+      if (subs.size !== before) notifyWatchers(subs.size);
+      sink.on('close', () => {
+        if (subs.delete(sink)) notifyWatchers(subs.size);
+      });
     },
 
     start({ kind, run, idempotencyKey }) {
@@ -444,7 +469,12 @@ function createDocumentJobHub(
       abort = null;
       running = false;
       for (const sink of subs) sink.end?.();
+      const had = subs.size;
       subs.clear();
+      // Ending every sink here does *not* run their `close` handlers — those are the
+      // transport's, and this is a local teardown. So dispose announces the drop to zero
+      // itself; without this a disposed document would leave its poller running forever.
+      if (had > 0) notifyWatchers(0);
       events = [];
       droppedEvents = 0;
       byKey.clear();
@@ -462,13 +492,16 @@ export function createJobHubRegistry(options: JobHubOptions = {}): JobHubRegistr
   const maxIdempotencyKeys = Math.max(1, options.maxIdempotencyKeys ?? IDEMPOTENCY_LIMIT);
   const now = options.now ?? Date.now;
   const hubs = new Map<string, DocumentJobHub>();
+  let watchers: WatcherListener | null = null;
 
   return {
     hub(documentId) {
       if (!DOCUMENT_ID_RE.test(documentId)) throw new Error(`invalid documentId: ${documentId}`);
       let existing = hubs.get(documentId);
       if (!existing) {
-        existing = createDocumentJobHub(documentId, maxEvents, maxIdempotencyKeys, now);
+        existing = createDocumentJobHub(documentId, maxEvents, maxIdempotencyKeys, now, (count) =>
+          watchers?.(documentId, count),
+        );
         hubs.set(documentId, existing);
       }
       return existing;
@@ -492,6 +525,10 @@ export function createJobHubRegistry(options: JobHubOptions = {}): JobHubRegistr
     disposeAll() {
       for (const existing of hubs.values()) existing.dispose();
       hubs.clear();
+    },
+
+    onWatchersChanged(listener) {
+      watchers = listener;
     },
   };
 }

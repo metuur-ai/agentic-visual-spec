@@ -106,16 +106,26 @@ function fakeScheduler() {
 
 function sink() {
   const frames: (JobEvent | JobSync)[] = [];
+  // `close` callbacks are captured rather than dropped, so a test can detach a
+  // subscriber the way the transport does and observe what that costs the poller (R-8.6).
+  const closers: Array<() => void> = [];
   const s: SseSink = {
     writeHead() {},
     write(chunk: string) {
       frames.push(JSON.parse(chunk.replace(/^data: /, '').trim()));
     },
-    on() {},
+    on(_event: 'close', cb: () => void) {
+      closers.push(cb);
+    },
     end() {},
     writableEnded: false,
   };
-  return Object.assign(s, { frames });
+  return Object.assign(s, {
+    frames,
+    close: () => {
+      for (const cb of closers) cb();
+    },
+  });
 }
 
 const settled = async (): Promise<void> => {
@@ -161,7 +171,7 @@ function host(options: { config?: ResolvedVisualSpecConfig; responses?: Array<Pa
   });
   const call = (method: string, pathname: string, body: Record<string, unknown> = {}, sse?: SseSink): Promise<CollabRouteResult> =>
     router.handle({ method, pathname, query: {}, body, ...(sse ? { sse } : {}) });
-  return { wiring, router, call, calls, endpoints, documents, syncs, fire };
+  return { wiring, router, call, calls, endpoints, documents, syncs, fire, jobs };
 }
 
 /* ================================================================== *
@@ -223,15 +233,35 @@ describe('7.2 routes run 8.2 job bodies (integration)', () => {
 });
 
 /* ================================================================== *
- * The poller is host-owned and stops on shutdown
+ * The poller is host-owned, follows SSE subscribers, and stops on shutdown
+ *
+ * R-8.6 — polling exists to feed `sync` frames to attached subscribers, so it runs
+ * exactly while a document has at least one. These are the guards on that rule: nobody
+ * watching means nobody is paying GitHub's rate limit for the privilege.
  * ================================================================== */
 describe('interval polling is wired by the host (R-8.6)', () => {
-  it('starts once the document is PR-open, syncs through the same body, and stops on shutdown', async () => {
+  it('does not poll a document nobody is watching, even a freshly created one', async () => {
     const h = host({ responses: [...CREATE_OK, LIST_COMMENTS] });
     expect(h.wiring.pollingDocumentIds()).toEqual([]);
 
     await h.call('POST', '/start', { documentId: 'doc-1', documentPath: 'documents/doc-1.json' });
     await settled();
+
+    // Create no longer starts the poller by itself. The document is PR-open, but no
+    // browser is attached to it, so there is nothing for a sync frame to reach.
+    expect(h.wiring.pollingDocumentIds()).toEqual([]);
+    h.calls.length = 0;
+    h.fire();
+    await settled();
+    expect(h.calls).toHaveLength(0);
+  });
+
+  it('starts on the first subscriber, syncs through the same body, and stops on shutdown', async () => {
+    const h = host({ responses: [...CREATE_OK, LIST_COMMENTS] });
+    await h.call('POST', '/start', { documentId: 'doc-1', documentPath: 'documents/doc-1.json' });
+    await settled();
+
+    await h.call('GET', '/doc-1/events', {}, sink());
     expect(h.wiring.pollingDocumentIds()).toEqual(['doc-1']);
     h.calls.length = 0;
 
@@ -246,6 +276,101 @@ describe('interval polling is wired by the host (R-8.6)', () => {
     h.fire();
     await settled();
     expect(h.calls).toHaveLength(0);
+  });
+
+  it('keeps polling while any subscriber remains, and stops only when the last one detaches', async () => {
+    const h = host({ responses: [...CREATE_OK, LIST_COMMENTS] });
+    await h.call('POST', '/start', { documentId: 'doc-1', documentPath: 'documents/doc-1.json' });
+    await settled();
+
+    const first = sink();
+    const second = sink();
+    await h.call('GET', '/doc-1/events', {}, first);
+    await h.call('GET', '/doc-1/events', {}, second);
+    expect(h.wiring.pollingDocumentIds()).toEqual(['doc-1']);
+
+    // One of two tabs closes: someone is still watching, so the poller must survive.
+    first.close();
+    expect(h.wiring.pollingDocumentIds()).toEqual(['doc-1']);
+
+    second.close();
+    expect(h.wiring.pollingDocumentIds()).toEqual([]);
+
+    // …and the stop is real, not just bookkeeping: the interval no longer reaches GitHub.
+    h.calls.length = 0;
+    h.fire();
+    await settled();
+    expect(h.calls).toHaveLength(0);
+  });
+
+  it('resumes polling when a reviewer reopens a closed tab', async () => {
+    const h = host({ responses: [...CREATE_OK, LIST_COMMENTS] });
+    await h.call('POST', '/start', { documentId: 'doc-1', documentPath: 'documents/doc-1.json' });
+    await settled();
+
+    const before = sink();
+    await h.call('GET', '/doc-1/events', {}, before);
+    before.close();
+    expect(h.wiring.pollingDocumentIds()).toEqual([]);
+
+    // Reattaching is the same call the reopened tab makes. Polling has to come back, and
+    // it has to come back *working* — so the tick is fired and the GitHub read asserted,
+    // not merely the id in `pollingDocumentIds`.
+    await h.call('GET', '/doc-1/events', {}, sink());
+    expect(h.wiring.pollingDocumentIds()).toEqual(['doc-1']);
+
+    h.calls.length = 0;
+    h.fire();
+    await settled();
+    expect(h.endpoints()).toEqual(['/repos/acme/docs/issues/42/comments?per_page=100&page=1']);
+    expect(h.syncs.map((s) => s.trigger)).toEqual(['poll']);
+  });
+
+  it('ignores a repeated close for a sink already gone, so a live subscriber keeps its poller', async () => {
+    const h = host({ responses: [...CREATE_OK, LIST_COMMENTS] });
+    await h.call('POST', '/start', { documentId: 'doc-1', documentPath: 'documents/doc-1.json' });
+    await settled();
+
+    const leaver = sink();
+    await h.call('GET', '/doc-1/events', {}, leaver);
+    await h.call('GET', '/doc-1/events', {}, sink());
+
+    leaver.close();
+    leaver.close();
+
+    // The second `close` must not be mistaken for the *other* subscriber leaving.
+    expect(h.wiring.pollingDocumentIds()).toEqual(['doc-1']);
+  });
+
+  it('leaves no poller behind when the document is disposed', async () => {
+    const h = host({ responses: [...CREATE_OK, LIST_COMMENTS] });
+    await h.call('POST', '/start', { documentId: 'doc-1', documentPath: 'documents/doc-1.json' });
+    await settled();
+
+    await h.call('GET', '/doc-1/events', {}, sink());
+    expect(h.wiring.pollingDocumentIds()).toEqual(['doc-1']);
+
+    // `dispose` ends every sink itself; their transport `close` handlers never run, so
+    // the drop to zero has to be announced by the hub or the poller outlives the document.
+    h.jobs.dispose('doc-1');
+    expect(h.wiring.pollingDocumentIds()).toEqual([]);
+    h.calls.length = 0;
+    h.fire();
+    await settled();
+    expect(h.calls).toHaveLength(0);
+  });
+
+  it('keys polling per document, so one document detaching does not stop another', async () => {
+    // Attaching is the whole trigger, so this needs no create and touches no GitHub —
+    // which is the point: the two pollers are keyed on `documentId` and nothing else.
+    const h = host({ responses: [] });
+    const one = sink();
+    await h.call('GET', '/doc-1/events', {}, one);
+    await h.call('GET', '/doc-2/events', {}, sink());
+    expect(h.wiring.pollingDocumentIds()).toEqual(['doc-1', 'doc-2']);
+
+    one.close();
+    expect(h.wiring.pollingDocumentIds()).toEqual(['doc-2']);
   });
 });
 

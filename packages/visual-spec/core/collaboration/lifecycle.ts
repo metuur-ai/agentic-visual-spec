@@ -136,9 +136,13 @@ export interface Lifecycle {
    * There is no other way to sync in this package.
    */
   sync(documentId: string, trigger: SyncTrigger): JobRouteResult;
-  /** Begin interval polling for a document. Idempotent. */
+  /**
+   * Begin interval polling for a document. Idempotent, and safe to call again after
+   * `stopPolling` — 7.2 drives both from SSE subscriber arrivals and departures (R-8.6),
+   * so a reviewer closing and reopening a tab lands here twice with a stop in between.
+   */
   startPolling(documentId: string): void;
-  /** Stop polling one document. */
+  /** Stop polling one document. Idempotent, and a no-op for a document not polling. */
   stopPolling(documentId: string): void;
   /** Stop every poller. Call on server shutdown. */
   stopAllPolling(): void;

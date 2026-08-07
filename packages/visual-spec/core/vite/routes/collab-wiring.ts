@@ -114,30 +114,43 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
   });
 
+  // R-8.6 — POLLING FOLLOWS WATCHERS, and that is the whole rule.
+  //
+  // The poller exists for one purpose: to feed `sync` frames to attached SSE
+  // subscribers. So it runs exactly while a document has at least one, keyed on the same
+  // `documentId` the hubs and the lifecycle already key on. The first subscriber to
+  // attach starts it; the last to detach stops it; a reattach starts it again, because
+  // this listener sees every change and not just the first. `dispose()` ends every
+  // subscriber and announces the drop to zero, so a disposed document stops too, and
+  // `stopAllPolling` on shutdown remains the backstop for anything still attached.
+  //
+  // This replaces the unconditional `startPolling` that `create` and `open` used to do.
+  // That start ran *before* any subscriber existed, so a document created by the CLI
+  // that nobody ever opened in a browser polled GitHub on the interval forever — which
+  // is precisely the rate-limit burn this rule removes. An unwatched document therefore
+  // does not poll at all now, freshly created or not: the browser that ran create or
+  // open attaches to `GET /:id/events` immediately afterwards, and *that* is what starts
+  // it. This is a deliberate narrowing, not a lost start.
+  options.jobs.onWatchersChanged((documentId, count) => {
+    if (count > 0) lifecycle.startPolling(documentId);
+    else lifecycle.stopPolling(documentId);
+  });
+
   return {
     bodies: {
-      // Polling begins the moment a document is PR-open, which is the only moment this
-      // package can currently observe one reaching that state (R-8.6). It stops on
-      // shutdown via `stopAllPolling`; per-document stops arrive with 11.x's close path.
       // R-8.18 (task 8.4) — `withOrphanCleanup` deletes the branch a partial create left
       // behind, on the way out of the failure. It adds no GitHub call to the success
       // path, so create's shipped call sequence is unchanged.
-      create: (input) => async (ctx) => {
-        await withOrphanCleanup(bodies.create(input), {
+      create: (input) =>
+        withOrphanCleanup(bodies.create(input), {
           adapter,
           repo: input.repo,
           store: input.store,
           documentId: input.documentId,
-        })(ctx);
-        lifecycle.startPolling(input.documentId);
-      },
+        }),
       // R-11.2 — the reviewer's entry point. The document reaches the local store here,
-      // which is what `GET /__vs/collab/:id` then serves; polling starts for the same
-      // reason it does after `create`, and stops with `stopAllPolling` on shutdown.
-      open: (input) => async (ctx) => {
-        await openBody(input)(ctx);
-        lifecycle.startPolling(input.documentId);
-      },
+      // which is what `GET /__vs/collab/:id` then serves.
+      open: (input) => openBody(input),
       sync: (input) => bodies.sync(input),
       // R-8.9 … R-8.14. Publish neither starts nor stops the poller — the document stays
       // PR-open on the branch until it is merged on github.com. R-8.21 / R-8.22 (task

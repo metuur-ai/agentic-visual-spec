@@ -29,6 +29,7 @@ import { serializeCollaborationDocument } from '../../collaboration/document-pro
 import type { DocumentStore } from '../../collaboration/document-store';
 import { createGitHubAdapter } from '../../collaboration/github-adapter';
 import type { GhExecutor } from '../../collaboration/github-executor';
+import type { SseSink } from '../../collaboration/job-hub';
 import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { IntervalScheduler } from '../../collaboration/lifecycle';
 import { buildPullRequestBody } from '../../collaboration/lifecycle';
@@ -168,14 +169,33 @@ function reviewerHost() {
     commentStore: ({ documentId, document }) =>
       githubCommentStore({ adapter, repo: { owner: REPO.owner, repo: REPO.repo }, pullNumber: 42, documentId, documentPath: document.documentPath }),
   });
-  const call = (method: string, pathname: string, body: Record<string, unknown> = {}): Promise<CollabRouteResult> =>
-    router.handle({ method, pathname, query: {}, body });
+  const call = (method: string, pathname: string, body: Record<string, unknown> = {}, sse?: SseSink): Promise<CollabRouteResult> =>
+    router.handle({ method, pathname, query: {}, body, ...(sse ? { sse } : {}) });
   return { call, gh, documents, wiring, ticks };
 }
 
 const settled = async (): Promise<void> => {
   for (let i = 0; i < 40; i += 1) await Promise.resolve();
 };
+
+/** A minimal SSE sink whose `close` can be run on demand, to model a tab going away. */
+function reviewerSink() {
+  const closers: Array<() => void> = [];
+  const s: SseSink = {
+    writeHead() {},
+    write() {},
+    on(_event: 'close', cb: () => void) {
+      closers.push(cb);
+    },
+    end() {},
+    writableEnded: false,
+  };
+  return Object.assign(s, {
+    close: () => {
+      for (const cb of closers) cb();
+    },
+  });
+}
 
 describe('SC-4 (simulated) — a read-only reviewer completes open → read → comment', () => {
   it('opens a document it has never seen, reads it back, and comments on it', async () => {
@@ -224,13 +244,29 @@ describe('SC-4 (simulated) — a read-only reviewer completes open → read → 
     expect(res.json).toMatchObject({ available: true, login: 'reviewer-rita', repo: { owner: 'acme', repo: 'docs' } });
   });
 
-  it('starts polling the opened document, so the author’s replies arrive without a reload', async () => {
+  it('polls the opened document once the reviewer is watching it, so the author’s replies arrive without a reload', async () => {
     const h = reviewerHost();
     await h.call('POST', '/open', { documentId: 'doc-1', pullNumber: 42 });
     await settled();
+
+    // R-8.6 — `open` no longer starts the poller on its own. A reviewer who opened the
+    // document on the CLI and never attached a browser is nobody watching, and polling
+    // GitHub on their behalf would buy nothing but rate limit.
+    expect(h.wiring.pollingDocumentIds()).toEqual([]);
+
+    // Their browser attaching to the SSE stream is what starts it — the same call the
+    // editor makes on load.
+    const s = reviewerSink();
+    await h.call('GET', '/doc-1/events', {}, s);
     expect(h.wiring.pollingDocumentIds()).toEqual(['doc-1']);
 
-    // …and it is stopped on shutdown, which is the only stop that exists today.
+    // Closing the tab stops it, and reopening starts it again.
+    s.close();
+    expect(h.wiring.pollingDocumentIds()).toEqual([]);
+    await h.call('GET', '/doc-1/events', {}, reviewerSink());
+    expect(h.wiring.pollingDocumentIds()).toEqual(['doc-1']);
+
+    // …and shutdown remains the backstop for whatever is still attached.
     h.wiring.stopAllPolling();
     expect(h.wiring.pollingDocumentIds()).toEqual([]);
   });

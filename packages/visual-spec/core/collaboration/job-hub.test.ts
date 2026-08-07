@@ -497,3 +497,118 @@ describe('disposal', () => {
     expect(reg.documentIds()).toEqual([]);
   });
 });
+
+/* ================================================================== *
+ * R-8.6 — the hub reports who is watching
+ *
+ * The hub takes no view of what a subscriber count *means*; it reports every change so
+ * 7.2 can drive the interval poller off it. What is guarded here is that the report is
+ * accurate — no missed drop to zero, no phantom change — because a missed edge either
+ * leaves a poller running for a document nobody is watching or kills one that is.
+ * ================================================================== */
+describe('subscriber-count notifications (R-8.6)', () => {
+  const observe = (reg: JobHubRegistry) => {
+    const seen: Array<[string, number]> = [];
+    reg.onWatchersChanged((documentId, count) => seen.push([documentId, count]));
+    return seen;
+  };
+
+  it('reports the rise to one and the fall back to zero, per document', () => {
+    const reg = registry();
+    const seen = observe(reg);
+    const hub = reg.hub('doc-a');
+
+    const sub = fakeSink();
+    hub.subscribe(sub);
+    expect(seen).toEqual([['doc-a', 1]]);
+
+    sub.close();
+    expect(seen).toEqual([
+      ['doc-a', 1],
+      ['doc-a', 0],
+    ]);
+  });
+
+  it('reports each intermediate count, so a poller is stopped only on the last departure', () => {
+    const reg = registry();
+    const seen = observe(reg);
+    const hub = reg.hub('doc-a');
+
+    const first = fakeSink();
+    const second = fakeSink();
+    hub.subscribe(first);
+    hub.subscribe(second);
+    first.close();
+
+    // The `1` after the `2` is the whole point: one tab closed, one is still watching.
+    expect(seen.map(([, n]) => n)).toEqual([1, 2, 1]);
+    expect(hub.subscriberCount()).toBe(1);
+  });
+
+  it('reports a re-attach, so polling can resume for a reopened tab', () => {
+    const reg = registry();
+    const seen = observe(reg);
+    const hub = reg.hub('doc-a');
+
+    const before = fakeSink();
+    hub.subscribe(before);
+    before.close();
+    hub.subscribe(fakeSink());
+
+    expect(seen.map(([, n]) => n)).toEqual([1, 0, 1]);
+  });
+
+  it('stays silent when nothing actually changed', () => {
+    const reg = registry();
+    const seen = observe(reg);
+    const hub = reg.hub('doc-a');
+
+    const sub = fakeSink();
+    hub.subscribe(sub);
+    hub.subscribe(sub); // same sink twice — the set is unchanged
+    expect(seen.map(([, n]) => n)).toEqual([1]);
+
+    sub.close();
+    sub.close(); // already gone — must not read as a second departure
+    expect(seen.map(([, n]) => n)).toEqual([1, 0]);
+  });
+
+  it('announces the drop to zero on dispose, since ending sinks runs no close handler', () => {
+    const reg = registry();
+    const seen = observe(reg);
+    const hub = reg.hub('doc-a');
+    hub.subscribe(fakeSink());
+
+    hub.dispose();
+    expect(seen).toEqual([
+      ['doc-a', 1],
+      ['doc-a', 0],
+    ]);
+    expect(hub.subscriberCount()).toBe(0);
+  });
+
+  it('says nothing when a document with no subscribers is disposed', () => {
+    const reg = registry();
+    const seen = observe(reg);
+    reg.hub('doc-a').dispose();
+    expect(seen).toEqual([]);
+  });
+
+  it('keeps documents apart, including hubs created before the listener was registered', () => {
+    const reg = registry();
+    const early = reg.hub('doc-a'); // exists before `onWatchersChanged` is called
+    const seen = observe(reg);
+    const late = reg.hub('doc-b');
+
+    const a = fakeSink();
+    early.subscribe(a);
+    late.subscribe(fakeSink());
+    a.close();
+
+    expect(seen).toEqual([
+      ['doc-a', 1],
+      ['doc-b', 1],
+      ['doc-a', 0],
+    ]);
+  });
+});
