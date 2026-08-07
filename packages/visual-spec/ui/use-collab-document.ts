@@ -5,15 +5,21 @@
  * `GET /:id/events` is the whole snapshot, so a subscriber that attaches late — or
  * reattaches after a reload — recovers without replaying anything. This hook is
  * therefore deliberately thin: seed from `GET /:id`, then let the stream be the source
- * of truth via `applyJobFrame`. It does NOT poll, and it does not re-fetch after each
- * frame; doing either would race the stream it already trusts.
+ * of truth for job state via `applyJobFrame`. It does NOT poll.
  *
  * WHY THREE READS. The stream carries the job snapshot and nothing else, so everything
- * a component actually renders comes from a plain GET, each fetched once per document
- * id: `GET /:id` for identity + the R-8.4 snapshot, `GET /:id/document` for the
- * canonical document, `GET /:id/comments` for the conversation. They are separate
- * requests because `GET /:id`'s body doubles as the SSE `sync` frame and must not grow.
- * None of the three is polled — see above.
+ * a component actually renders comes from a plain GET: `GET /:id` for identity + the
+ * R-8.4 snapshot, `GET /:id/document` for the canonical document, `GET /:id/comments`
+ * for the conversation. They are separate requests because `GET /:id`'s body doubles as
+ * the SSE `sync` frame and must not grow.
+ *
+ * WHY A FRAME RE-READS TWO OF THEM. Re-fetching the *snapshot* on every frame would
+ * race the stream, so that never happens — `applyJobFrame` stays authoritative. But the
+ * document and the comments are not in the stream at all, so there is nothing for a
+ * re-read of those to race. Without one, a reviewer's comment reaches the server (the
+ * hub's poller runs `sync` on an interval) and then dies there: the frame announcing it
+ * arrives and the author's browser renders nothing until a reload. So a successful
+ * `job-done` re-reads what that kind of job can have changed — see `COMMENT_ONLY_JOBS`.
  *
  * WHY 409 IS NOT AN ERROR HERE (R-8.1). `sync` and `publish` answer `conflict` when a
  * job is already running for this document. That is the expected answer to a second
@@ -26,7 +32,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CollaborationDocument } from '../core/collaboration/document-protocol';
 import type { CommentRecord } from '../core/editing/comment-doc';
-import type { JobEvent, JobSnapshot, JobSync } from '../core/collaboration/job-hub';
+import type { JobEvent, JobKind, JobSnapshot, JobSync } from '../core/collaboration/job-hub';
 import type { CommentPatch } from '../core/vite/routes/comments';
 import {
   applyJobFrame,
@@ -37,6 +43,15 @@ import {
   type JobAccepted,
   type PublishInput,
 } from './collab-client';
+
+/**
+ * Job kinds whose only remote effect is on comments. The hub's poller runs `sync` on an
+ * interval, so re-reading the document on those would replace `fullDocument` every tick
+ * and re-render the editor surface underneath an author who is typing. Any kind NOT
+ * listed re-reads both, which makes a newly added kind stale-free by default and merely
+ * costs it one extra pair of GETs.
+ */
+const COMMENT_ONLY_JOBS: ReadonlySet<JobKind> = new Set<JobKind>(['sync', 'remap', 'resolve']);
 
 /** The minimum of `EventSource` this hook uses — so a test double stays small. */
 export type EventSourceLike = {
@@ -142,6 +157,32 @@ export function useCollabDocument(documentId: string, options: UseCollabDocument
       setLoading(false);
     });
 
+    /**
+     * A finished job can have changed data the stream does not carry. Failures here are
+     * swallowed on purpose: these reads run in the background, and `error` blanks the
+     * whole document view (`collab-app.tsx`), so a blip must not replace a working
+     * screen — the last good data stays on screen until a later frame succeeds.
+     */
+    const reread = (frame: JobEvent | JobSync) => {
+      if (frame.type !== 'job-done' || !frame.ok) return;
+
+      void client.comments(documentId).then((result) => {
+        if (live && result.ok) setComments(result.value);
+      });
+
+      if (COMMENT_ONLY_JOBS.has(frame.kind)) return;
+
+      void client.document(documentId).then((result) => {
+        if (live && result.ok) setFullDocument(result.value);
+      });
+      void client.status(documentId).then((result) => {
+        // Only the identity half: `create` is how a PR number first appears in the title
+        // bar. The job half is deliberately dropped — a racing read of it could rewind
+        // the state the frame just advanced.
+        if (live && result.ok) setDocument(result.value.document);
+      });
+    };
+
     const factory = openStream.current ?? ((url: string) => new EventSource(url) as unknown as EventSourceLike);
     const stream = factory(client.eventsUrl(documentId));
     stream.onmessage = (event) => {
@@ -155,6 +196,7 @@ export function useCollabDocument(documentId: string, options: UseCollabDocument
         return;
       }
       setSnapshot((current) => applyJobFrame(current, frame));
+      reread(frame);
     };
 
     return () => {

@@ -20,7 +20,7 @@
  * a later task is covered the moment it lands rather than when someone remembers to add
  * it here. That is the property that would have caught all four originals.
  */
-import { readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -52,14 +52,7 @@ const IS_TEST = /\.test\.tsx?$/;
  *
  * Every entry must name the decision, not merely restate the fact.
  */
-const DELIBERATELY_UNMOUNTED: Record<string, string> = {
-  'ui/collab-editor.tsx':
-    'The author-edit slice is deferred. `collab-app.tsx` mounts `CollabDocumentView` ' +
-    '(read-only) plus the comment panel — the reviewer half of the feature — because ' +
-    "`CommentPanel` anchors on `[data-vs-node-id]`, which the view stamps and an editor's " +
-    'live tree does not stably provide. Mounting this is the remaining author-UI task; ' +
-    'when it lands, delete this entry rather than editing the assertion.',
-};
+const DELIBERATELY_UNMOUNTED: Record<string, string> = {};
 
 function collabUiModules(): string[] {
   return readdirSync(resolve(pkgRoot, 'ui'))
@@ -91,7 +84,15 @@ describe('the collaboration UI is reachable from the app (task U-1)', () => {
     expect([...reachableFromApp()].sort()).toContain(module);
   });
 
-  it.each(Object.keys(DELIBERATELY_UNMOUNTED))(
+  // The list is empty today — every collaboration module is mounted. `it.each([])` is an
+  // error in vitest, so the exception suite reports itself as skipped rather than vanishing
+  // silently; the moment an entry is added it runs.
+  const unmounted = Object.keys(DELIBERATELY_UNMOUNTED);
+  const eachUnmounted = unmounted.length
+    ? it.each(unmounted)
+    : it.skip.each(['(no recorded exceptions)']);
+
+  eachUnmounted(
     '%s is unreachable, and that is a recorded decision — not an oversight',
     (module) => {
       // Asserted in both directions. If someone wires it up, this fails and the entry
@@ -104,8 +105,11 @@ describe('the collaboration UI is reachable from the app (task U-1)', () => {
 
   it('reports absence rather than always passing', () => {
     const reached = reachableFromApp();
-    // A module that exists but is not on the graph is exactly what the walker must see.
-    expect(reached.has('ui/collab-editor.tsx')).toBe(false);
+    // The negative control needs a module that exists on disk and is never imported by
+    // the app. A test file is that by construction, so this control cannot rot the way
+    // naming a production module does the moment someone mounts it.
+    expect(existsSync(resolve(pkgRoot, 'ui/collab-editor.test.tsx'))).toBe(true);
+    expect(reached.has('ui/collab-editor.test.tsx')).toBe(false);
     expect(reached.has('ui/collab-document-view.tsx')).toBe(true);
     expect(reached.size).toBeGreaterThan(modules.length);
   });
