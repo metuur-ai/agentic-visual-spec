@@ -319,8 +319,26 @@ describe('execution-path invariants', () => {
     expect(spawned).toEqual(['gh']);
   });
 
-  it('depends on no GraphQL anywhere (R-4.6)', () => {
-    expect(source.toLowerCase()).not.toContain('graphql');
+  /*
+   * This assertion used to be "no GraphQL anywhere". It was correct while comments
+   * were PR *issue* comments, which have no resolvable-thread state to reach for.
+   * Review comments do, and `isResolved` exists **only** on GraphQL — verified
+   * against a live pull request: the REST review-comment payload carries no
+   * `resolved` field and no thread id.
+   *
+   * So R-4.6 narrowed rather than disappeared: GraphQL reads resolution and does
+   * nothing else. The blanket ban is replaced by the two checks below, because a
+   * ban that no longer matches the design would simply be deleted by whoever hit
+   * it — and then nothing would guard the part that still matters.
+   */
+  it('sends exactly one GraphQL operation, and it is a query (R-4.6)', () => {
+    const operations = [...source.matchAll(/\b(query|mutation)\s*\(/g)].map((m) => m[1]);
+    expect(operations).toEqual(['query']);
+  });
+
+  it('never writes over GraphQL — resolving happens on github.com (R-5.13)', () => {
+    // The mutation names that would reintroduce a second resolution writer.
+    expect(source).not.toMatch(/resolveReviewThread|unresolveReviewThread|addPullRequestReview/i);
   });
 
   it('uses no bespoke HTTP client (R-4.2)', () => {

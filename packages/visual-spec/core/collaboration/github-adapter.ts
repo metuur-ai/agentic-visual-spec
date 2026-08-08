@@ -22,6 +22,9 @@
  * comments, which require a diff hunk a JSON payload cannot provide.
  */
 import { type GhExecutor, defaultExecGh, scrubCredentials } from './github-executor';
+import { type ReviewComment, type ThreadResolution, toReviewComment } from './review-comments';
+
+export type { ReviewComment, ThreadResolution };
 
 /** Owner + repo, the pair every endpoint needs. */
 export type RepoRef = { owner: string; repo: string };
@@ -198,12 +201,120 @@ export interface GitHubAdapter {
   updateIssueComment(repo: RepoRef, commentId: number, body: string): Promise<IssueComment>;
   /** R-4.4 — delete an issue comment by its id. */
   deleteIssueComment(repo: RepoRef, commentId: number): Promise<void>;
+
+  /**
+   * R-4.5 — every **review** comment on the PR, across all pages, in one array.
+   *
+   * Callers must group threads only on the complete result (R-5.17): a root on one
+   * page whose reply lands on the next would project as an orphan otherwise. `sort`
+   * and `direction` are deliberately not passed — the default `created` ascending is
+   * what threading wants, and a non-default sort risks a reply preceding its root.
+   */
+  listReviewComments(repo: RepoRef, pullNumber: number): Promise<ReviewComment[]>;
+
+  /**
+   * R-4.4 / R-4.13 — create a review comment, opening a new thread.
+   *
+   * `commitId` is **required by GitHub** and must be the PR's current head, re-read at
+   * creation time; a stale sha makes the comment outdated the moment it is posted.
+   *
+   * Omitting `line` posts a file-level comment (`subject_type: file`) — the R-4.14
+   * fallback for a line outside the diff. This method does not retry on its own: a
+   * `422` surfaces as a `GitHubError` with status 422 so the caller can apply the
+   * disclosure-then-degrade policy rather than having it buried here.
+   */
+  createReviewComment(repo: RepoRef, pullNumber: number, input: CreateReviewCommentInput): Promise<ReviewComment>;
+
+  /**
+   * R-4.4 — reply inside an existing thread. `commentId` should be the thread root;
+   * GitHub flattens, so replying to a reply still attaches to the root.
+   */
+  replyToReviewComment(repo: RepoRef, pullNumber: number, commentId: number, body: string): Promise<ReviewComment>;
+
+  /**
+   * R-4.6 / R-4.15 — the one GraphQL read in the adapter: review-thread resolution.
+   *
+   * REST's review-comment payload carries no `resolved` field and no thread id at all
+   * (verified), so this is not a preference. Results join onto the REST projection by
+   * `rootCommentId`, which is GraphQL's `databaseId` — the same integer REST uses.
+   *
+   * Nothing is ever written over GraphQL: resolving happens on github.com (R-5.13).
+   */
+  listThreadResolution(repo: RepoRef, pullNumber: number): Promise<ThreadResolution[]>;
 }
+
+/** Input for `createReviewComment`. Omit `line` for a file-level thread. */
+export type CreateReviewCommentInput = {
+  path: string;
+  body: string;
+  /** The PR's CURRENT head sha. Required by GitHub. */
+  commitId: string;
+  /** Omit for `subject_type: file`. */
+  line?: number;
+  startLine?: number;
+  side?: 'LEFT' | 'RIGHT';
+};
 
 type Json = Record<string, unknown>;
 
 const str = (v: unknown, fallback = ''): string => (typeof v === 'string' ? v : fallback);
 const num = (v: unknown): number => (typeof v === 'number' ? v : Number.NaN);
+
+/**
+ * The one GraphQL document this adapter sends. Threads, their comments' REST integer
+ * ids, and resolution — everything `listThreadResolution` needs in a single request.
+ *
+ * Measured at 1 point against a 5,000/hour budget that is separate from REST's, so
+ * this read is cheaper than the conversation read it accompanies.
+ */
+const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$after:String){
+  repository(owner:$owner,name:$repo){
+    pullRequest(number:$number){
+      reviewThreads(first:100,after:$after){
+        pageInfo{ hasNextPage endCursor }
+        nodes{ isResolved isOutdated comments(first:1){ nodes{ databaseId } } }
+      }
+    }
+  }
+}`;
+
+/**
+ * R-4.11 — classify a `gh api graphql` failure.
+ *
+ * Separate from `classify()` because the REST classifier reads an `(HTTP nnn)` marker
+ * out of stderr, and GraphQL has none to give: it answers **HTTP 200** for schema
+ * errors, runtime errors, and partial failures alike. Routing a GraphQL failure
+ * through the REST classifier would surface it unclassified, with a status of
+ * `undefined` and a message that says nothing useful.
+ *
+ * What `gh` does give us — verified — is a non-zero exit whenever `errors` is present,
+ * *including* a partial failure that also returns usable `data`. So the exit code is a
+ * sound failure signal; only the status is missing. `graphqlErrorsIn` below covers the
+ * remaining case: a caller that reads the body directly must not mistake a partial
+ * error for a complete answer.
+ */
+function classifyGraphql(operation: string, res: { stdout: string; stderr: string }): GitHubError {
+  const message = graphqlErrorsIn(res.stdout) ?? res.stderr.trim() ?? '';
+  return new GitHubError(operation, message || 'gh api graphql failed', undefined, 'graphql_error');
+}
+
+/**
+ * The joined `errors[].message` of a GraphQL response body, or `null` when it carries
+ * none. Exported-in-spirit: the partial-failure guard, kept here so both the failure
+ * path and the success path consult the same rule.
+ */
+function graphqlErrorsIn(stdout: string): string | null {
+  let body: Json = {};
+  try {
+    const parsed = JSON.parse(stdout) as unknown;
+    if (parsed && typeof parsed === 'object') body = parsed as Json;
+  } catch {
+    return null;
+  }
+  const errors = Array.isArray(body.errors) ? (body.errors as Json[]) : [];
+  if (errors.length === 0) return null;
+  return errors.map((e) => str(e.message, 'unknown GraphQL error')).join('; ');
+}
 
 /** Pull `{ status, message, errors[].code }` out of a `gh api` failure. */
 function classify(operation: string, res: { stdout: string; stderr: string }): GitHubError {
@@ -281,6 +392,38 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
 
   const send = (operation: string, method: 'POST' | 'PATCH' | 'PUT', endpoint: string, body: Json) =>
     call<Json>(operation, ['api', '--method', method, '-H', ACCEPT, endpoint, '--input', '-'], JSON.stringify(body));
+
+  /**
+   * One `gh api graphql` call. Deliberately not routed through `call()`: that helper
+   * hands a failure to `classify()`, which reads an HTTP status GraphQL never sends
+   * (R-4.11). The success path also re-checks for `errors`, because a *partial*
+   * failure returns HTTP 200 with both `data` and `errors` — and a caller that trusted
+   * `data` alone would treat a half-answer as a whole one.
+   */
+  async function graphql<T>(operation: string, variables: Json): Promise<T> {
+    const args = ['api', 'graphql', '-f', `query=${REVIEW_THREADS_QUERY}`];
+    for (const [key, value] of Object.entries(variables)) {
+      if (value === undefined || value === null) continue;
+      args.push(typeof value === 'number' ? '-F' : '-f', `${key}=${String(value)}`);
+    }
+    const res = await exec(args);
+    if (res.exitCode === null) {
+      throw new GitHubError(
+        operation,
+        `GitHub CLI could not be started: ${res.stderr.trim() || 'gh not found on PATH'}`,
+        undefined,
+        'executor_unavailable',
+      );
+    }
+    if (res.exitCode !== 0) throw classifyGraphql(operation, res);
+    const errors = graphqlErrorsIn(res.stdout);
+    if (errors) throw new GitHubError(operation, errors, undefined, 'graphql_error');
+    try {
+      return JSON.parse(res.stdout) as T;
+    } catch {
+      throw new GitHubError(operation, 'gh api graphql returned a non-JSON response');
+    }
+  }
 
   return {
     async getBranch(repo, branch) {
@@ -441,6 +584,95 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
       }
       // 204 No Content — gh exits 0 with an empty body, so there is nothing to parse.
       if (res.exitCode !== 0) throw classify('deleteIssueComment', res);
+    },
+
+    async listReviewComments(repo, pullNumber) {
+      const out: ReviewComment[] = [];
+      // Same explicit page loop as `listIssueComments`, for the same reason: the
+      // buffered executor cannot see `Link` headers.
+      for (let page = 1; page <= MAX_PAGES; page += 1) {
+        const endpoint = `/repos/${repo.owner}/${repo.repo}/pulls/${pullNumber}/comments?per_page=${PER_PAGE}&page=${page}`;
+        const raw = await call<Json[]>('listReviewComments', ['api', '--method', 'GET', '-H', ACCEPT, endpoint]);
+        const items = Array.isArray(raw) ? raw : [];
+        for (const item of items) out.push(toReviewComment(item));
+        if (items.length < PER_PAGE) return out;
+      }
+      // A truncated list is worse than a loud failure here: threading groups on the
+      // whole result, so a missing page turns replies into orphan threads (R-5.17).
+      throw new Error(
+        `listReviewComments: pull ${pullNumber} did not terminate within ${MAX_PAGES} pages of ${PER_PAGE}`,
+      );
+    },
+
+    async createReviewComment(repo, pullNumber, input) {
+      const body: Json = {
+        body: input.body,
+        path: input.path,
+        commit_id: input.commitId,
+      };
+      if (input.line === undefined) {
+        // No line ⇒ a file-level thread. GitHub requires `subject_type` to be explicit;
+        // sending neither `line` nor `subject_type` is a 422 of its own.
+        body.subject_type = 'file';
+      } else {
+        body.line = input.line;
+        body.side = input.side ?? 'RIGHT';
+        if (input.startLine !== undefined && input.startLine !== input.line) {
+          body.start_line = input.startLine;
+          body.start_side = input.side ?? 'RIGHT';
+        }
+      }
+      const raw = await send(
+        'createReviewComment',
+        'POST',
+        `/repos/${repo.owner}/${repo.repo}/pulls/${pullNumber}/comments`,
+        body,
+      );
+      return toReviewComment(raw);
+    },
+
+    async replyToReviewComment(repo, pullNumber, commentId, body) {
+      const raw = await send(
+        'replyToReviewComment',
+        'POST',
+        `/repos/${repo.owner}/${repo.repo}/pulls/${pullNumber}/comments/${commentId}/replies`,
+        { body },
+      );
+      return toReviewComment(raw);
+    },
+
+    async listThreadResolution(repo, pullNumber) {
+      const out: ThreadResolution[] = [];
+      let after: string | undefined;
+      for (let page = 1; page <= MAX_PAGES; page += 1) {
+        const raw = await graphql<Json>('listThreadResolution', {
+          owner: repo.owner,
+          repo: repo.repo,
+          number: pullNumber,
+          ...(after ? { after } : {}),
+        });
+        const threads = (((raw.data as Json | undefined)?.repository as Json | undefined)?.pullRequest as Json | undefined)
+          ?.reviewThreads as Json | undefined;
+        const nodes = Array.isArray(threads?.nodes) ? (threads?.nodes as Json[]) : [];
+        for (const node of nodes) {
+          const comments = node.comments as Json | undefined;
+          const first = Array.isArray(comments?.nodes) ? (comments?.nodes as Json[])[0] : undefined;
+          const rootCommentId = num(first?.databaseId);
+          // A thread with no readable root cannot be joined to anything, so carrying
+          // it would produce resolution state attached to no comment.
+          if (Number.isNaN(rootCommentId)) continue;
+          out.push({
+            rootCommentId,
+            isResolved: node.isResolved === true,
+            isOutdated: node.isOutdated === true,
+          });
+        }
+        const pageInfo = threads?.pageInfo as Json | undefined;
+        if (pageInfo?.hasNextPage !== true) return out;
+        after = str(pageInfo.endCursor) || undefined;
+        if (!after) return out;
+      }
+      throw new Error(`listThreadResolution: pull ${pullNumber} did not terminate within ${MAX_PAGES} pages`);
     },
   };
 }
