@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /**
  * git-chip.test.tsx — the header's git context chip and the branch at the point
- * of apply (R-3.1 … R-3.9, R-4.1, R-4.2).
+ * of apply (R-3.1 … R-3.9, R-4.1 … R-4.3).
  *
  * Driven through `MainHeader` and `BrandHeader` rather than the chip in isolation:
  * R-3.1 is a claim about where the chip *is* — beside the served path, in both
@@ -239,12 +239,46 @@ describe('the branch at the point of apply (R-4.1 / R-4.2)', () => {
     expect(screen.getByText('Whole workspace')).toBeTruthy();
   });
 
+  /*
+   * R-4.3. The same lie R-3.9 forbids in the chip, forbidden at the point where it
+   * costs something: `on a1b2c3d` reads as a branch called `a1b2c3d`, and the user
+   * is about to let an agent write files against it.
+   */
+  it('presents a detached HEAD as detached, not as a branch name (R-4.3)', async () => {
+    await openScopeChooser({
+      state: 'remote',
+      branch: 'a1b2c3d',
+      detached: true,
+      owner: 'acme',
+      repo: 'docs',
+      host: 'github.com',
+      url: 'https://github.com/acme/docs.git',
+    });
+    const branch = await screen.findByTestId('scope-branch');
+    const text = branch.textContent ?? '';
+    expect(text).toContain('a1b2c3d'); // the sha is still the useful fact
+    expect(text).toContain('detached HEAD');
+    expect(branch.getAttribute('title')).toContain('detached HEAD');
+    // The exact misreading: the sha standing alone where a branch name would be.
+    expect(text.replace(/\s+/g, ' ').trim()).not.toBe('on a1b2c3d');
+  });
+
+  it('a named branch is still shown bare, with no detached label (R-4.3)', async () => {
+    await openScopeChooser(REMOTE_GITHUB);
+    const branch = await screen.findByTestId('scope-branch');
+    expect((branch.textContent ?? '').replace(/\s+/g, ' ').trim()).toBe('on main');
+    expect(branch.textContent).not.toContain('detached');
+  });
+
   it('shows no branch for state none, and every scope button still runs (R-4.2)', async () => {
     await openScopeChooser({ state: 'none' });
     expect(screen.queryByTestId('scope-branch')).toBeNull();
 
+    for (const label of [/Whole workspace/, /This file/, /Pick comments/]) {
+      const btn = screen.getByText(label).closest('button') as HTMLButtonElement;
+      expect(btn.disabled).toBe(false);
+    }
     const whole = screen.getByText('Whole workspace').closest('button') as HTMLButtonElement;
-    expect(whole.disabled).toBe(false);
     fireEvent.click(whole);
     await waitFor(() =>
       expect(vi.mocked(fetch).mock.calls.some(([u]) => String(u) === '/__vs/apply/start')).toBe(true),

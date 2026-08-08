@@ -25,7 +25,10 @@ redundant: one produces the message, the other closes the race.
 
 **Why:** Rename exists so a mistyped name does not send the author back to the
 terminal this feature was built to avoid. It must not be able to destroy a file,
-and it must not orphan the review attached to the file it moves.
+and it must not orphan the review attached to the file it moves. It also has to
+reach the same set of destinations create reaches: a user who created
+`notes/2026/kickoff.md` without `notes/` existing has no way to guess why moving a
+file into `other/folder/` would require the folder to be there already.
 
 | ID | EARS statement |
 | --- | --- |
@@ -39,6 +42,8 @@ and it must not orphan the review attached to the file it moves.
 | R-2.8 | WHEN the move succeeds, THE SYSTEM SHALL answer 200 carrying the new posix-relative path. |
 | R-2.9 | THE SYSTEM SHALL NOT expose any operation that deletes a file. |
 | R-2.10 | IF `from` names a directory, THE SYSTEM SHALL refuse, because directory rename is out of scope. |
+| R-2.11 | WHEN every check in R-2.2 through R-2.4 passes and `to` names a path whose parent directories do not all exist, THE SYSTEM SHALL create the missing parent directories and then move the file, on the same terms R-1.9 gives create; and IF the move fails after those directories were created, THE SYSTEM SHALL report the failure and MAY leave them in place, as R-1.11 allows for create. |
+| R-2.12 | IF a rename is refused by any of R-2.2, R-2.3 or R-2.4, THE SYSTEM SHALL NOT create any directory, so that a refused rename costs nothing on disk. |
 
 ## Unit 3: Freshness of the tree
 

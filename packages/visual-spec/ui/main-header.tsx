@@ -3,7 +3,7 @@ import { memo, useEffect, useReducer, useRef, useState } from 'react';
 import { HelpButton } from './help-page';
 import { CommentHistoryList } from './comment-history-list';
 import { toPath } from './md-path';
-import { branchOf, useGitContext } from './use-git-context';
+import { useGitContext } from './use-git-context';
 
 function CommentIcon({ size = 14 }: { size?: number }) {
   return (
@@ -89,15 +89,24 @@ function LinkIcon({ size = 12 }: { size?: number }) {
 }
 
 /**
- * The branch slot. A detached HEAD's "branch" is a 7-character hex string, and
- * rendered bare it reads as a branch literally called `a1b2c3d` (R-3.9). The sha
- * is still shown — it is the useful fact — but it is labelled as what it is.
+ * How a HEAD is worded, in ONE place (R-3.9 / R-4.3). A detached HEAD's "branch"
+ * is a 7-character hex string, and rendered bare it reads as a branch literally
+ * called `a1b2c3d`. The sha is still shown — it is the useful fact — but it is
+ * labelled as what it is.
+ *
+ * Two surfaces say this: the header chip and the apply scope chooser. They must
+ * be honest together or not at all, so the wording is a shared function rather
+ * than a shape each site re-derives — the chip's version drifting away from the
+ * chooser's is exactly how the chooser came to print a bare sha in the first place.
  */
+const DETACHED_TITLE = 'detached HEAD';
+const headText = (branch: string, detached: boolean) => (detached ? `${DETACHED_TITLE} @ ${branch}` : branch);
+
+/** The chip's branch slot. */
 function BranchLabel({ branch, detached }: { branch: string; detached: boolean }) {
-  if (!detached) return <span style={gitBranchText}>{branch}</span>;
   return (
-    <span style={gitBranchText} title="detached HEAD">
-      detached HEAD @ {branch}
+    <span style={gitBranchText} title={detached ? DETACHED_TITLE : undefined}>
+      {headText(branch, detached)}
     </span>
   );
 }
@@ -563,7 +572,11 @@ function ScopeChooser({
   // whichever branch happened to be checked out", and this popover is where the
   // user commits to the run. R-4.2: where no branch is known — state `none`, or
   // the first read has not come back — nothing is shown and nothing is blocked.
-  const branch = branchOf(useGitContext());
+  // The whole context is read, not just the branch string: R-4.3 needs `detached`,
+  // and believing you are on a branch when you are not matters MORE here than in
+  // the chip — the chip is orientation, this is consent to let an agent edit files.
+  const ctx = useGitContext();
+  const head = ctx && ctx.state !== 'none' ? ctx : null;
   const toggle = (id: string) =>
     setChecked((prev) => {
       const next = new Set(prev);
@@ -577,9 +590,17 @@ function ScopeChooser({
       <div style={applyPopHead}>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
           <span style={{ fontWeight: 700 }}>Apply comments…</span>
-          {branch && (
-            <span style={scopeBranch} data-testid="scope-branch" title="Edits will land on this branch">
-              on {branch}
+          {head && (
+            <span
+              style={head.detached ? { ...scopeBranch, ...scopeBranchDetached } : scopeBranch}
+              data-testid="scope-branch"
+              title={
+                head.detached
+                  ? `${DETACHED_TITLE} — edits will land on this commit, not on a branch`
+                  : 'Edits will land on this branch'
+              }
+            >
+              on {headText(head.branch, head.detached)}
             </span>
           )}
         </span>
@@ -1057,6 +1078,11 @@ const gitRepoText: React.CSSProperties = { font: '700 11px ui-monospace, "SF Mon
 const gitRepoLink: React.CSSProperties = { ...gitRepoText, color: 'inherit', textDecoration: 'underline', textUnderlineOffset: 2 };
 const gitDot: React.CSSProperties = { opacity: 0.5 };
 const scopeBranch: React.CSSProperties = { flexShrink: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', font: '600 11px ui-monospace, "SF Mono", monospace', color: '#15803d', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 999, padding: '1px 8px' };
+// Detached overrides the green pill with the same amber the chip's `local` tone
+// uses (R-4.3). Green here reads as "settled, a branch, safe to run"; a detached
+// HEAD is none of those, and the tone must not contradict the words beside it.
+// Tone alone never carries the fact — the label already says "detached HEAD".
+const scopeBranchDetached: React.CSSProperties = { color: '#b45309', background: '#fffbeb', border: '1px solid #fde68a' };
 const cart: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 5, background: '#f1f5f9', borderRadius: 99, padding: '3px 10px', fontSize: 13, color: '#475569' };
 const segWrap: React.CSSProperties = { display: 'inline-flex', padding: 2, gap: 2, background: '#f1f5f9', border: '1px solid #e5e7eb', borderRadius: 9 };
 const segBtn: React.CSSProperties = { padding: '5px 12px', border: 'none', borderRadius: 7, background: 'transparent', color: '#64748b', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };

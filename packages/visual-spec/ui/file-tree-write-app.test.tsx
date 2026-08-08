@@ -13,17 +13,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { invalidateTree } from './use-tree';
 
-// The two document panes are stood in for. What is under test is the shell's
-// response to a write — which path the pane is pointed at and in which mode — and
-// the real panes drag in the Lexical editor and the HMR source hook, neither of
-// which survives jsdom and neither of which this behaviour depends on. The stub
-// renders the path it was handed, which is exactly the fact being asserted.
+// Only the *edit* pane is stood in for, and only because it drags in the Lexical
+// editor, which does not survive jsdom. The view pane is the real component: it
+// used to be stubbed as well, but that was collateral from the `hot.off` bug in
+// useMarkdownSource — unmounting it threw and took the tree down. With that fixed
+// the real pane mounts, so the assertions read the path off what it actually
+// renders (its ContentTitle) rather than off a stub echoing its own prop.
 vi.mock('./markdown-doc-editor', () => ({
   MarkdownDocEditor: ({ path }: { path: string }) => <div data-testid="pane-edit">{path}</div>,
 }));
-vi.mock('./markdown-editor', () => ({
-  MarkdownEditor: ({ path }: { path: string }) => <div data-testid="pane-view">{path}</div>,
-}));
+
+/** The path the real view pane is showing, per the sticky title inside <main>. */
+const viewPanePath = () => (document.querySelector('main > div[title]') as HTMLElement | null)?.getAttribute('title');
 
 const TREE = [
   { path: 'notes', name: 'notes', type: 'dir' },
@@ -121,7 +122,7 @@ describe('R-5.5 — the pane follows the document it is showing', () => {
     await screen.findByText('+ New file');
     expandNotes();
     fireEvent.click(tree().getByTitle('notes/kickof.md'));
-    expect((await screen.findByTestId('pane-view')).textContent).toBe('notes/kickof.md');
+    await waitFor(() => expect(viewPanePath()).toBe('notes/kickof.md'));
     const before = treeReads(calls);
 
     beginRename('notes/kickof.md');
@@ -130,7 +131,7 @@ describe('R-5.5 — the pane follows the document it is showing', () => {
 
     // Still the same document in the same pane, now under the new path — it did not
     // go blank, and it did not fall back to "select a file".
-    await waitFor(() => expect(screen.getByTestId('pane-view').textContent).toBe('notes/kickoff.md'));
+    await waitFor(() => expect(viewPanePath()).toBe('notes/kickoff.md'));
     expect(screen.queryByText(/Select a file or folder/)).toBeNull();
     expect(treeReads(calls)).toBe(before + 1);
   });

@@ -93,13 +93,14 @@ const SIDECAR = JSON.stringify(
  */
 /**
  * Directories in the fixture that belong to the harness, not to the routes under
- * test: `.git` is the repository the git fixture created once, and `.vite` is the
- * dep-optimizer cache the Vite host writes into its own root on a schedule of its
- * own. Neither route touches either, and `.vite` in particular appears whenever the
- * optimizer happens to flush — comparing it would make this suite flaky for a
- * reason that has nothing to do with host parity.
+ * test: `.git` is the repository the git fixture created once, and no route touches
+ * it. `.vite` used to be listed here too — the dep-optimizer cache the Vite host
+ * wrote into its own root, which is this fixture — but the host now points
+ * `cacheDir` outside the directory it serves (see md-plugin.ts and
+ * cache-dir.test.ts), so there is nothing left to exclude. Keeping the exclusion
+ * would hide a regression back into the served workspace.
  */
-const HARNESS_DIRS = new Set(['.git', '.vite']);
+const HARNESS_DIRS = new Set(['.git']);
 
 async function reset(): Promise<void> {
   for (const entry of await readdir(fixture)) {

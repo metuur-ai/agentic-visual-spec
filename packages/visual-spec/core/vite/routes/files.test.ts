@@ -213,6 +213,65 @@ describe('rename — the move', () => {
     expect(await snapshot(base)).toEqual(before);
   });
 
+  it('builds the missing parents of `to` and carries the review with it (R-2.11)', async () => {
+    await writeFile(join(base, 'a.md'), '# a\n\noriginal body\n');
+    const comments = memoryComments({
+      version: 1,
+      comments: [
+        { id: 'c-00000005', workflow: 'visual-spec', target: { path: 'a.md', kind: 'file' }, comment: 'x', status: 'open', ts: 'T0' },
+      ],
+    });
+    const store = writeStore();
+
+    const res = await rename(store, 'a.md', 'nueva/carpeta/b.md', comments);
+
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({ path: 'nueva/carpeta/b.md' });
+    expect(await readFile(join(base, 'nueva', 'carpeta', 'b.md'), 'utf8')).toBe('# a\n\noriginal body\n');
+    expect(await readdir(join(base, 'nueva'))).toEqual(['carpeta']);
+    expect(await readdir(base)).toEqual(['nueva']); // a.md is gone
+    expect(comments.doc.comments[0].target.path).toBe('nueva/carpeta/b.md');
+  });
+
+  // The three below are the ordering tests: `mkdir` must sit *after* every refusal,
+  // so a rename that is going to be refused leaves no directory behind (R-2.12).
+  it('creates no directory when the collision refusal fires (R-2.12)', async () => {
+    await writeFile(join(base, 'a.md'), '# a\n');
+    // A colliding `to` necessarily has an existing parent — the colliding file
+    // proves it — so the assertion here is the whole tree: the refusal must not have
+    // added a single directory anywhere, which is what puts the mkdir below it.
+    await mkdir(join(base, 'nueva'));
+    await writeFile(join(base, 'nueva', 'b.md'), '# b\n');
+    const before = await snapshot(base);
+
+    const res = await rename(writeStore(), 'a.md', 'nueva/b.md');
+
+    expect(res.status).toBe(409);
+    expect(await snapshot(base)).toEqual(before);
+    expect(await readdir(join(base, 'nueva'))).toEqual(['b.md']);
+  });
+
+  it('creates no directory when the `from` refusal fires (R-2.12)', async () => {
+    await writeFile(join(base, 'kept.md'), '# kept\n');
+    const before = await snapshot(base);
+
+    const res = await rename(writeStore(), 'gone.md', 'nueva/carpeta/b.md');
+
+    expect(res.status).toBe(404);
+    expect(await snapshot(base)).toEqual(before); // no `nueva/`, no `nueva/carpeta/`
+  });
+
+  it('creates no directory when the traversal guard refuses (R-2.12)', async () => {
+    await writeFile(join(base, 'a.md'), '# a\n');
+    const before = await snapshot(base);
+
+    const res = await rename(writeStore(), 'a.md', '../fuera/b.md');
+
+    expect(res.status).toBe(400);
+    expect(await snapshot(base)).toEqual(before);
+    expect(await readdir(dirname(base))).not.toContain('fuera');
+  });
+
   it('never reaches for fs.rename, which overwrites silently (R-2.5)', async () => {
     const src = await readFile(fileURLToPath(new URL('./files.ts', import.meta.url)), 'utf8');
     expect(src).not.toMatch(/\brename\s*\(/); // no bare rename() call — renameFile( does not match

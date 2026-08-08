@@ -148,11 +148,6 @@ async function moveFile(fromAbs: string, toAbs: string, toRel: string): Promise<
     await link(fromAbs, toAbs);
   } catch (err) {
     if (errno(err) === 'EEXIST') throw new HttpError(409, `rename: ${toRel} already exists`);
-    if (errno(err) === 'ENOENT') {
-      // The source was checked moments ago, so this is the destination's parent.
-      // Reported rather than created: rename moves a file, it does not build a tree.
-      throw new HttpError(400, `rename: the parent directory of ${toRel} does not exist`);
-    }
     throw new HttpError(500, `rename: could not link ${toRel}: ${(err as Error).message}`);
   }
   await unlink(fromAbs);
@@ -205,6 +200,15 @@ async function renameFile(
   if (!src.isFile()) throw new HttpError(400, `rename: ${from} is not a regular file`);
 
   if (await exists(toAbs)) throw new HttpError(409, `rename: ${toRel} already exists`);
+
+  // R-2.11/R-2.12. The `mkdir` is here, below every refusal above, and not a line
+  // earlier: a rename refused for traversal, for a missing `from`, or for the
+  // collision just checked must leave no directory behind. Once past this line the
+  // request is accepted, so building the parents costs nothing that create does not
+  // already cost — and if `link` still fails, the directories stay, exactly as
+  // R-1.11 lets them stay for create. Rejected: refusing with a 400 naming the
+  // missing parent, which made rename reach fewer destinations than create.
+  await mkdir(dirname(toAbs), { recursive: true });
   await moveFile(fromAbs, toAbs, toRel);
 
   await retargetComments(comments, from, toRel);

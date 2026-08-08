@@ -87,15 +87,25 @@ directory is invisible in the tree and harmless.
 
 1. Both `from` and `to` through step 2–3 above.
 2. `from` must exist and be a regular file.
-3. `link(from, to)` — fails `EEXIST` atomically, which is the whole reason it is
+3. `stat` the target; existing → 409 with a message naming the collision.
+4. `mkdir(dirname(to), { recursive: true })`. This is the last step that can be
+   reached without the request being accepted, and it sits **after** every refusal
+   above for exactly that reason: a rename refused for traversal, for a missing
+   `from`, or for a collision must leave no directory behind.
+5. `link(from, to)` — fails `EEXIST` atomically, which is the whole reason it is
    used instead of `rename`. Node's `rename` **overwrites the destination
    silently**, and this feature must not be able to destroy a file.
-4. `unlink(from)`.
-5. **Rewrite the comment sidecar**: every record whose `target.path` equals `from`
+6. `unlink(from)`.
+7. **Rewrite the comment sidecar**: every record whose `target.path` equals `from`
    is rewritten to `to`, with every other field preserved.
-6. `store.invalidate?.()`.
+8. `store.invalidate?.()`.
 
-Step 5 is not incidental. Comments are pinned to `target.path`, so a rename
+Directories created in step 4 survive a step-5 failure, the same trade the create
+sequence already makes. No transactional unwind: an empty directory is invisible
+in the tree, and removing it could delete one a concurrent request had just begun
+using.
+
+Step 7 is not incidental. Comments are pinned to `target.path`, so a rename
 without it orphans the entire review of that document — the comments survive in
 the sidecar pointing at a path that no longer exists, and the apply run cannot
 resolve them. This is why the handler takes the comment store as an argument.
@@ -174,6 +184,15 @@ that away.
 **`link` + `unlink` for rename, not `rename`.** Rejected: `fs.rename`, which
 overwrites the destination without warning. The feature's guarantee is that it
 cannot destroy a file, and `rename` cannot provide it.
+
+**Rename builds the missing parents of `to`, like create.** Rejected: refusing with
+a 400 naming the parent that does not exist — the previous behaviour. It made
+rename reach a smaller set of destinations than create for no reason the user can
+see, and reopened the terminal round trip this feature exists to close. The reason
+it was refusing (not leaving orphaned directories behind when the `link` fails) is
+answered by ordering, not by refusal: the `mkdir` moves after the collision check,
+so nothing is created unless the request is already accepted. Also rejected:
+unwinding the directories when `link` fails — create does not do it either.
 
 **Rename rewrites comment paths.** Rejected: leaving the sidecar alone. Orphaned
 comments are worse than no rename.

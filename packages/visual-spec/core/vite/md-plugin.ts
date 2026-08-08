@@ -10,10 +10,12 @@
  *   POST /__vs/comments/add                → append { file, heading, line, snippet, comment }
  *   PATCH/DELETE /__vs/comments/:id        → status / remove
  */
+import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { extname, isAbsolute, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { extname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
 import type { Connect, Plugin } from 'vite';
 import { GUARD_NOT_RUN, attestGuardRan, guardRan } from './guard-attestation';
 import { checkRequest } from './request-guard';
@@ -124,12 +126,52 @@ export type MarkdownOptions = {
   config?: VisualSpecConfig;
 };
 
+/** `child` is `parent` or sits underneath it. */
+function isInside(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/**
+ * Where Vite's dep-optimizer cache goes when the Vite root IS the directory we are
+ * serving.
+ *
+ * Vite derives `cacheDir` from `root` — `<root>/.vite`, or `<pkg>/node_modules/.vite`
+ * when a package.json is found above it. That default assumes `root` is a project
+ * you own. Here it is the user's *content* directory, so the optimizer drops `.vite`
+ * (plus its `deps_temp_*` scratch dirs) straight into the workspace being browsed:
+ * serve `~/docs` and `~/docs/.vite` appears. `.visualspecignore`/DEFAULT_IGNORE hides
+ * it from the tree, which is why it went unnoticed, but hidden is not "not written" —
+ * it still churns files in someone else's folder, and it made the on-disk snapshots in
+ * host-parity.test.ts diverge between hosts on the optimizer's own schedule.
+ *
+ * The cache is a rebuildable, root-specific artifact, so it belongs in the OS temp
+ * dir, keyed by a hash of the root so two served directories never share one.
+ */
+function externalCacheDir(root: string): string {
+  return join(tmpdir(), 'visual-spec-vite-cache', createHash('sha256').update(root).digest('hex').slice(0, 16));
+}
+
 function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
   let root = process.cwd();
 
   return {
     name: 'visual-spec:md-api',
     apply: 'serve',
+    // Runs before Vite resolves its defaults — `cacheDir` is read once at resolve
+    // time, so redirecting it in `configResolved` would be too late.
+    config(userConfig) {
+      // An explicit `cacheDir` is the caller's decision; never second-guess it.
+      if (userConfig.cacheDir) return null;
+      const viteRoot = resolvePath(userConfig.root ?? process.cwd());
+      const served = isAbsolute(opts.contentDir) ? resolvePath(opts.contentDir) : resolvePath(viteRoot, opts.contentDir);
+      // Every default Vite would pick sits at or above `root`, so the cache can only
+      // land in the served tree when `root` itself does. When the content dir is a
+      // subfolder of a real project root (the `dev` layout), the default is already
+      // outside it and is left alone.
+      if (!isInside(served, viteRoot)) return null;
+      return { cacheDir: externalCacheDir(viteRoot) };
+    },
     configResolved(config) {
       root = config.root;
     },

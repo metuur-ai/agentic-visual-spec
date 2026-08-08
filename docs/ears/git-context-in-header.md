@@ -63,7 +63,16 @@ scenario — leaving for a terminal and coming back.
 chip in the header corner does not fix that on its own — the branch has to be
 visible where the user commits to the run.
 
+And "the branch" is not always a branch. A detached HEAD reports a 7-character
+sha, which read bare is indistinguishable from a branch named `a1b2c3d`. R-3.9
+already forbids that misreading in the chip; it must hold here too, and for a
+stronger reason. The chip is passive orientation. This chooser is the moment
+someone consents to an agent editing files — believing you are on a branch when
+you are not is precisely the failure this unit exists to prevent, and this is
+where it has consequences.
+
 | ID | EARS statement |
 | --- | --- |
-| R-4.1 | WHEN the user is presented with the apply scope chooser, THE SYSTEM SHALL display the active branch. |
+| R-4.1 | WHEN the user is presented with the apply scope chooser, THE SYSTEM SHALL display the head the run will edit, as defined by R-4.3. |
 | R-4.2 | WHERE no branch is known — state `none`, or the first read has not completed — THE SYSTEM SHALL display no branch there, and SHALL NOT block the apply run. |
+| R-4.3 | WHERE `detached` is true, THE SYSTEM SHALL present the displayed sha in the scope chooser as a detached HEAD rather than as a branch name; WHERE `detached` is false, THE SYSTEM SHALL display the branch name. |

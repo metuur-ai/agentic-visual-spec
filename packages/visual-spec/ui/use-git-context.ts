@@ -81,10 +81,14 @@ export function useGitContext(): GitContext | null {
 }
 
 /**
- * The branch to show where a branch is the point — the header chip's branch slot
- * and the apply scope chooser (R-4.1). `null` means "no branch is known", which
- * covers both state `none` and the pre-first-read state (R-4.2); callers render
- * nothing at all in that case rather than a placeholder.
+ * The branch NAME alone, for callers that need nothing else. `null` means "no
+ * branch is known", covering both state `none` and the pre-first-read state
+ * (R-4.2); callers render nothing at all in that case rather than a placeholder.
+ *
+ * The two surfaces that show a HEAD — the header chip and the apply scope chooser
+ * — deliberately do NOT use this: they read the context itself, because R-3.9 and
+ * R-4.3 make `detached` part of what they must say, and a bare string cannot
+ * carry it.
  */
 export function branchOf(ctx: GitContext | null): string | null {
   if (!ctx || ctx.state === 'none') return null;
