@@ -86,6 +86,7 @@ export function FileTree({
   commentCounts,
   onCreated,
   onRenamed,
+  readOnly = false,
 }: {
   entries: TreeEntry[];
   current: string;
@@ -94,6 +95,15 @@ export function FileTree({
   commentCounts?: Map<string, number>;
   onCreated?: (path: string) => void;
   onRenamed?: (from: string, to: string) => void;
+  /**
+   * R-13.19 — browse without any way to write. A Pull Request checkout is a review
+   * surface, not a workspace: the tree still expands and still opens files, but "+ New
+   * file" and the per-row rename are not rendered at all. Not disabled — absent. A
+   * disabled control still tells the reviewer that writing is a thing this view does,
+   * and the create/rename routes write to the *served* directory regardless of which
+   * tree the row came from, so offering them here would be offering the wrong write.
+   */
+  readOnly?: boolean;
 }) {
   const q = filter.trim().toLowerCase();
   const matching = useMemo(() => (q ? entries.filter((e) => e.path.toLowerCase().includes(q)) : entries), [entries, q]);
@@ -161,19 +171,28 @@ export function FileTree({
     })();
   };
 
-  const write: WriteState = { draft, value, error, busy, setValue, begin, submit, dismiss };
+  // `begin` is replaced rather than merely hidden behind: a row that somehow called it
+  // in read-only mode would open an input onto the served directory, which is not the
+  // tree being browsed. The one write path is closed at its source.
+  const write: WriteState = readOnly
+    ? { draft: null, value: '', error: null, busy: false, setValue: () => {}, begin: () => {}, submit: () => {}, dismiss: () => {} }
+    : { draft, value, error, busy, setValue, begin, submit, dismiss };
 
   return (
     <div>
-      <div style={writeBar}>
-        <button type="button" onClick={() => begin({ kind: 'create' }, '')} style={newFileBtn}>
-          + New file
-        </button>
-      </div>
-      {draft?.kind === 'create' && <PathInput write={write} label="New file path" submitLabel="Create" indent={8} />}
+      {!readOnly && (
+        <>
+          <div style={writeBar}>
+            <button type="button" onClick={() => begin({ kind: 'create' }, '')} style={newFileBtn}>
+              + New file
+            </button>
+          </div>
+          {draft?.kind === 'create' && <PathInput write={write} label="New file path" submitLabel="Create" indent={8} />}
+        </>
+      )}
       <ul style={listReset}>
         {tree.children.map((node) => (
-          <TreeItem key={node.path} node={node} depth={0} current={current} onPick={onPick} expanded={expanded} toggle={toggle} forceOpen={q.length > 0} commentCounts={commentCounts} write={write} />
+          <TreeItem key={node.path} node={node} depth={0} current={current} onPick={onPick} expanded={expanded} toggle={toggle} forceOpen={q.length > 0} commentCounts={commentCounts} write={write} readOnly={readOnly} />
         ))}
       </ul>
     </div>
@@ -229,6 +248,7 @@ function TreeItem({
   forceOpen,
   commentCounts,
   write,
+  readOnly = false,
 }: {
   node: TreeNode;
   depth: number;
@@ -239,6 +259,7 @@ function TreeItem({
   forceOpen: boolean;
   commentCounts?: Map<string, number>;
   write: WriteState;
+  readOnly?: boolean;
 }) {
   const pad = 8 + depth * 13;
   const active = node.path === current;
@@ -268,7 +289,7 @@ function TreeItem({
             <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{node.name}</span>
             {count > 0 && <span style={countBadge}>{count}</span>}
           </button>
-          {(hover || active) && (
+          {!readOnly && (hover || active) && (
             <button
               type="button"
               onClick={() => write.begin({ kind: 'rename', from: node.path }, node.path)}
@@ -322,7 +343,7 @@ function TreeItem({
       {open && (
         <ul style={listReset}>
           {node.children.map((child) => (
-            <TreeItem key={child.path} node={child} depth={depth + 1} current={current} onPick={onPick} expanded={expanded} toggle={toggle} forceOpen={forceOpen} commentCounts={commentCounts} write={write} />
+            <TreeItem key={child.path} node={child} depth={depth + 1} current={current} onPick={onPick} expanded={expanded} toggle={toggle} forceOpen={forceOpen} commentCounts={commentCounts} write={write} readOnly={readOnly} />
           ))}
         </ul>
       )}

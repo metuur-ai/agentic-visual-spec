@@ -1,0 +1,796 @@
+/**
+ * collab.pulls.test.ts — the repo-level `/__vs/collab/pulls/*` family.
+ *
+ * Kept apart from `collab.test.ts` because nothing here is document-scoped: there is no
+ * document, no job hub in play and no comment store, and the doubles these routes need
+ * (a `GitExecutor` and a repo-level `GitHubAdapter`) are shared by no test in that file.
+ *
+ * No real network, no `gh` and no `git`: both executors are injected (R-4.8 / R-12.3).
+ * The one thing that touches the filesystem is `ensureIgnored`, which the mount path runs
+ * before creating a worktree, so the happy-path cases are given a real temporary
+ * directory to write `.gitignore` into.
+ */
+import { readFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import type { CollaborationPreflight } from '../../collaboration/credentials';
+import { GitHubError, type GitHubAdapter, type PullRequestSummary } from '../../collaboration/github-adapter';
+import { createJobHubRegistry } from '../../collaboration/job-hub';
+import type { GitExecutor } from '../../git-context';
+import type { ResolvedVisualSpecConfig } from '../../config';
+import {
+  type CollabAuthorizer,
+  type CollabDeps,
+  type CollabOperation,
+  type CollabRouteResult,
+  createCollabRoutes,
+} from './collab';
+
+const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+const src = (rel: string) => readFileSync(resolve(pkgRoot, rel), 'utf8');
+
+const REPO = { owner: 'acme', repo: 'specs', baseBranch: 'main' } as const;
+const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO } };
+const DISABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: null };
+
+const OK_PREFLIGHT: CollaborationPreflight = {
+  available: true,
+  source: 'gh-auth-state',
+  login: 'octocat',
+  scopes: ['repo'],
+  repo: { ...REPO },
+};
+
+const ALLOW_ALL: CollabAuthorizer = () => ({ ok: true });
+
+function summary(over: Partial<PullRequestSummary> = {}): PullRequestSummary {
+  return {
+    number: 7,
+    title: 'Tighten the onboarding guide',
+    state: 'open',
+    draft: false,
+    headBranch: 'vs/doc-1',
+    baseBranch: 'main',
+    headSha: 'a'.repeat(40),
+    htmlUrl: 'https://github.com/acme/specs/pull/7',
+    author: 'octocat',
+    updatedAt: 'T0',
+    ...over,
+  };
+}
+
+/** The repo-level adapter double, recording what the routes asked for. */
+function repoAdapter(
+  options: { pulls?: PullRequestSummary[]; listFails?: Error; pullFails?: Error; files?: string[] } = {},
+) {
+  const states: (string | undefined)[] = [];
+  const compares: { base: string; head: string }[] = [];
+  const adapter = {
+    async listPullRequests(_repo: unknown, state?: string) {
+      states.push(state);
+      if (options.listFails) throw options.listFails;
+      return options.pulls ?? [summary()];
+    },
+    async getPullRequest(_repo: unknown, pullNumber: number) {
+      if (options.pullFails) throw options.pullFails;
+      return {
+        number: pullNumber,
+        headSha: 'a'.repeat(40),
+        baseBranch: 'main',
+        headBranch: 'contributor:patch-1',
+        state: 'open',
+        htmlUrl: 'https://github.com/acme/specs/pull/7',
+        body: '',
+        merged: false,
+        mergeable: true,
+        mergeableState: 'clean',
+      };
+    },
+    async compareCommits(_repo: unknown, base: string, head: string) {
+      compares.push({ base, head });
+      return { mergeBaseSha: 'b'.repeat(40), aheadBy: 2, behindBy: 0, files: options.files ?? ['docs/spec.md'] };
+    },
+  } as unknown as GitHubAdapter;
+  return { adapter, states, compares };
+}
+
+/**
+ * A `GitExecutor` that answers per command, recording every call. `answer` returns
+ * `undefined` for anything it does not care about, which then succeeds silently — so a
+ * test names only the command it is about.
+ */
+function stubGit(answer: (args: string[]) => { stdout?: string; exitCode: number | null } | undefined = () => undefined) {
+  const calls: string[][] = [];
+  const exec: GitExecutor = async (args) => {
+    calls.push(args);
+    const { stdout = '', exitCode = 0 } = answer(args) ?? {};
+    return { stdout, exitCode };
+  };
+  return { exec, calls };
+}
+
+/** True when `args` contains the git subcommand `name` (the `-C <dir>` prefix aside). */
+const isCommand = (args: string[], name: string): boolean => args[2] === name;
+
+function router(overrides: Partial<CollabDeps> = {}) {
+  return createCollabRoutes({
+    jobs: createJobHubRegistry(),
+    config: () => ENABLED,
+    documents: () => {
+      throw new Error('the /pulls family must not read the document store');
+    },
+    preflight: async () => OK_PREFLIGHT,
+    authorize: ALLOW_ALL,
+    baseDir: () => '/tmp/does-not-matter',
+    git: stubGit().exec,
+    repoAdapter: () => repoAdapter().adapter,
+    ...overrides,
+  });
+}
+
+const call = (
+  r: ReturnType<typeof router>,
+  method: string,
+  pathname: string,
+  query: Record<string, string> = {},
+): Promise<CollabRouteResult> => r.handle({ method, pathname, query, body: {} });
+
+/* ================================================================== *
+ * Route ordering — `/pulls` is not a documentId
+ * ================================================================== */
+describe('/pulls is matched before the document-scoped route', () => {
+  /*
+   * The failure this guards is silent: `pulls` is a legal documentId, so a family placed
+   * after the scoped match is not rejected — `GET /pulls` is answered as the status
+   * snapshot of a document called "pulls", with a 200 and no pull requests in it. The
+   * `documents()` thunk in `router()` throws for exactly that reason.
+   */
+  it('answers the pull list rather than treating `pulls` as a documentId', async () => {
+    const res = await call(router(), 'GET', '/pulls');
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({ pulls: [{ number: 7 }] });
+  });
+
+  it('every /pulls handler is declared above the scoped-documentId match in the source', () => {
+    const text = src('core/vite/routes/collab.ts');
+    const scoped = text.indexOf('const scoped = /^\\/([^/]+)(\\/.*)?$/.exec(pathname)');
+    expect(scoped).toBeGreaterThan(-1);
+    for (const marker of ["pathname === '/pulls'", "pathname === '/pulls/mounted'", '/^\\/pulls\\/([^/]+)\\/mount$/', '/^\\/pulls\\/([^/]+)\\/files$/']) {
+      const at = text.indexOf(marker);
+      expect(at, marker).toBeGreaterThan(-1);
+      expect(at, marker).toBeLessThan(scoped);
+    }
+  });
+
+  // The converse, kept as documentation: anything under /pulls the family does not
+  // recognise DOES fall through to the scoped match, and that is what the ordering above
+  // is protecting the recognised paths from.
+  it('an unrecognised /pulls path falls through to the document-scoped match', async () => {
+    const res = await call(router(), 'GET', '/pulls/7/nope');
+    expect(res.status).toBe(404);
+    expect(res.json).toMatchObject({ error: 'no route: GET /__vs/collab/pulls/7/nope' });
+  });
+});
+
+/* ================================================================== *
+ * R-9.8 — the whole family is a read, and reads are any-role
+ * ================================================================== */
+describe('R-9.8 — the /pulls family gates on `read` and nothing stronger', () => {
+  it('asks the authorizer for `read` with no document, on every route', async () => {
+    const seen: { op: CollabOperation; documentId: string | null }[] = [];
+    const authorize: CollabAuthorizer = (op, ctx) => {
+      seen.push({ op, documentId: ctx.documentId });
+      return { ok: true };
+    };
+    const r = router({ authorize });
+    await call(r, 'GET', '/pulls');
+    await call(r, 'GET', '/pulls/mounted');
+    await call(r, 'GET', '/pulls/7/files');
+    await r.handle({ method: 'POST', pathname: '/pulls/7/mount', query: {}, body: {} });
+    await r.handle({ method: 'DELETE', pathname: '/pulls/7/mount', query: {}, body: {} });
+
+    expect(seen).toHaveLength(5);
+    expect(new Set(seen.map((s) => s.op))).toEqual(new Set(['read']));
+    expect(seen.every((s) => s.documentId === null)).toBe(true);
+  });
+
+  it('honours a refusal from the authorizer', async () => {
+    const authorize: CollabAuthorizer = () => ({ ok: false, status: 403, error: 'nope' });
+    const res = await call(router({ authorize }), 'GET', '/pulls');
+    expect(res).toEqual({ status: 403, json: { error: 'nope' } });
+  });
+
+  it('reports collaboration being off as a 503 carrying the availability payload', async () => {
+    const res = await call(router({ config: () => DISABLED }), 'GET', '/pulls');
+    expect(res.status).toBe(503);
+    expect(res.json).toMatchObject({ available: false, reason: 'not-configured' });
+  });
+});
+
+/* ================================================================== *
+ * GET /pulls
+ * ================================================================== */
+describe('GET /__vs/collab/pulls', () => {
+  it('defaults to the open pull requests', async () => {
+    const gh = repoAdapter();
+    await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls');
+    expect(gh.states).toEqual(['open']);
+  });
+
+  it('passes a requested state through', async () => {
+    const gh = repoAdapter();
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls', { state: 'all' });
+    expect(res.status).toBe(200);
+    expect(gh.states).toEqual(['all']);
+  });
+
+  it('refuses a state GitHub has no name for, before asking GitHub anything', async () => {
+    const gh = repoAdapter();
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls', { state: 'merged' });
+    expect(res.status).toBe(400);
+    expect(res.json).toMatchObject({ error: expect.stringContaining('invalid state: merged') });
+    expect(gh.states).toEqual([]);
+  });
+
+  it('surfaces a GitHub failure with GitHub’s own status', async () => {
+    const gh = repoAdapter({ listFails: new GitHubError('listPullRequests', 'Not Found', 404, 'not_found') });
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls');
+    expect(res.status).toBe(404);
+    expect(res.json).toMatchObject({ error: 'Not Found' });
+  });
+});
+
+/* ================================================================== *
+ * pullNumber validation — a 400 at the edge, never a 500 from the core
+ * ================================================================== */
+describe('an unusable pull number is refused at the route', () => {
+  /*
+   * `worktree.ts` throws on these, and the router’s catch-all would turn the throw into a
+   * 400 anyway — by accident, with the core’s wording. These assert the route decided.
+   */
+  for (const raw of ['0', 'abc', '-1', '1.5', '01x']) {
+    it(`rejects ${raw} on mount, unmount and files`, async () => {
+      const r = router();
+      for (const [method, path] of [
+        ['POST', `/pulls/${raw}/mount`],
+        ['DELETE', `/pulls/${raw}/mount`],
+        ['GET', `/pulls/${raw}/files`],
+      ] as const) {
+        const res = await r.handle({ method, pathname: path, query: {}, body: {} });
+        expect(res.status, `${method} ${path}`).toBe(400);
+        expect(res.json).toMatchObject({ error: `invalid pullNumber: ${raw}` });
+      }
+    });
+  }
+
+  it('refuses before consulting availability, so a malformed request needs no credential', async () => {
+    const r = router({
+      config: () => {
+        throw new Error('availability must not be consulted');
+      },
+    });
+    // `parsePullNumber` runs first; if it did not, the throwing config would surface here.
+    const res = await r.handle({ method: 'POST', pathname: '/pulls/0/mount', query: {}, body: {} });
+    expect(res.status).toBe(400);
+  });
+});
+
+/* ================================================================== *
+ * Mounting — each failure reason gets its own status and its own words
+ * ================================================================== */
+describe('POST /__vs/collab/pulls/:n/mount', () => {
+  let dir: string;
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'vs-collab-pulls-'));
+  });
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const mount = (git: GitExecutor, baseDir = dir) =>
+    router({ git, baseDir: () => baseDir }).handle({ method: 'POST', pathname: '/pulls/7/mount', query: {}, body: {} });
+
+  it('reports a served directory that is not a repository as a 409 naming the directory', async () => {
+    const res = await mount(stubGit((args) => (isCommand(args, 'rev-parse') ? { exitCode: 1 } : undefined)).exec);
+    expect(res.status).toBe(409);
+    expect(res.json).toMatchObject({ reason: 'not-a-repo', error: expect.stringContaining('not a git working tree') });
+  });
+
+  it('reports a missing origin as a 409 naming the remote', async () => {
+    const res = await mount(stubGit((args) => (isCommand(args, 'remote') ? { exitCode: 1 } : undefined)).exec);
+    expect(res.status).toBe(409);
+    expect(res.json).toMatchObject({ reason: 'no-origin', error: expect.stringContaining('`origin`') });
+  });
+
+  it('reports a failed fetch as a 502, because the refusal came from upstream', async () => {
+    const res = await mount(stubGit((args) => (isCommand(args, 'fetch') ? { exitCode: 1 } : undefined)).exec);
+    expect(res.status).toBe(502);
+    expect(res.json).toMatchObject({ reason: 'fetch-failed', error: expect.stringContaining('gh auth status') });
+  });
+
+  it('reports git refusing the checkout as a 500, because that one is ours', async () => {
+    // `rev-parse` inside the worktree must fail too, or the mount takes the re-checkout
+    // branch instead of `worktree add`. Both are answered by the same guard.
+    const res = await mount(
+      stubGit((args) => {
+        if (isCommand(args, 'worktree')) return { exitCode: 1 };
+        if (isCommand(args, 'rev-parse') && args[1] !== dir) return { exitCode: 1 };
+        return undefined;
+      }).exec,
+    );
+    expect(res.status).toBe(500);
+    expect(res.json).toMatchObject({ reason: 'worktree-failed', error: expect.stringContaining('git worktree prune') });
+  });
+
+  it('answers 200 with the worktree when the mount lands', async () => {
+    const head = 'c'.repeat(40);
+    const git = stubGit((args) => {
+      if (isCommand(args, 'rev-parse') && args[3] === 'HEAD') return { stdout: `${head}\n`, exitCode: 0 };
+      if (isCommand(args, 'rev-parse') && args[3] === '--show-toplevel') return { stdout: `${dir}/.visual-spec/worktrees/pr-7\n`, exitCode: 0 };
+      if (isCommand(args, 'rev-parse') && args[1] !== dir) return { exitCode: 1 };
+      return undefined;
+    });
+    const res = await mount(git.exec);
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({
+      ok: true,
+      worktree: { pullNumber: 7, path: `${dir}/.visual-spec/worktrees/pr-7`, headSha: head },
+    });
+    // The fetch uses the fork-safe refspec, not the head branch by name.
+    expect(git.calls.some((c) => c.includes('+refs/pull/7/head:refs/visual-spec/pr/7'))).toBe(true);
+  });
+});
+
+/* ================================================================== *
+ * Listing and unmounting
+ * ================================================================== */
+describe('the mounted worktrees', () => {
+  it('lists what git itself reports, not what this process remembers', async () => {
+    const porcelain = [
+      'worktree /repo',
+      'HEAD 1111111111111111111111111111111111111111',
+      'branch refs/heads/main',
+      '',
+      'worktree /repo/.visual-spec/worktrees/pr-7',
+      'HEAD 2222222222222222222222222222222222222222',
+      'detached',
+      '',
+    ].join('\n');
+    const git = stubGit((args) => (isCommand(args, 'worktree') ? { stdout: porcelain, exitCode: 0 } : undefined));
+    const res = await call(router({ git: git.exec }), 'GET', '/pulls/mounted');
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({
+      worktrees: [{ pullNumber: 7, path: '/repo/.visual-spec/worktrees/pr-7', headSha: '2'.repeat(40) }],
+    });
+  });
+
+  it('reports an unmount of something that was never mounted as a success', async () => {
+    const git = stubGit((args) => (isCommand(args, 'worktree') ? { exitCode: 1 } : undefined));
+    const res = await router({ git: git.exec }).handle({
+      method: 'DELETE',
+      pathname: '/pulls/7/mount',
+      query: {},
+      body: {},
+    });
+    expect(res).toEqual({ status: 200, json: { ok: true, removed: false } });
+    // The private ref goes either way, so the PR's objects are not pinned forever.
+    expect(git.calls.some((c) => c.includes('update-ref') && c.includes('refs/visual-spec/pr/7'))).toBe(true);
+  });
+
+  it('reports a real unmount as removed', async () => {
+    const res = await router({ git: stubGit().exec }).handle({
+      method: 'DELETE',
+      pathname: '/pulls/7/mount',
+      query: {},
+      body: {},
+    });
+    expect(res).toEqual({ status: 200, json: { ok: true, removed: true } });
+  });
+});
+
+/* ================================================================== *
+ * GET /pulls/:n/files
+ * ================================================================== */
+describe('GET /__vs/collab/pulls/:n/files', () => {
+  it('compares the base branch against the head SHA, so a fork PR still answers', async () => {
+    const gh = repoAdapter({ files: ['docs/spec.md', 'README.md'] });
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/7/files');
+    expect(res.status).toBe(200);
+    expect(gh.compares).toEqual([{ base: 'main', head: 'a'.repeat(40) }]);
+    expect(res.json).toMatchObject({
+      pullNumber: 7,
+      baseBranch: 'main',
+      headBranch: 'contributor:patch-1',
+      mergeBaseSha: 'b'.repeat(40),
+      files: ['docs/spec.md', 'README.md'],
+    });
+  });
+
+  it('passes a GitHub 404 through rather than reporting an empty file list', async () => {
+    const gh = repoAdapter({ pullFails: new GitHubError('getPullRequest', 'Not Found', 404, 'not_found') });
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/999/files');
+    expect(res.status).toBe(404);
+  });
+});
+
+/* ================================================================== *
+ * Held review comments — /pulls/:n/drafts (R-13.13 … R-13.18)
+ * ================================================================== */
+
+/** The head `repoAdapter()` reports for every pull request, i.e. "current". */
+const CURRENT_HEAD = 'a'.repeat(40);
+/** A head that is not the current one, i.e. "the draft was written before a push". */
+const OLD_HEAD = 'd'.repeat(40);
+
+/**
+ * The repo adapter again, plus a recording `createReviewComment`. The recording is the
+ * point: R-13.16 is a statement about how many times this method is called, so the
+ * assertion has to be able to count them.
+ */
+function draftAdapter(options: { createFails?: Error } = {}) {
+  const base = repoAdapter();
+  const creates: { pullNumber: number; input: Record<string, unknown> }[] = [];
+  let nextId = 1000;
+  const adapter = {
+    ...(base.adapter as unknown as Record<string, unknown>),
+    async createReviewComment(_repo: unknown, pullNumber: number, input: Record<string, unknown>) {
+      creates.push({ pullNumber, input });
+      if (options.createFails) throw options.createFails;
+      const id = ++nextId;
+      return {
+        id,
+        inReplyToId: null,
+        path: input.path,
+        line: (input.line as number | undefined) ?? null,
+        startLine: (input.startLine as number | undefined) ?? null,
+        originalLine: (input.line as number | undefined) ?? 1,
+        side: 'RIGHT',
+        subjectType: input.line === undefined ? 'file' : 'line',
+        commitId: input.commitId,
+        originalCommitId: input.commitId,
+        diffHunk: '',
+        body: input.body,
+        user: 'octocat',
+        createdAt: 'T0',
+        updatedAt: 'T0',
+        htmlUrl: `https://github.com/acme/specs/pull/${pullNumber}#discussion_r${id}`,
+      };
+    },
+  } as unknown as GitHubAdapter;
+  return { adapter, creates };
+}
+
+describe('/__vs/collab/pulls/:n/drafts', () => {
+  let dir: string;
+  let gh: ReturnType<typeof draftAdapter>;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'vs-collab-drafts-'));
+    gh = draftAdapter();
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const drafts = (overrides: Partial<CollabDeps> = {}) =>
+    router({ baseDir: () => dir, repoAdapter: () => gh.adapter, ...overrides });
+
+  const send = (method: string, pathname: string, body: Record<string, unknown> = {}, overrides: Partial<CollabDeps> = {}) =>
+    drafts(overrides).handle({ method, pathname, query: {}, body });
+
+  /** Hold one comment and answer with its id. */
+  async function hold(body: Record<string, unknown> = {}): Promise<string> {
+    const res = await send('POST', '/pulls/7/drafts', {
+      path: 'docs/spec.md',
+      comment: 'this paragraph contradicts the one above',
+      headSha: CURRENT_HEAD,
+      ...body,
+    });
+    expect(res.status).toBe(200);
+    return (res.json as { draft: { id: string } }).draft.id;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * R-13.13 / R-13.14 — held locally, no GitHub
+   * ---------------------------------------------------------------- */
+  it('holds a comment on disk without contacting GitHub, recording the head it was written against', async () => {
+    const exploding = {
+      getPullRequest() {
+        throw new Error('writing a draft must not contact GitHub');
+      },
+      createReviewComment() {
+        throw new Error('writing a draft must not contact GitHub');
+      },
+    } as unknown as GitHubAdapter;
+
+    const res = await send(
+      'POST',
+      '/pulls/7/drafts',
+      { path: 'docs/spec.md', comment: 'needs a caveat', headSha: OLD_HEAD, line: 12 },
+      { repoAdapter: () => exploding },
+    );
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({
+      ok: true,
+      draft: {
+        pullNumber: 7,
+        headSha: OLD_HEAD,
+        status: 'draft',
+        comment: 'needs a caveat',
+        target: { path: 'docs/spec.md', kind: 'range', startLine: 12 },
+      },
+    });
+    // R-13.5 — the store writes under the git-ignored directory of the served tree.
+    expect(readFileSync(join(dir, '.visual-spec/reviews/pr-7.json'), 'utf8')).toContain('needs a caveat');
+  });
+
+  it('lists held and published comments together, in creation order', async () => {
+    const first = await hold({ comment: 'one' });
+    const second = await hold({ comment: 'two', line: 3 });
+    await send('POST', `/pulls/7/drafts/${second}/publish`);
+
+    const res = await send('GET', '/pulls/7/drafts');
+    expect(res.status).toBe(200);
+    const listed = (res.json as { drafts: { id: string; status: string }[] }).drafts;
+    // R-13.17 — the published one is still there, marked, not deleted.
+    expect(listed.map((d) => [d.id, d.status])).toEqual([
+      [first, 'draft'],
+      [second, 'published'],
+    ]);
+  });
+
+  it('answers an empty list for a pull request nobody has commented on', async () => {
+    expect(await send('GET', '/pulls/7/drafts')).toEqual({ status: 200, json: { drafts: [] } });
+  });
+
+  /* ---------------------------------------------------------------- *
+   * Edge validation — 400 before disk, before network
+   * ---------------------------------------------------------------- */
+  describe('an unusable identifier is refused at the route', () => {
+    for (const raw of ['0', 'abc', '-1', '1.5']) {
+      it(`rejects pullNumber ${raw} on every drafts route`, async () => {
+        for (const [method, path] of [
+          ['GET', `/pulls/${raw}/drafts`],
+          ['POST', `/pulls/${raw}/drafts`],
+          ['DELETE', `/pulls/${raw}/drafts/d-deadbeef`],
+          ['POST', `/pulls/${raw}/drafts/d-deadbeef/publish`],
+        ] as const) {
+          const res = await send(method, path, { path: 'a.md', comment: 'x', headSha: CURRENT_HEAD });
+          expect(res.status, `${method} ${path}`).toBe(400);
+          expect(res.json).toMatchObject({ error: `invalid pullNumber: ${raw}` });
+        }
+      });
+    }
+
+    /*
+     * `c-...` is the id space of a GitHub review comment, not of a local draft, and the
+     * two must never be confusable — which is why `newDraftId` mints `d-` at all.
+     */
+    for (const raw of ['c-deadbeef', 'nope', 'd-DEADBEEF', 'd-dead']) {
+      it(`rejects draftId ${raw} on delete and publish`, async () => {
+        for (const [method, path] of [
+          ['DELETE', `/pulls/7/drafts/${raw}`],
+          ['POST', `/pulls/7/drafts/${raw}/publish`],
+        ] as const) {
+          const res = await send(method, path);
+          expect(res.status, `${method} ${path}`).toBe(400);
+          expect(res.json).toMatchObject({ error: `invalid draftId: ${raw}` });
+        }
+      });
+    }
+
+    it('refuses an incomplete body before it reaches disk or GitHub', async () => {
+      for (const body of [
+        { comment: 'x', headSha: CURRENT_HEAD },
+        { path: 'a.md', headSha: CURRENT_HEAD },
+        { path: 'a.md', comment: 'x' },
+        { path: 'a.md', comment: 'x', headSha: CURRENT_HEAD, startLine: 4, endLine: 2 },
+        { path: 'a.md', comment: 'x', headSha: CURRENT_HEAD, line: 0 },
+      ]) {
+        const res = await send('POST', '/pulls/7/drafts', body);
+        expect(res.status, JSON.stringify(body)).toBe(400);
+      }
+      expect(await send('GET', '/pulls/7/drafts')).toEqual({ status: 200, json: { drafts: [] } });
+    });
+
+    it('refuses a target that would escape the checkout', async () => {
+      const res = await send('POST', '/pulls/7/drafts', {
+        path: '../../etc/passwd',
+        comment: 'x',
+        headSha: CURRENT_HEAD,
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it('answers 404 for a well-formed id that names no draft', async () => {
+      const res = await send('POST', '/pulls/7/drafts/d-deadbeef/publish');
+      expect(res.status).toBe(404);
+      expect(gh.creates).toHaveLength(0);
+    });
+  });
+
+  /* ---------------------------------------------------------------- *
+   * Deleting
+   * ---------------------------------------------------------------- */
+  describe('DELETE /pulls/:n/drafts/:draftId', () => {
+    it('removes a held comment', async () => {
+      const id = await hold();
+      expect(await send('DELETE', `/pulls/7/drafts/${id}`)).toEqual({ status: 200, json: { ok: true, removed: true } });
+      expect(await send('GET', '/pulls/7/drafts')).toEqual({ status: 200, json: { drafts: [] } });
+    });
+
+    it('reports deleting something that was never there as a success', async () => {
+      expect(await send('DELETE', '/pulls/7/drafts/d-deadbeef')).toEqual({
+        status: 200,
+        json: { ok: true, removed: false },
+      });
+    });
+
+    it('refuses to delete a published record, because that record is the duplicate guard', async () => {
+      const id = await hold();
+      await send('POST', `/pulls/7/drafts/${id}/publish`);
+      const res = await send('DELETE', `/pulls/7/drafts/${id}`);
+      expect(res.status).toBe(409);
+      expect(res.json).toMatchObject({ reason: 'already-published', error: expect.stringContaining('github.com') });
+      expect((await send('GET', '/pulls/7/drafts')).json).toMatchObject({ drafts: [{ id, status: 'published' }] });
+    });
+  });
+
+  /* ---------------------------------------------------------------- *
+   * Publishing
+   * ---------------------------------------------------------------- */
+  describe('POST /pulls/:n/drafts/:draftId/publish', () => {
+    it('anchors on the pull request’s CURRENT head, not the one stored on the draft', async () => {
+      const id = await hold({ line: 12, headSha: CURRENT_HEAD });
+      const res = await send('POST', `/pulls/7/drafts/${id}/publish`);
+      expect(res.status).toBe(200);
+      expect(gh.creates).toHaveLength(1);
+      expect(gh.creates[0]).toMatchObject({
+        pullNumber: 7,
+        input: { path: 'docs/spec.md', commitId: CURRENT_HEAD, line: 12, startLine: 12, side: 'RIGHT' },
+      });
+    });
+
+    it('posts a file-level comment when the held comment names no line', async () => {
+      const id = await hold();
+      await send('POST', `/pulls/7/drafts/${id}/publish`);
+      expect(gh.creates[0]!.input.line).toBeUndefined();
+    });
+
+    it('marks the record published with the id and link GitHub returned (R-13.17)', async () => {
+      const id = await hold();
+      const res = await send('POST', `/pulls/7/drafts/${id}/publish`);
+      expect(res.json).toMatchObject({
+        ok: true,
+        alreadyPublished: false,
+        draft: { id, status: 'published', published: { reviewCommentId: 1001 } },
+      });
+      const stored = ((await send('GET', '/pulls/7/drafts')).json as { drafts: { published?: { htmlUrl: string } }[] }).drafts;
+      expect(stored[0]!.published!.htmlUrl).toContain('#discussion_r1001');
+    });
+
+    /*
+     * R-13.16, THE requirement this route exists to close. `markDraftPublished` is
+     * first-write-wins on disk, but it runs AFTER the network call — so on its own it
+     * would record one id while GitHub had been handed two comments. The gate is the
+     * re-read of the record before the call, and the only way to assert it is by counting
+     * the adapter's calls, not by inspecting the file afterwards.
+     */
+    it('publishing twice results in exactly one comment on the pull request', async () => {
+      const id = await hold({ line: 4 });
+      const first = await send('POST', `/pulls/7/drafts/${id}/publish`);
+      const second = await send('POST', `/pulls/7/drafts/${id}/publish`);
+
+      expect(gh.creates).toHaveLength(1);
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(first.json).toMatchObject({ alreadyPublished: false });
+      // A redundant publish is answered, not refused: the caller asked for the comment to
+      // be on the pull request, and it is — with the link from the FIRST publish.
+      expect(second.json).toMatchObject({
+        ok: true,
+        alreadyPublished: true,
+        draft: { id, status: 'published', published: { reviewCommentId: 1001 } },
+      });
+    });
+
+    it('re-reads the record from disk, so a second server also refuses to post again', async () => {
+      const id = await hold();
+      await send('POST', `/pulls/7/drafts/${id}/publish`);
+      // A brand-new router over the same directory: nothing is carried in memory.
+      const fresh = draftAdapter();
+      const res = await drafts({ repoAdapter: () => fresh.adapter }).handle({
+        method: 'POST',
+        pathname: `/pulls/7/drafts/${id}/publish`,
+        query: {},
+        body: {},
+      });
+      expect(fresh.creates).toHaveLength(0);
+      expect(res.json).toMatchObject({ alreadyPublished: true });
+    });
+
+    it('leaves the record publishable when GitHub refuses', async () => {
+      const failing = draftAdapter({ createFails: new GitHubError('createReviewComment', 'Unprocessable', 500, 'server') });
+      const id = await hold();
+      const res = await drafts({ repoAdapter: () => failing.adapter }).handle({
+        method: 'POST',
+        pathname: `/pulls/7/drafts/${id}/publish`,
+        query: {},
+        body: {},
+      });
+      expect(res.status).toBe(502);
+      expect((await send('GET', '/pulls/7/drafts')).json).toMatchObject({ drafts: [{ id, status: 'draft' }] });
+    });
+
+    /* -------------------------------------------------------------- *
+     * The stale case
+     * -------------------------------------------------------------- */
+    it('refuses to publish against a head the comment was not written against, naming both', async () => {
+      const id = await hold({ headSha: OLD_HEAD, line: 12 });
+      const res = await send('POST', `/pulls/7/drafts/${id}/publish`);
+      expect(res.status).toBe(409);
+      expect(res.json).toMatchObject({ reason: 'stale-draft', draftHeadSha: OLD_HEAD, currentHeadSha: CURRENT_HEAD });
+      expect(gh.creates).toHaveLength(0);
+      expect((await send('GET', '/pulls/7/drafts')).json).toMatchObject({ drafts: [{ id, status: 'draft' }] });
+    });
+
+    it('publishes a stale comment when the reviewer says so explicitly', async () => {
+      const id = await hold({ headSha: OLD_HEAD, line: 12 });
+      const res = await send('POST', `/pulls/7/drafts/${id}/publish`, { force: true });
+      expect(res.status).toBe(200);
+      // Still anchored on the CURRENT head — forcing changes what is allowed, not what is
+      // truthful about which commit GitHub is being asked to anchor to.
+      expect(gh.creates[0]!.input.commitId).toBe(CURRENT_HEAD);
+    });
+  });
+
+  /* ---------------------------------------------------------------- *
+   * Authorization (R-9.8)
+   * ---------------------------------------------------------------- */
+  describe('the operations these routes gate on', () => {
+    it('gates the local routes on `read` and the publish on `comment`', async () => {
+      const seen: CollabOperation[] = [];
+      const authorize: CollabAuthorizer = (op) => {
+        seen.push(op);
+        return { ok: true };
+      };
+      const id = await hold();
+      seen.length = 0;
+      const r = drafts({ authorize });
+      await r.handle({ method: 'GET', pathname: '/pulls/7/drafts', query: {}, body: {} });
+      await r.handle({
+        method: 'POST',
+        pathname: '/pulls/7/drafts',
+        query: {},
+        body: { path: 'a.md', comment: 'x', headSha: CURRENT_HEAD },
+      });
+      await r.handle({ method: 'DELETE', pathname: `/pulls/7/drafts/${id}`, query: {}, body: {} });
+      await r.handle({ method: 'POST', pathname: `/pulls/7/drafts/${id}/publish`, query: {}, body: {} });
+
+      // `comment` is `any-role` (R-9.8) — a reviewer with no write access may publish a
+      // held comment, because commenting on a pull request needs no write access.
+      expect(seen).toEqual(['read', 'read', 'read', 'comment']);
+    });
+
+    it('honours a refusal, and reports collaboration being off as a 503', async () => {
+      const authorize: CollabAuthorizer = () => ({ ok: false, status: 403, error: 'nope' });
+      expect(await send('GET', '/pulls/7/drafts', {}, { authorize })).toEqual({ status: 403, json: { error: 'nope' } });
+      const off = await send('GET', '/pulls/7/drafts', {}, { config: () => DISABLED });
+      expect(off.status).toBe(503);
+    });
+  });
+
+  it('every drafts handler is declared above the scoped-documentId match in the source', () => {
+    const text = src('core/vite/routes/collab.ts');
+    const scoped = text.indexOf('const scoped = /^\\/([^/]+)(\\/.*)?$/.exec(pathname)');
+    for (const marker of ['/^\\/pulls\\/([^/]+)\\/drafts$/', '/^\\/pulls\\/([^/]+)\\/drafts\\/([^/]+)$/', '/^\\/pulls\\/([^/]+)\\/drafts\\/([^/]+)\\/publish$/']) {
+      const at = text.indexOf(marker);
+      expect(at, marker).toBeGreaterThan(-1);
+      expect(at, marker).toBeLessThan(scoped);
+    }
+  });
+});

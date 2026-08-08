@@ -36,6 +36,19 @@ function nearestHeading(anchor: HTMLElement, root: HTMLElement): string | null {
 
 type PanelTab = 'open' | 'history';
 
+/**
+ * R-13.18 — where a comment lives, stated positively.
+ *
+ * Every card gets one of these, always. It exists because the panel used to say this only
+ * by implication: a row with an "Open on GitHub" link and a "Reply" button was a pull
+ * request thread, a row without them was local. Both controls are conditional for
+ * *other* reasons — a resolved thread is deliberately not linked, a thread whose html url
+ * did not resolve has nothing to link to — so a genuine GitHub comment could render with
+ * neither, and be indistinguishable from a local one. Absence of a control is not a
+ * label; this is.
+ */
+export type CommentOrigin = { where: 'local' | 'github'; label: string };
+
 /** How the current selection reads, or why it cannot be commented on at all. */
 export type SelectionDescription = { title: string; detail: string } | { uncommentable: string };
 
@@ -82,7 +95,16 @@ export type CommentPanelSource = {
    * else; the row renders it as a link out rather than as a control that writes.
    */
   link?: (c: CommentRecord) => string | undefined;
+  /**
+   * R-13.18 — the provenance chip. Unset means every comment on this surface is local,
+   * which is true of the sidecar panel: it reads and writes a file on this machine and
+   * has never heard of a pull request.
+   */
+  origin?: (c: CommentRecord) => CommentOrigin;
 };
+
+/** The sidecar's answer, and the default for any source that does not supply one. */
+const LOCAL_ONLY: CommentOrigin = { where: 'local', label: 'Local only — not on GitHub' };
 
 export function CommentPanel({ file, width, source }: { file?: string; width: number; source?: CommentPanelSource }) {
   return source ? <Panel width={width} source={source} /> : <LocalCommentPanel file={file ?? ''} width={width} />;
@@ -318,6 +340,7 @@ function CommentList({ source }: { source: CommentPanelSource }) {
   // Only open comments: once the apply-comments skill marks one "applied", it drops off the list.
   const mine = source.comments.filter((c) => c.status === 'open');
   const link = source.link ?? (() => undefined);
+  const origin = source.origin ?? (() => LOCAL_ONLY);
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [replyId, setReplyId] = useState<string | null>(null);
   const [replyText, setReplyText] = useState('');
@@ -337,6 +360,14 @@ function CommentList({ source }: { source: CommentPanelSource }) {
       <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 8 }}>
         {mine.map((c) => (
           <li key={c.id} ref={(el) => { rows.current[c.id] = el; }} style={{ ...card, ...(c.id === activeId ? cardActive : {}) }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+              <span
+                data-vs-comment-origin={origin(c).where}
+                style={origin(c).where === 'github' ? originGithub : originLocal}
+              >
+                {origin(c).label}
+              </span>
+            </div>
             <div style={{ fontSize: 12, opacity: 0.6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {source.label(c)}
             </div>
@@ -477,6 +508,10 @@ const sectionBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'c
 const textarea: React.CSSProperties = { width: '100%', height: 70, padding: '6px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: 'inherit', resize: 'vertical' };
 const btnPrimary: React.CSSProperties = { padding: '5px 12px', border: '1px solid #2563eb', borderRadius: 4, background: '#2563eb', color: 'white', cursor: 'pointer', font: 'inherit' };
 const card: React.CSSProperties = { border: '1px solid #f1f5f9', borderRadius: 8, padding: 8, overflowWrap: 'anywhere' };
+/** R-13.18's two chips. Different words and different colours — never one chip and a gap. */
+const originChip: React.CSSProperties = { font: '600 10px system-ui', padding: '1px 7px', borderRadius: 99, whiteSpace: 'nowrap', letterSpacing: 0.2 };
+const originLocal: React.CSSProperties = { ...originChip, border: '1px solid #fcd34d', background: '#fef3c7', color: '#92400e' };
+const originGithub: React.CSSProperties = { ...originChip, border: '1px solid #bbf7d0', background: '#f0fdf4', color: '#166534' };
 const cardActive: React.CSSProperties = { border: '1px solid #f59e0b', background: '#fffbeb', boxShadow: '0 0 0 2px rgba(245,158,11,0.25)' };
 const locateBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, width: 22, height: 22, padding: 0, border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer' };
 const delBtn: React.CSSProperties = { ...locateBtn, color: '#ef4444' };

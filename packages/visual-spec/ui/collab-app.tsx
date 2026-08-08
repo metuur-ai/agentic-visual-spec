@@ -33,8 +33,11 @@ import { deriveReadiness, type ReadinessVerdict } from '../core/collaboration/re
 import { buildApplyPrompt } from '../core/editing/apply-prompt';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { collabCommentPanelSource, collabIndicatorTargets } from './collab-comment-source';
+import type { MountedWorktree, PullRequestSummary } from './collab-client';
 import { CollabEditor, type CollabEditorHandle } from './collab-editor';
 import { CollabOpenPanel } from './collab-open-panel';
+import { CollabPrReview } from './collab-pr-review';
+import { CollabPullsPanel } from './collab-pulls-panel';
 import { ActiveCommentProvider } from './active-comment';
 import { CommentPanel, type CommentPanelSource } from './comment-panel';
 import { IndicatorLayer } from './indicator-layer';
@@ -76,8 +79,19 @@ function rememberInUrl(documentId: string | null): void {
   window.history.replaceState(null, '', url);
 }
 
+/**
+ * The Pull Request whose code is being read (Unit 13), if any.
+ *
+ * Held here and not in the URL, unlike `documentId`. The reason `documentId` is in the
+ * URL is that a document can carry unpublished local work that only `open` could refetch;
+ * a checkout carries none — it is a detached copy of a commit, and remounting it is one
+ * click and no loss. So the cheaper state is the honest one.
+ */
+type PullReview = { pull: PullRequestSummary; worktree: MountedWorktree };
+
 export function CollabApp({ onExit }: { onExit: () => void }) {
   const [documentId, setDocumentIdState] = useState<string | null>(documentFromUrl);
+  const [pullReview, setPullReview] = useState<PullReview | null>(null);
   const setDocumentId = useCallback((id: string | null) => {
     setDocumentIdState(id);
     rememberInUrl(id);
@@ -93,9 +107,24 @@ export function CollabApp({ onExit }: { onExit: () => void }) {
       </header>
       {documentId ? (
         <CollabDocumentPane documentId={documentId} />
+      ) : pullReview ? (
+        <CollabPrReview
+          key={pullReview.pull.number}
+          pull={pullReview.pull}
+          worktree={pullReview.worktree}
+          onExit={() => setPullReview(null)}
+        />
       ) : (
         <div style={{ flex: 1, overflow: 'auto' }}>
+          {/*
+            * Two entries, and they answer different questions. `CollabOpenPanel` opens a
+            * *document* whose pull request the reviewer already holds a link to;
+            * `CollabPullsPanel` starts from "what is there to review at all?" and ends in
+            * a read-only checkout of a pull request's code (R-13.1 / R-13.11).
+            */}
           <CollabOpenPanel onOpened={setDocumentId} />
+          <hr style={sectionRule} />
+          <CollabPullsPanel onReview={(pull, worktree) => setPullReview({ pull, worktree })} />
         </div>
       )}
     </>
@@ -408,6 +437,7 @@ const backBtn: React.CSSProperties = {
   cursor: 'pointer',
 };
 const title: React.CSSProperties = { fontWeight: 700, color: '#334155' };
+const sectionRule: React.CSSProperties = { border: 0, borderTop: '1px solid #e5e7eb', margin: '4px 12px', maxWidth: 720 };
 const centerMsg: React.CSSProperties = { flex: 1, display: 'grid', placeItems: 'center', opacity: 0.6 };
 const docPane: React.CSSProperties = { flex: 1, minWidth: 0, position: 'relative', overflow: 'auto', background: '#f8fafc' };
 const docTitleBar: React.CSSProperties = { padding: '14px 56px 0', font: '14px system-ui', color: '#334155' };

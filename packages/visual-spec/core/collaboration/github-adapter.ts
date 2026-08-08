@@ -85,6 +85,26 @@ export type PullRequestDetail = PullRequest & {
 /** Task 8.4's name for the same read-back shape. */
 export type PullRequestStatus = PullRequestDetail;
 
+/** Which Pull Requests a list call asks for. GitHub's own vocabulary, passed through. */
+export type PullRequestListState = 'open' | 'closed' | 'all';
+
+/**
+ * One row of a Pull Request list. Deliberately not `PullRequestDetail`: see
+ * `listPullRequests`. `author` is the login, or `''` when GitHub reports a deleted user.
+ */
+export type PullRequestSummary = {
+  number: number;
+  title: string;
+  state: string;
+  draft: boolean;
+  headBranch: string;
+  baseBranch: string;
+  headSha: string;
+  htmlUrl: string;
+  author: string;
+  updatedAt: string;
+};
+
 /**
  * `GET /compare/{base}...{head}` reduced to what a divergence check needs: the branch
  * point and the paths that changed between it and `head` (R-8.22).
@@ -185,6 +205,17 @@ export interface GitHubAdapter {
    * reaches the pull number the open path needs.
    */
   findOpenPullRequestForBranch(repo: RepoRef, branch: string): Promise<PullRequestDetail | null>;
+  /**
+   * Every Pull Request on the repo, newest first, across all pages — what a "which PRs
+   * can I review?" list needs and `findOpenPullRequestForBranch` cannot answer, because
+   * that one starts from a branch the caller must already know.
+   *
+   * Returns summaries, not `PullRequestDetail`: the list endpoint omits `mergeable`
+   * (GitHub only computes it per-PR), so promising the detail shape here would mean
+   * promising a field that is always `null`. Carries `title` and `author`, which the
+   * detail shape lacks and a list has to render.
+   */
+  listPullRequests(repo: RepoRef, state?: PullRequestListState): Promise<PullRequestSummary[]>;
   /**
    * R-8.22 — `GET /compare/{base}...{head}`. Called as `compareCommits(repo, branch,
    * baseBranch)`, `files` is exactly "what changed on the base branch since the branch
@@ -348,6 +379,24 @@ function toPullRequestDetail(raw: Json): PullRequestDetail {
     // `null` means GitHub has not finished computing it — a third answer, kept.
     mergeable: typeof raw.mergeable === 'boolean' ? raw.mergeable : null,
     mergeableState: str(raw.mergeable_state, 'unknown'),
+  };
+}
+
+function toPullRequestSummary(raw: Json): PullRequestSummary {
+  const head = raw.head as Json | undefined;
+  const base = raw.base as Json | undefined;
+  const user = raw.user as Json | undefined;
+  return {
+    number: num(raw.number),
+    title: str(raw.title),
+    state: str(raw.state),
+    draft: raw.draft === true,
+    headBranch: str(head?.ref),
+    baseBranch: str(base?.ref),
+    headSha: str(head?.sha),
+    htmlUrl: str(raw.html_url),
+    author: str(user?.login),
+    updatedAt: str(raw.updated_at),
   };
 }
 
@@ -524,6 +573,20 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
       const raw = await call<Json[]>('findOpenPullRequestForBranch', ['api', '--method', 'GET', '-H', ACCEPT, endpoint]);
       const first = Array.isArray(raw) ? raw[0] : undefined;
       return first ? toPullRequestDetail(first) : null;
+    },
+
+    async listPullRequests(repo, state = 'open') {
+      const out: PullRequestSummary[] = [];
+      // Same explicit page loop as the comment lists: the buffered executor cannot
+      // see `Link` headers, so the short page is the only available exit.
+      for (let page = 1; page <= MAX_PAGES; page += 1) {
+        const endpoint = `/repos/${repo.owner}/${repo.repo}/pulls?state=${state}&sort=updated&direction=desc&per_page=${PER_PAGE}&page=${page}`;
+        const raw = await call<Json[]>('listPullRequests', ['api', '--method', 'GET', '-H', ACCEPT, endpoint]);
+        const items = Array.isArray(raw) ? raw : [];
+        for (const item of items) out.push(toPullRequestSummary(item));
+        if (items.length < PER_PAGE) return out;
+      }
+      throw new Error(`listPullRequests: ${repo.owner}/${repo.repo} did not terminate within ${MAX_PAGES} pages of ${PER_PAGE}`);
     },
 
     async compareCommits(repo, base, head) {

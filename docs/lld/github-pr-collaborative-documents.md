@@ -589,3 +589,63 @@ recorded in §10.
   standalone CLI cannot assume a configured `gh`.
 - Whether the comment cache is keyed per PR so concurrent collaboration sessions do not
   overwrite each other before merge.
+
+### Reviewing a pull request's code (Unit 13)
+
+**The shape problem.** Everything above reads GitHub one path at a time through the
+`gh api` adapter. That is right for a single document and wrong for a pull request: a
+reviewer wants the changed files, the files around them, and no round trip per path.
+A `git worktree` gives the whole tree at one commit for one fetch.
+
+**Why a worktree and not a checkout.** The served directory may hold unsaved local
+work. `git checkout` would disturb it; a linked worktree materialises the pull request
+elsewhere and leaves the served copy at whatever commit it was on.
+
+**Location.** `<servedDir>/.visual-spec/worktrees/pr-<n>`. Inside the repository,
+because the state belongs to the project and travels with it. That makes `.gitignore`
+load-bearing rather than cosmetic — a worktree git can see is thousands of untracked
+files in `git status` — so the ignore entry is written *before* the first worktree is
+created, never after. Verified against a real repository: without it, `git status`
+lists the worktree immediately.
+
+**Reference: `refs/pull/<n>/head`, not the branch name.** Fetching the branch by name
+only works when the pull request comes from the same repository. `refs/pull/<n>/head`
+is served for fork pull requests too, so it is the one refspec that covers every pull
+request the list can show. It is fetched into `refs/visual-spec/pr/<n>` — a private
+namespace, so nothing can collide with the user's branches or with
+`refs/remotes/origin/*`. The fetch is forced, because a force-pushed head is not a
+fast-forward and refusing it would pin the reviewer to a commit the pull request no
+longer has.
+
+**Read-only is a UI contract, not a filesystem one.** The checkout is detached at the
+head, so no stray write can land on a branch. Making the tree genuinely unwritable was
+considered and rejected: it breaks the reviewer's editor and language servers for no
+guarantee the detached HEAD does not already give.
+
+**Re-mount moves, not recreates.** Selecting a mounted pull request again checks the
+existing worktree out at the new head. Recreating it would invalidate every editor tab
+open inside it and pay a full re-materialisation for what is usually a few commits.
+
+**One spelling per path.** `mount` originally reported `join(baseDir, rel)` while
+`list` reported what git printed. On macOS a served directory under `/tmp` is really
+under `/private/tmp`, so the same worktree had two spellings and "is this pull request
+already mounted?" answered no. `mount` now asks git for the canonical path. The
+regression test asserts `mount ≡ list` rather than a literal path, because a literal
+path is exactly what let the defect through.
+
+**Input validation is about paths, not shells.** Every git call goes through `spawn`
+with an argument array, so there is no shell to inject into. The pull number is still
+validated at the boundary because it is interpolated into a filesystem path, where
+`../..` escapes the worktree directory and an argument array does nothing to stop it.
+
+**Comments: held locally, published on request.** A review comment written against the
+checkout is stored under the same ignored directory and carries the head it was written
+against. Publication is a separate, explicit act — writing, saving and refreshing never
+contact GitHub. This is the one place where the reviewer's intent and the network are
+deliberately decoupled, because the alternative (publish on save) makes every keystroke
+a public act.
+
+**Changed files and the checkout can disagree.** The worktree gives the full tree for
+free; the changed-file list comes from `compareCommits`, a separate network read. A
+push landing between the two leaves them describing different commits, so the refresh
+that moves the worktree must also refresh the list.

@@ -371,6 +371,8 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         jobs: collabJobs,
         config: () => collabConfig,
         documents: () => fsCollaborationStore(specsRoot),
+        // Same directory the documents come from, read per request for the same reason.
+        baseDir: () => specsRoot,
         bodies: collabWiring.bodies,
         authorize: collabWiring.authorize,
       });

@@ -187,6 +187,9 @@ export function createVisualSpecServer(opts: ServeOptions) {
     jobs: collabJobs,
     config: () => collabConfig,
     documents: () => fsCollaborationStore(contentDir),
+    // A thunk, like every other store above: PR worktrees are mounted under whatever
+    // directory is being served *now*, so a runtime re-root moves them with it.
+    baseDir: () => contentDir,
     bodies: collabWiring.bodies,
     authorize: collabWiring.authorize,
   });

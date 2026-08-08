@@ -52,6 +52,27 @@ describe('treeStore', () => {
     expect(paths.some((p) => p.startsWith('secret'))).toBe(false);
   });
 
+  /*
+   * A linked worktree (`git worktree add`, which is how a pull request is checked out)
+   * carries `.git` as a FILE holding `gitdir: …`, not as a directory. The `.git/`
+   * pattern does not match a file, so every pull request checkout showed a browsable
+   * `.git` at its root. Caught in the browser; this is the case that reproduces it.
+   */
+  it('hides .git whether it is a directory or a linked worktree`s gitdir file', async () => {
+    const repo = await mkdtemp(join(tmpdir(), 'vs-tree-git-'));
+    await mkdir(join(repo, 'plain', '.git'), { recursive: true });
+    await writeFile(join(repo, 'plain', '.git', 'HEAD'), 'ref: refs/heads/main\n');
+    await mkdir(join(repo, 'linked'), { recursive: true });
+    await writeFile(join(repo, 'linked', '.git'), 'gitdir: /somewhere/.git/worktrees/pr-1\n');
+    await writeFile(join(repo, 'linked', 'spec.md'), '# visible\n');
+
+    const paths = (await treeStore(repo).tree()).map((e) => e.path);
+    expect(paths).toContain('linked/spec.md');
+    expect(paths.some((p) => p.endsWith('.git') || p.includes('.git/'))).toBe(false);
+
+    await rm(repo, { recursive: true, force: true });
+  });
+
   it('tags each entry with type and kind (size is fetched per-file, not walked)', async () => {
     const entries = await treeStore(base).tree();
     const app = entries.find((e) => e.path === 'src/app.ts')!;

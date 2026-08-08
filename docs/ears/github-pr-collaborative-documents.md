@@ -322,3 +322,37 @@ that fails loudly when GitHub changes.
 | R-12.10 | THE SYSTEM SHALL include a test asserting that a comment reporting no current line, whose snippet matches exactly once, anchors to that line and is marked outdated, and that one matching zero or many times is presented unanchored. |
 | R-12.11 | THE SYSTEM SHALL include a test asserting that a review-comment list spanning multiple pages is accumulated before threads are grouped. |
 | R-12.12 | THE SYSTEM SHALL include a test asserting that a GraphQL response carrying an `errors` array is classified as a failure and not as success. |
+
+## Unit 13: Reviewing a pull request's code
+
+**Why:** Units 1–12 make *one document* reviewable. They do not let a reviewer see
+which pull requests exist, and they read a single file through the GitHub API — the
+right shape for one document and the wrong one for a pull request, where the reviewer
+needs the changed files, the files around them, and no round trip per path. This unit
+adds pull-request discovery and a local checkout of the pull request's tree, kept
+outside the directory the user is currently serving so that unsaved local work is never
+disturbed. The checkout is a review surface, not a workspace: nothing here commits,
+pushes, or merges, and Unit 7's "merging is not part of visual-spec" is unchanged.
+
+| ID | EARS statement |
+| --- | --- |
+| R-13.1 | THE SYSTEM SHALL list the pull requests of the configured repository, carrying at least number, title, state, author, head branch and head commit, so that a reviewer can choose one without leaving the application. |
+| R-13.2 | THE SYSTEM SHALL treat listing pull requests as a read, requiring no write access to the repository. |
+| R-13.3 | WHEN a reviewer selects a pull request, THE SYSTEM SHALL materialise that pull request's tree on the local filesystem at a path derived from its number, without changing the commit or the working copy of the directory being served. |
+| R-13.4 | THE SYSTEM SHALL fetch the pull request head through a reference that GitHub serves for pull requests opened from forks, so that a fork-based pull request is reviewable on the same path as a same-repository one. |
+| R-13.5 | THE SYSTEM SHALL place every such checkout under a single directory inside the served directory, and SHALL ensure that directory is ignored by git before creating the first checkout, so that a checkout never appears as untracked content of the repository under review. |
+| R-13.6 | THE SYSTEM SHALL check out the pull request head in a detached state, so that no edit made inside the checkout can be committed to a branch by accident. |
+| R-13.7 | WHEN a pull request that is already checked out is selected again, THE SYSTEM SHALL move the existing checkout to the current head rather than recreating it, so that the path stays stable across a force-push. |
+| R-13.8 | THE SYSTEM SHALL report the same filesystem path for a given checkout from every operation that names one, so that a caller can determine whether a pull request is already checked out by comparing paths. |
+| R-13.9 | IF a checkout cannot be created, THE SYSTEM SHALL report which of the following occurred — the served directory is not a git repository, it has no origin remote, the pull request reference could not be fetched, or git refused the checkout — rather than a generic failure. |
+| R-13.10 | THE SYSTEM SHALL reject a pull request identifier that is not a positive integer before it reaches a filesystem path or a git reference. |
+| R-13.11 | THE SYSTEM SHALL present the pull request's changed files as the entry point to a review, and SHALL allow opening any other file in the checkout, so that a reviewer can read the context surrounding a change. |
+| R-13.12 | WHEN the pull request head moves while a checkout is mounted, THE SYSTEM SHALL refresh the set of changed files together with the checkout, so that the two cannot disagree about which commit is under review. |
+| R-13.13 | THE SYSTEM SHALL allow a comment to be written against a file and line of a checked-out pull request and held locally, in the ignored directory of R-13.5, without contacting GitHub. |
+| R-13.14 | THE SYSTEM SHALL record, on each such held comment, the pull request head it was written against. |
+| R-13.15 | THE SYSTEM SHALL publish a held comment to the pull request only when publication is explicitly requested, and SHALL NOT publish as a side effect of writing, saving, or refreshing. |
+| R-13.16 | THE SYSTEM SHALL ensure that requesting publication twice for the same held comment results in at most one comment on the pull request. |
+| R-13.17 | THE SYSTEM SHALL retain a published comment in its local record, marked as published and carrying the identifier GitHub returned, rather than deleting it. |
+| R-13.18 | THE SYSTEM SHALL distinguish, in the reviewing interface, a comment held locally from one that exists on the pull request, so that a reviewer is never left inferring a comment's origin from the absence of a control. |
+| R-13.19 | THE SYSTEM SHALL NOT commit, push, or merge from a pull request checkout. |
+| R-13.20 | THE SYSTEM SHALL include tests that drive the checkout operations against real git repositories, since the behaviours being relied on — the fork reference, the detached checkout, and the path git reports — are git's, not this system's. |

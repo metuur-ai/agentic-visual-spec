@@ -32,7 +32,23 @@
 import type { ResolvedCollaborationConfig, ResolvedVisualSpecConfig } from '../../config';
 import { type CollaborationPreflight, credentialFingerprint, preflightCollaboration } from '../../collaboration/credentials';
 import { githubCommentStore } from '../../collaboration/comment-projection';
-import { createGitHubAdapter, GitHubError, type GitHubAdapter, type RepoRef } from '../../collaboration/github-adapter';
+import {
+  createGitHubAdapter,
+  GitHubError,
+  type GitHubAdapter,
+  type PullRequestListState,
+  type RepoRef,
+} from '../../collaboration/github-adapter';
+import { defaultExecGit, type GitExecutor } from '../../git-context';
+import { listMountedWorktrees, mountPullRequest, unmountPullRequest, type WorktreeFailure } from '../../collaboration/worktree';
+import {
+  addReviewDraft,
+  deleteReviewDraft,
+  isStale,
+  markDraftPublished,
+  readReviewDrafts,
+  type ReviewDraft,
+} from '../../collaboration/review-drafts';
 import type { CollaborationRecord, GitHubBinding } from '../../collaboration/document-record';
 import { DOCUMENT_ID_RE, newCollaborationRecord } from '../../collaboration/document-record';
 import type { CollaborationStore } from '../../collaboration/record-store';
@@ -266,6 +282,22 @@ export type CollabDeps = {
     document: CollaborationRecord;
     repo: ResolvedCollaborationConfig;
   }) => GitHubAdapter;
+  /**
+   * The adapter the **repo-level** routes drive (the Pull Request list, the compare a
+   * mounted PR's file list comes from). Deliberately not `adapter` above: that one is
+   * built from a document's binding and there is no document in play here — the question
+   * "which Pull Requests can I review?" is asked before any document is chosen.
+   * Injectable so a test never execs `gh`.
+   */
+  repoAdapter?: () => GitHubAdapter;
+  /**
+   * The served directory PR worktrees are mounted under, read per request so a runtime
+   * re-root is honoured. Optional with a `process.cwd()` default so the two existing
+   * hosts keep compiling; both pass their content directory.
+   */
+  baseDir?: () => string;
+  /** Injectable so tests never exec `git`. Defaults to the real CLI. */
+  git?: GitExecutor;
   /** Injectable so tests never exec `gh`. Memoized by the router, successes only. */
   preflight?: (repo: ResolvedCollaborationConfig) => Promise<CollaborationPreflight>;
   /** How long a successful preflight may be reused. Mirrors `createCollabAuthorizer`. */
@@ -430,17 +462,23 @@ function fileLevelBody(
  * non-empty body already established, the unresolvable line is the remaining way for a
  * line create to be refused — and degrading on some other 422 costs a file-level comment
  * rather than a lost one.
+ *
+ * `input.commitId` is the one way to skip the `getPullRequest` above, and it exists for a
+ * caller that has *just* read the current head for another reason — the draft-publish
+ * route reads it to decide whether the draft is stale. Re-reading it here would be a
+ * second answer to the same question, and the two could disagree, which is the one thing
+ * the staleness check exists to prevent. It is not an escape hatch for a cached sha:
+ * R-4.13 is about freshness, not about who made the call.
  */
 async function createReviewCommentWithPolicy(
   ctx: ReviewContext,
-  input: { path: string; comment: string; startLine?: number; endLine?: number; selectedText?: string },
+  input: { path: string; comment: string; commitId?: string; startLine?: number; endLine?: number; selectedText?: string },
 ): Promise<{ created: ReviewComment; degraded?: { to: 'file'; reason: string } }> {
   const { adapter, repoRef, pullNumber } = ctx;
   const { path, comment, startLine, endLine, selectedText } = input;
 
   // R-4.13 — re-read at creation time. Never a sha held from open.
-  const pull = await adapter.getPullRequest(repoRef, pullNumber);
-  const commitId = pull.headSha;
+  const commitId = input.commitId ?? (await adapter.getPullRequest(repoRef, pullNumber)).headSha;
 
   // No line to anchor to: a document-level comment is file-level by intent, not by
   // degradation, so it carries no "we had to" disclosure.
@@ -500,6 +538,91 @@ function githubFailure(err: GitHubError): CollabRouteResult {
 }
 
 /* ------------------------------------------------------------------ *
+ * Pull Requests and their worktrees (repo-level, no document in play)
+ * ------------------------------------------------------------------ */
+
+/**
+ * A pull number as it arrives in a path segment.
+ *
+ * Validated **here**, at the edge, and not left to `worktree.ts`'s own
+ * `assertPullNumber`: that one throws, and a throw inside `handle` lands in the catch-all
+ * that answers `400` with the raw message — which happens to be right, but by accident.
+ * Returning `null` keeps the refusal a route decision with the route's own wording.
+ */
+function parsePullNumber(raw: string): number | null {
+  if (!/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * Why a mount did not happen, said in the words of the thing the user has to fix.
+ *
+ * Each reason gets its own status because each is a different actor's problem: the first
+ * two are the served directory's (nothing to do with GitHub, so `409` — the request was
+ * fine, the state it addresses is not), `fetch-failed` is the network or the credential
+ * (`502` — an upstream we depend on refused), and `worktree-failed` is git on this
+ * machine (`500` — ours). Collapsing them into one "mount failed" would leave a user
+ * with an unconfigured `origin` reading a message about GitHub being unreachable.
+ */
+const MOUNT_FAILURE: Record<WorktreeFailure, { status: number; message: string }> = {
+  'not-a-repo': {
+    status: 409,
+    message:
+      'The served directory is not a git working tree, so a pull request cannot be checked out next to it. ' +
+      'Serve a directory inside the repository this pull request belongs to.',
+  },
+  'no-origin': {
+    status: 409,
+    message:
+      'The served directory has no `origin` remote, so there is nowhere to fetch the pull request from. ' +
+      'Add one with `git remote add origin <url>`.',
+  },
+  'fetch-failed': {
+    status: 502,
+    message:
+      'The pull request head could not be fetched from `origin`. Check that you are online, that the pull ' +
+      'request number is right, and that `gh auth status` reports a credential that can read the repository.',
+  },
+  'worktree-failed': {
+    status: 500,
+    message:
+      'git refused to create the worktree. Run `git worktree prune` in the served directory and try again — ' +
+      'a leftover registration from a previous mount is the usual cause.',
+  },
+};
+
+/* ------------------------------------------------------------------ *
+ * Held review comments on a checked-out Pull Request (Unit 13, R-13.13 … R-13.18)
+ * ------------------------------------------------------------------ */
+
+/**
+ * A draft id as it arrives in a path segment. Same edge-validation argument as
+ * `parsePullNumber`: `review-drafts.ts` looks the id up and reports "unknown draft", which
+ * would read as a 404 for a request that was never well formed. The shape is the one
+ * `newDraftId` mints — `d-` plus four hex bytes — so a `c-<hex>` GitHub comment id, which
+ * is a *different id space* entirely, is refused here rather than missed later.
+ */
+const DRAFT_ID_RE = /^d-[0-9a-f]{8}$/;
+
+/**
+ * The line a held comment should be anchored to, read off its stored target.
+ *
+ * A `file` target has no line by construction and posts file-level (`subject_type: file`,
+ * R-4.14). A `range` carries `startLine` and, only when the range spans more than one
+ * line, `endLine` — `targetFor` normalises a one-line range to the former, so this reads
+ * the two spellings back into the one pair GitHub takes.
+ */
+function draftLines(draft: ReviewDraft): { startLine?: number; endLine?: number } {
+  const { target } = draft;
+  if (target.kind !== 'range' || typeof target.startLine !== 'number') return {};
+  return {
+    startLine: target.startLine,
+    ...(typeof target.endLine === 'number' ? { endLine: target.endLine } : {}),
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * The router
  * ------------------------------------------------------------------ */
 
@@ -511,6 +634,11 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   const runPreflight = deps.preflight ?? ((repo: ResolvedCollaborationConfig) => preflightCollaboration({ repo }));
   const preflightTtl = deps.preflightTtlMs ?? DEFAULT_PREFLIGHT_TTL_MS;
   const clock = deps.clock ?? (() => Date.now());
+  const repoAdapter = deps.repoAdapter ?? (() => createGitHubAdapter());
+  const baseDir = deps.baseDir ?? (() => process.cwd());
+  const git = deps.git ?? defaultExecGit;
+  /** The configured repo as the adapter addresses it — `baseBranch` is not part of a ref. */
+  const repoRefOf = (repo: ResolvedCollaborationConfig): RepoRef => ({ owner: repo.owner, repo: repo.repo });
 
   // Memoized per repo *and* credential identity: the preflight shells out to `gh`, and
   // every mutating route consults it. Keyed by owner/repo/base plus
@@ -771,6 +899,330 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
             ...(idempotencyKey ? { idempotencyKey } : {}),
           }),
         });
+      }
+
+      /*
+       * `/pulls/*` — the repo-level family, and it MUST stay above the document-scoped
+       * match below. That match takes the first path segment as a documentId, and `pulls`
+       * satisfies `DOCUMENT_ID_RE`, so a family placed after it is not merely unreachable —
+       * it is silently answered by the wrong handler: `GET /pulls` becomes the status
+       * snapshot of a document called "pulls" and returns `200` with an empty document.
+       * Nothing about that reads as a routing bug from the client, which is why the
+       * ordering is asserted in `collab.pulls.test.ts` rather than left to a comment.
+       *
+       * Every route in the family is a READ (`read` is `any-role`, R-9.8). Mounting looks
+       * like a write because it puts files on disk, but what it writes is a detached,
+       * read-only checkout in this user's own working directory — nothing reaches GitHub,
+       * and gating it author-only would lock reviewers out of the one feature that exists
+       * for them.
+       */
+
+      /* GET /__vs/collab/pulls — which Pull Requests can I review? */
+      if (method === 'GET' && (pathname === '/pulls' || pathname === '/pulls/')) {
+        const state = req.query.state ?? 'open';
+        if (state !== 'open' && state !== 'closed' && state !== 'all') {
+          return bad(`invalid state: ${state} — expected open, closed or all`);
+        }
+        const gated = await gate('read', null);
+        if (!gated.ok) return gated.result;
+        try {
+          const pulls = await repoAdapter().listPullRequests(repoRefOf(gated.repo), state as PullRequestListState);
+          return { status: 200, json: { pulls } };
+        } catch (err) {
+          if (err instanceof GitHubError) return githubFailure(err);
+          throw err;
+        }
+      }
+
+      /*
+       * GET /__vs/collab/pulls/mounted — what is checked out right now.
+       *
+       * Answered from git's own worktree registry rather than from anything this process
+       * remembers, so a mount made by a previous run of the server, or a worktree removed
+       * by hand, is reported correctly on the first request after a restart.
+       */
+      if (method === 'GET' && pathname === '/pulls/mounted') {
+        const gated = await gate('read', null);
+        if (!gated.ok) return gated.result;
+        return { status: 200, json: { worktrees: await listMountedWorktrees(baseDir(), git) } };
+      }
+
+      const mount = /^\/pulls\/([^/]+)\/mount$/.exec(pathname);
+      if (mount && (method === 'POST' || method === 'DELETE')) {
+        const pullNumber = parsePullNumber(mount[1]!);
+        if (pullNumber === null) return bad(`invalid pullNumber: ${mount[1]!}`);
+        const gated = await gate('read', null);
+        if (!gated.ok) return gated.result;
+
+        /* DELETE — "already gone" is the outcome the caller wanted, so it is a 200. */
+        if (method === 'DELETE') {
+          const removed = await unmountPullRequest(baseDir(), pullNumber, git);
+          return { status: 200, json: { ok: true, removed } };
+        }
+
+        const result = await mountPullRequest(baseDir(), pullNumber, git);
+        if (!result.ok) {
+          const { status, message } = MOUNT_FAILURE[result.reason];
+          return { status, json: { error: message, reason: result.reason } };
+        }
+        return { status: 200, json: { ok: true, worktree: result.worktree } };
+      }
+
+      /*
+       * GET /__vs/collab/pulls/:n/files — the paths the Pull Request changed.
+       *
+       * The head is named by **sha**, not by branch: a pull request from a fork has a head
+       * branch that does not exist on this repository, and comparing against its name
+       * would 404 for exactly the contributors a reviewer most needs to read.
+       */
+      const pullFiles = /^\/pulls\/([^/]+)\/files$/.exec(pathname);
+      if (pullFiles && method === 'GET') {
+        const pullNumber = parsePullNumber(pullFiles[1]!);
+        if (pullNumber === null) return bad(`invalid pullNumber: ${pullFiles[1]!}`);
+        const gated = await gate('read', null);
+        if (!gated.ok) return gated.result;
+        const repoRef = repoRefOf(gated.repo);
+        try {
+          const adapter = repoAdapter();
+          const pull = await adapter.getPullRequest(repoRef, pullNumber);
+          const comparison = await adapter.compareCommits(repoRef, pull.baseBranch, pull.headSha);
+          return {
+            status: 200,
+            json: {
+              pullNumber,
+              headSha: pull.headSha,
+              baseBranch: pull.baseBranch,
+              headBranch: pull.headBranch,
+              mergeBaseSha: comparison.mergeBaseSha,
+              files: comparison.files,
+            },
+          };
+        } catch (err) {
+          if (err instanceof GitHubError) return githubFailure(err);
+          throw err;
+        }
+      }
+
+      /*
+       * `/pulls/:n/drafts*` — the held review comments of a checked-out Pull Request
+       * (R-13.13 … R-13.18). Part of the `/pulls` family and therefore still ABOVE the
+       * scoped match, for the reason spelled out at the top of the family.
+       *
+       * WHY THESE ARE NOT DOCUMENT-SCOPED. A reviewer reading a mounted Pull Request is
+       * reading a *tree*, not one collaboration document: the file they comment on may
+       * never have been published through this tool and has no `CollaborationRecord`, no
+       * binding and no job hub. Hanging the drafts off `/:documentId` would mean minting a
+       * document for a file nobody is collaborating on, and the whole of Unit 13 exists
+       * precisely so a reviewer does not have to.
+       *
+       * THE AUTHORIZATION OPERATION IS `read` FOR THE LOCAL ONES AND `comment` FOR
+       * PUBLISH. Writing, listing and deleting a draft never leaves this machine — the
+       * bytes land in the git-ignored `.visual-spec/reviews/` (R-13.13) — so `read` is
+       * both sufficient and honest; a stronger op would lock reviewers out of the feature
+       * built for them. Publishing DOES contact GitHub, and what it creates there is a
+       * pull-request review comment, which is exactly what `OPERATION_POLICY` already
+       * classifies as `comment`: `any-role`, R-9.8, and COLLABORATION.md's table states
+       * that commenting needs no write access. Gating it `publish` would be wrong twice —
+       * `publish` is author-only and means "commit the document to the branch", which this
+       * does not do.
+       */
+
+      const draftsList = /^\/pulls\/([^/]+)\/drafts$/.exec(pathname);
+      if (draftsList && (method === 'GET' || method === 'POST')) {
+        const pullNumber = parsePullNumber(draftsList[1]!);
+        if (pullNumber === null) return bad(`invalid pullNumber: ${draftsList[1]!}`);
+
+        /* GET — everything held for this Pull Request, published records included
+         * (R-13.17: a published comment is retained, not deleted, so the reviewer can see
+         * what they already sent alongside what they have not). Ordering is creation
+         * order, straight off the store. */
+        if (method === 'GET') {
+          const gated = await gate('read', null);
+          if (!gated.ok) return gated.result;
+          return { status: 200, json: { drafts: await readReviewDrafts(baseDir(), pullNumber) } };
+        }
+
+        /*
+         * POST — hold a comment locally. Validated fully before the gate, and long before
+         * disk: the same order `POST /:id/publish` uses, so a malformed body is a 400 that
+         * needs no credential and touches no filesystem.
+         */
+        const path = requireString(body, 'path');
+        const comment = requireString(body, 'comment');
+        const headSha = requireString(body, 'headSha');
+        // `line` is the single-line spelling the file tree sends; `startLine`/`endLine` is
+        // the range spelling `POST /:id/comments` already takes. Accepting both here means
+        // the client that has one line does not have to pretend it has a range.
+        const startLine = optionalLine(body, 'startLine') ?? optionalLine(body, 'line');
+        const endLine = optionalLine(body, 'endLine');
+        if (startLine === undefined && endLine !== undefined) return bad('endLine without startLine');
+        if (startLine !== undefined && endLine !== undefined && endLine < startLine) return bad('endLine precedes startLine');
+        const gated = await gate('read', null);
+        if (!gated.ok) return gated.result;
+        try {
+          const draft = await addReviewDraft(baseDir(), pullNumber, {
+            path,
+            comment,
+            headSha,
+            ...(startLine !== undefined ? { startLine } : {}),
+            ...(endLine !== undefined ? { endLine } : {}),
+            ...(typeof body.snippet === 'string' && body.snippet ? { snippet: body.snippet } : {}),
+            ...(typeof body.heading === 'string' || body.heading === null ? { heading: body.heading as string | null } : {}),
+          });
+          return { status: 200, json: { ok: true, draft } };
+        } catch (err) {
+          // The store's own path guard (a target that would escape the worktree root). It
+          // throws rather than returning, and a traversal attempt is the caller's mistake.
+          return bad((err as Error).message);
+        }
+      }
+
+      const draftItem = /^\/pulls\/([^/]+)\/drafts\/([^/]+)$/.exec(pathname);
+      if (draftItem && method === 'DELETE') {
+        const pullNumber = parsePullNumber(draftItem[1]!);
+        if (pullNumber === null) return bad(`invalid pullNumber: ${draftItem[1]!}`);
+        const draftId = draftItem[2]!;
+        if (!DRAFT_ID_RE.test(draftId)) return bad(`invalid draftId: ${draftId}`);
+        const gated = await gate('read', null);
+        if (!gated.ok) return gated.result;
+        try {
+          // "Already gone" is the outcome the caller asked for, so it is a 200 with
+          // `removed: false` — the same answer `DELETE /pulls/:n/mount` gives.
+          return { status: 200, json: { ok: true, removed: await deleteReviewDraft(baseDir(), pullNumber, draftId) } };
+        } catch {
+          /*
+           * R-13.17 — the store refuses to delete a published record, and this is the
+           * status for it: the request was well formed, the state it addresses forbids it.
+           * Deleting it would destroy the only local evidence that the comment went out,
+           * which is the evidence R-13.16's gate below reads. The comment itself is still
+           * on GitHub either way, so the deletion would not even mean what it looks like —
+           * withdrawing it is a github.com action.
+           */
+          return {
+            status: 409,
+            json: {
+              error:
+                `${draftId} has already been published to pull request #${pullNumber}, so the local record cannot be deleted — ` +
+                'it is what stops the comment being posted a second time. Delete the comment on github.com instead.',
+              reason: 'already-published',
+            },
+          };
+        }
+      }
+
+      const draftPublish = /^\/pulls\/([^/]+)\/drafts\/([^/]+)\/publish$/.exec(pathname);
+      if (draftPublish && method === 'POST') {
+        const pullNumber = parsePullNumber(draftPublish[1]!);
+        if (pullNumber === null) return bad(`invalid pullNumber: ${draftPublish[1]!}`);
+        const draftId = draftPublish[2]!;
+        if (!DRAFT_ID_RE.test(draftId)) return bad(`invalid draftId: ${draftId}`);
+        const gated = await gate('comment', null);
+        if (!gated.ok) return gated.result;
+
+        const draft = (await readReviewDrafts(baseDir(), pullNumber)).find((d) => d.id === draftId);
+        if (!draft) return { status: 404, json: { error: `unknown draft: ${draftId}` } };
+
+        /*
+         * R-13.16 LIVES HERE — "requesting publication twice results in at most one
+         * comment on the pull request".
+         *
+         * `markDraftPublished` is first-write-wins, but that is a guarantee about the
+         * FILE, not about the network: it runs *after* the POST, so on its own it would
+         * happily record one id while GitHub had already been given two comments. The
+         * duplicate has to be stopped before the call, and the only fact that survives a
+         * restart, a second browser tab or a lost response is the one on disk. So the
+         * draft is re-read from disk here — not taken from the request, not from a cache —
+         * and a record that is no longer `draft` short-circuits.
+         *
+         * It answers 200, not 409 or 304. "This comment is on the pull request and here is
+         * its link" is precisely what the caller asked for and precisely what it got the
+         * first time; an error would push every client into distinguishing a failed
+         * publish from a redundant one, and the ones that got it wrong would retry. The
+         * `alreadyPublished` flag is there for a client that wants to say "already sent"
+         * rather than "sent" — nothing more depends on it.
+         *
+         * What this does NOT close, deliberately: two publishes racing within the same few
+         * milliseconds both read `draft` and both post. Closing it needs a lock file or a
+         * "publishing" reservation state, and `review-drafts.ts` weighs and rejects both
+         * for the same reason — it costs a stuck-lock recovery path to defend against two
+         * humans sharing one checkout. Sequential retries, the case the requirement is
+         * actually about, are closed.
+         */
+        if (draft.status !== 'draft') {
+          return { status: 200, json: { ok: true, alreadyPublished: true, draft } };
+        }
+
+        const repoRef = repoRefOf(gated.repo);
+        const adapter = repoAdapter();
+        try {
+          // R-4.13 — the head GitHub will anchor against, read now. The `headSha` on the
+          // draft is the head it was WRITTEN against and is deliberately not used as the
+          // commit id: that is the whole distinction the staleness check below rests on.
+          const pull = await adapter.getPullRequest(repoRef, pullNumber);
+
+          /*
+           * R-13.14's payoff. The draft names a line in a tree that has since moved, and
+           * GitHub would anchor it to whatever now sits at that line — confidently wrong,
+           * in the author's inbox, with the reviewer's name on it. So it is refused, both
+           * shas named, and the refusal is 409 for the same reason the delete above is:
+           * the request is fine, the state is not.
+           *
+           * `force: true` exists because the alternative is worse. Most head moves do not
+           * touch the file being commented on, and a hard refusal would mean re-typing the
+           * comment after every push — so the reviewer is given the fact and the choice
+           * rather than a wall. It is opt-in per request and never a default, so nothing
+           * publishes against a moved head without someone having said so.
+           */
+          if (isStale(draft, pull.headSha) && body.force !== true) {
+            return {
+              status: 409,
+              json: {
+                error:
+                  `This comment was written against ${draft.headSha}, and pull request #${pullNumber} is now at ` +
+                  `${pull.headSha}. Publishing it now would anchor it to whatever currently sits at that line. ` +
+                  'Re-mount the pull request and check the line still says what you meant, or send `force: true` to publish anyway.',
+                reason: 'stale-draft',
+                draftHeadSha: draft.headSha,
+                currentHeadSha: pull.headSha,
+              },
+            };
+          }
+
+          const { created, degraded } = await createReviewCommentWithPolicy(
+            { adapter, repoRef, pullNumber },
+            {
+              path: draft.target.path,
+              comment: draft.comment,
+              commitId: pull.headSha,
+              ...draftLines(draft),
+              ...(draft.target.snippet ? { selectedText: draft.target.snippet } : {}),
+            },
+          );
+
+          // R-13.17 — the record is kept and marked, never removed. `alreadyPublished` can
+          // still come back true from a write that raced this one; the store's
+          // first-write-wins means the stored link is the first publisher's, and reporting
+          // it is more honest than overwriting it with ours.
+          const marked = await markDraftPublished(baseDir(), pullNumber, draftId, {
+            reviewCommentId: created.id,
+            htmlUrl: created.htmlUrl,
+          });
+          return {
+            status: 200,
+            json: {
+              ok: true,
+              alreadyPublished: marked.alreadyPublished,
+              draft: marked.draft,
+              comment: projectCreated(created),
+              ...(degraded ? { degraded } : {}),
+            },
+          };
+        } catch (err) {
+          // A failed publish leaves the record a `draft`, which is the correct resting
+          // state: nothing on GitHub, and the comment still retryable.
+          if (err instanceof GitHubError) return githubFailure(err);
+          throw err;
+        }
       }
 
       // Everything below is document-scoped. One match, then a switch on the tail —

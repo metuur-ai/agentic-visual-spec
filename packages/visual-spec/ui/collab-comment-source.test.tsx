@@ -439,3 +439,101 @@ describe('R-10.1 — local mode, mounted exactly as markdown-editor.tsx mounts i
     expect(document.querySelector('[data-vs-orphan-list]')).toBeNull();
   });
 });
+
+/* ================================================================== *
+ * R-13.18 — a comment says where it lives, and never by omission
+ * ================================================================== */
+describe('R-13.18 — provenance is a label, not an inference', () => {
+  const bound = (): CollaborationRecord => ({
+    ...record(),
+    github: { owner: 'acme', repo: 'docs', branch: 'spec/1', pullNumber: 42, resolved: false },
+  });
+
+  const thread = (id: string, github: Partial<{ htmlUrl: string; isResolved: boolean }>): CommentRecord =>
+    ({
+      ...comment(id, { startLine: 3 }),
+      github: {
+        reviewCommentId: 700003,
+        isOutdated: false,
+        htmlUrl: '',
+        user: 'octocat',
+        updatedAt: 'T0',
+        ...github,
+      },
+      replies: [],
+    }) as unknown as CommentRecord;
+
+  const mount = (comments: CommentRecord[]) =>
+    render(
+      <InspectorProvider surfaceId="docs/spec.md" pageIndex={0}>
+        <CommentPanel
+          width={320}
+          source={collabCommentPanelSource({ document: bound(), comments, add: async () => {}, reply: async () => {} })}
+        />
+      </InspectorProvider>,
+    );
+
+  it('names the pull request a thread lives on', () => {
+    mount([thread('c-1', { htmlUrl: 'https://github.com/acme/docs/pull/42#discussion_r700003' })]);
+    const chip = document.querySelector('[data-vs-comment-origin]') as HTMLElement;
+    expect(chip.getAttribute('data-vs-comment-origin')).toBe('github');
+    expect(chip.textContent).toBe('On GitHub · #42');
+  });
+
+  /*
+   * The trap. Both of these render with NO "Open on GitHub" link — one is resolved, so
+   * there is no act left to send the reader to, and the other has no permalink to give.
+   * Before the chip, each was a card with a comment on it and no control at all: exactly
+   * what a local comment looked like. The label must not be derived from the link.
+   */
+  it('still labels a GitHub thread whose link does not resolve as a GitHub thread', () => {
+    mount([
+      thread('c-resolved', { htmlUrl: 'https://github.com/acme/docs/pull/42#discussion_r700003', isResolved: true }),
+      thread('c-nolink', {}),
+    ]);
+    const chips = Array.from(document.querySelectorAll('[data-vs-comment-origin]')) as HTMLElement[];
+    expect(chips).toHaveLength(2);
+    expect(chips.map((c) => c.getAttribute('data-vs-comment-origin'))).toEqual(['github', 'github']);
+    expect(chips.map((c) => c.textContent)).toEqual(['On GitHub · #42', 'On GitHub · #42']);
+    // The absence this used to be read from is still there — it just no longer says anything.
+    expect(screen.queryByText('Open on GitHub')).toBeNull();
+  });
+
+  it('says "On GitHub" without a number when the document has no pull request bound yet', () => {
+    render(
+      <InspectorProvider surfaceId="docs/spec.md" pageIndex={0}>
+        <CommentPanel
+          width={320}
+          source={collabCommentPanelSource({
+            document: record(),
+            comments: [thread('c-1', {})],
+            add: async () => {},
+            reply: async () => {},
+          })}
+        />
+      </InspectorProvider>,
+    );
+    expect((document.querySelector('[data-vs-comment-origin]') as HTMLElement).textContent).toBe('On GitHub');
+  });
+
+  it('labels the sidecar panel’s own comments as local, for a source that declares no origin', async () => {
+    const local: CommentRecord = {
+      id: 'c-local',
+      workflow: 'visual-spec',
+      target: { path: 'a.md', kind: 'range', startLine: 10, heading: 'Intro' },
+      comment: 'local comment',
+      status: 'open',
+      ts: '2026-08-07T00:00:00.000Z',
+    };
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify([local]))));
+    render(
+      <InspectorProvider surfaceId="a" pageIndex={0}>
+        <CommentPanel file="a" width={320} />
+      </InspectorProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('local comment')).toBeTruthy());
+    const chip = document.querySelector('[data-vs-comment-origin]') as HTMLElement;
+    expect(chip.getAttribute('data-vs-comment-origin')).toBe('local');
+    expect(chip.textContent).toBe('Local only — not on GitHub');
+  });
+});

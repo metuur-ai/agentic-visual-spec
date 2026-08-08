@@ -28,11 +28,19 @@
  * `node:fs` reaches the browser bundle through `job-hub.ts`; the shapes are still the
  * server's, declared once.
  */
+import type { PullRequestListState, PullRequestSummary } from '../core/collaboration/github-adapter';
 import type { JobEvent, JobKind, JobSnapshot, JobSync } from '../core/collaboration/job-hub';
 import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
+import type { ReviewDraft } from '../core/collaboration/review-drafts';
+import type { MountedWorktree } from '../core/collaboration/worktree';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import type { CommentPatch } from '../core/vite/routes/comments';
 import type { CollaborationRecord, GitHubBinding } from '../core/collaboration/document-record';
+
+// Re-exported so a component can name what it renders without reaching into `core/`
+// itself — the same courtesy `collab-open-panel.tsx` already takes with the
+// availability snapshot. These are the server's shapes, declared once, over there.
+export type { MountedWorktree, PullRequestListState, PullRequestSummary, ReviewDraft };
 
 /** Root of the route family. Not configurable — the server mounts it at one path. */
 const BASE = '/__vs/collab';
@@ -123,6 +131,72 @@ export type AddCommentInput = Idempotent & {
 };
 
 /**
+ * `GET /__vs/collab/pulls/:n/files` — what the Pull Request changed (R-13.11).
+ *
+ * The head is named by **sha**, never by branch: a fork's head branch does not exist on
+ * this repository, and the route compares `baseBranch...headSha` for exactly that reason.
+ * `files` are repo-relative paths between the merge base and the head, which is the set a
+ * review opens on; everything else in the checkout is reachable but not listed here.
+ */
+export type PullRequestChangedFiles = {
+  pullNumber: number;
+  headSha: string;
+  baseBranch: string;
+  headBranch: string;
+  /** The branch point the changed paths were computed against. */
+  mergeBaseSha: string;
+  files: string[];
+};
+
+/** `POST /__vs/collab/pulls/:n/mount` — R-13.3, the checkout git actually produced. */
+export type WorktreeMounted = { ok: true; worktree: MountedWorktree };
+
+/**
+ * `DELETE /__vs/collab/pulls/:n/mount`. `removed: false` is not a failure — it is
+ * "nothing was mounted", which is the state the caller asked for either way.
+ */
+export type WorktreeRemoved = { ok: true; removed: boolean };
+
+/**
+ * What `POST /__vs/collab/pulls/:n/drafts` takes (R-13.13).
+ *
+ * `path` is relative to the *checkout root*, which is the path the pull request names —
+ * not the served-directory path the tree walk browses with. `headSha` is mandatory
+ * because a held comment says "this line, at this commit", and R-13.14's staleness check
+ * is the comparison of it against the head at publish time.
+ */
+export type ReviewDraftInput = {
+  path: string;
+  comment: string;
+  headSha: string;
+  startLine?: number;
+  endLine?: number;
+  snippet?: string;
+  heading?: string | null;
+};
+
+/** `POST /pulls/:n/drafts` — the record as it landed on disk, id and timestamp minted. */
+export type ReviewDraftSaved = { ok: true; draft: ReviewDraft };
+
+/** `DELETE /pulls/:n/drafts/:id`. `removed: false` is "there was no such draft". */
+export type ReviewDraftRemoved = { ok: true; removed: boolean };
+
+/**
+ * `POST /pulls/:n/drafts/:id/publish` — R-13.16 / R-13.17.
+ *
+ * `alreadyPublished` is not a failure: the comment is on the pull request and the stored
+ * link is the first publisher's. `degraded` is R-7.13's disclosure, reaching this route
+ * through the same policy the document comments use.
+ */
+export type ReviewDraftPublished = {
+  ok: true;
+  alreadyPublished?: boolean;
+  draft: ReviewDraft;
+  comment?: ReviewThreadRecord;
+  degraded?: { to: 'file'; reason: string };
+};
+
+/**
  * Expected failures, kept apart from thrown ones. `status` is the server's, so a caller
  * that wants to log the raw code still can.
  */
@@ -133,8 +207,25 @@ export type CollabFailure =
   | { ok: false; kind: 'forbidden'; status: number; message: string }
   /** 404 — unknown document, unknown comment, or no such route. */
   | { ok: false; kind: 'not-found'; status: number; message: string }
-  /** 409 — a job is already running, or (comment routes) there is no pull request yet. */
-  | { ok: false; kind: 'conflict'; status: 409; message: string }
+  /**
+   * 409 — a job is already running, or (comment routes) there is no pull request yet, or
+   * (the draft routes) the state named by `reason` forbids what was asked.
+   *
+   * `reason` and the two shas are carried verbatim when the server sends them, and are
+   * absent otherwise. They are what lets a caller tell R-13.14's `stale-draft` — which
+   * has an answer, `force: true` — from R-13.17's `already-published`, which is not a
+   * failure the reviewer caused and is answered with a link rather than a retry. Reducing
+   * either to `message` would leave the UI parsing prose to decide which one it got.
+   */
+  | {
+      ok: false;
+      kind: 'conflict';
+      status: 409;
+      message: string;
+      reason?: string;
+      draftHeadSha?: string;
+      currentHeadSha?: string;
+    }
   /** 400 — a malformed request; the route layer's own validation. */
   | { ok: false; kind: 'bad-request'; status: 400; message: string }
   /** `fetch` rejected, or the body was not JSON. Nothing reached the route layer. */
@@ -204,20 +295,91 @@ export interface CollabClient {
   replyToComment(documentId: string, commentId: string, input: { comment: string }): Promise<CollabResult<CommentSaved>>;
   /** `PATCH /__vs/collab/:id/comments/:commentId`. */
   patchComment(documentId: string, commentId: string, patch: CommentPatch): Promise<CollabResult<CommentUpdated>>;
+  /**
+   * `GET /__vs/collab/pulls?state=` — R-13.1 / R-13.2, the repository's Pull Requests.
+   *
+   * A read: listing needs no write access, so a reviewer's credential lists exactly what
+   * an author's does. The route answers `{ pulls }`; the envelope is unwrapped here so no
+   * component has to know it existed.
+   */
+  pullRequests(state?: PullRequestListState): Promise<CollabResult<PullRequestSummary[]>>;
+  /**
+   * `GET /__vs/collab/pulls/mounted` — R-13.8, which Pull Requests are checked out.
+   *
+   * Answered from git's own worktree registry, so a checkout made by a previous run of
+   * the server — or removed by hand — is reported correctly. The `path` is the one git
+   * reports, which is what makes "is this one already mounted?" a path comparison.
+   */
+  mountedPullRequests(): Promise<CollabResult<MountedWorktree[]>>;
+  /**
+   * `POST /__vs/collab/pulls/:n/mount` — R-13.3 … R-13.7, materialise the Pull Request's
+   * tree locally, detached, without touching the served directory's working copy.
+   *
+   * R-13.9's four causes arrive as ordinary failures with the server's own sentence:
+   * `409` for "not a git repository" and "no origin remote", `502` for a fetch that did
+   * not land, `500` for a checkout git refused. Each is a different thing for the
+   * reviewer to do, which is why none of them is flattened here.
+   */
+  mountPullRequest(pullNumber: number): Promise<CollabResult<WorktreeMounted>>;
+  /** `DELETE /__vs/collab/pulls/:n/mount` — drop the checkout and its private ref. */
+  unmountPullRequest(pullNumber: number): Promise<CollabResult<WorktreeRemoved>>;
+  /** `GET /__vs/collab/pulls/:n/files` — R-13.11, the review's entry point. */
+  pullRequestFiles(pullNumber: number): Promise<CollabResult<PullRequestChangedFiles>>;
+  /**
+   * `GET /__vs/collab/pulls/:n/drafts` — R-13.13 / R-13.17, everything held for this
+   * pull request, **published records included**. The published ones are how the UI can
+   * say a comment is on the pull request rather than leaving the reviewer to infer it
+   * (R-13.18); dropping them here would make that impossible one layer up.
+   */
+  reviewDrafts(pullNumber: number): Promise<CollabResult<ReviewDraft[]>>;
+  /** `POST /__vs/collab/pulls/:n/drafts` — R-13.13, hold a comment locally. No GitHub call. */
+  holdReviewDraft(pullNumber: number, input: ReviewDraftInput): Promise<CollabResult<ReviewDraftSaved>>;
+  /** `DELETE /__vs/collab/pulls/:n/drafts/:id` — drop a held comment. 409 once published. */
+  discardReviewDraft(pullNumber: number, draftId: string): Promise<CollabResult<ReviewDraftRemoved>>;
+  /**
+   * `POST /__vs/collab/pulls/:n/drafts/:id/publish` — R-13.14 … R-13.17.
+   *
+   * `force` is the reviewer's answer to a `stale-draft` 409 and nothing else: it is never
+   * sent on the first attempt, because publishing against a moved head without being
+   * asked is exactly what R-13.14 refuses.
+   */
+  publishReviewDraft(
+    pullNumber: number,
+    draftId: string,
+    input?: { force?: boolean },
+  ): Promise<CollabResult<ReviewDraftPublished>>;
   /** The URL of the R-8.2 event stream, for whoever opens the `EventSource`. */
   eventsUrl(documentId: string): string;
 }
 
 /** The 503 body is the availability snapshot; every other failure body is `{ error }`. */
 function failureOf(status: number, body: unknown): CollabFailure {
-  const json = (body ?? {}) as { error?: string; message?: string };
+  const json = (body ?? {}) as {
+    error?: string;
+    message?: string;
+    reason?: string;
+    draftHeadSha?: string;
+    currentHeadSha?: string;
+  };
   const message = json.error ?? json.message ?? `HTTP ${status}`;
   if (status === 503) {
     return { ok: false, kind: 'unavailable', status: 503, availability: body as CollabAvailabilitySnapshot, message };
   }
   if (status === 401 || status === 403) return { ok: false, kind: 'forbidden', status, message };
   if (status === 404) return { ok: false, kind: 'not-found', status, message };
-  if (status === 409) return { ok: false, kind: 'conflict', status: 409, message };
+  if (status === 409) {
+    // Spread conditionally: a 409 from the job routes carries none of these, and adding
+    // three `undefined` keys to every one of them would change a shape callers compare.
+    return {
+      ok: false,
+      kind: 'conflict',
+      status: 409,
+      message,
+      ...(typeof json.reason === 'string' ? { reason: json.reason } : {}),
+      ...(typeof json.draftHeadSha === 'string' ? { draftHeadSha: json.draftHeadSha } : {}),
+      ...(typeof json.currentHeadSha === 'string' ? { currentHeadSha: json.currentHeadSha } : {}),
+    };
+  }
   if (status === 400) return { ok: false, kind: 'bad-request', status: 400, message };
   return { ok: false, kind: 'server', status, message };
 }
@@ -246,6 +408,17 @@ export function createCollabClient(fetchImpl?: typeof fetch): CollabClient {
   const send = <T>(path: string, method: string, body: unknown): Promise<CollabResult<T>> =>
     call<T>(path, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
 
+  /**
+   * Two of the `/pulls` routes answer a named envelope (`{ pulls }`, `{ worktrees }`)
+   * rather than the array itself. Unwrapping it here rather than in the component keeps
+   * the envelope a fact about the route: a failure passes through untouched, so the
+   * server's own words survive the projection.
+   */
+  const projected = async <T, U>(result: Promise<CollabResult<T>>, pick: (value: T) => U): Promise<CollabResult<U>> => {
+    const res = await result;
+    return res.ok ? { ok: true, value: pick(res.value) } : res;
+  };
+
   return {
     availability: () => call<CollabAvailabilitySnapshot>(''),
     start: (input) => send<JobAccepted>('/start', 'POST', input),
@@ -260,6 +433,21 @@ export function createCollabClient(fetchImpl?: typeof fetch): CollabClient {
       send<CommentSaved>(`/${documentId}/comments/${commentId}/reply`, 'POST', input),
     patchComment: (documentId, commentId, patch) =>
       send<CommentUpdated>(`/${documentId}/comments/${commentId}`, 'PATCH', patch),
+    pullRequests: (state) =>
+      projected(call<{ pulls: PullRequestSummary[] }>(state ? `/pulls?state=${state}` : '/pulls'), (b) => b.pulls),
+    mountedPullRequests: () =>
+      projected(call<{ worktrees: MountedWorktree[] }>('/pulls/mounted'), (b) => b.worktrees),
+    // No body: the pull number is the whole request, and it is in the path.
+    mountPullRequest: (pullNumber) => send<WorktreeMounted>(`/pulls/${pullNumber}/mount`, 'POST', {}),
+    unmountPullRequest: (pullNumber) => call<WorktreeRemoved>(`/pulls/${pullNumber}/mount`, { method: 'DELETE' }),
+    pullRequestFiles: (pullNumber) => call<PullRequestChangedFiles>(`/pulls/${pullNumber}/files`),
+    reviewDrafts: (pullNumber) =>
+      projected(call<{ drafts: ReviewDraft[] }>(`/pulls/${pullNumber}/drafts`), (b) => b.drafts),
+    holdReviewDraft: (pullNumber, input) => send<ReviewDraftSaved>(`/pulls/${pullNumber}/drafts`, 'POST', input),
+    discardReviewDraft: (pullNumber, draftId) =>
+      call<ReviewDraftRemoved>(`/pulls/${pullNumber}/drafts/${draftId}`, { method: 'DELETE' }),
+    publishReviewDraft: (pullNumber, draftId, input) =>
+      send<ReviewDraftPublished>(`/pulls/${pullNumber}/drafts/${draftId}/publish`, 'POST', input ?? {}),
     eventsUrl: (documentId) => `${BASE}/${documentId}/events`,
   };
 }

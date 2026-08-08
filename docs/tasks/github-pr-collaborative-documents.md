@@ -386,3 +386,68 @@ Recorded so they are not re-litigated.
 - **The ~400-line in-repo Markdown emitter stays unbuilt.** It is the escape hatch if unattended/CI publish is ever required — trigger is a publish with no human at a keyboard (scheduled publish, bot-authored docs, CI-gated merge), not a vague "someday". If built it must never sit on the publish path, since a byte-equality veto turns every Luthor upgrade into an outage: CI differential test only, using `canonicalizeMarkdown` (`ui/luthor-bridge.ts:45`) as the oracle. See the third correction above for why the existing guard cannot simply be extended to cover it.
 - **No retry, backoff, or `Retry-After` anywhere.** `github-executor.ts` punts it to the CLI, but the executor is deliberately buffered and header-blind, so rate-limit headers are structurally unobservable — while `credentials.ts` already parses the full header map for `x-oauth-scopes` and discards them. Batching is *not* the fix: there is no per-comment fan-out (the projection maps in memory, cost is O(pages)); U-4 and O-4 are the real sources. Accepted; revisit if throttling is observed.
 - **`frontmatter.title` wins** (`document-protocol.ts`, four tests) — settled, do not reopen. Flipping the precedence would silently retitle every existing document.
+
+## Unit 13 — reviewing a pull request's code (in flight)
+
+### Landed
+
+- **`core/collaboration/worktree.ts`** — mount/list/unmount a PR's tree at
+  `.visual-spec/worktrees/pr-<n>`, detached, fetched via `refs/pull/<n>/head` so fork
+  PRs work. `ensureIgnored` writes the ignore entry before the first mount. 16 tests
+  against real repositories.
+- **`listPullRequests`** on the GitHub adapter, paginated like the comment lists.
+- **`core/collaboration/review-drafts.ts`** — held comments at
+  `.visual-spec/reviews/pr-<n>.json`, `d-<8hex>` ids, `headSha` on every draft. 17 tests.
+- **`/pulls/*` routes** in the collaboration router, above the document-scoped match.
+  26 tests. Suite at 949 green.
+
+### Findings worth keeping
+
+- **A misordered `/pulls` route fails silently, not loudly.** The premise going in was
+  that placing it below the document-scoped match would yield
+  `bad('invalid documentId: pulls')`. False: `DOCUMENT_ID_RE` is `/^[a-z0-9][a-z0-9-_]*$/i`
+  and `pulls` satisfies it, so the request would be answered **200** as the status
+  snapshot of a document named "pulls" — nothing at all from the client's side. The
+  ordering constraint is therefore load-bearing in a way a 400 would not have been, and
+  it is asserted both behaviourally and by source index.
+- **One worktree, two spellings.** `mount` reported `join(baseDir, rel)` and `list`
+  reported git's resolved path; under `/tmp` on macOS those differ (`/private/tmp`), so
+  "is this PR mounted?" answered no. Fixed by asking git for the canonical path. The
+  test now asserts `mount ≡ list` rather than a literal path — a literal path is what
+  let it through.
+- **R-13.16 is not closed by the store alone — now closed by the route.**
+  `markDraftPublished` is first-write-wins *on disk*, but it runs **after** the network
+  call, so on its own it would record one id while GitHub had been handed two comments.
+  The gate is the publish route re-reading the record from disk and short-circuiting on
+  `status !== 'draft'`, answering 200 with `alreadyPublished: true` rather than an error
+  — a 4xx would push clients into retrying the thing that must not repeat. Asserted by
+  counting adapter calls (exactly one across two requests), and again through a fresh
+  router over the same directory so the gate is provably the disk read and not process
+  memory. The same-process millisecond race stays open, matching the lock-file rejection
+  argued in `review-drafts.ts`.
+
+### Two defects the suite could not have found
+
+- **`.git` was browsable in every checkout.** A linked worktree carries `.git` as a
+  *file* holding `gitdir: …`, not a directory, so the `.git/` ignore pattern missed it.
+  Fixed by listing the bare name too; the regression was confirmed to fail without the
+  fix before being kept.
+- **Markdown files could not be commented on.** The rendered surface has no lines and a
+  comment anchors to one, so the composer was unreachable on exactly the files this
+  product exists to review. Fixed with a rendered/source toggle on the review surface;
+  flipping it clears any pending selection, so no composer outlives the line it names.
+
+Both were found by driving a real pull request in a browser. Neither was visible to
+1,264 passing tests.
+
+### Open
+
+- **R-13.12 — the checkout and the changed-file list can disagree.** The worktree comes
+  from git, the changed files from `compareCommits`. A push between the two leaves them
+  describing different commits. `mount` re-points the checkout; nothing yet re-reads the
+  file list with it.
+- ~~**R-13.18 — comment provenance.**~~ **Closed.** Every card now carries a positive
+  chip driven by the record's own state — `Local draft — not on GitHub` vs
+  `On GitHub · #<n>` — never by whether a control is renderable. The trap case is
+  pinned: a resolved thread and a thread with no readable `htmlUrl` both render no link
+  and still read as GitHub.

@@ -33,7 +33,7 @@ import type { SelectedTarget } from '../core/app';
 import { resolveMarkdownAnchors } from './anchor-resolver';
 import { flash } from './comment-history-list';
 import type { IndicatorTarget } from './indicator-layer';
-import type { CommentPanelSource } from './comment-panel';
+import type { CommentOrigin, CommentPanelSource } from './comment-panel';
 
 /** R-6.10 — a thread GitHub reports as having lost its line. */
 function isOutdated(comment: CommentRecord): boolean {
@@ -145,6 +145,22 @@ function threadLink(comment: CommentRecord): string | undefined {
   return github.htmlUrl;
 }
 
+/**
+ * R-13.18 — every comment on this surface is a thread projected off the pull request, so
+ * every one of them is labelled as such, and the label does not depend on `threadLink`.
+ *
+ * That independence is the point. A resolved thread gets no link (there is no act left to
+ * send the reader to) and a thread whose html url could not be read has none to give, so
+ * two genuine GitHub comments render with no link at all — and under the old panel they
+ * were then indistinguishable from something held on this machine. The pull number comes
+ * from the document's binding when it is known; "On GitHub" without it is still an
+ * unambiguous statement of origin, which is what the requirement asks for.
+ */
+function collabOrigin(record: CollaborationRecord): CommentOrigin {
+  const pullNumber = record.github?.pullNumber;
+  return { where: 'github', label: pullNumber ? `On GitHub · #${pullNumber}` : 'On GitHub' };
+}
+
 export type CollabCommentSourceDeps = {
   document: CollaborationRecord;
   /** Threads projected off the Pull Request. */
@@ -180,6 +196,7 @@ export function collabCommentPanelSource(deps: CollabCommentSourceDeps): Comment
     comments: deps.comments.filter((c) => !orphaned.has(c.id)),
     reply: deps.reply,
     link: threadLink,
+    origin: () => collabOrigin(record),
     orphans,
     // Section selection reaches into the local sidecar's heading model; collaboration
     // posts a line range and has no use for it.
