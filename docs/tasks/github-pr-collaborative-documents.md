@@ -1,5 +1,19 @@
 # GitHub PR-Based Collaborative Documents — Tasks
 
+> **HISTORICAL RECORD — completed against the retired JSON design. Do not plan new
+> work from this file.**
+>
+> Every task below was built and shipped, and the file is kept as an accurate account
+> of what was done. Its premise — a canonical JSON document with `nodeId` block
+> identity, comments carried on PR issue comments — has since been retired in favour
+> of Markdown-native collaboration over PR review comments. Task descriptions here
+> are **not** amended, because rewriting them would misrepresent work that actually
+> happened.
+>
+> For what is true now, read `docs/ears/github-pr-collaborative-documents.md` (Unit 0
+> states the current premise; Units 1–3 are retired stubs). A new task breakdown for
+> the Markdown-native design is written separately.
+
 Source of truth: `docs/ears/github-pr-collaborative-documents.md` (acceptance IDs `R-x.y`) and `docs/lld/github-pr-collaborative-documents.md` (architecture, build order). Source paths below are relative to `packages/visual-spec/`.
 
 **Build order.** Phase 0 pins the two invariants everything else assumes (`nodeId` survives a live editor; local mode does not regress). Then the foundation — protocol types and the owned-node layer — because both the store and the renderer depend on `nodeId` existing. The **renderer (Unit 7) is the critical path**: it is the largest single item, nothing about reviewing works without it, and it can start as soon as the node layer lands. The GitHub adapter (Unit 4) is fully independent and can run in parallel from day one.
