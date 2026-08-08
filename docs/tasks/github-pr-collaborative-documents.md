@@ -331,6 +331,20 @@ A post-completion review checked every claim against the code. All seven defects
 
 U-5 (`droppedNodes` computed and discarded) was **withdrawn**: dropping is the specified outcome (SC-8, "publishes, but not silently") and `prepareDocumentForBridge` substitutes a visible placeholder. The producer was finished ahead of its consumer; the consumer arrived with O-1, as the publish confirm dialog that lists the losses before the author commits.
 
+### Closed — found by running the loop end to end, 2026-08-08
+
+- **O-12 — publish never sealed the local record, so the review pane went blank after publishing.** Found by driving the whole loop against `metuur-ai/visual-spec-collaboration-test` in a browser: create a document from the panel, write it in the editor, publish. The bytes reached the branch and verified. Then Review rendered an empty pane, and the console carried a 409.
+
+  `publish.ts` committed `input.markdown`, re-read it, checked content and blob sha, and went straight to `setState('published')` — with no `store.write`. The local record kept its pre-publish Markdown, which for a freshly created document is `""`, and its `contentSha` stayed `da39a3ee…`, the SHA-1 of the empty string.
+
+  The blank pane is the cheap half. `contentSha` is the seal that answers "does the local copy hold work that is not on the branch?", and `open.ts:345` reads it to tell a stale copy from a divergent one. Frozen at the empty-string hash while the branch holds real content, that seal lies, and `open` misclassifies — which is where the 409 came from.
+
+  **This was never a spec gap.** R-11.6 already says the hash is updated "when the document is created, opened, **or published**", and `document-record.ts`'s own doc comment says it is "written by create, by open, and by publish once the committed bytes are verified". Create and open complied; publish did not. Nothing was added to the EARS.
+
+  The write goes after the verification and never in a `finally` — R-8.21 says a failed verification regenerates and overwrites nothing, and a test now pins that the record is untouched on that path.
+
+  **A test asserted the defect.** `publish.test.ts` carried `never writes to the local store — publish has one artifact and it is on the branch`, with a rationale claiming there is no local copy to reconcile. It contradicted R-11.6 and the type's own contract, so it was removed rather than worked around. Noted here because it was a deliberate assertion someone wrote, not an oversight, and because a suite that pins the wrong behaviour is why this survived to be found by hand.
+
 ### Open — re-verified 2026-08-07 after the mount work
 
 Two items. O-10 is closed; O-11 is new; O-6 is down to a single unobserved fact. What is left is one thing only a real repository can prove, and the O-9 entry below, whose defect half landed as 12.1.

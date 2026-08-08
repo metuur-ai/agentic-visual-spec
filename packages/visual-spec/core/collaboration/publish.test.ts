@@ -17,6 +17,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { CollaborationRecord } from './document-record';
 import type { CollaborationStore } from './record-store';
 import { createGitHubAdapter } from './github-adapter';
+import { documentContentSha } from './lifecycle';
 import type { GhExecutor, GhResult } from './github-executor';
 import { type JobEvent, type LifecycleState, type SseSink, createJobHubRegistry } from './job-hub';
 import { PublishVerificationError, createPublishBody, gitBlobSha } from './publish';
@@ -456,20 +457,25 @@ describe('R-8.9 — publish requires markdown, and nothing else', () => {
     expect(gh.files.get('documents/doc-1.md')).toBe(MARKDOWN);
   });
 
-  /*
-   * Publish writes nothing back to the local store. With Markdown canonical there is no
-   * second, structured copy to reconcile: the branch holds the client's bytes and the
-   * store's own copy is whatever the store already holds. The store is read here (for the
-   * path and the branch) and never written.
+});
+
+/* ------------------------------------------------------------------ *
+ * R-11.6 — a verified publish is a point of agreement, and it is sealed
+ * ------------------------------------------------------------------ */
+
+describe('R-11.6 — publish seals the local record against the branch', () => {
+  /**
+   * The bug this covers: publish committed and verified the bytes but never wrote them
+   * back, so a document created in the browser kept the empty Markdown it was seeded with
+   * and its `contentSha` stayed the sha of "". The document pane rendered blank on the way
+   * back to review, and `open.ts` read the frozen seal as unpublished local work (R-11.7).
    */
-  it('never writes to the local store — publish has one artifact and it is on the branch', async () => {
-    const doc = makeDoc();
+  it('writes the published Markdown back to the store, replacing what was there', async () => {
+    // The record starts on Markdown that is NOT what gets published — the create-then-edit
+    // case, where the store still holds the seed.
+    const doc = makeDoc({ markdown: '' });
     const gh = fakeGh({ files: { 'documents/doc-1.md': '# stale\n' } });
     const store = memoryStore(doc);
-    const writes: string[] = [];
-    store.write = async (written) => {
-      writes.push(written.documentId);
-    };
     const body = createPublishBody({ adapter: createGitHubAdapter(gh.exec) })({
       documentId: 'doc-1',
       repo,
@@ -478,11 +484,71 @@ describe('R-8.9 — publish requires markdown, and nothing else', () => {
       markdown: MARKDOWN,
     });
 
-    const { states } = await runBody(body);
+    await runBody(body);
 
+    expect((await store.read('doc-1'))?.markdown).toBe(MARKDOWN);
+  });
+
+  it('records the contentSha of the Markdown it just published', async () => {
+    const { body, store } = rig();
+    await runBody(body);
+
+    const saved = (await store.read('doc-1')) as CollaborationRecord;
+    expect(saved.github?.contentSha).toBe(documentContentSha({ markdown: MARKDOWN }));
+    // The seal describes the record it sits on — which is what R-11.7 depends on.
+    expect(documentContentSha(saved)).toBe(saved.github?.contentSha);
+  });
+
+  it('leaves everything else on the record and its binding untouched', async () => {
+    const { body, store, doc } = rig();
+    await runBody(body);
+
+    const saved = (await store.read('doc-1')) as CollaborationRecord;
+    expect(saved.documentId).toBe(doc.documentId);
+    expect(saved.documentPath).toBe(doc.documentPath);
+    expect(saved.title).toBe(doc.title);
+    // Publish learns nothing about the PR — it must not blank what create and open set.
+    expect(saved.github).toEqual({ ...doc.github, contentSha: documentContentSha({ markdown: MARKDOWN }) });
+    expect(saved.github?.owner).toBe(repo.owner);
+    expect(saved.github?.repo).toBe(repo.repo);
+    expect(saved.github?.branch).toBe(BRANCH);
+    expect(saved.github?.pullNumber).toBe(42);
+    expect(saved.github?.headSha).toBe('abc123');
+  });
+
+  /**
+   * R-8.21 — the ordering rule. The seal is written *after* verification passes, so a
+   * failed publish leaves the record exactly as it was. Sealing bytes we have not proven
+   * are on the branch would write the lie into the store instead of leaving it out.
+   */
+  it('does NOT touch the local record when verification fails (R-8.21)', async () => {
+    const before = makeDoc({ markdown: '# whatever the store held\n' });
+    const gh = fakeGh({
+      files: { 'documents/doc-1.md': '# stale\n' },
+      corruptOnRead: (path, content) => (path.endsWith('.md') ? `${content}tampered\n` : content),
+    });
+    const store = memoryStore(before);
+    const writes: CollaborationRecord[] = [];
+    const write = store.write.bind(store);
+    store.write = async (written) => {
+      writes.push(written);
+      await write(written);
+    };
+    const body = createPublishBody({ adapter: createGitHubAdapter(gh.exec) })({
+      documentId: 'doc-1',
+      repo,
+      store,
+      document: before,
+      markdown: MARKDOWN,
+    });
+
+    await expect(runBody(body)).rejects.toBeInstanceOf(PublishVerificationError);
+
+    // Nothing was regenerated and nothing was overwritten — not on the branch, and not here.
     expect(writes).toEqual([]);
-    expect(states).toEqual(['publishing', 'verifying', 'published']);
-    expect(gh.files.get('documents/doc-1.md')).toBe(MARKDOWN);
+    const after = (await store.read('doc-1')) as CollaborationRecord;
+    expect(after.markdown).toBe('# whatever the store held\n');
+    expect(after.github?.contentSha).toBeUndefined();
   });
 });
 

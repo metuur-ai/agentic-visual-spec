@@ -60,6 +60,36 @@
  * no client-supplied hash anywhere in `PublishJobInput` to trust, by construction.
  *
  * ---------------------------------------------------------------------------
+ * SEALING THE LOCAL RECORD, AFTER VERIFICATION AND NEVER BEFORE (R-11.6)
+ * ---------------------------------------------------------------------------
+ * A verified publish is a *point of agreement*: the branch provably holds exactly the
+ * bytes we sent. R-11.6 says the binding's `contentSha` records the document as it stood
+ * at the last such point, and names create, open and publish as the three that produce
+ * one. `lifecycle.ts` seals it after the PR opens and `open.ts` seals it after the fetch;
+ * this is the third, and it was the one missing. Without it the store keeps whatever
+ * Markdown it held before the publish — empty, for a document created and edited in the
+ * browser — so the document pane renders blank on the way back to review, and, worse, the
+ * seal stays frozen at the hash of that stale copy while the branch has moved on.
+ *
+ * That second half is why this is not merely a display bug. `open.ts` compares
+ * `documentContentSha(local)` against the recorded seal to tell "stale local copy" from
+ * "local copy carries unpublished work" (R-11.7). A seal that never advanced past create
+ * makes every post-publish open look like divergence, and the author is refused re-open
+ * over work that is already safely on the branch.
+ *
+ * **The write goes after verification, never before and never in a `finally`.** R-8.21
+ * forbids publish from regenerating or overwriting anything once the committed blob does
+ * not match, and the local record is exactly such a thing: sealing bytes we have not
+ * proven are on the branch would put the lie *into* the store rather than leave it out of
+ * it — the local copy would claim agreement with a branch whose contents we know nothing
+ * about. On the failure path this line is simply not reached, and the record keeps the
+ * last state that was actually true. That ordering is asserted in `publish.test.ts`.
+ *
+ * Only `markdown` and `contentSha` move. Everything else on the record and on its GitHub
+ * binding is spread through untouched: publish learns nothing about the PR number, the
+ * head sha or the title, and must not blank what create and open established.
+ *
+ * ---------------------------------------------------------------------------
  * CLIENT MARKDOWN IS OPAQUE (R-8.12)
  * ---------------------------------------------------------------------------
  * `input.markdown` is committed exactly as received: not parsed, not re-rendered, not
@@ -102,6 +132,7 @@
 import { createHash } from 'node:crypto';
 import type { ResolvedCollaborationConfig } from '../config';
 import type { CollaborationRecord } from './document-record';
+import { documentContentSha } from './lifecycle';
 import type { CollaborationStore } from './record-store';
 import type { GitHubAdapter, RepoRef } from './github-adapter';
 import type { JobBody } from './job-hub';
@@ -183,8 +214,9 @@ export function createPublishBody(options: PublishBodyOptions): (input: PublishB
 
     const doc = input.document ?? (await store.read(documentId));
     if (!doc) throw new Error(`no collaboration document: ${documentId}`);
-    const branch = doc.github?.branch;
-    if (!branch) throw new Error(`no collaboration branch for ${documentId}`);
+    const github = doc.github;
+    const branch = github?.branch;
+    if (!github || !branch) throw new Error(`no collaboration branch for ${documentId}`);
 
     /** The one artifact: the client's bytes, at the document's own path. */
     const path = doc.documentPath;
@@ -221,6 +253,15 @@ export function createPublishBody(options: PublishBodyOptions): (input: PublishB
       });
     }
     ctx.log(`verified markdown at ${path} — blob ${expectedSha}`, 'progress');
+
+    // R-11.6 — the branch provably holds `content`, so this is a point of agreement and
+    // the local record is sealed against it. Reached only past verification: on the
+    // failure path above we threw, and R-8.21 leaves the record exactly as it was.
+    await store.write({
+      ...doc,
+      markdown: content,
+      github: { ...github, contentSha: documentContentSha({ markdown: content }) },
+    });
 
     // R-8.13 — the Markdown is on the branch and readable by the same `getFile` the
     // verification step just used, so an agent can build the PR summary and changelog.
