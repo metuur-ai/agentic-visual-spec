@@ -33,7 +33,9 @@
  * every reconcile and is the single place `version` is defined.
  */
 import type { CollaborationDocument, CollaborationNode, JsonDocument } from './document-protocol';
-import { type DocumentStore, resolveNodeIn } from './document-store';
+import type { DocumentStore } from './document-store';
+// Pure module: this file is reachable from the browser via `ui/collab-editor.tsx`.
+import { resolveNodeIn } from './node-location';
 
 /**
  * Node types that are **not** addressable blocks, so they neither carry a `nodeId`

@@ -41,7 +41,9 @@
  * file's own source as well as behaviourally.
  */
 import type { CollaborationAnchor, CollaborationDocument, CollaborationNode } from './document-protocol';
-import { resolveNodeIn } from './document-store';
+// The pure module, not `document-store`: this file is reachable from the browser and
+// `document-store` imports `node:fs/promises` / `node:path`.
+import { resolveNodeIn } from './node-location';
 import { nodeTextContent } from './node-identity';
 
 /** R-6.2 / R-6.3 / R-6.4 — the three states a collaborative comment can be in. */

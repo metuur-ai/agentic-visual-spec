@@ -152,7 +152,11 @@ describe('DocumentStore', () => {
   it('does not import surface-store (R-3.7)', async () => {
     const source = await readFile(join(here, 'document-store.ts'), 'utf8');
     const specifiers = [...source.matchAll(/from\s*'([^']+)'/g)].map((m) => m[1]);
-    expect(specifiers).toEqual(['node:fs/promises', 'node:path', './document-protocol']);
+    // `./node-location` appears three times: the value import this module uses, plus the
+    // two re-exports that keep `resolveNodeIn` / `NodeResolution` importable from here.
+    // That module is deliberately pure — splitting it out is what let the browser bundle
+    // reach `resolveNodeIn` without dragging `node:fs/promises` along (`ui/browser-safety.test.ts`).
+    expect([...new Set(specifiers)]).toEqual(['node:fs/promises', 'node:path', './document-protocol', './node-location']);
     expect(specifiers.some((s) => s.includes('surface-store'))).toBe(false);
   });
 

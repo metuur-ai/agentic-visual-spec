@@ -32,7 +32,9 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { InspectorProvider } from '../core/app';
 import type { ProjectedCommentRecord } from '../core/collaboration/comment-projection';
-import { deriveReadiness, type ReadinessVerdict } from '../core/collaboration/failure-states';
+// From the pure module, not `failure-states`: that one reaches `cache-lifecycle` and
+// `node:fs/promises`, which the browser bundle cannot resolve.
+import { deriveReadiness, type ReadinessVerdict } from '../core/collaboration/readiness';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { collabCommentPanelSource } from './collab-comment-source';
 import { CollabDocumentView } from './collab-document-view';
