@@ -75,3 +75,49 @@ describe('the agent runs where the documents are', () => {
     expect(cwd).toBe(base);
   });
 });
+
+/*
+ * R-4.1 / R-2.3 (git) — the static half of host parity, extending the HOSTS block
+ * above rather than inventing a second convention for the same class of claim.
+ *
+ * This is the cheap guard: it reads both hosts' source and asserts each one *reaches*
+ * the shared handler and carries no create/rename/git implementation of its own. It
+ * cannot prove the two behave identically — `host-parity.test.ts` runs both servers
+ * against one directory for that — but it fails the instant someone answers a wiring
+ * bug by pasting a local copy into one host, which is the failure the live test would
+ * report only as a confusing diff.
+ *
+ * Comments are stripped first: a claim about code must not be satisfied by prose that
+ * merely mentions the symbol.
+ */
+describe('both hosts reach one shared module for the write and git routes', () => {
+  const HOSTS = ['src/server.ts', 'core/vite/md-plugin.ts'];
+  const code = (host: string) =>
+    readFileSync(resolve(pkgRoot, host), 'utf8').replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '');
+
+  it.each(HOSTS)('%s imports handleFilesRequest from routes/files and dispatches to it', (host) => {
+    const text = code(host);
+    expect(text).toMatch(/import \{[^}]*handleFilesRequest[^}]*\} from '[^']*routes\/files'/);
+    expect(text).toContain('handleFilesRequest(tree, comments,');
+  });
+
+  it.each(HOSTS)('%s imports handleGitRequest from routes/git and dispatches to it', (host) => {
+    const text = code(host);
+    expect(text).toMatch(/import \{[^}]*handleGitRequest[^}]*\} from '[^']*routes\/git'/);
+    // The getter form, not a captured string: `setRoot` reassigns the root at
+    // runtime and a value captured at wiring time would freeze R-2.2.
+    expect(text).toMatch(/handleGitRequest\(\(\) => \w+,/);
+  });
+
+  it.each(HOSTS)('%s declares no create/rename/git implementation of its own', (host) => {
+    const text = code(host);
+    // The write half: no host may reach the filesystem write primitives these
+    // routes are built from, nor re-derive the seed or the .md rule.
+    for (const forbidden of ['writeFile(', 'mkdir(', 'link(', 'unlink(', 'readGitContext(']) {
+      expect(`${host}:${forbidden}${text.includes(forbidden)}`).toBe(`${host}:${forbidden}false`);
+    }
+    // And no second answer to "which subpaths are writes" beyond the one branch.
+    expect(text.split("'/create'").length - 1).toBe(1);
+    expect(text.split("'/rename'").length - 1).toBe(1);
+  });
+});

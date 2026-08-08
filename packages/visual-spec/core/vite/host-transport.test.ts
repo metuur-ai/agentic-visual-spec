@@ -177,8 +177,15 @@ describe('R-4.2 — the standalone host reads a JSON body for non-GET /__vs/tree
     // One socket, reused: if the first request's body were left unread, this
     // second request would never get an answer and the test would time out.
     const agent = new Agent({ keepAlive: true, maxSockets: 1 });
-    const posted = await raw(standalonePort, 'POST', '/__vs/tree/create', {}, JSON.stringify({ path: 'notes/x.md' }), agent);
-    expect(posted.status).toBe(404); // no create route yet — 1.2 adds it
+    // An empty object rather than a real path: the create route is wired now (1.4),
+    // so a valid body would write a file and this test would be measuring that. An
+    // empty body is still a *parsed* body, which is the only thing under test here.
+    const posted = await raw(standalonePort, 'POST', '/__vs/tree/create', {}, JSON.stringify({}), agent);
+    // The route now exists, so the refusal names the missing FIELD. A host that had
+    // not read the body could only have said "no body"; a 404 would mean the route
+    // was never reached at all.
+    expect(posted.status).toBe(400);
+    expect(JSON.parse(posted.body).error).toContain('path');
     const after = await raw(standalonePort, 'GET', '/__vs/tree', {}, undefined, agent);
     expect(after.status).toBe(200);
     agent.destroy();
@@ -197,14 +204,15 @@ describe('R-4.2 — the standalone host reads a JSON body for non-GET /__vs/tree
     }
   });
 
-  // The wire cannot yet show the body reaching the handler — no non-GET route on
-  // this prefix exists until 1.2. What it can show is that both hosts pass one,
-  // which is the drift 4.2 exists to close.
+  // The 400 above now shows the body reaching a handler, so this is the narrower
+  // claim it cannot make: that *both* hosts pass one, which is the drift 4.2 exists
+  // to close. The Vite host's call reads `method` from a local since 1.4 put the
+  // write branch in front of it, so the shape is matched rather than the literal.
   it('both hosts hand handleTree a body argument', async () => {
     const standaloneSrc = await src('src/server.ts');
     const viteSrc = await src('core/vite/md-plugin.ts');
     expect(standaloneSrc).toContain('handleTree(tree, method, sub, query, body)');
-    expect(viteSrc).toContain("handleTree(tree, req.method ?? 'GET', pathname, query, body)");
+    expect(viteSrc).toMatch(/handleTree\(tree, method, pathname, query, body\)/);
     for (const text of [standaloneSrc, viteSrc]) {
       expect(text).toMatch(/async function handleTree\([^)]*_body\?: Record<string, unknown>\)/);
     }

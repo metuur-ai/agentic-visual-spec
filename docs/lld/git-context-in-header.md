@@ -177,6 +177,12 @@ without a repository — ambiguous between "not a repository" and "broken".
 **Redeclare the type in the UI hook.** Rejected: importing it across the boundary
 under `import type`.
 
+**Cross the served-directory boundary, and limit what leaves instead.** Recorded
+in `docs/decisions/0001-git-context-crosses-the-served-directory-boundary.md`.
+Rejected: refusing to search upward, which reports "not a git repo" in the most
+common case; a confirmation prompt for a read-only lookup; a configuration flag
+nobody asked for.
+
 ## Out of Scope
 
 - Any git write operation.

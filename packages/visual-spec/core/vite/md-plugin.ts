@@ -18,6 +18,8 @@ import type { Connect, Plugin } from 'vite';
 import { GUARD_NOT_RUN, attestGuardRan, guardRan } from './guard-attestation';
 import { checkRequest } from './request-guard';
 import { type CommentDocStore, fileCommentStore, handleCommentsRequest } from './routes/comments';
+import { handleFilesRequest } from './routes/files';
+import { handleGitRequest } from './routes/git';
 import { createApplyHub } from './routes/apply';
 import { createCollabRoutes } from './routes/collab';
 import { createCollabWiring } from './routes/collab-wiring';
@@ -194,8 +196,32 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       }));
 
       // Generic directory browser API (matches the production server.ts).
-      server.middlewares.use('/__vs/tree', middleware((req, query, pathname, body) =>
-        handleTree(tree, req.method ?? 'GET', pathname, query, body)));
+      //
+      // The write routes branch off *inside* this middleware rather than from a
+      // `use('/__vs/tree/create')` of their own, so the two hosts match line for
+      // line (R-4.1). A separate mount would also acquire its own body read and its
+      // own 404, and this prefix already has both: the `middleware` helper reads the
+      // body for every non-GET, and `handleTree`'s trailing 404 is the one fallback
+      // for anything on the prefix that no branch claims.
+      server.middlewares.use('/__vs/tree', middleware((req, query, pathname, body) => {
+        const method = req.method ?? 'GET';
+        if (pathname === '/create' || pathname === '/rename') {
+          // R-4.4. These routes write to a caller-chosen path on an unauthenticated
+          // localhost server, so — exactly as the collaboration dispatch below does —
+          // they refuse unless they can *prove* the guard registered above ran on
+          // this request, instead of trusting that registration order never breaks.
+          if (!guardRan(req.headers)) return Promise.resolve({ status: 500, json: { error: GUARD_NOT_RUN } });
+          return handleFilesRequest(tree, comments, method, pathname, body);
+        }
+        return handleTree(tree, method, pathname, query, body);
+      }));
+
+      // R-2.1 (git). Read-only, so it inherits the `/__vs` guard registered above by
+      // position and needs no attestation of its own. The root is a getter because
+      // `setRoot` reassigns `specsRoot` at runtime; a captured string would report
+      // the startup directory forever (R-2.2).
+      server.middlewares.use('/__vs/git', middleware((req, _query, pathname) =>
+        handleGitRequest(() => specsRoot, req.method ?? 'GET', pathname)));
 
       // Raw bytes for image previews / downloads. Streams (not JSON), so it's not
       // wrapped in the json `middleware` helper.

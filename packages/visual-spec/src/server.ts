@@ -32,6 +32,8 @@ import {
   fileCommentStore,
   handleCommentsRequest,
 } from '../core/vite/routes/comments';
+import { handleFilesRequest } from '../core/vite/routes/files';
+import { handleGitRequest } from '../core/vite/routes/git';
 import { createApplyHub } from '../core/vite/routes/apply';
 import { createCollabRoutes } from '../core/vite/routes/collab';
 import { createCollabWiring } from '../core/vite/routes/collab-wiring';
@@ -222,7 +224,41 @@ export function createVisualSpecServer(opts: ServeOptions) {
           // POST answer differently on the two hosts. It also leaves the request
           // stream undrained, which stalls the keep-alive connection it arrived on.
           const body = await readJsonBody(req);
+          // The write routes branch off *here*, inside the `/__vs/tree` block, rather
+          // than at a `/__vs/tree/create` case of their own further up. Three reasons,
+          // all of them about the two hosts staying identical (R-4.1):
+          //   1. the prefix slicing and the R-4.2 body read above are the transport
+          //      contract for this prefix. A sibling block would own a second copy of
+          //      both, and a second copy is the drift this feature keeps closing;
+          //   2. `handleTree`'s own 404 stays the single fallback for the prefix, so
+          //      an unknown subpath answers with one message and not two;
+          //   3. it puts the branch after the `/__vs/` guard above with nothing in
+          //      between, which is what R-4.3 asks for — no filesystem access at all
+          //      on a refused request.
+          if (sub === '/create' || sub === '/rename') {
+            // R-4.4. These routes write to a path the caller chooses on an
+            // unauthenticated localhost server, so the same reasoning as the
+            // collaboration dispatch applies: registration order is invisible at
+            // runtime and both hosts express it differently, so this refuses unless
+            // it can *prove* the guard ran on this very request. Delete the guard
+            // above and creating files breaks loudly instead of opening quietly.
+            if (!guardRan(req.headers)) return sendJson(res, 500, { error: GUARD_NOT_RUN });
+            const w = await handleFilesRequest(tree, comments, method, sub, body);
+            return sendJson(res, w.status, w.json);
+          }
           const r = await handleTree(tree, method, sub, query, body);
+          return sendJson(res, r.status, r.json);
+        }
+
+        // R-2.1 (git). Read-only, so unlike the write routes above it needs no
+        // attestation — it inherits the `/__vs/` guard by position and has nothing
+        // to open up if that were to break. The root is passed as a getter because
+        // `setRoot` reassigns `contentDir` at runtime; capturing the string once
+        // would report the first directory ever served for the life of the process
+        // (R-2.2).
+        if (url.pathname === '/__vs/git' || url.pathname.startsWith('/__vs/git/')) {
+          const sub = url.pathname.slice('/__vs/git'.length);
+          const r = await handleGitRequest(() => contentDir, method, sub);
           return sendJson(res, r.status, r.json);
         }
 
