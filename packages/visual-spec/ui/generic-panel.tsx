@@ -111,8 +111,14 @@ export function GenericPanel({
             {open.map((c) => (
               <li key={c.id} ref={(el) => { rows.current[c.id] = el; }} style={{ ...card, ...(c.id === activeId ? cardActive : {}) }}>
                 <div style={{ fontSize: 12, opacity: 0.6 }}>
-                  {c.target.kind === 'range'
-                    ? c.target.endLine && c.target.endLine > (c.target.startLine ?? 0)
+                  {/*
+                    `startLine` is optional even on a `range` target — `POST /__vs/comments/add`
+                    accepts `{path, comment, kind:'range'}` with no line. Falling through to the
+                    kind rather than printing "line undefined" is the same guard the comment
+                    panel and the header picker use, in the shape this label needs.
+                  */}
+                  {c.target.kind === 'range' && c.target.startLine != null
+                    ? c.target.endLine && c.target.endLine > c.target.startLine
                       ? `lines ${c.target.startLine}–${c.target.endLine}`
                       : `line ${c.target.startLine}`
                     : c.target.kind}

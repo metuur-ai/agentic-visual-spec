@@ -99,7 +99,14 @@ function LocalCommentPanel({ file, width }: { file: string; width: number }) {
       remove: (id) => comments.remove(id),
       supportsSections: true,
       orphans: [],
-      label: (c) => `${c.target.heading ?? '(top)'} · L${c.target.startLine}${c.target.endLine ? `–${c.target.endLine}` : ''}`,
+      // `startLine` is optional: a whole-file comment (`kind: 'file'`) has no line, and
+      // interpolating it unguarded renders the literal "Lundefined" next to the heading.
+      // The guarded form already existed in main-header.tsx's picker; these two labels
+      // were written without it.
+      label: (c) =>
+        c.target.startLine == null
+          ? (c.target.heading ?? '(top)')
+          : `${c.target.heading ?? '(top)'} · L${c.target.startLine}${c.target.endLine ? `–${c.target.endLine}` : ''}`,
       locate: (c) => locate(c.target),
       describe: (selection) => {
         const selected = selection[0]!;

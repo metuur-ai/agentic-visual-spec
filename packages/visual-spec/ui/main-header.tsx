@@ -970,7 +970,11 @@ function AllComments({ open, onPick }: { open: CommentRecord[]; onPick: (surface
             <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
               {cs.map((c) => (
                 <li key={c.id} style={allItem}>
-                  <div style={{ fontSize: 11, opacity: 0.55 }}>{c.target.heading ?? '(top)'} · L{c.target.startLine}</div>
+                  {/* Same guard as the picker above: a whole-file comment has no line. */}
+                  <div style={{ fontSize: 11, opacity: 0.55 }}>
+                    {c.target.heading ?? '(top)'}
+                    {c.target.startLine != null ? ` · L${c.target.startLine}` : ''}
+                  </div>
                   <div>{c.comment}</div>
                 </li>
               ))}
