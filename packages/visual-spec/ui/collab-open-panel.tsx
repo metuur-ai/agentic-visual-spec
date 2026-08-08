@@ -23,21 +23,11 @@
  * browser concern anyway, so it lives here; the *machine* format (the PR trailer, the
  * printed command) stays in core, where its round trip with 8.2 is asserted.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
-/** The `CollabAvailability` shape `GET /__vs/collab` serves (`core/vite/routes/collab.ts`). */
-export type CollabAvailabilitySnapshot =
-  | {
-      available: true;
-      login: string;
-      repo: { owner: string; repo: string };
-      scopes?: readonly string[];
-      /** R-9.7 as a hint. Absent means the server could not determine it — say nothing. */
-      canPublish?: boolean;
-      /** R-12.5 — why, when `canPublish` is false. The server owns the wording. */
-      publishBlocked?: { reason: 'no_write_access' | 'no_repo'; message: string };
-    }
-  | { available: false; reason: string; message: string };
+import { type CollabAvailabilitySnapshot, createCollabClient } from './collab-client';
+
+export type { CollabAvailabilitySnapshot };
 
 export type CollabOpenPanelProps = {
   /** Called with the document id once the open job has been accepted. */
@@ -64,7 +54,10 @@ export function parsePullRequestReference(input: string): number | null {
 type Status = { kind: 'idle' } | { kind: 'busy' } | { kind: 'error'; message: string } | { kind: 'ok'; message: string };
 
 export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
-  const doFetch = fetchImpl ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
+  // One contract, not two. Issuing these routes with an inline `fetch` here is what left
+  // `availability`, `open` and `start` on `CollabClient` with no caller — a typed surface
+  // and a hand-rolled copy of it, only one of which the tests covered.
+  const client = useMemo(() => createCollabClient(fetchImpl), [fetchImpl]);
   const [availability, setAvailability] = useState<CollabAvailabilitySnapshot | null>(null);
   const [reference, setReference] = useState('');
   const [documentId, setDocumentId] = useState('');
@@ -74,22 +67,23 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
 
   useEffect(() => {
     let live = true;
-    void doFetch('/__vs/collab')
-      .then((res) => res.json() as Promise<CollabAvailabilitySnapshot>)
-      .then((snapshot) => {
-        if (live) setAvailability(snapshot);
-      })
-      .catch((err: unknown) => {
-        // The request never reached the server, so this is not a preflight verdict
-        // and must not borrow one: `message` is the only field rendered, and a bare
-        // "Failed to fetch" would sit where `gh` remediation text goes.
-        if (live)
-          setAvailability({
-            available: false,
-            reason: 'request_failed',
-            message: `Could not reach the visual-spec server to check your GitHub identity. Confirm it is still running, then reload. (${(err as Error).message})`,
-          });
+    void client.availability().then((res) => {
+      if (!live) return;
+      // The route answers 200 with `available: false` when collaboration is off, so an
+      // `ok` result already carries both outcomes.
+      if (res.ok) {
+        setAvailability(res.value);
+        return;
+      }
+      // The request never reached the route layer, so this is not a preflight verdict
+      // and must not borrow one: `message` is the only field rendered, and a bare
+      // "Failed to fetch" would sit where `gh` remediation text goes.
+      setAvailability({
+        available: false,
+        reason: 'request_failed',
+        message: `Could not reach the visual-spec server to check your GitHub identity. Confirm it is still running, then reload. (${res.message})`,
       });
+    });
     return () => {
       live = false;
     };
@@ -109,24 +103,16 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
       return;
     }
     setStatus({ kind: 'busy' });
-    try {
-      const res = await doFetch('/__vs/collab/open', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ documentId: id, pullNumber }),
-      });
-      const json = (await res.json()) as { error?: string; message?: string };
-      if (!res.ok) {
-        // The server's own words — a 503 carries the availability message (R-7.8), a 4xx
-        // carries `error`. Neither is flattened into "could not open".
-        setStatus({ kind: 'error', message: json.error ?? json.message ?? `Open failed (HTTP ${res.status}).` });
-        return;
-      }
-      setStatus({ kind: 'ok', message: `Opening ${id} from #${pullNumber}…` });
-      onOpened?.(id);
-    } catch (err) {
-      setStatus({ kind: 'error', message: (err as Error).message });
+    // The server's own words either way — a 503 carries the availability message (R-7.8),
+    // a 4xx carries `error`, and a dead server carries `fetch`'s. `failureOf` already
+    // applies exactly that precedence, so nothing is flattened into "could not open".
+    const res = await client.open({ documentId: id, pullNumber });
+    if (!res.ok) {
+      setStatus({ kind: 'error', message: res.message });
+      return;
     }
+    setStatus({ kind: 'ok', message: `Opening ${id} from #${pullNumber}…` });
+    onOpened?.(id);
   }
 
   /**
@@ -145,31 +131,22 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
       return;
     }
     setStatus({ kind: 'busy' });
-    try {
-      const title = newTitle.trim();
-      const res = await doFetch('/__vs/collab/start', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          documentId: id,
-          // The path `fsDocumentStore` already uses, so the committed artifact and the
-          // local copy agree without the author having to know either convention.
-          documentPath: `documents/${id}.json`,
-          ...(title ? { title, frontmatter: { title } } : {}),
-        }),
-      });
-      const json = (await res.json()) as { error?: string; message?: string };
-      if (!res.ok) {
-        // Same rule as `open`: the server's own words. A reviewer's credential is
-        // refused here by `authorize` with a message naming write access.
-        setStatus({ kind: 'error', message: json.error ?? json.message ?? `Create failed (HTTP ${res.status}).` });
-        return;
-      }
-      setStatus({ kind: 'ok', message: `Creating ${id} — opening a pull request…` });
-      onOpened?.(id);
-    } catch (err) {
-      setStatus({ kind: 'error', message: (err as Error).message });
+    const title = newTitle.trim();
+    const res = await client.start({
+      documentId: id,
+      // The path `fsDocumentStore` already uses, so the committed artifact and the local
+      // copy agree without the author having to know either convention.
+      documentPath: `documents/${id}.json`,
+      ...(title ? { title, frontmatter: { title } } : {}),
+    });
+    if (!res.ok) {
+      // Same rule as `open`: the server's own words. A reviewer's credential is refused
+      // here by `authorize` with a message naming write access.
+      setStatus({ kind: 'error', message: res.message });
+      return;
     }
+    setStatus({ kind: 'ok', message: `Creating ${id} — opening a pull request…` });
+    onOpened?.(id);
   }
 
   return (

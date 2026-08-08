@@ -94,11 +94,15 @@ export default defineConfig({
 `collaboration` block entirely and collaboration reports itself unavailable while local
 mode carries on unaffected.
 
-> **The standalone CLI cannot enable collaboration.** `visual-spec <dir>` never passes a
-> config through to the server, so `collaboration` resolves to `null` on that host and the
-> feature reports itself as not configured. The Vite plugin is the only host that can turn
-> it on. The one exception is `visual-spec collab open`, which builds its own config — see
-> step 5.
+Or, on the standalone CLI, name the repository with a flag:
+
+```bash
+visual-spec . --repo acme/docs [--base-branch release]
+```
+
+`--base-branch` is optional and defaults to `main`. Omit `--repo` and collaboration stays
+off, local mode entirely unaffected. Both hosts reach the same routes; the flags exist so
+the CLI does not need a config file it has no loader for.
 
 ## 3. Start the server
 

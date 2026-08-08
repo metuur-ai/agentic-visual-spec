@@ -59,7 +59,7 @@
  * Node-reachable from the CLI: node builtins and sibling core modules only — no
  * `@lyfie/luthor`, no react (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
  */
-import type { ResolvedCollaborationConfig } from '../config';
+import type { ResolvedCollaborationConfig, VisualSpecConfig } from '../config';
 import { parseCommentBody } from './comment-projection';
 import type { GitHubBinding } from './document-protocol';
 import { parseCollaborationDocument } from './document-protocol';
@@ -213,12 +213,41 @@ export function readPullRequestReference(pr: PullRequestDetail, fallback: RepoRe
  */
 export function parseOpenCommand(command: string): { owner: string; repo: string; branch: string; documentId: string } | null {
   const flag = (name: string): string | undefined => new RegExp(`--${name}\\s+(\\S+)`).exec(command)?.[1];
-  const repoFlag = flag('repo');
+  const ref = parseRepoFlag(flag('repo'));
   const branch = flag('branch');
   const documentId = flag('document');
-  const slash = repoFlag?.split('/');
-  if (!slash || slash.length !== 2 || !slash[0] || !slash[1] || !branch || !documentId) return null;
-  return { owner: slash[0], repo: slash[1], branch, documentId };
+  if (!ref || !branch || !documentId) return null;
+  return { owner: ref.owner, repo: ref.repo, branch, documentId };
+}
+
+/**
+ * The one parser for every `--repo <owner/name>` the CLI accepts — `collab open` and
+ * `serve` both go through here, so there is one notion of a well-formed repository flag,
+ * not two. `null` means malformed, which each caller reports as a usage error.
+ */
+export function parseRepoFlag(value: string | undefined): RepoRef | null {
+  const slash = value?.split('/');
+  if (!slash || slash.length !== 2 || !slash[0] || !slash[1]) return null;
+  return { owner: slash[0], repo: slash[1] };
+}
+
+/**
+ * `visual-spec <dir> --repo owner/name [--base-branch b]` → the `config` the standalone
+ * server takes. Three outcomes, because the flag has three states:
+ *   - no `--repo`      → `undefined`, so `resolveConfig` yields `collaboration: null` and
+ *                        local mode is untouched (R-9.19).
+ *   - malformed `--repo` → `null`, a usage error for the caller to report.
+ *   - good `--repo`    → a config with a collaboration block. `--base-branch` is omitted
+ *                        when unset so `resolveConfig` applies its own default.
+ */
+export function parseServeCollaborationFlags(
+  repoFlag: string | undefined,
+  baseBranchFlag: string | undefined,
+): VisualSpecConfig | null | undefined {
+  if (repoFlag === undefined) return undefined;
+  const ref = parseRepoFlag(repoFlag);
+  if (!ref) return null;
+  return { collaboration: baseBranchFlag === undefined ? ref : { ...ref, baseBranch: baseBranchFlag } };
 }
 
 /**

@@ -8,6 +8,7 @@
  * asserted rather than assumed (R-11.1).
  */
 import { describe, expect, it } from 'vitest';
+import { resolveConfig } from '../config';
 import type { CollaborationDocument } from './document-protocol';
 import { serializeCollaborationDocument } from './document-protocol';
 import type { DocumentStore } from './document-store';
@@ -23,6 +24,8 @@ import {
   createOpenBody,
   findPullNumberForBranch,
   parseOpenCommand,
+  parseRepoFlag,
+  parseServeCollaborationFlags,
   readPullRequestReference,
 } from './open';
 
@@ -213,6 +216,49 @@ describe('R-11.1 — the PR body carries repo, branch and document', () => {
       documentId: 'doc-1',
     });
     expect(parseOpenCommand('visual-spec init .')).toBeNull();
+  });
+});
+
+/* ================================================================== *
+ * R-9.19 — the standalone CLI's `--repo` / `--base-branch` flags
+ * ================================================================== */
+describe('serve collaboration flags', () => {
+  it('turns --repo owner/name into a collaboration config', () => {
+    expect(parseServeCollaborationFlags('acme/docs', undefined)).toEqual({
+      collaboration: { owner: 'acme', repo: 'docs' },
+    });
+  });
+
+  it('leaves baseBranch unset so resolveConfig applies its own default', () => {
+    const config = parseServeCollaborationFlags('acme/docs', undefined);
+    expect(config?.collaboration && 'baseBranch' in config.collaboration).toBe(false);
+    expect(resolveConfig(config ?? undefined).collaboration).toEqual({ owner: 'acme', repo: 'docs', baseBranch: 'main' });
+  });
+
+  it('honours --base-branch when given', () => {
+    expect(parseServeCollaborationFlags('acme/docs', 'release')).toEqual({
+      collaboration: { owner: 'acme', repo: 'docs', baseBranch: 'release' },
+    });
+    expect(resolveConfig(parseServeCollaborationFlags('acme/docs', 'release') ?? undefined).collaboration?.baseBranch).toBe('release');
+  });
+
+  it('leaves collaboration off when --repo is absent, base branch or not', () => {
+    expect(parseServeCollaborationFlags(undefined, undefined)).toBeUndefined();
+    expect(parseServeCollaborationFlags(undefined, 'release')).toBeUndefined();
+    // Which is what the server was already doing with no config at all.
+    expect(resolveConfig(undefined).collaboration).toBeNull();
+  });
+
+  it('rejects every malformed --repo so the CLI can print its usage line', () => {
+    for (const bad of ['acme', 'a/b/c', '', '/docs', 'acme/', '/']) {
+      expect(parseServeCollaborationFlags(bad, undefined)).toBeNull();
+      expect(parseRepoFlag(bad)).toBeNull();
+    }
+  });
+
+  it('shares one owner/name parser with `collab open`', () => {
+    expect(parseRepoFlag('acme/docs')).toEqual(REPO_REF);
+    expect(parseOpenCommand('visual-spec collab open --repo a/b/c --branch b --document d')).toBeNull();
   });
 });
 

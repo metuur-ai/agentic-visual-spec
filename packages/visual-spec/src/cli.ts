@@ -3,6 +3,8 @@
  * ranges, and folders; an agent applies the comments via the bundled skills.
  *
  *   visual-spec <dir> [--port 5180] [--no-open]   start the browser on <dir> (default cmd)
+ *                     [--repo <owner/name>] [--base-branch <branch>]
+ *                                                 …with collaboration on that repository
  *   visual-spec init <dir> [--name <pkg>]         scaffold a new surface project
  *   visual-spec install-skills [--dest <dir>]     copy the agent skills (default ~/.claude/skills)
  *   visual-spec collab open --repo o/r --branch b --document d
@@ -18,7 +20,12 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createGitHubAdapter } from '../core/collaboration/github-adapter';
-import { classifyBranchLookupFailure, findPullNumberForBranch, parseOpenCommand } from '../core/collaboration/open';
+import {
+  classifyBranchLookupFailure,
+  findPullNumberForBranch,
+  parseOpenCommand,
+  parseServeCollaborationFlags,
+} from '../core/collaboration/open';
 import { createVisualSpecServer } from './server';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -48,8 +55,16 @@ async function serve(args: string[]) {
   const explicitPort = args.includes('--port');
   const noOpen = args.includes('--no-open');
   const assetsDir = flag(args, '--assets-dir');
+  // Collaboration is off unless `--repo` names one (R-9.19): with no flag `config` stays
+  // undefined, exactly as before, and the server reports collaboration not configured.
+  const config = parseServeCollaborationFlags(flag(args, '--repo'), flag(args, '--base-branch'));
+  if (config === null) {
+    console.error('Usage: visual-spec <dir> [--repo <owner/name>] [--base-branch <branch>]');
+    process.exit(1);
+    return;
+  }
 
-  const { server, commentsPath } = createVisualSpecServer({ contentDir, uiDir: UI_DIR, port: requestedPort, assetsDir });
+  const { server, commentsPath } = createVisualSpecServer({ contentDir, uiDir: UI_DIR, port: requestedPort, assetsDir, config });
 
   server.on('listening', () => {
     // The real bound port — differs from requestedPort after a port-0 fallback.
@@ -202,6 +217,7 @@ async function main() {
     console.log(`visual-spec — browse a directory in the browser and comment on files, line ranges, and folders
 
   visual-spec <dir> [--port 5180] [--no-open] [--assets-dir <dir>]   open the browser on a directory
+                    [--repo <owner/name>] [--base-branch <branch>]
   visual-spec init <dir> [--name <pkg>]         scaffold a new surface project
   visual-spec install-skills [--dest <dir>]     install the agent skills
   visual-spec collab open --repo <owner/name> --branch <branch> --document <id>
@@ -211,6 +227,11 @@ async function main() {
 
   --assets-dir <dir>  where toolbar image uploads are saved, relative to <dir>
                       (default: assets). E.g. --assets-dir images or docs/img.
+
+  --repo <owner/name> turn collaboration on against that GitHub repository.
+                      Omit it and collaboration stays off (local mode).
+  --base-branch <b>   branch Pull Requests are opened against (default: main).
+                      Only meaningful alongside --repo.
 
   Filtering: a .visualspecignore at the directory root is honored (gitignore
   syntax). .git/, node_modules/, and the comments sidecar are always hidden;
