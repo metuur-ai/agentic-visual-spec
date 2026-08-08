@@ -119,10 +119,9 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
    * R-8.5 — create the branch and the pull request for a document that does not exist
    * yet. This is the author's entry; `open` above is the reviewer's.
    *
-   * No `doc` is sent. `markdownToInjectable` is forbidden on the collaboration path
-   * (it reparses Markdown and drops every `nodeId`), so the browser has no way to author
-   * starting content — the server seeds a valid empty document and the author fills it
-   * in the editor before the first publish.
+   * No `markdown` is sent. The server seeds an empty record (`newCollaborationRecord`)
+   * and the create job commits it, so the branch exists with the file on it; the author
+   * writes the body in the editor and the first publish puts real content there.
    */
   async function create() {
     const id = newId.trim();
@@ -134,10 +133,13 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
     const title = newTitle.trim();
     const res = await client.start({
       documentId: id,
-      // The path `fsDocumentStore` already uses, so the committed artifact and the local
-      // copy agree without the author having to know either convention.
-      documentPath: `documents/${id}.json`,
-      ...(title ? { title, frontmatter: { title } } : {}),
+      // R-0.1 — the artifact is the Markdown, so the path the create job commits to is a
+      // `.md`. It means the same thing on the branch and under the content directory
+      // (see `CollaborationRecord.documentPath`), so the author never has to know either
+      // convention. It was `.json` until the envelope was retired; committing Markdown
+      // bytes to a `.json` path is what that leftover did.
+      documentPath: `documents/${id}.md`,
+      ...(title ? { title } : {}),
     });
     if (!res.ok) {
       // Same rule as `open`: the server's own words. A reviewer's credential is refused

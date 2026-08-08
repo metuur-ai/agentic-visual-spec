@@ -110,9 +110,9 @@ describe('R-8.5 — starting a new document', () => {
     await waitFor(() => expect(onOpened).toHaveBeenCalledWith('doc-7'));
     expect(calls.at(-1)).toEqual({
       url: '/__vs/collab/start',
-      // `documentPath` is the convention `fsDocumentStore` reads back, and the title is
-      // sent as frontmatter too because frontmatter is what wins on the envelope.
-      body: { documentId: 'doc-7', documentPath: 'documents/doc-7.json', title: 'Payment rules', frontmatter: { title: 'Payment rules' } },
+      // A `.md` path, not `.json`: the create job commits `doc.markdown` to
+      // `documentPath` verbatim (R-0.1), so the extension has to match the bytes.
+      body: { documentId: 'doc-7', documentPath: 'documents/doc-7.md', title: 'Payment rules' },
     });
   });
 
@@ -125,7 +125,7 @@ describe('R-8.5 — starting a new document', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create pull request' }));
 
     await waitFor(() => expect(calls.at(-1)?.url).toBe('/__vs/collab/start'));
-    expect(calls.at(-1)?.body).toEqual({ documentId: 'doc-8', documentPath: 'documents/doc-8.json' });
+    expect(calls.at(-1)?.body).toEqual({ documentId: 'doc-8', documentPath: 'documents/doc-8.md' });
   });
 
   it('refuses to post without a document id', async () => {

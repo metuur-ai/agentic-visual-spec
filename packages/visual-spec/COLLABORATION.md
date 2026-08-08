@@ -5,9 +5,12 @@ version: 0.1.7
 
 # Reviewing documents through GitHub pull requests
 
-Collaboration turns a document into a pull request: the canonical JSON and its generated
-Markdown are committed to a branch, reviewers read and comment in visual-spec, and the
-author publishes. GitHub's own permissions decide who can do which half.
+Collaboration turns a document into a pull request: the Markdown is committed to a branch,
+reviewers read and comment in visual-spec, and the author publishes. GitHub's own
+permissions decide who can do which half.
+
+The Markdown **is** the document. There is no second, generated artifact — one `.md` on
+the branch, committed verbatim.
 
 Everything below is the real, current behaviour, verified against the source. Where the
 product deliberately stops short — merging, for one — this guide says so rather than
@@ -124,14 +127,14 @@ Title         Payment rules
 
 **Create pull request** then:
 
-1. writes `documents/<id>.json` locally as an empty document,
+1. writes `documents/<id>.md` locally as an empty document,
 2. creates the branch `visual-spec/<id>` off your base branch,
 3. commits that document to the branch,
 4. opens the pull request, whose body carries the `collab open` command reviewers need.
 
 The document opens straight into the pane. Switch to **Edit**, write it, and publish as in
 step 6 — publishing is what puts real content on the branch; the create commit is just the
-empty envelope the branch needs to exist.
+empty file the branch needs to exist.
 
 The form appears only when your credential can publish. A review-only session does not get
 it, because `create` is author-only and the route would refuse it anyway.
@@ -152,7 +155,7 @@ anything it states who you are:
 npx @metuur/visual-spec collab open --repo <owner/name> --branch <branch> --document <id> [--pull <n>]
 ```
 
-Read access is enough for either. Opening fetches the canonical JSON off the branch, so a
+Read access is enough for either. Opening fetches the Markdown off the branch, so a
 reviewer with no local copy still gets the rendered document. If a local copy is stale it
 is refreshed; the one refusal is a copy already bound to a *different* pull request.
 
@@ -162,15 +165,14 @@ Reviewers read the document and comment in the review pane. Comments are posted 
 pull request as your own GitHub account.
 
 The author switches the pane to **Edit**, makes changes, and clicks **Publish** once every
-comment is resolved. Publish first shows a confirmation listing anything the Markdown
-cannot carry — each entry names the block and whether it was replaced or dropped — so you
-approve the loss before it is committed.
+comment is resolved. The edit surface is the Markdown itself, so what you publish is
+byte-for-byte the buffer you were looking at — there is no derivation step and therefore
+nothing that can be dropped in translation.
 
 Publishing then, in order:
 
-1. commits the canonical JSON to the pull request branch,
-2. commits the generated Markdown beside it,
-3. re-reads both from GitHub and verifies the bytes and blob SHAs match what was sent.
+1. commits the Markdown to the pull request branch at `documentPath`,
+2. re-reads it from GitHub and verifies the bytes and the blob SHA match what was sent.
 
 Verification happens *after* the commit and before anything else. If it fails, nothing is
 regenerated or overwritten — the mismatch is reported and the branch is left exactly as
@@ -185,9 +187,8 @@ request the way you finish any other.
 
 ## Working with an agent
 
-When a coding agent applies review comments in collaboration mode, it edits only the
-canonical JSON, never the generated Markdown, and it cannot publish. It ends its run with
-a single line:
+When a coding agent applies review comments in collaboration mode, it edits the document's
+Markdown at `documentPath`, and it cannot publish. It ends its run with a single line:
 
 ```
 READY TO PUBLISH: <documentPath>
