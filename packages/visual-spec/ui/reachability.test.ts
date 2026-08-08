@@ -67,18 +67,20 @@ const IS_TEST = /\.test\.tsx?$/;
  *
  * Every entry must name the decision, not merely restate the fact.
  */
-const DELIBERATELY_UNMOUNTED: Record<string, string> = {
-  'ui/collab-document-view.tsx':
-    'Retired with the JSON document format (R-0.1/R-0.2). It walked a canonical `doc.root` and stamped ' +
-    '`data-vs-node-id` on every block; the review surface now renders the Markdown through `MarkdownSurface` ' +
-    'and anchors on `data-vs-loc` (R-7.3), so there is no tree to walk and no id to stamp. Left on disk ' +
-    'pending deletion, unmounted so nothing can grow a second renderer against it.',
-  'ui/collab-anchor-resolver.ts':
-    'Retired with `nodeId` identity (Unit 2). It located a block by `[data-vs-node-id]`, which no rendered ' +
-    'document carries any more; R-6.6 now requires collaboration and local mode to share one resolver, and ' +
-    'that resolver is `resolveMarkdownAnchors`. Left on disk pending deletion, unmounted so a second anchor ' +
-    'path cannot come back through it.',
-};
+/*
+ * Empty again, and it should stay that way.
+ *
+ * It briefly held `ui/collab-document-view.tsx` and `ui/collab-anchor-resolver.ts`
+ * while they sat on disk unreferenced between the detachment and the deletion. Both
+ * files are gone now, so the exceptions go with them: an entry here says "this module
+ * exists and is deliberately not mounted", and an entry naming a file that no longer
+ * exists is a claim about nothing. Worse, it would keep the reason for the deletion
+ * alive as if the code were still a live option.
+ *
+ * The reason itself is not lost — it is in the commit that removed them, and in
+ * R-7.3 / R-6.6, which say what replaced them.
+ */
+const DELIBERATELY_UNMOUNTED: Record<string, string> = {};
 
 function collabUiModules(): string[] {
   return readdirSync(resolve(pkgRoot, 'ui'))
@@ -99,7 +101,13 @@ describe('the collaboration UI is reachable from the app (task U-1)', () => {
 
   it('finds the collaboration UI modules on disk (guards against a vacuous pass)', () => {
     // If a rename empties this list, every test below would pass by having nothing to check.
-    expect(modules.length).toBeGreaterThanOrEqual(7);
+    //
+    // The floor was 7 and is now 5: `collab-document-view.tsx` and
+    // `collab-anchor-resolver.ts` were deleted with the JSON document format, not
+    // renamed. Lowering it is the honest move — leaving it at 7 would fail forever on
+    // a count that can no longer be reached, and the named assertions below are what
+    // actually catch a rename anyway.
+    expect(modules.length).toBeGreaterThanOrEqual(5);
     expect(modules).toContain('ui/collab-editor.tsx');
     expect(modules).toContain('ui/collab-comment-source.ts');
   });
