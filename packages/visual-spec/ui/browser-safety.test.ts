@@ -81,6 +81,26 @@ function nodeBuiltinChains(entry: string): string[] {
   return offences.sort();
 }
 
+/** Every module value-reachable from `entry`, as package-relative paths. */
+function valueReachableModules(entry: string): Set<string> {
+  const reached = new Set<string>();
+  const queue: string[] = [resolve(pkgRoot, entry)];
+
+  while (queue.length > 0) {
+    const file = queue.shift()!;
+    const rel = relative(pkgRoot, file);
+    if (reached.has(rel)) continue;
+    reached.add(rel);
+
+    for (const specifier of valueSpecifiersOf(readFileSync(file, 'utf8'))) {
+      if (!specifier.startsWith('.')) continue;
+      const next = resolveRelative(file, specifier);
+      if (next) queue.push(next);
+    }
+  }
+  return reached;
+}
+
 describe('the browser bundle reaches no node builtin', () => {
   it(`nothing value-imported from ${ENTRY} imports \`node:*\``, () => {
     // Joined rather than compared as an array so a failure prints the offending chains in
@@ -107,5 +127,61 @@ describe('the browser bundle reaches no node builtin', () => {
     // A value binding alongside an inline type is still a value import.
     expect(valueSpecifiersOf("import { type A, b } from './a';")).toEqual(['./a']);
     expect(valueSpecifiersOf("import { a } from './a';")).toEqual(['./a']);
+  });
+});
+
+/*
+ * R-1.3 — the git reader stays out of the browser bundle.
+ *
+ * `core/git-context.ts` shells out to git through `node:child_process`. The blanket
+ * `node:*` assertion above would catch it once it were reachable, but naming it here is
+ * not redundant: the failure message is the difference between "something in this graph
+ * imports node:child_process" and "the git reader crossed the boundary", and that module
+ * is the one the header chip work is actively pulling on.
+ *
+ * WHY THIS IS PHRASED AS REACHABILITY, NOT AS ABSENCE. Today nothing imports
+ * `core/git-context.ts` at all, so it is outside every graph by omission. An assertion
+ * that merely said "the browser graph does not contain node:child_process" would pass
+ * trivially now and go on passing for the wrong reason — right up until someone wires the
+ * chip up wrongly, at which point it would finally do its job, having taught nobody
+ * anything in between. So the module is named explicitly, and the control below asserts
+ * the graph the assertion is drawn over is a real one.
+ *
+ * THE INTENDED WAY ACROSS. Not `import type`. `ui/use-tree.ts` redeclares `TreeEntry` and
+ * `FileKind` rather than importing them from `tree-store.ts`, precisely because a `type`
+ * keyword a later edit deletes is not a boundary. `ui/use-git-context.ts` redeclares
+ * `GitContext` for the same reason; this test is what keeps that honest.
+ */
+describe('the browser bundle does not reach the git reader (R-1.3)', () => {
+  const GIT_CONTEXT = 'core/git-context.ts';
+
+  it(`${GIT_CONTEXT} is not value-reachable from ${ENTRY}`, () => {
+    expect([...valueReachableModules(ENTRY)]).not.toContain(GIT_CONTEXT);
+  });
+
+  it(`nothing value-reachable from ${ENTRY} imports node:child_process`, () => {
+    const offences = nodeBuiltinChains(ENTRY).filter((chain) => chain.includes('node:child_process'));
+    expect(offences.join('\n')).toBe('');
+  });
+
+  /*
+   * The two controls, one per half of the claim above.
+   *
+   * First: the reachability set is genuinely populated by walking, so "git-context is not
+   * in it" means something. `ui/use-tree.ts` is a module the app really does import.
+   */
+  it('the reachability set is a real graph, not an empty one', () => {
+    const reached = valueReachableModules(ENTRY);
+    expect(reached.size).toBeGreaterThan(1);
+    expect([...reached]).toContain('ui/use-tree.ts');
+  });
+
+  /*
+   * Second: the module being excluded is genuinely the dangerous one. If `git-context.ts`
+   * ever stops shelling out, this fails and someone gets to ask whether the guard above is
+   * still guarding anything.
+   */
+  it(`${GIT_CONTEXT} really does import node:child_process`, () => {
+    expect(nodeBuiltinChains(GIT_CONTEXT).join('\n')).toMatch(/node:child_process/);
   });
 });
