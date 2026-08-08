@@ -334,6 +334,55 @@ describe('R-7.1 — POST /start', () => {
     });
   });
 
+  /*
+   * The `create` body commits whatever `store.read(documentId)` returns and throws when
+   * that is null, so a route that only started the job accepted work no job could finish.
+   * The document has to exist before the branch does.
+   */
+  it('materializes the document before the job runs', async () => {
+    const store = memoryDocuments();
+    const create = vi.fn<CollabJobBodies['create']>(() => async () => {});
+    const r = router({ documents: () => store, bodies: { create } });
+
+    const res = await call(r, 'POST', '/start', {
+      documentId: 'doc-new',
+      documentPath: 'documents/doc-new.json',
+      title: 'Payment rules',
+    });
+    expect(res.status).toBe(200);
+
+    const seeded = await store.read('doc-new');
+    expect(seeded).toMatchObject({
+      documentId: 'doc-new',
+      documentPath: 'documents/doc-new.json',
+      title: 'Payment rules',
+      nodes: [],
+    });
+    // Not `{ root: {} }` — that root has no `type` and `injectJSON` throws on it, which
+    // would strand the author in an editor that never loaded.
+    expect((seeded?.doc.root as { type?: string }).type).toBe('root');
+    expect((seeded?.doc.root as { children?: unknown[] }).children).toHaveLength(1);
+  });
+
+  it('leaves an existing document alone, so a retried start cannot blank it', async () => {
+    const existing = document({ documentId: 'doc-1', title: 'Written already' });
+    const store = memoryDocuments([existing]);
+    const r = router({ documents: () => store, bodies: { create: () => async () => {} } });
+
+    await call(r, 'POST', '/start', { documentId: 'doc-1', documentPath: 'documents/doc-1.json', title: 'Blank' });
+
+    expect(await store.read('doc-1')).toBe(existing);
+  });
+
+  it('seeds nothing when authorization refuses, so a reviewer leaves no trace', async () => {
+    const store = memoryDocuments();
+    const authorize: CollabAuthorizer = () => ({ ok: false, status: 403, error: 'author only' });
+    const r = router({ documents: () => store, authorize });
+
+    expect((await call(r, 'POST', '/start', { documentId: 'doc-new', documentPath: 'a.json' })).status).toBe(403);
+    expect(await store.read('doc-new')).toBeNull();
+  });
+
   it('rejects a missing or traversal documentId with 400', async () => {
     const r = router();
     expect((await call(r, 'POST', '/start', { documentPath: 'a.md' })).status).toBe(400);

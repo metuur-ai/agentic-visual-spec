@@ -36,6 +36,7 @@ import { githubCommentStore } from '../../collaboration/comment-projection';
 import { createGitHubAdapter } from '../../collaboration/github-adapter';
 import type { GitHubBinding } from '../../collaboration/document-protocol';
 import type { CollaborationDocument, DocumentFrontmatter, JsonDocument } from '../../collaboration/document-protocol';
+import { newCollaborationDocument } from '../../collaboration/document-protocol';
 import { DOCUMENT_ID_RE, type DocumentStore } from '../../collaboration/document-store';
 import type { JobBody, JobHubRegistry, SseSink } from '../../collaboration/job-hub';
 import { DEFAULT_WORKFLOW, type CommentRecord, type CommentStatus } from '../../editing/comment-doc';
@@ -476,6 +477,30 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         const gated = await gate('create', documentId);
         if (!gated.ok) return gated.result;
         const idempotencyKey = optionalKey(body);
+
+        /*
+         * Materialize the document before the job runs. `create` commits what
+         * `store.read(documentId)` returns and throws when that is null, so without this
+         * the route accepted a request no job could complete — the operation was
+         * reachable and the path through it was not.
+         *
+         * Seed only when absent. A retried `start` (R-8.23) must find the document it
+         * created the first time, not a blank one: overwriting here would silently
+         * discard an author's content on a double click.
+         */
+        const store = deps.documents();
+        if (!(await store.read(documentId))) {
+          await store.write(
+            newCollaborationDocument({
+              documentId,
+              documentPath,
+              ...(typeof body.title === 'string' ? { title: body.title } : {}),
+              ...(body.frontmatter ? { frontmatter: body.frontmatter as DocumentFrontmatter } : {}),
+              ...(body.doc ? { doc: body.doc as JsonDocument } : {}),
+            }),
+          );
+        }
+
         return deps.jobs.hub(documentId).start({
           kind: 'create',
           idempotencyKey,

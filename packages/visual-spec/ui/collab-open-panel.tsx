@@ -69,6 +69,8 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
   const [reference, setReference] = useState('');
   const [documentId, setDocumentId] = useState('');
   const [status, setStatus] = useState<Status>({ kind: 'idle' });
+  const [newId, setNewId] = useState('');
+  const [newTitle, setNewTitle] = useState('');
 
   useEffect(() => {
     let live = true;
@@ -121,6 +123,49 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
         return;
       }
       setStatus({ kind: 'ok', message: `Opening ${id} from #${pullNumber}…` });
+      onOpened?.(id);
+    } catch (err) {
+      setStatus({ kind: 'error', message: (err as Error).message });
+    }
+  }
+
+  /**
+   * R-8.5 — create the branch and the pull request for a document that does not exist
+   * yet. This is the author's entry; `open` above is the reviewer's.
+   *
+   * No `doc` is sent. `markdownToInjectable` is forbidden on the collaboration path
+   * (it reparses Markdown and drops every `nodeId`), so the browser has no way to author
+   * starting content — the server seeds a valid empty document and the author fills it
+   * in the editor before the first publish.
+   */
+  async function create() {
+    const id = newId.trim();
+    if (!id) {
+      setStatus({ kind: 'error', message: 'Enter a document id — it names the branch and the file, e.g. doc-1.' });
+      return;
+    }
+    setStatus({ kind: 'busy' });
+    try {
+      const title = newTitle.trim();
+      const res = await doFetch('/__vs/collab/start', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          documentId: id,
+          // The path `fsDocumentStore` already uses, so the committed artifact and the
+          // local copy agree without the author having to know either convention.
+          documentPath: `documents/${id}.json`,
+          ...(title ? { title, frontmatter: { title } } : {}),
+        }),
+      });
+      const json = (await res.json()) as { error?: string; message?: string };
+      if (!res.ok) {
+        // Same rule as `open`: the server's own words. A reviewer's credential is
+        // refused here by `authorize` with a message naming write access.
+        setStatus({ kind: 'error', message: json.error ?? json.message ?? `Create failed (HTTP ${res.status}).` });
+        return;
+      }
+      setStatus({ kind: 'ok', message: `Creating ${id} — opening a pull request…` });
       onOpened?.(id);
     } catch (err) {
       setStatus({ kind: 'error', message: (err as Error).message });
@@ -187,6 +232,43 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
           {status.message}
         </p>
       )}
+
+      {/*
+        The author's half. Rendered only when the credential can actually publish:
+        `create` is author-only (`OPERATION_POLICY`), so offering it to a reviewer would
+        be a control that exists to be refused. Absent `canPublish` means the server
+        could not determine write access — the form is shown, because hiding it on an
+        unknown would strand an author who is merely offline from the permission probe,
+        and the route refuses server-side regardless (R-9.11).
+      */}
+      {availability?.available === true && availability.canPublish !== false && (
+        <>
+          <hr style={rule} />
+          <h2 style={heading}>Start a new document</h2>
+          <p style={identity}>
+            Creates the branch <code>visual-spec/&lt;id&gt;</code>, commits an empty document and opens a pull request.
+            You write it in the editor, then publish.
+          </p>
+
+          <label style={row}>
+            <span style={label}>New document id</span>
+            <input value={newId} onChange={(e) => setNewId(e.target.value)} placeholder="payment-rules" style={input} />
+          </label>
+          <label style={row}>
+            <span style={label}>Title</span>
+            <input
+              value={newTitle}
+              onChange={(e) => setNewTitle(e.target.value)}
+              placeholder="Optional — defaults to the document id"
+              style={input}
+            />
+          </label>
+
+          <button type="button" onClick={() => void create()} disabled={status.kind === 'busy'} style={button}>
+            {status.kind === 'busy' ? 'Creating…' : 'Create pull request'}
+          </button>
+        </>
+      )}
     </section>
   );
 }
@@ -198,5 +280,6 @@ const row: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 6
 const label: React.CSSProperties = { fontSize: 11, color: '#64748b', width: 92, flexShrink: 0 };
 const input: React.CSSProperties = { font: '12px ui-monospace, monospace', padding: '3px 6px', border: '1px solid #d1d5db', borderRadius: 4, flex: 1 };
 const button: React.CSSProperties = { font: '12px system-ui, sans-serif', padding: '4px 10px', border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#334155', alignSelf: 'flex-start' };
+const rule: React.CSSProperties = { border: 0, borderTop: '1px solid #e5e7eb', margin: '4px 0 0' };
 const note: React.CSSProperties = { fontSize: 12, color: '#0f766e', margin: 0 };
 const error: React.CSSProperties = { fontSize: 12, color: '#b91c1c', margin: 0 };

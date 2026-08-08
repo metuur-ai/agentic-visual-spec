@@ -107,6 +107,60 @@ export function resolveDocumentTitle(doc: {
 }
 
 /**
+ * A valid, empty Lexical document: a root holding one empty paragraph. This is the
+ * serialized shape, declared here rather than imported, for the same reason
+ * `JsonDocument` is (R-3.3) — nothing on the CLI path may reach `@lyfie/luthor`.
+ */
+export function emptyDocument(): JsonDocument {
+  return {
+    root: {
+      type: 'root',
+      format: '',
+      indent: 0,
+      version: 1,
+      direction: null,
+      children: [{ type: 'paragraph', format: '', indent: 0, version: 1, direction: null, children: [] }],
+    },
+  };
+}
+
+/**
+ * The envelope a document starts life as, before it has ever met GitHub.
+ *
+ * `create` (R-8.5) reads the document out of the store and commits it — it never authors
+ * one, because the branch it commits to is derived from a document that must already
+ * exist. Something has to write the first version, and this is that something. There is
+ * deliberately no `github` binding: that field is what `create` adds once the branch
+ * exists, and its absence is how an unbound document is recognised everywhere else.
+ *
+ * `doc` defaults to `EMPTY_DOCUMENT_ROOT` — one empty paragraph, not the bare `{ root: {} }`
+ * that `parseCollaborationDocument` falls back to. The two differ deliberately: that
+ * fallback exists to survive a malformed file, while this is content the editor has to
+ * mount, and `injectJSON` on a root with no `type` or `children` throws. The browser
+ * cannot supply the content itself — `markdownToInjectable` is forbidden on the
+ * collaboration path because it reparses Markdown and drops every `nodeId` — so the
+ * empty document is authored here, in the module that already declares the shape.
+ */
+export function newCollaborationDocument(input: {
+  documentId: string;
+  documentPath: string;
+  title?: string;
+  frontmatter?: DocumentFrontmatter;
+  doc?: JsonDocument;
+}): CollaborationDocument {
+  const frontmatter = input.frontmatter ?? {};
+  return {
+    documentId: input.documentId,
+    documentPath: input.documentPath,
+    // Same precedence as every other write: `frontmatter.title` wins when present.
+    title: resolveDocumentTitle({ title: input.title, frontmatter }),
+    frontmatter,
+    nodes: [],
+    doc: input.doc ?? emptyDocument(),
+  };
+}
+
+/**
  * R-1.8 — read a persisted collaboration document. Known fields are defaulted; every
  * other key on the envelope (and inside nodes) is carried through untouched.
  */

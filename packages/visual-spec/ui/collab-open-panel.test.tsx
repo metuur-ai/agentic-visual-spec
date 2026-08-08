@@ -59,7 +59,7 @@ describe('R-11.5 — the reviewer sees their own GitHub identity', () => {
     );
     render(<CollabOpenPanel fetchImpl={impl} />);
     await waitFor(() => expect(screen.getByText(/no GitHub credential is configured/)).toBeTruthy());
-    expect((screen.getByRole('button') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Open' }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
 
@@ -89,6 +89,87 @@ describe('R-12.5 — a session that cannot publish says so, and says why', () =>
   });
 });
 
+/*
+ * R-8.5 — the author's entry. Before this existed, `POST /__vs/collab/start` was
+ * implemented, exported on the client, and called by nothing: an author could not create
+ * a first document at all. These pin the caller, not just the route.
+ */
+describe('R-8.5 — starting a new document', () => {
+  const authoring = { ...AVAILABLE, canPublish: true };
+
+  it('posts the document id, the store path and the title', async () => {
+    const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true, kind: 'create' } }, authoring);
+    const onOpened = vi.fn();
+    render(<CollabOpenPanel fetchImpl={impl} onOpened={onOpened} />);
+    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
+
+    type('New document id', 'doc-7');
+    type('Title', 'Payment rules');
+    fireEvent.click(screen.getByRole('button', { name: 'Create pull request' }));
+
+    await waitFor(() => expect(onOpened).toHaveBeenCalledWith('doc-7'));
+    expect(calls.at(-1)).toEqual({
+      url: '/__vs/collab/start',
+      // `documentPath` is the convention `fsDocumentStore` reads back, and the title is
+      // sent as frontmatter too because frontmatter is what wins on the envelope.
+      body: { documentId: 'doc-7', documentPath: 'documents/doc-7.json', title: 'Payment rules', frontmatter: { title: 'Payment rules' } },
+    });
+  });
+
+  it('omits the title entirely rather than sending an empty one', async () => {
+    const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true } }, authoring);
+    render(<CollabOpenPanel fetchImpl={impl} onOpened={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
+
+    type('New document id', 'doc-8');
+    fireEvent.click(screen.getByRole('button', { name: 'Create pull request' }));
+
+    await waitFor(() => expect(calls.at(-1)?.url).toBe('/__vs/collab/start'));
+    expect(calls.at(-1)?.body).toEqual({ documentId: 'doc-8', documentPath: 'documents/doc-8.json' });
+  });
+
+  it('refuses to post without a document id', async () => {
+    const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true } }, authoring);
+    render(<CollabOpenPanel fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create pull request' }));
+
+    await waitFor(() => expect(screen.getByText(/Enter a document id/)).toBeTruthy());
+    expect(calls.map((c) => c.url)).toEqual(['/__vs/collab']);
+  });
+
+  it('shows the server’s refusal verbatim', async () => {
+    const message = 'create is available to the document author only: the GitHub credential has no write access to acme/docs.';
+    const { impl } = fakeFetch({ ok: false, status: 403, json: { error: message } }, authoring);
+    render(<CollabOpenPanel fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
+
+    type('New document id', 'doc-9');
+    fireEvent.click(screen.getByRole('button', { name: 'Create pull request' }));
+
+    await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
+  });
+
+  /*
+   * R-9.11 — hiding a control is never the enforcement, but offering a reviewer a button
+   * that exists only to be refused is its own defect. `false` is a definite answer.
+   */
+  it('is hidden for a session the server said cannot publish', async () => {
+    const { impl } = fakeFetch({ ok: true, status: 200, json: { ok: true } }, { ...AVAILABLE, canPublish: false });
+    render(<CollabOpenPanel fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
+    expect(screen.queryByRole('button', { name: 'Create pull request' })).toBeNull();
+  });
+
+  it('is shown when write access is undeterminable, because the route still refuses', async () => {
+    const { impl } = fakeFetch({ ok: true, status: 200, json: { ok: true } });
+    render(<CollabOpenPanel fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
+    expect(screen.getByRole('button', { name: 'Create pull request' })).toBeTruthy();
+  });
+});
+
 describe('R-11.2 — opening by pull request reference', () => {
   it('posts the parsed pull number and the document id', async () => {
     const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true, kind: 'sync' } });
@@ -98,7 +179,7 @@ describe('R-11.2 — opening by pull request reference', () => {
 
     type('Pull request', 'https://github.com/acme/docs/pull/42');
     type('Document id', 'doc-1');
-    fireEvent.click(screen.getByRole('button'));
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
 
     await waitFor(() => expect(onOpened).toHaveBeenCalledWith('doc-1'));
     expect(calls.at(-1)).toEqual({ url: '/__vs/collab/open', body: { documentId: 'doc-1', pullNumber: 42 } });
@@ -111,7 +192,7 @@ describe('R-11.2 — opening by pull request reference', () => {
 
     type('Pull request', 'acme/docs');
     type('Document id', 'doc-1');
-    fireEvent.click(screen.getByRole('button'));
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
 
     await waitFor(() => expect(screen.getByText(/Enter a pull request URL or number/)).toBeTruthy());
     expect(calls.map((c) => c.url)).toEqual(['/__vs/collab']);
@@ -127,7 +208,7 @@ describe('R-11.4 — the server’s specific cause reaches the reviewer verbatim
 
     type('Pull request', '#42');
     type('Document id', 'doc-1');
-    fireEvent.click(screen.getByRole('button'));
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
 
     await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
   });
