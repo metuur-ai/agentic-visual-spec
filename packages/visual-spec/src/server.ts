@@ -85,7 +85,10 @@ async function readRawBody(req: IncomingMessage, limit: number): Promise<Buffer>
   return Buffer.concat(chunks);
 }
 
-async function handleTree(store: TreeStore, method: string, pathname: string, query: Record<string, string>) {
+// `_body` is unread here and read by the write routes that land on this prefix
+// next; it is in the signature now so the two hosts hand the handler the same
+// four arguments (R-4.1) rather than one of them growing a body later.
+async function handleTree(store: TreeStore, method: string, pathname: string, query: Record<string, string>, _body?: Record<string, unknown>) {
   if (method === 'GET' && (pathname === '' || pathname === '/')) {
     return { status: 200, json: await store.tree() };
   }
@@ -214,7 +217,12 @@ export function createVisualSpecServer(opts: ServeOptions) {
         if (url.pathname === '/__vs/tree' || url.pathname.startsWith('/__vs/tree/')) {
           const sub = url.pathname.slice('/__vs/tree'.length);
           const query = Object.fromEntries(url.searchParams.entries());
-          const r = await handleTree(tree, method, sub, query);
+          // R-4.2. The Vite host runs this prefix through its `middleware` helper,
+          // which always reads the body, so not reading it here would make the same
+          // POST answer differently on the two hosts. It also leaves the request
+          // stream undrained, which stalls the keep-alive connection it arrived on.
+          const body = await readJsonBody(req);
+          const r = await handleTree(tree, method, sub, query, body);
           return sendJson(res, r.status, r.json);
         }
 
@@ -335,6 +343,20 @@ export function createVisualSpecServer(opts: ServeOptions) {
           const body = await readJsonBody(req);
           const r = await handleCommentsRequest(comments, method, sub, query, body);
           return sendJson(res, r.status, r.json);
+        }
+
+        // R-4.5. Every route above answers for itself, so anything still on `/__vs/`
+        // is a path this server does not implement. `serveStatic` below SPA-falls-back
+        // to index.html, which would answer such a request 200 with HTML: a client
+        // newer than its server would see `res.ok` and then fail parsing JSON, with
+        // nothing to report. Only `/__vs/` is claimed — an unknown app path still
+        // reaches the SPA shell.
+        if (url.pathname.startsWith('/__vs/')) {
+          // Discarded rather than buffered: the bytes are already on the wire and
+          // an unread stream costs the client its connection, but a path with no
+          // route has no reason to hold an arbitrary upload in memory.
+          req.resume();
+          return sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
         }
 
         await serveStatic(opts.uiDir, url.pathname, res);

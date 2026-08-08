@@ -86,7 +86,10 @@ function middleware(fn: (req: IncomingMessage, query: Record<string, string>, pa
   };
 }
 
-async function handleTree(store: TreeStore, method: string, pathname: string, query: Record<string, string>) {
+// `_body` is unread here and read by the write routes that land on this prefix
+// next; it is in the signature now so the two hosts hand the handler the same
+// four arguments (R-4.1) rather than one of them growing a body later.
+async function handleTree(store: TreeStore, method: string, pathname: string, query: Record<string, string>, _body?: Record<string, unknown>) {
   if (method === 'GET' && (pathname === '' || pathname === '/')) return { status: 200, json: await store.tree() };
   if (method === 'GET' && pathname === '/file') {
     if (!query.path) return { status: 400, json: { error: 'missing path' } };
@@ -191,8 +194,8 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       }));
 
       // Generic directory browser API (matches the production server.ts).
-      server.middlewares.use('/__vs/tree', middleware((req, query, pathname) =>
-        handleTree(tree, req.method ?? 'GET', pathname, query)));
+      server.middlewares.use('/__vs/tree', middleware((req, query, pathname, body) =>
+        handleTree(tree, req.method ?? 'GET', pathname, query, body)));
 
       // Raw bytes for image previews / downloads. Streams (not JSON), so it's not
       // wrapped in the json `middleware` helper.
@@ -325,6 +328,21 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       server.httpServer?.on('close', () => {
         collabWiring.stopAllPolling();
         collab.dispose();
+      });
+
+      // R-4.5. Registered last, so it only ever sees a `/__vs` path none of the
+      // handlers above claimed — including the ones that `next()` on a method they
+      // do not serve. Without it those fall through to Vite's SPA fallback and
+      // answer 200 with index.html, so a client newer than its server reads
+      // `res.ok` and then fails parsing JSON, with no status to report. Connect
+      // strips the mount prefix from `req.url`, so it is put back for the message.
+      server.middlewares.use('/__vs', (req, res) => {
+        // Discarded rather than buffered: the bytes are already on the wire and an
+        // unread stream costs the client its connection, but a path with no route
+        // has no reason to hold an arbitrary upload in memory.
+        req.resume();
+        const sub = new URL(req.url ?? '', 'http://localhost').pathname;
+        sendJson(res, 404, { error: `no route: ${req.method ?? 'GET'} /__vs${sub === '/' ? '' : sub}` });
       });
 
       // Live-reload: when a .md file under the specs dir changes (it may live

@@ -7,10 +7,10 @@
  * against traversal.
  */
 import { createReadStream } from 'node:fs';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { lstat, readFile, readdir, realpath, stat } from 'node:fs/promises';
 // stat is still used by file()/resolve() for content gating; the tree walk no
 // longer stats every entry (size isn't shown in the UI).
-import { basename, extname, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path';
 import ignore, { type Ignore } from 'ignore';
 import { DEFAULT_IGNORE } from './default-ignore';
 
@@ -37,6 +37,20 @@ export interface TreeStore {
   file(path: string): Promise<FileContent>;
   /** Guarded absolute path, for streaming raw bytes (images/downloads). */
   resolve(path: string): string;
+  /**
+   * Guarded absolute path for a target that does **not** exist yet (create/rename).
+   * Adds a filesystem-level symlink check on top of `resolve`'s string check.
+   *
+   * `resolveForWrite` and `invalidate` are **optional** because `TreeStore` is
+   * published — `core/vite/index.ts` re-exports this module and package.json ships
+   * it as the `"./vite"` entrypoint — so a required addition would break every
+   * external implementation. `CommentDocStore` in `routes/comments.ts` set this
+   * precedent for the same reason. The store `treeStore()` returns always provides
+   * both; callers reaching an arbitrary `TreeStore` must handle their absence.
+   */
+  resolveForWrite?(path: string): Promise<string>;
+  /** Drop the cached walk. Absent → the caller accepts the TTL. */
+  invalidate?(): void;
 }
 
 /** Always hidden, regardless of .visualspecignore — keeps the tree free of junk. */
@@ -141,6 +155,51 @@ export function treeStore(baseDir: string): TreeStore {
     return abs;
   };
 
+  /**
+   * `safe` plus a filesystem check, for paths we are about to *create*.
+   *
+   * `safe` compares strings: `resolve(base, rel)` then `startsWith(base + sep)`.
+   * A symlink *inside* base pointing outside it passes that untouched. For the
+   * read routes that is disclosure; for a caller that runs `mkdir -p` it is
+   * directory creation anywhere on the disk.
+   *
+   * Rejected alternative: `realpath(abs)`. The target does not exist yet, so
+   * `realpath` throws ENOENT — there is nothing to resolve. Rejected alternative:
+   * `realpath` after `mkdir`. Too late; `mkdir` already followed the symlink and
+   * created the directories the check was supposed to prevent.
+   *
+   * So we resolve the deepest ancestor that *does* exist and compare that against
+   * the real base, before anything is written. Existence is tested with `lstat`,
+   * not `stat`, so a dangling symlink counts as existing rather than being walked
+   * past as if it were absent. `realpath` on such a link throws, and that throw is
+   * the refusal — this guard fails closed.
+   */
+  const safeForWrite = async (rel: string): Promise<string> => {
+    const abs = safe(rel);
+    let dir = dirname(abs);
+    for (;;) {
+      try {
+        await lstat(dir);
+        break;
+      } catch {
+        const parent = dirname(dir);
+        if (parent === dir) break; // filesystem root; realpath below still decides
+        dir = parent;
+      }
+    }
+    let realAncestor: string;
+    let realBase: string;
+    try {
+      [realAncestor, realBase] = await Promise.all([realpath(dir), realpath(base)]);
+    } catch {
+      throw new Error(`path escapes base: ${rel}`);
+    }
+    if (realAncestor !== realBase && !realAncestor.startsWith(realBase + sep)) {
+      throw new Error(`path escapes base: ${rel}`);
+    }
+    return abs;
+  };
+
   return {
     async tree() {
       const now = Date.now();
@@ -167,6 +226,17 @@ export function treeStore(baseDir: string): TreeStore {
 
     resolve(path) {
       return safe(path);
+    },
+
+    resolveForWrite(path) {
+      return safeForWrite(path);
+    },
+
+    invalidate() {
+      // A successful write makes the cached walk wrong for up to TREE_CACHE_TTL_MS,
+      // and the next tree read is the one the user is waiting on. Dropping the
+      // entry is enough — `tree()` re-walks whenever there is no entry.
+      cache = null;
     },
   };
 }
