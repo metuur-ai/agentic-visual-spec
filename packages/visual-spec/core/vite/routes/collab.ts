@@ -90,7 +90,8 @@ const NOT_CONFIGURED: CollabAvailability = {
   available: false,
   reason: 'not-configured',
   message:
-    'Collaboration is not configured. Add a `collaboration: { owner, repo }` block to visual-spec.config.ts to enable it. Local mode is unaffected.',
+    'Collaboration is not configured. On the CLI, restart with `--repo <owner>/<name>` (optionally `--base-branch <branch>`); ' +
+    'under Vite, pass `config: { collaboration: { owner, repo } }` to `visualSpecMarkdown()` in vite.config.ts. Local mode is unaffected.',
   missingScopes: [],
 };
 

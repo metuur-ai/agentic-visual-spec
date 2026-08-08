@@ -19,6 +19,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { INIT_VALUE_FLAGS, SERVE_VALUE_FLAGS, firstPositional } from '../core/cli-args';
 import { createGitHubAdapter } from '../core/collaboration/github-adapter';
 import {
   classifyBranchLookupFailure,
@@ -45,7 +46,7 @@ function openBrowser(url: string) {
 }
 
 async function serve(args: string[]) {
-  const target = args.find((a) => !a.startsWith('-')) ?? '.';
+  const target = firstPositional(args, SERVE_VALUE_FLAGS) ?? '.';
   const contentDir = isAbsolute(target) ? target : resolve(process.cwd(), target);
   if (!existsSync(contentDir)) {
     console.error(`Directory not found: ${contentDir}`);
@@ -173,7 +174,7 @@ async function collab(args: string[]) {
 }
 
 async function init(args: string[]) {
-  const target = args.find((a) => !a.startsWith('-'));
+  const target = firstPositional(args, INIT_VALUE_FLAGS);
   if (!target) {
     console.error('Usage: visual-spec init <dir> [--name <pkg-name>]');
     process.exit(1);

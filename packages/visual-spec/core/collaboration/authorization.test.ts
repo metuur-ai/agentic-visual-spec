@@ -589,7 +589,11 @@ describe('writeAccess — the availability hint', () => {
     const authorize = createCollabAuthorizer({ exec, documents: () => memoryDocuments([document()]) });
     const verdict = await authorize.writeAccess?.({ ...REPO });
     expect(verdict).toMatchObject({ write: false, reason: 'no_repo' });
-    expect(verdict && 'message' in verdict && verdict.message).toContain('visual-spec.config.ts');
+    expect(verdict && 'message' in verdict && verdict.message).toBe(
+      `${REPO.owner}/${REPO.repo} was not found. Either the configured repository is wrong — check the ` +
+        '`--repo` flag, or the `collaboration` block passed to `visualSpecMarkdown()` in vite.config.ts — ' +
+        'or this credential cannot see it, so run `gh auth status`.',
+    );
   });
 
   it('reports null — not false — when the permission cannot be read', async () => {

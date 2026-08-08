@@ -244,8 +244,8 @@ export function createCollabAuthorizer(options: CollabAuthorizerOptions): Collab
    * snapshot can tell a reviewer their session is comment-only before they look for a
    * publish control. Shares `hasWriteAccess`'s cache.
    *
-   * R-12.5 — three answers, not two. A 404 is the *repo* being wrong (a typo in
-   * `visual-spec.config.ts`, or a credential that cannot see it at all) and is worth
+   * R-12.5 — three answers, not two. A 404 is the *repo* being wrong (a typo in `--repo`
+   * or in the plugin's `collaboration` block, or a credential that cannot see it at all) and is worth
    * saying out loud; every other failure is an outage and stays `null`, so it reads as
    * "unknown" rather than demoting an author to reviewer on a network blip.
    */
@@ -267,8 +267,9 @@ export function createCollabAuthorizer(options: CollabAuthorizerOptions): Collab
           write: false,
           reason: 'no_repo',
           message:
-            `${repo.owner}/${repo.repo} was not found. Either the repository in visual-spec.config.ts is wrong, ` +
-            'or this credential cannot see it — check the owner and name, then run `gh auth status`.',
+            `${repo.owner}/${repo.repo} was not found. Either the configured repository is wrong — check the ` +
+            '`--repo` flag, or the `collaboration` block passed to `visualSpecMarkdown()` in vite.config.ts — ' +
+            'or this credential cannot see it, so run `gh auth status`.',
         };
       }
       return { write: null, reason: 'unknown' };

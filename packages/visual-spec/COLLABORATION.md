@@ -39,7 +39,7 @@ on.
 | Not logged in | Collaboration is unavailable: no GitHub credential is configured. Run `gh auth login`, or set `GH_TOKEN` in the environment of the visual-spec server. |
 | Credential lacks the scope | Collaboration is unavailable: the GitHub credential is missing the required scope "repo". Run `gh auth refresh -h github.com -s repo` to grant it, or use a credential that carries it. |
 | No write access to the repo | You do not have write access to `<owner>/<repo>`, so this is a review-only session. You can comment and reply on any document; publishing needs write access. |
-| Repository not found | `<owner>/<repo>` was not found. Either the repository in visual-spec.config.ts is wrong, or this credential cannot see it — check the owner and name, then run `gh auth status`. |
+| Repository not found | `<owner>/<repo>` was not found. Either the configured repository is wrong — check the `--repo` flag, or the `collaboration` block passed to `visualSpecMarkdown()` in vite.config.ts — or this credential cannot see it, so run `gh auth status`. |
 
 The required scope is `repo`. Nothing implies it — a credential carrying only
 `public_repo` will fail the scope check and be told to run the `gh auth refresh` command

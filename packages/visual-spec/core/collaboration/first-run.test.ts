@@ -100,7 +100,7 @@ describe('the five ways a first run stops (R-12.5)', () => {
       /Run "gh auth login"/,
       /Run "gh auth refresh -h github\.com -s repo"/,
       /publishing needs write access/,
-      /visual-spec\.config\.ts/,
+      /run `gh auth status`/,
     ];
 
     const rungs = await ladder();
