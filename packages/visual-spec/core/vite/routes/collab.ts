@@ -130,9 +130,11 @@ export type SyncJobInput = JobInputBase & { document: CollaborationDocument | nu
 /** `POST /__vs/collab/:id/publish` — task 8.3 (R-8.9 … R-8.14). */
 export type PublishJobInput = JobInputBase & {
   document: CollaborationDocument | null;
-  /** The structured document, exactly as received. Never re-derived server-side. */
-  json: unknown;
-  /** R-8.12 — opaque bytes. This layer only checks that it is a string (R-8.9). */
+  /**
+   * R-8.9 — the whole publish payload. Markdown is the document (LLD §2), so there is
+   * one artifact and no second, structured half to carry beside it.
+   * R-8.12 — opaque bytes. This layer only checks that it is a string.
+   */
   markdown: string;
 };
 
@@ -923,7 +925,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
       if (method === 'POST' && tail === '/publish') {
         // Validated BEFORE the gate so R-12.7's assertion holds without a credential:
         // an incomplete payload is a malformed request, not an authorization problem.
-        if (body.json === undefined || body.json === null) return bad('missing json');
+        // R-8.9 — `markdown` is the entire payload; a request that omits it is rejected.
         if (typeof body.markdown !== 'string') return bad('missing markdown');
         const gated = await gate('publish', documentId);
         if (!gated.ok) return gated.result;
@@ -934,7 +936,6 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
           run: bodies.publish({
             documentId,
             document: await deps.documents().read(documentId),
-            json: body.json,
             markdown: body.markdown,
             repo: gated.repo,
             store: deps.documents(),

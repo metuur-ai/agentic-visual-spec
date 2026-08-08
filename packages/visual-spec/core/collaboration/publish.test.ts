@@ -10,7 +10,8 @@
  * the code *does not* do and no positive test can imply them:
  *   - no merge endpoint is ever reached (R-8.10, LLD §7);
  *   - no git subprocess is ever spawned — every call is `gh api` (LLD §7 / Constraints);
- *   - the client's Markdown is never touched (R-8.12).
+ *   - the client's Markdown is never touched (R-8.12);
+ *   - exactly one path is written, and it is the document's own (LLD §7).
  */
 import { describe, expect, it, vi } from 'vitest';
 import type { CollaborationDocument } from './document-protocol';
@@ -19,9 +20,7 @@ import { createGitHubAdapter } from './github-adapter';
 import type { GhExecutor, GhResult } from './github-executor';
 import { type JobEvent, type LifecycleState, type SseSink, createJobHubRegistry } from './job-hub';
 import type { BoundCollaborationDocument } from './lifecycle';
-import { PublishVerificationError, createPublishBody, gitBlobSha, markdownPathFor } from './publish';
-import { documentContentSha } from './lifecycle';
-import { serializeCollaborationDocument } from './document-protocol';
+import { PublishVerificationError, createPublishBody, gitBlobSha } from './publish';
 
 const repo = { owner: 'acme', repo: 'docs', baseBranch: 'main' };
 const BRANCH = 'visual-spec/doc-1';
@@ -88,7 +87,8 @@ function fakeGh(options: FakeOptions = {}): { exec: GhExecutor; calls: Call[]; f
 function makeDoc(overrides: Partial<BoundCollaborationDocument> = {}): BoundCollaborationDocument {
   return {
     documentId: 'doc-1',
-    documentPath: 'documents/doc-1.json',
+    // Markdown is the document (LLD §2) — the document's path *is* the published path.
+    documentPath: 'documents/doc-1.md',
     title: 'Onboarding guide',
     frontmatter: {},
     nodes: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'hello' }],
@@ -146,7 +146,7 @@ const MARKDOWN = '# Onboarding guide\n\nhello\n';
 function rig(options: FakeOptions = {}, inputOverrides: Record<string, unknown> = {}) {
   const doc = makeDoc();
   const gh = fakeGh({
-    files: { [doc.documentPath]: '{"documentId":"doc-1"}\n', ...(options.files ?? {}) },
+    files: { [doc.documentPath]: '# stale\n', ...(options.files ?? {}) },
     ...options,
   });
   const publish = createPublishBody({ adapter: createGitHubAdapter(gh.exec) });
@@ -156,7 +156,6 @@ function rig(options: FakeOptions = {}, inputOverrides: Record<string, unknown> 
     repo,
     store,
     document: doc,
-    json: doc.doc,
     markdown: MARKDOWN,
     ...inputOverrides,
   });
@@ -206,18 +205,14 @@ describe('R-8.11 — gitBlobSha', () => {
  * ------------------------------------------------------------------ */
 
 describe('R-8.10 — commit then verify', () => {
-  it('commits both artifacts to the PR branch and verifies each by reading it back', async () => {
+  it('commits ONE artifact to the PR branch and verifies it by reading it back', async () => {
     const { gh, body, doc } = rig();
     await runBody(body);
 
-    // O-2 — after verification, publish also ensures `.gitattributes` on the same
-    // branch (see the "O-2" describe block below); that PUT/GET is the third entry.
+    // LLD §7 — one artifact, at the document's own path. Nothing else is written:
+    // no generated sibling, no `.gitattributes` upkeep for a machine-readable half.
     const puts = gh.calls.filter((c) => methodOf(c.args) === 'PUT').map((c) => endpointOf(c.args));
-    expect(puts).toEqual([
-      `/repos/acme/docs/contents/${doc.documentPath}`,
-      `/repos/acme/docs/contents/documents/doc-1.md`,
-      `/repos/acme/docs/contents/.gitattributes`,
-    ]);
+    expect(puts).toEqual([`/repos/acme/docs/contents/${doc.documentPath}`]);
 
     // Every PUT names the PR branch, never the base.
     for (const call of gh.calls.filter((c) => methodOf(c.args) === 'PUT')) {
@@ -225,15 +220,12 @@ describe('R-8.10 — commit then verify', () => {
     }
     expect(gh.calls.some((c) => endpointOf(c.args).includes(`ref=${repo.baseBranch}`))).toBe(false);
 
-    // Read-before-write for the sha, then read-back to verify: two GETs per artifact,
-    // plus the `.gitattributes` read-before-write for O-2.
+    // Read-before-write for the sha, then read-back to verify: two GETs, both of the
+    // one path. Dropping the second artifact did not drop either check on this one.
     const gets = gh.calls.filter((c) => methodOf(c.args) === 'GET').map((c) => endpointOf(c.args));
     expect(gets).toEqual([
-      `/repos/acme/docs/contents/documents/doc-1.json?ref=${BRANCH}`,
       `/repos/acme/docs/contents/documents/doc-1.md?ref=${BRANCH}`,
-      `/repos/acme/docs/contents/documents/doc-1.json?ref=${BRANCH}`,
       `/repos/acme/docs/contents/documents/doc-1.md?ref=${BRANCH}`,
-      `/repos/acme/docs/contents/.gitattributes?ref=${BRANCH}`,
     ]);
   });
 
@@ -251,7 +243,7 @@ describe('R-8.10 — commit then verify', () => {
   });
 
   it('never calls adapter.mergePullRequest, even if the adapter offers it', async () => {
-    const gh = fakeGh({ files: { 'documents/doc-1.json': '{}\n' } });
+    const gh = fakeGh({ files: { 'documents/doc-1.md': '# stale\n' } });
     const adapter = createGitHubAdapter(gh.exec);
     const merge = vi.spyOn(adapter, 'mergePullRequest');
     const doc = makeDoc();
@@ -260,7 +252,6 @@ describe('R-8.10 — commit then verify', () => {
       repo,
       store: memoryStore(doc),
       document: doc,
-      json: doc.doc,
       markdown: MARKDOWN,
     });
     await runBody(body);
@@ -294,8 +285,8 @@ describe('R-8.21 — verification failure', () => {
       corruptOnRead: (path, content) => (path.endsWith('.md') ? `${content}tampered\n` : content),
     });
     await expect(runBody(body)).rejects.toBeInstanceOf(PublishVerificationError);
-    // R-8.21 — nothing is regenerated or overwritten: still exactly two PUTs.
-    expect(gh.calls.filter((c) => methodOf(c.args) === 'PUT')).toHaveLength(2);
+    // R-8.21 — nothing is regenerated or overwritten: still exactly the one PUT.
+    expect(gh.calls.filter((c) => methodOf(c.args) === 'PUT')).toHaveLength(1);
     // …and still no merge.
     expect(gh.calls.map((c) => endpointOf(c.args)).filter((e) => e.includes('/merge'))).toEqual([]);
   });
@@ -395,7 +386,7 @@ describe('R-8.13 — the published Markdown is readable for the summary + change
     await runBody(body);
 
     const adapter = createGitHubAdapter(gh.exec);
-    const readBack = await adapter.getFile({ owner: repo.owner, repo: repo.repo }, markdownPathFor(doc.documentPath), BRANCH);
+    const readBack = await adapter.getFile({ owner: repo.owner, repo: repo.repo }, doc.documentPath, BRANCH);
     expect(readBack?.content).toBe(MARKDOWN);
     expect(readBack?.sha).toBe(gitBlobSha(MARKDOWN));
   });
@@ -406,20 +397,18 @@ describe('R-8.13 — the published Markdown is readable for the summary + change
     expect(logs.join('\n')).toContain('documents/doc-1.md');
   });
 
-  it('derives the Markdown path from the document path, with no stored field', () => {
-    expect(markdownPathFor('documents/doc-1.json')).toBe('documents/doc-1.md');
-    expect(markdownPathFor('a/b/c/spec.json')).toBe('a/b/c/spec.md');
-    // A path that is not `.json` still gets a derivable, stable answer.
-    expect(markdownPathFor('documents/doc-1')).toBe('documents/doc-1.md');
-  });
-
-  it('commits the canonical JSON envelope with the client payload installed as `doc`', async () => {
-    const { gh, body } = rig({}, { json: { root: { children: [{ id: 'n-9', type: 'paragraph', version: 1 }] } } });
+  it('publishes at the document path itself — no derived path, no stored field', async () => {
+    const doc = makeDoc({ documentPath: 'a/b/c/spec.md' });
+    const gh = fakeGh();
+    const body = createPublishBody({ adapter: createGitHubAdapter(gh.exec) })({
+      documentId: 'doc-1',
+      repo,
+      store: memoryStore(doc),
+      document: doc,
+      markdown: MARKDOWN,
+    });
     await runBody(body);
-    const written = JSON.parse(gh.files.get('documents/doc-1.json') as string) as CollaborationDocument;
-    expect(written.documentId).toBe('doc-1');
-    expect(written.documentPath).toBe('documents/doc-1.json');
-    expect(written.doc).toEqual({ root: { children: [{ id: 'n-9', type: 'paragraph', version: 1 }] } });
+    expect([...gh.files.keys()]).toEqual(['a/b/c/spec.md']);
   });
 });
 
@@ -427,19 +416,14 @@ describe('R-8.13 — the published Markdown is readable for the summary + change
  * R-8.9 / R-12.7 — the payload is required
  * ------------------------------------------------------------------ */
 
-describe('R-8.9 — publish requires json AND markdown', () => {
+describe('R-8.9 — publish requires markdown, and nothing else', () => {
   // The 400 lives in the route and is asserted in `core/vite/routes/collab.test.ts`
   // ("R-8.9 / R-12.7 — publish payload validation"). These cover the body reached
   // directly, so no entrypoint can commit an incomplete payload.
-  it('rejects a missing json before any GitHub call', async () => {
-    const { gh, body } = rig({}, { json: undefined });
-    await expect(runBody(body)).rejects.toThrow(/missing json/);
+  it('rejects a missing markdown before any GitHub call', async () => {
+    const { gh, body } = rig({}, { markdown: undefined });
+    await expect(runBody(body)).rejects.toThrow(/missing markdown/);
     expect(gh.calls).toEqual([]);
-  });
-
-  it('rejects a null json', async () => {
-    const { body } = rig({}, { json: null });
-    await expect(runBody(body)).rejects.toThrow(/missing json/);
   });
 
   it('rejects a non-string markdown before any GitHub call', async () => {
@@ -456,7 +440,6 @@ describe('R-8.9 — publish requires json AND markdown', () => {
       repo,
       store: memoryStore(doc),
       document: doc,
-      json: doc.doc,
       markdown: MARKDOWN,
     });
     await expect(runBody(body)).rejects.toThrow(/no collaboration branch/);
@@ -465,14 +448,13 @@ describe('R-8.9 — publish requires json AND markdown', () => {
 
   it('falls back to the store when the route supplied no document', async () => {
     const doc = makeDoc();
-    const gh = fakeGh({ files: { 'documents/doc-1.json': '{}\n' } });
+    const gh = fakeGh({ files: { 'documents/doc-1.md': '# stale\n' } });
     const store = memoryStore(doc);
     const body = createPublishBody({ adapter: createGitHubAdapter(gh.exec) })({
       documentId: 'doc-1',
       repo,
       store,
       document: null,
-      json: doc.doc,
       markdown: MARKDOWN,
     });
     await runBody(body);
@@ -481,82 +463,32 @@ describe('R-8.9 — publish requires json AND markdown', () => {
   });
 
   /*
-   * Publish took the editor's payload to GitHub and never told the local store, so
-   * `store.read` kept answering with the pre-publish envelope. The reviewer pane renders
-   * the store rather than the branch, so a successful publish was immediately followed by
-   * an empty document on screen — and it stayed empty until an `open` refetched it.
-   * Asserted against the bytes that were verified onto the branch, not against the input,
-   * so the local copy provably cannot drift from what was committed.
+   * Publish writes nothing back to the local store. With Markdown canonical there is no
+   * second, structured copy to reconcile: the branch holds the client's bytes and the
+   * store's own copy is whatever the store already holds. The store is read here (for the
+   * path and the branch) and never written.
    */
-  it('writes the published document back to the local store, so the copy matches the branch', async () => {
+  it('never writes to the local store — publish has one artifact and it is on the branch', async () => {
     const doc = makeDoc();
-    const gh = fakeGh({ files: { 'documents/doc-1.json': '{}\n' } });
+    const gh = fakeGh({ files: { 'documents/doc-1.md': '# stale\n' } });
     const store = memoryStore(doc);
-    const publishedJson = { root: { type: 'root', version: 1, children: [{ type: 'paragraph', version: 1, children: [] }] } };
-    const body = createPublishBody({ adapter: createGitHubAdapter(gh.exec) })({
-      documentId: 'doc-1',
-      repo,
-      store,
-      document: doc,
-      json: publishedJson as typeof doc.doc,
-      markdown: MARKDOWN,
-    });
-
-    await runBody(body);
-
-    const local = await store.read('doc-1');
-    expect(local?.doc).toEqual(publishedJson);
-    // The committed JSON is the serialization of that same value — no second source.
-    expect(gh.files.get('documents/doc-1.json')).toBe(serializeCollaborationDocument({ ...doc, doc: publishedJson as typeof doc.doc }));
-  });
-
-  /*
-   * R-11.6 — publish is the moment local and branch provably agree, and the only one
-   * inside this body. Recording the hash here is what later lets `open` tell a stale copy
-   * from one an agent moved on: without it, every copy looks the same and the refresh
-   * that destroys unpublished work cannot be distinguished from the refresh that fixes a
-   * stale one.
-   */
-  it('seals the local copy with the content hash of what it verified onto the branch', async () => {
-    const doc = makeDoc();
-    const gh = fakeGh({ files: { 'documents/doc-1.json': '{}\n' } });
-    const store = memoryStore(doc);
-    const body = createPublishBody({ adapter: createGitHubAdapter(gh.exec) })({
-      documentId: 'doc-1',
-      repo,
-      store,
-      document: doc,
-      json: doc.doc,
-      markdown: MARKDOWN,
-    });
-
-    await runBody(body);
-
-    const local = (await store.read('doc-1')) as CollaborationDocument & { github?: { contentSha?: string } };
-    expect(local.github?.contentSha).toBe(documentContentSha(local));
-  });
-
-  it('still publishes when the local write fails — the commits landed and were verified', async () => {
-    const doc = makeDoc();
-    const gh = fakeGh({ files: { 'documents/doc-1.json': '{}\n' } });
-    const store = memoryStore(doc);
-    store.write = async () => {
-      throw new Error('disk full');
+    const writes: string[] = [];
+    store.write = async (written) => {
+      writes.push(written.documentId);
     };
     const body = createPublishBody({ adapter: createGitHubAdapter(gh.exec) })({
       documentId: 'doc-1',
       repo,
       store,
       document: doc,
-      json: doc.doc,
       markdown: MARKDOWN,
     });
 
-    const run = await runBody(body);
+    const { states } = await runBody(body);
 
+    expect(writes).toEqual([]);
+    expect(states).toEqual(['publishing', 'verifying', 'published']);
     expect(gh.files.get('documents/doc-1.md')).toBe(MARKDOWN);
-    expect(run.states).toContain('published');
-    expect(run.logs.some((l) => l.includes('the local copy could not be updated'))).toBe(true);
   });
 });
 
@@ -585,7 +517,7 @@ describe('R-8.14 — publish completes after the client disconnects', () => {
   }
 
   it('runs to `published` through the hub after the only subscriber disconnects mid-flight', async () => {
-    const gh = fakeGh({ files: { 'documents/doc-1.json': '{}\n' } });
+    const gh = fakeGh({ files: { 'documents/doc-1.md': '# stale\n' } });
     const doc = makeDoc();
     const hubs = createJobHubRegistry({ now: () => 1 });
     const hub = hubs.hub('doc-1');
@@ -612,7 +544,6 @@ describe('R-8.14 — publish completes after the client disconnects', () => {
       repo,
       store: memoryStore(doc),
       document: doc,
-      json: doc.doc,
       markdown: MARKDOWN,
     });
     expect(hub.start({ kind: 'publish', run: body }).status).toBe(200);
@@ -650,69 +581,5 @@ describe('R-8.14 — publish completes after the client disconnects', () => {
     const { states } = await runBody(body, { signal: aborted.signal });
     expect(states).toEqual(['publishing', 'verifying', 'published']);
     expect(gh.files.get('documents/doc-1.md')).toBe(MARKDOWN);
-  });
-});
-
-/* ------------------------------------------------------------------ *
- * O-2 — `.gitattributes` collapses the JSON diff on github.com
- * ------------------------------------------------------------------ */
-
-describe('O-2 — .gitattributes marks the document path linguist-generated', () => {
-  it('adds the entry on the PR branch, on top of the two document commits', async () => {
-    const { gh, body, doc } = rig();
-    await runBody(body);
-    expect(gh.files.get('.gitattributes')).toBe(`${doc.documentPath} linguist-generated=true -diff\n`);
-  });
-
-  it('publishing the same document twice makes no second `.gitattributes` commit', async () => {
-    const doc = makeDoc();
-    const gh = fakeGh({ files: { [doc.documentPath]: '{"documentId":"doc-1"}\n' } });
-    const adapter = createGitHubAdapter(gh.exec);
-    const store = memoryStore(doc);
-
-    const run = () =>
-      runBody(
-        createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, document: doc, json: doc.doc, markdown: MARKDOWN }),
-      );
-
-    await run();
-    const attributesPuts = () =>
-      gh.calls.filter((c) => methodOf(c.args) === 'PUT' && endpointOf(c.args).includes('.gitattributes'));
-    expect(attributesPuts()).toHaveLength(1);
-
-    await run();
-    expect(attributesPuts()).toHaveLength(1);
-    expect(gh.files.get('.gitattributes')).toBe(`${doc.documentPath} linguist-generated=true -diff\n`);
-  });
-
-  it('never fails the publish when the `.gitattributes` write itself fails', async () => {
-    const doc = makeDoc();
-    const base = fakeGh({ files: { [doc.documentPath]: '{"documentId":"doc-1"}\n' } });
-    // Every call goes through the recorded fake except a PUT to `.gitattributes`,
-    // which fails as e.g. a permissions error or a concurrent-write conflict would.
-    const flaky: GhExecutor = async (args, input) => {
-      const endpoint = endpointOf(args);
-      if (methodOf(args) === 'PUT' && endpoint.endsWith('/contents/.gitattributes')) {
-        return { stdout: JSON.stringify({ message: 'Conflict', status: '409' }), stderr: '', exitCode: 1 };
-      }
-      return base.exec(args, input);
-    };
-    const adapter = createGitHubAdapter(flaky);
-    const store = memoryStore(doc);
-    const publishBody = createPublishBody({ adapter })({
-      documentId: 'doc-1',
-      repo,
-      store,
-      document: doc,
-      json: doc.doc,
-      markdown: MARKDOWN,
-    });
-
-    const { states, logs } = await runBody(publishBody);
-    // The publish itself still reaches `published` — the document and markdown are
-    // committed and verified — even though the presentation nicety failed.
-    expect(states).toEqual(['publishing', 'verifying', 'published']);
-    expect(base.files.has('.gitattributes')).toBe(false);
-    expect(logs.some((l) => l.includes('gitattributes') && l.includes('Conflict'))).toBe(true);
   });
 });

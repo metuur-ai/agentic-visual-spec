@@ -350,7 +350,7 @@ describe('R-7.8 — collaboration availability', () => {
       ['POST', '/start', { documentId: 'doc-1', documentPath: 'a.md' }],
       ['POST', '/open', { documentId: 'doc-1', pullNumber: 7 }],
       ['POST', '/doc-1/sync', {}],
-      ['POST', '/doc-1/publish', { json: {}, markdown: '# x' }],
+      ['POST', '/doc-1/publish', { markdown: '# x' }],
       ['POST', '/doc-1/reconcile', {}],
       ['POST', '/doc-1/ready', {}],
       ['POST', '/doc-1/comments', { comment: 'hi' }],
@@ -634,41 +634,35 @@ describe('R-8.18 / R-8.15 — the 8.4 recovery routes', () => {
  * R-8.9 / R-12.7 — publish payload validation is route-layer
  * ================================================================== */
 describe('R-8.9 / R-12.7 — publish payload validation', () => {
-  it('rejects a payload missing json', async () => {
-    const res = await call(router(), 'POST', '/doc-1/publish', { markdown: '# Title' });
-    expect(res.status).toBe(400);
-    expect((res.json as { error: string }).error).toBe('missing json');
-  });
-
-  it('rejects a payload missing markdown', async () => {
-    const res = await call(router(), 'POST', '/doc-1/publish', { json: { root: {} } });
+  it('rejects a payload missing markdown — R-8.9, markdown is the whole payload', async () => {
+    const res = await call(router(), 'POST', '/doc-1/publish', {});
     expect(res.status).toBe(400);
     expect((res.json as { error: string }).error).toBe('missing markdown');
   });
 
   it('rejects a non-string markdown', async () => {
-    const res = await call(router(), 'POST', '/doc-1/publish', { json: { root: {} }, markdown: 42 });
+    const res = await call(router(), 'POST', '/doc-1/publish', { markdown: 42 });
     expect(res.status).toBe(400);
   });
 
   it('rejects an incomplete payload even with collaboration unconfigured — it is malformed, not unauthorized', async () => {
-    const res = await call(router({ config: () => DISABLED }), 'POST', '/doc-1/publish', { markdown: '# x' });
+    const res = await call(router({ config: () => DISABLED }), 'POST', '/doc-1/publish', {});
     expect(res.status).toBe(400);
   });
 
-  it('starts a publish job when both artifacts are present, passing the bytes through untouched', async () => {
+  it('starts a publish job on markdown alone, passing the bytes through untouched', async () => {
     const publish = vi.fn<CollabJobBodies['publish']>(() => async () => {});
     const r = router({ bodies: { publish } });
-    const res = await call(r, 'POST', '/doc-1/publish', { json: { root: { children: [] } }, markdown: '# Title\n' });
+    const res = await call(r, 'POST', '/doc-1/publish', { markdown: '# Title\n' });
     expect(res.status).toBe(200);
     expect(res.json).toMatchObject({ kind: 'publish' });
     // R-8.12 — the Markdown reaches the body byte-for-byte; nothing parses or rewrites it.
-    expect(publish.mock.calls[0]![0]).toMatchObject({ markdown: '# Title\n', json: { root: { children: [] } } });
+    expect(publish.mock.calls[0]![0]).toMatchObject({ markdown: '# Title\n' });
   });
 
   it('accepts an empty markdown string — emptiness is the body’s business, presence is this layer’s', async () => {
     const publish = vi.fn<CollabJobBodies['publish']>(() => async () => {});
-    const res = await call(router({ bodies: { publish } }), 'POST', '/doc-1/publish', { json: {}, markdown: '' });
+    const res = await call(router({ bodies: { publish } }), 'POST', '/doc-1/publish', { markdown: '' });
     expect(res.status).toBe(200);
   });
 });
@@ -1069,7 +1063,7 @@ describe('role-enforcement seam (task 9.2)', () => {
       bodies: { publish },
       authorize: (op) => (op === 'publish' ? { ok: false, status: 403, error: 'author-only operation' } : { ok: true }),
     });
-    const res = await call(r, 'POST', '/doc-1/publish', { json: {}, markdown: '# x' });
+    const res = await call(r, 'POST', '/doc-1/publish', { markdown: '# x' });
     expect(res.status).toBe(403);
     expect(res.json).toEqual({ error: 'author-only operation' });
     expect(publish).not.toHaveBeenCalled();
@@ -1096,7 +1090,7 @@ describe('role-enforcement seam (task 9.2)', () => {
     await call(r, 'POST', '/start', { documentId: 'doc-2', documentPath: 'a.md' });
     await call(r, 'POST', '/open', { documentId: 'doc-3', pullNumber: 1 });
     await call(r, 'POST', '/doc-1/sync');
-    await call(r, 'POST', '/doc-1/publish', { json: {}, markdown: '' });
+    await call(r, 'POST', '/doc-1/publish', { markdown: '' });
     await call(r, 'POST', '/doc-1/comments', { comment: 'x' });
     await call(r, 'POST', '/doc-1/reconcile', {});
     await call(r, 'POST', '/doc-1/ready', {});

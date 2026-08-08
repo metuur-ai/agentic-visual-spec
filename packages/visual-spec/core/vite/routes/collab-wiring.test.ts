@@ -384,7 +384,7 @@ describe('interval polling is wired by the host (R-8.6)', () => {
  * ================================================================== */
 describe('a body that cannot do its work fails loudly', () => {
   for (const [what, method, path, body] of [
-    ['publish (task 8.3)', 'POST', '/doc-1/publish', { json: { root: {} }, markdown: '# x' }],
+    ['publish (task 8.3)', 'POST', '/doc-1/publish', { markdown: '# x' }],
   ] as const) {
     it(`${what} fails loudly and touches no GitHub endpoint`, async () => {
       const h = host({ responses: CREATE_OK });
@@ -493,12 +493,13 @@ describe('7.2 routes run the 8.3 publish body (integration)', () => {
 
   it('POST /:id/publish commits the payload to the branch and verifies it, with no merge', async () => {
     const doc: CollaborationDocument & { github: Record<string, unknown> } = {
-      ...makeDoc(),
+      // Markdown is the document (LLD §2): publish writes the document's own path.
+      ...makeDoc({ documentPath: 'documents/doc-1.md' }),
       github: { owner: 'acme', repo: 'docs', branch: 'visual-spec/doc-1', pullNumber: 42, resolved: false },
     };
     const documents = memoryDocuments([doc]);
     const jobs = createJobHubRegistry();
-    const gh = contentsReplay({ 'documents/doc-1.json': '{"documentId":"doc-1"}\n' });
+    const gh = contentsReplay({ 'documents/doc-1.md': '# stale\n' });
     const wiring = createCollabWiring({ config: () => ENABLED, documents: () => documents, jobs, exec: gh.exec });
 
     // The wiring supplies it now — before task 8.3 this key was absent and 7.2's
@@ -520,21 +521,16 @@ describe('7.2 routes run the 8.3 publish body (integration)', () => {
       method: 'POST',
       pathname: '/doc-1/publish',
       query: {},
-      body: { json: doc.doc, markdown: '# Onboarding guide\n' },
+      body: { markdown: '# Onboarding guide\n' },
     });
     expect(res.status).toBe(200);
     await settled();
 
+    // One artifact (LLD §7): read-before-write, commit, read-back to verify.
     expect(gh.calls.map((c) => endpointOf(c.args))).toEqual([
-      '/repos/acme/docs/contents/documents/doc-1.json?ref=visual-spec/doc-1',
-      '/repos/acme/docs/contents/documents/doc-1.json',
       '/repos/acme/docs/contents/documents/doc-1.md?ref=visual-spec/doc-1',
       '/repos/acme/docs/contents/documents/doc-1.md',
-      '/repos/acme/docs/contents/documents/doc-1.json?ref=visual-spec/doc-1',
       '/repos/acme/docs/contents/documents/doc-1.md?ref=visual-spec/doc-1',
-      // O-2 — publish also ensures `.gitattributes` on the branch after verifying.
-      '/repos/acme/docs/contents/.gitattributes?ref=visual-spec/doc-1',
-      '/repos/acme/docs/contents/.gitattributes',
     ]);
     expect(gh.files.get('documents/doc-1.md')).toBe('# Onboarding guide\n');
     expect(jobs.hub('doc-1').snapshot().state).toBe('published');

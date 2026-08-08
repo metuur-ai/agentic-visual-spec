@@ -171,8 +171,16 @@ export type StartDocumentInput = Idempotent & {
 
 export type OpenDocumentInput = Idempotent & { documentId: string; pullNumber: number; discardLocal?: boolean };
 
-/** R-8.9 — both fields are required by the route *before* it checks authorization. */
-export type PublishInput = Idempotent & { json: JsonDocument; markdown: string };
+/**
+ * R-8.9 — `markdown` is the whole payload, and the route requires it *before* it checks
+ * authorization. Markdown is the document (LLD §2), so publish commits one artifact and
+ * there is no structured half to send beside it.
+ *
+ * `json` is optional and **ignored by the server**. It survives only because
+ * `ui/publish-payload.ts` and `ui/collab-app.tsx` still produce a JSON+Markdown pair; it
+ * goes when that generator does.
+ */
+export type PublishInput = Idempotent & { json?: JsonDocument; markdown: string };
 
 export interface CollabClient {
   /** `GET /__vs/collab` — R-7.8 availability + the login comments will be attributed to. */

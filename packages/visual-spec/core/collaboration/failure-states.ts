@@ -75,7 +75,7 @@ import type { DocumentStore } from './document-store';
 import type { GitHubAdapter, MergeMethod, PullRequestStatus, RepoRef } from './github-adapter';
 import { type JobBody, type LifecycleState, markStateDecided } from './job-hub';
 import { type BoundCollaborationDocument, branchNameFor } from './lifecycle';
-import { PublishVerificationError, markdownPathFor } from './publish';
+import { PublishVerificationError } from './publish';
 
 import { type ReadinessVerdict, deriveReadiness } from './readiness';
 
@@ -332,7 +332,9 @@ export function withPublishFailureStates(
       const doc = (await input.store.read(input.documentId)) as BoundCollaborationDocument | null;
       const branch = doc?.github?.branch;
       if (doc && branch) {
-        const paths = [doc.documentPath, markdownPathFor(doc.documentPath)];
+        // Publish commits one artifact, at the document's own path (LLD §7), so that
+        // is the only path a base change could legitimately diverge on.
+        const paths = [doc.documentPath];
         const diverged = await detectBaseDivergence({ adapter: input.adapter, repo: input.repo, branch, paths });
         if (diverged.length > 0) {
           // Before the commit, so nothing is written and nothing is resolved for anyone.

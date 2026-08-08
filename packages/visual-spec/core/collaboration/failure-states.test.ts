@@ -41,12 +41,12 @@ import { createGitHubAdapter } from './github-adapter';
 import type { GhExecutor, GhResult } from './github-executor';
 import { type JobEvent, type LifecycleState, createJobHubRegistry } from './job-hub';
 import { type BoundCollaborationDocument, createLifecycleBodies } from './lifecycle';
-import { createPublishBody, gitBlobSha, markdownPathFor } from './publish';
+import { createPublishBody, gitBlobSha } from './publish';
 
 const repo = { owner: 'acme', repo: 'docs', baseBranch: 'main' };
 const BRANCH = 'visual-spec/doc-1';
-const DOC_PATH = 'documents/doc-1.json';
-const MD_PATH = markdownPathFor(DOC_PATH);
+// Markdown is the document (LLD §2): publish commits one artifact, at this path.
+const DOC_PATH = 'documents/doc-1.md';
 const NOW = 1_700_000_000_000;
 
 const ACCEPT_FLAG_VALUE = 'Accept: application/vnd.github+json';
@@ -226,7 +226,7 @@ function fakeGitHub(options: FakeOptions = {}) {
         threads.map((t) => ({
           id: t.id,
           in_reply_to_id: null,
-          path: MD_PATH,
+          path: DOC_PATH,
           line: 3,
           start_line: null,
           original_line: 3,
@@ -353,7 +353,7 @@ function project(threads: FakeThread[], options: { resolutionRead?: boolean } = 
     threads.map((t) => ({
       id: t.id,
       inReplyToId: null,
-      path: MD_PATH,
+      path: DOC_PATH,
       line: 3,
       startLine: null,
       originalLine: 3,
@@ -711,25 +711,25 @@ describe('orphaned branch cleanup (R-8.18)', () => {
 
 describe('base divergence (R-8.22)', () => {
   it('names only the generated paths that moved on base since the branch point', async () => {
-    const gh = fakeGitHub({ baseChanged: ['README.md', MD_PATH] });
+    const gh = fakeGitHub({ baseChanged: ['README.md', DOC_PATH] });
     const diverged = await detectBaseDivergence({
       adapter: createGitHubAdapter(gh.exec),
       repo,
       branch: BRANCH,
-      paths: [DOC_PATH, MD_PATH],
+      paths: [DOC_PATH],
     });
-    expect(diverged).toEqual([MD_PATH]);
+    expect(diverged).toEqual([DOC_PATH]);
     // The comparison is branch...base, which is what asks about the branch point.
     expect(gh.endpoints()).toEqual([`GET /repos/acme/docs/compare/${BRANCH}...main`]);
   });
 
   it('aborts publish BEFORE the commit and records `base-diverged`', async () => {
-    const gh = fakeGitHub({ baseChanged: [MD_PATH], files: { [DOC_PATH]: '{}\n' } });
+    const gh = fakeGitHub({ baseChanged: [DOC_PATH], files: { [DOC_PATH]: '{}\n' } });
     const adapter = createGitHubAdapter(gh.exec);
     const store = memoryStore(BOUND());
     const { hub, frames } = hubRig();
     const body = withPublishFailureStates(
-      createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, json: { root: {} }, markdown: '# x\n' }),
+      createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, markdown: '# x\n' }),
       { adapter, repo, store, documentId: 'doc-1', checkBaseDivergence: true },
     );
     hub.start({ kind: 'publish', run: body });
@@ -743,14 +743,14 @@ describe('base divergence (R-8.22)', () => {
   });
 
   it('is off by default, so publish still reads only the PR branch', async () => {
-    const gh = fakeGitHub({ baseChanged: [MD_PATH], files: { [DOC_PATH]: '{}\n' } });
+    const gh = fakeGitHub({ baseChanged: [DOC_PATH], files: { [DOC_PATH]: '{}\n' } });
     const adapter = createGitHubAdapter(gh.exec);
     const store = memoryStore(BOUND());
     const { hub } = hubRig();
     hub.start({
       kind: 'publish',
       run: withPublishFailureStates(
-        createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, json: { root: {} }, markdown: '# x\n' }),
+        createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, markdown: '# x\n' }),
         { adapter, repo, store, documentId: 'doc-1' },
       ),
     });
@@ -763,7 +763,7 @@ describe('base divergence (R-8.22)', () => {
     const publishWith = async (options: { diverged: boolean }) => {
       const gh = fakeGitHub({
         files: { [DOC_PATH]: '{}\n' },
-        ...(options.diverged ? { baseChanged: [MD_PATH] } : { corruptOnRead: (p) => (p === MD_PATH ? '# tampered\n' : null) }),
+        ...(options.diverged ? { baseChanged: [DOC_PATH] } : { corruptOnRead: (p) => (p === DOC_PATH ? '# tampered\n' : null) }),
       });
       const adapter = createGitHubAdapter(gh.exec);
       const store = memoryStore(BOUND());
@@ -771,7 +771,7 @@ describe('base divergence (R-8.22)', () => {
       hub.start({
         kind: 'publish',
         run: withPublishFailureStates(
-          createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, json: { root: {} }, markdown: '# x\n' }),
+          createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, markdown: '# x\n' }),
           { adapter, repo, store, documentId: 'doc-1', checkBaseDivergence: true },
         ),
       });
@@ -798,14 +798,14 @@ describe('base divergence (R-8.22)', () => {
 
 describe('verification failure (R-8.21)', () => {
   it('records `verification-failed`, and no merge follows', async () => {
-    const gh = fakeGitHub({ files: { [DOC_PATH]: '{}\n' }, corruptOnRead: (p) => (p === MD_PATH ? '# tampered\n' : null) });
+    const gh = fakeGitHub({ files: { [DOC_PATH]: '{}\n' }, corruptOnRead: (p) => (p === DOC_PATH ? '# tampered\n' : null) });
     const adapter = createGitHubAdapter(gh.exec);
     const store = memoryStore(BOUND());
     const { hub, frames } = hubRig();
     hub.start({
       kind: 'publish',
       run: withPublishFailureStates(
-        createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, json: { root: {} }, markdown: '# x\n' }),
+        createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, markdown: '# x\n' }),
         { adapter, repo, store, documentId: 'doc-1' },
       ),
     });
@@ -814,8 +814,8 @@ describe('verification failure (R-8.21)', () => {
     expect(hub.snapshot().state).toBe<LifecycleState>('verification-failed');
     expect(statesIn(frames)).toEqual(['publishing', 'verifying', 'verification-failed']);
     expect(gh.endpoints().filter((e) => e.endsWith('/merge'))).toEqual([]);
-    // R-8.21 — nothing regenerated, nothing overwritten: exactly the two publish PUTs.
-    expect(gh.endpoints().filter((e) => e.startsWith('PUT '))).toHaveLength(2);
+    // R-8.21 — nothing regenerated, nothing overwritten: exactly the one publish PUT.
+    expect(gh.endpoints().filter((e) => e.startsWith('PUT '))).toHaveLength(1);
   });
 
   it('leaves a state a later sync reconciles rather than a dead end (R-8.24)', async () => {
@@ -823,7 +823,7 @@ describe('verification failure (R-8.21)', () => {
       files: { [DOC_PATH]: '{}\n' },
       threads: [thread(700001)],
       pull: { number: 42, state: 'open', merged: false, mergeable: true },
-      corruptOnRead: (p) => (p === MD_PATH ? '# tampered\n' : null),
+      corruptOnRead: (p) => (p === DOC_PATH ? '# tampered\n' : null),
     });
     const adapter = createGitHubAdapter(gh.exec);
     const store = memoryStore(BOUND());
@@ -831,7 +831,7 @@ describe('verification failure (R-8.21)', () => {
     hub.start({
       kind: 'publish',
       run: withPublishFailureStates(
-        createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, json: { root: {} }, markdown: '# x\n' }),
+        createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, markdown: '# x\n' }),
         { adapter, repo, store, documentId: 'doc-1' },
       ),
     });
@@ -1021,7 +1021,7 @@ async function runPublish(options: FakeOptions & { checkBaseDivergence?: boolean
   hub.start({
     kind: 'publish',
     run: withPublishFailureStates(
-      createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, json: { root: {} }, markdown: '# x\n' }),
+      createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, markdown: '# x\n' }),
       { adapter, repo, store, documentId: 'doc-1', ...(options.checkBaseDivergence ? { checkBaseDivergence: true } : {}) },
     ),
   });
@@ -1077,7 +1077,7 @@ const FAILURE_MATRIX: MatrixRow[] = [
   {
     step: 'publish — committed blob does not match the payload',
     requirement: 'R-8.21',
-    run: () => runPublish({ corruptOnRead: (p) => (p === MD_PATH ? '# tampered\n' : null), comments: [], pull: { ...OPEN_PULL } }),
+    run: () => runPublish({ corruptOnRead: (p) => (p === DOC_PATH ? '# tampered\n' : null), comments: [], pull: { ...OPEN_PULL } }),
     state: 'verification-failed',
     reconciled: 'ready',
     forbidden: ['PUT /repos/acme/docs/pulls/42/merge'],
@@ -1085,7 +1085,7 @@ const FAILURE_MATRIX: MatrixRow[] = [
   {
     step: 'publish — base moved the generated path',
     requirement: 'R-8.22',
-    run: () => runPublish({ baseChanged: [MD_PATH], checkBaseDivergence: true, comments: [], pull: { ...OPEN_PULL } }),
+    run: () => runPublish({ baseChanged: [DOC_PATH], checkBaseDivergence: true, comments: [], pull: { ...OPEN_PULL } }),
     state: 'base-diverged',
     reconciled: 'ready',
     forbidden: ['PUT /repos/acme/docs/contents/documents/doc-1.md'],
@@ -1168,15 +1168,14 @@ describe('failure injection matrix (R-8.24)', () => {
     const adapter = createGitHubAdapter(gh.exec);
     const store = memoryStore(BOUND());
     const { hub } = hubRig();
-    const body = () => createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, json: { root: {} }, markdown: '# x\n' });
+    const body = () => createPublishBody({ adapter })({ documentId: 'doc-1', repo, store, markdown: '# x\n' });
 
     hub.start({ kind: 'publish', run: body(), idempotencyKey: 'k-pub' });
     await settled();
     hub.start({ kind: 'publish', run: body(), idempotencyKey: 'k-pub' });
     await settled();
-    // The dedup (R-8.23) means the body runs once: two document artifacts (json +
-    // markdown) plus O-2's `.gitattributes` entry, three PUTs total.
-    expect(gh.endpoints().filter((e) => e.startsWith('PUT /repos/acme/docs/contents/'))).toHaveLength(3);
+    // The dedup (R-8.23) means the body runs once, and publish commits one artifact.
+    expect(gh.endpoints().filter((e) => e.startsWith('PUT /repos/acme/docs/contents/'))).toHaveLength(1);
   });
 
   it('names the four failure states, and every row reconciles to a state derived from GitHub', () => {
@@ -1301,8 +1300,8 @@ describe('typed failures', () => {
     const refused = new MergeRefusedError('doc-1', 'base-conflict', 'nope');
     expect(refused).toMatchObject({ name: 'MergeRefusedError', reason: 'base-conflict', verdict: null });
 
-    const diverged = new BaseDivergedError({ documentId: 'doc-1', branch: BRANCH, baseBranch: 'main', paths: [MD_PATH] });
-    expect(diverged).toMatchObject({ name: 'BaseDivergedError', paths: [MD_PATH] });
+    const diverged = new BaseDivergedError({ documentId: 'doc-1', branch: BRANCH, baseBranch: 'main', paths: [DOC_PATH] });
+    expect(diverged).toMatchObject({ name: 'BaseDivergedError', paths: [DOC_PATH] });
     expect(diverged).toBeInstanceOf(Error);
   });
 });

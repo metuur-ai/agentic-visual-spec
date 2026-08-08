@@ -13,33 +13,32 @@
  * overwriting). Verifying immediately after the commit catches a mismatch while it is
  * still confined to the PR branch, which is exactly where a human can look at it.
  *
- * **Merge is deliberately not part of publish.** Publishing writes the final artifacts
+ * **Merge is deliberately not part of publish.** Publishing writes the final artifact
  * to the PR branch and stops; merging happens on github.com where the reviewers already
  * are. That removes the irreversible half of the write primitive from an unauthenticated
  * localhost endpoint at no cost to the workflow. `adapter.mergePullRequest` exists and is
  * never called from this module — `publish.test.ts` asserts no merge endpoint is reached.
  *
  * ---------------------------------------------------------------------------
- * WHAT GETS COMMITTED, AND WHERE
+ * WHAT GETS COMMITTED, AND WHERE — ONE ARTIFACT (LLD §7)
  * ---------------------------------------------------------------------------
- * Two artifacts, both derived from `document.documentPath` so nothing has to be stored
- * to find them again:
+ * Markdown is the document (LLD §2), so publish commits exactly **one** artifact: the
+ * client's Markdown bytes at `document.documentPath`. There is no second, generated file
+ * and no derived path — nothing has to be stored or recomputed to find what was written,
+ * because the document's own path is where it lives.
  *
- *   - the canonical JSON at `document.documentPath` (`documents/<id>.json`) — the
- *     envelope the 3.1 stores read, with the client's payload installed as `doc`;
- *   - the generated Markdown at `markdownPathFor(document.documentPath)`, i.e. the same
- *     path with `.json` swapped for `.md` (`documents/<id>.md`).
- *
- * The Markdown path is a pure function of the document path, so task 11.x and the
- * changelog read it back with `markdownPathFor` rather than a persisted field that could
- * drift from the branch it claims to describe.
+ * Publish used to commit two artifacts (a canonical JSON envelope plus a generated `.md`
+ * beside it) and to mark the JSON `linguist-generated` in `.gitattributes` so reviewers
+ * were not shown a wall of machine diff. With one human-readable artifact there is no
+ * generated file to hide, so that upkeep — and the module that did it — is gone.
  *
  * ---------------------------------------------------------------------------
  * VERIFICATION: RE-READ THE BLOB, DO NOT TRUST THE WRITE'S OWN ECHO (R-8.10 / R-8.11)
  * ---------------------------------------------------------------------------
- * After both commits, each path is read back off the branch with `getFile` and checked
- * two ways: the returned content must equal the bytes we sent, and the blob sha GitHub
+ * After the commit, the path is read back off the branch with `getFile` and checked two
+ * ways: the returned content must equal the bytes we sent, and the blob sha GitHub
  * reports for it must equal `gitBlobSha(bytes)` computed here with `node:crypto`.
+ * Dropping the second artifact does not relax either check on the one that remains.
  *
  * The cheaper alternative — comparing `gitBlobSha(bytes)` against the `contentSha` the
  * `PUT /contents` response already carried — is one fewer round trip and is rejected on
@@ -78,19 +77,19 @@
  * subscriber closing its SSE stream only removes a sink — it does not abort anything. A
  * publish that has been accepted must reach a decided state (published or failed) even
  * with nobody watching: a half-published branch that nothing verified is the one outcome
- * this task exists to prevent. Publish is at most six `gh api` calls, so there is no long
+ * this task exists to prevent. Publish is at most four `gh api` calls, so there is no long
  * step for an abort check to shorten anyway.
  *
  * ---------------------------------------------------------------------------
  * ROOM FOR BASE DIVERGENCE (R-8.22 — task 8.4)
  * ---------------------------------------------------------------------------
  * Base divergence is a *distinct* state from verification failure: if base gained a
- * change to the same generated path after the branch point, the merge legitimately
- * produces different content, and reporting that as a verification failure would fire an
- * integrity alarm on a correct outcome. So:
+ * change to the same path after the branch point, the merge legitimately produces
+ * different content, and reporting that as a verification failure would fire an integrity
+ * alarm on a correct outcome. So:
  *   - this module reads only the PR branch, never `repo.baseBranch`. It cannot mistake
  *     one for the other because it never looks;
- *   - the read-before-write already fetches each target path's current blob on the
+ *   - the read-before-write already fetches the target path's current blob on the
  *     branch, which is the exact input a base comparison needs — 8.4 adds a
  *     `getFile(repo, path, repo.baseBranch)` beside it and throws its own error type
  *     *before* the commit;
@@ -102,14 +101,11 @@
  */
 import { createHash } from 'node:crypto';
 import type { ResolvedCollaborationConfig } from '../config';
-import type { CollaborationDocument, JsonDocument } from './document-protocol';
-import { serializeCollaborationDocument } from './document-protocol';
+import type { CollaborationDocument } from './document-protocol';
 import type { DocumentStore } from './document-store';
-import { ensureLinguistGeneratedEntry } from './gitattributes';
 import type { GitHubAdapter, RepoRef } from './github-adapter';
 import type { JobBody } from './job-hub';
 import type { BoundCollaborationDocument } from './lifecycle';
-import { documentContentSha } from './lifecycle';
 
 /**
  * Git's blob object hash: `sha1("blob " + byteLength + "\0" + content)`. Computed here,
@@ -120,15 +116,6 @@ import { documentContentSha } from './lifecycle';
 export function gitBlobSha(content: string): string {
   const bytes = Buffer.from(content, 'utf8');
   return createHash('sha1').update(`blob ${bytes.byteLength}\0`).update(bytes).digest('hex');
-}
-
-/**
- * Where the generated Markdown for a document lives: the canonical JSON path with
- * `.json` swapped for `.md`. A pure function of the document path, so task 11.x and the
- * changelog derive it instead of reading a stored field (R-8.13).
- */
-export function markdownPathFor(documentPath: string): string {
-  return documentPath.endsWith('.json') ? `${documentPath.slice(0, -'.json'.length)}.md` : `${documentPath}.md`;
 }
 
 /**
@@ -170,16 +157,11 @@ export type PublishBodyInput = {
   store: DocumentStore;
   /** The route's already-loaded document. Re-read from `store` when absent or null. */
   document?: CollaborationDocument | null;
-  /** The structured document, exactly as received. Never re-derived server-side. */
-  json: unknown;
-  /** R-8.12 — opaque bytes, committed verbatim. */
+  /** R-8.9 / R-8.12 — the whole payload: opaque bytes, committed verbatim. */
   markdown: string;
 };
 
 export type PublishBodyOptions = { adapter: GitHubAdapter };
-
-/** One thing publish writes and then checks. */
-type Artifact = { label: string; path: string; content: string };
 
 /**
  * The `publish` body factory, in the shape 7.2's `CollabJobBodies` declares. Hand it to
@@ -196,7 +178,6 @@ export function createPublishBody(options: PublishBodyOptions): (input: PublishB
     // R-8.9 — the route validates this first and rejects with 400 (R-12.7), so this is
     // reached only by a caller that bypassed it. Kept because the body is exported on
     // its own and a bad payload must not be committed under any entrypoint.
-    if (input.json === undefined || input.json === null) throw new Error('publish: missing json');
     if (typeof input.markdown !== 'string') throw new Error('publish: missing markdown');
 
     ctx.setState('publishing');
@@ -208,84 +189,46 @@ export function createPublishBody(options: PublishBodyOptions): (input: PublishB
     const branch = doc.github?.branch;
     if (!branch) throw new Error(`no collaboration branch for ${documentId}`);
 
-    const markdownPath = markdownPathFor(doc.documentPath);
-    /** What the branch will hold. Committed below, and — once verified — stored locally. */
-    const published = { ...doc, doc: input.json as JsonDocument };
-    const artifacts: Artifact[] = [
-      // The canonical JSON keeps its envelope — the 3.1 stores parse it — with the
-      // client's payload installed as `doc`. `serializeCollaborationDocument` is a
-      // deterministic stringify, so the bytes are still a pure function of what arrived.
-      { label: 'json', path: doc.documentPath, content: serializeCollaborationDocument(published) },
-      { label: 'markdown', path: markdownPath, content: input.markdown },
-    ];
+    /** The one artifact: the client's bytes, at the document's own path. */
+    const path = doc.documentPath;
+    const content = input.markdown;
 
     // Contents API only — a `git add` would apply `.gitattributes` CRLF normalization
     // and break byte verification permanently (LLD §7). No git subprocess exists here.
-    for (const artifact of artifacts) {
-      // Read-before-write: the Contents API needs the blob being replaced. This is also
-      // where 8.4's base-divergence check goes (see the header, R-8.22).
-      const existing = await adapter.getFile(repoRef, artifact.path, branch);
-      ctx.log(`committing ${artifact.label} to ${artifact.path} on ${branch}`, 'progress');
-      await adapter.commitFile(repoRef, {
-        path: artifact.path,
-        content: artifact.content,
-        message: `visual-spec: publish ${documentId} (${artifact.label})`,
-        branch,
-        ...(existing ? { sha: existing.sha } : {}),
-      });
-    }
+    //
+    // Read-before-write: the Contents API needs the blob being replaced. This is also
+    // where 8.4's base-divergence check goes (see the header, R-8.22).
+    const existing = await adapter.getFile(repoRef, path, branch);
+    ctx.log(`committing markdown to ${path} on ${branch}`, 'progress');
+    await adapter.commitFile(repoRef, {
+      path,
+      content,
+      message: `visual-spec: publish ${documentId}`,
+      branch,
+      ...(existing ? { sha: existing.sha } : {}),
+    });
 
     ctx.setState('verifying');
 
-    for (const artifact of artifacts) {
-      const expectedSha = gitBlobSha(artifact.content);
-      const committed = await adapter.getFile(repoRef, artifact.path, branch);
-      // Content first, then sha: the content comparison is the one that names the
-      // requirement (R-8.10), the sha closes the utf-8 decoding gap over raw bytes.
-      if (!committed || committed.content !== artifact.content || committed.sha !== expectedSha) {
-        // R-8.21 — abort. Nothing is regenerated and nothing is overwritten.
-        throw new PublishVerificationError({
-          path: artifact.path,
-          branch,
-          expectedSha,
-          actualSha: committed?.sha ?? null,
-        });
-      }
-      ctx.log(`verified ${artifact.label} at ${artifact.path} — blob ${expectedSha}`, 'progress');
+    const expectedSha = gitBlobSha(content);
+    const committed = await adapter.getFile(repoRef, path, branch);
+    // Content first, then sha: the content comparison is the one that names the
+    // requirement (R-8.10), the sha closes the utf-8 decoding gap over raw bytes.
+    if (!committed || committed.content !== content || committed.sha !== expectedSha) {
+      // R-8.21 — abort. Nothing is regenerated and nothing is overwritten.
+      throw new PublishVerificationError({
+        path,
+        branch,
+        expectedSha,
+        actualSha: committed?.sha ?? null,
+      });
     }
-
-    /*
-     * The local copy has to become what the branch now holds. Publish took the payload
-     * straight from the editor to GitHub and never told the store, so `store.read` kept
-     * answering with the pre-publish envelope: the reviewer pane, which renders the store
-     * and not the branch, showed an empty document immediately after a successful publish,
-     * and stayed that way until an `open` refetched. The bytes are already decided — this
-     * writes the same `published` value the verified JSON artifact was serialized from,
-     * so the local copy cannot drift from what was committed.
-     *
-     * A failure here does not fail the publish. The commits landed and were byte-verified;
-     * saying "publish failed" because a local write did would be false, and the next open
-     * or sync repairs the copy from the branch. It is logged rather than swallowed, so the
-     * divergence is visible instead of silent.
-     */
-    try {
-      // R-11.6 — the bytes were verified onto the branch above, so local and branch agree
-      // here and nowhere else in this body. The hash is over the same value that was
-      // serialized into the committed artifact.
-      await store.write({ ...published, github: { ...published.github, contentSha: documentContentSha(published) } });
-    } catch (err) {
-      ctx.log(`published, but the local copy could not be updated: ${(err as Error).message}`, 'error');
-    }
-
-    // O-2 — best effort, never allowed to fail the publish (see gitattributes.ts).
-    // Runs after verification, on the same PR head branch the artifacts just landed
-    // on, so a reviewer opening the PR sees the JSON diff already collapsed.
-    await ensureLinguistGeneratedEntry({ adapter, repo: repoRef, branch, documentPath: doc.documentPath, log: ctx.log });
+    ctx.log(`verified markdown at ${path} — blob ${expectedSha}`, 'progress');
 
     // R-8.13 — the Markdown is on the branch and readable by the same `getFile` the
     // verification step just used, so an agent can build the PR summary and changelog.
     // R-8.10 — publish stops here. Merge happens on github.com.
-    ctx.log(`published ${documentId} to ${branch} — markdown at ${markdownPath}; merge on github.com`);
+    ctx.log(`published ${documentId} to ${branch} — markdown at ${path}; merge on github.com`);
     ctx.setState('published');
   };
 }
