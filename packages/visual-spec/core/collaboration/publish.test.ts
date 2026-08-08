@@ -20,6 +20,8 @@ import type { GhExecutor, GhResult } from './github-executor';
 import { type JobEvent, type LifecycleState, type SseSink, createJobHubRegistry } from './job-hub';
 import type { BoundCollaborationDocument } from './lifecycle';
 import { PublishVerificationError, createPublishBody, gitBlobSha, markdownPathFor } from './publish';
+import { documentContentSha } from './lifecycle';
+import { serializeCollaborationDocument } from './document-protocol';
 
 const repo = { owner: 'acme', repo: 'docs', baseBranch: 'main' };
 const BRANCH = 'visual-spec/doc-1';
@@ -476,6 +478,85 @@ describe('R-8.9 — publish requires json AND markdown', () => {
     await runBody(body);
     expect(store.reads).toEqual(['doc-1']);
     expect(gh.files.get('documents/doc-1.md')).toBe(MARKDOWN);
+  });
+
+  /*
+   * Publish took the editor's payload to GitHub and never told the local store, so
+   * `store.read` kept answering with the pre-publish envelope. The reviewer pane renders
+   * the store rather than the branch, so a successful publish was immediately followed by
+   * an empty document on screen — and it stayed empty until an `open` refetched it.
+   * Asserted against the bytes that were verified onto the branch, not against the input,
+   * so the local copy provably cannot drift from what was committed.
+   */
+  it('writes the published document back to the local store, so the copy matches the branch', async () => {
+    const doc = makeDoc();
+    const gh = fakeGh({ files: { 'documents/doc-1.json': '{}\n' } });
+    const store = memoryStore(doc);
+    const publishedJson = { root: { type: 'root', version: 1, children: [{ type: 'paragraph', version: 1, children: [] }] } };
+    const body = createPublishBody({ adapter: createGitHubAdapter(gh.exec) })({
+      documentId: 'doc-1',
+      repo,
+      store,
+      document: doc,
+      json: publishedJson as typeof doc.doc,
+      markdown: MARKDOWN,
+    });
+
+    await runBody(body);
+
+    const local = await store.read('doc-1');
+    expect(local?.doc).toEqual(publishedJson);
+    // The committed JSON is the serialization of that same value — no second source.
+    expect(gh.files.get('documents/doc-1.json')).toBe(serializeCollaborationDocument({ ...doc, doc: publishedJson as typeof doc.doc }));
+  });
+
+  /*
+   * R-11.6 — publish is the moment local and branch provably agree, and the only one
+   * inside this body. Recording the hash here is what later lets `open` tell a stale copy
+   * from one an agent moved on: without it, every copy looks the same and the refresh
+   * that destroys unpublished work cannot be distinguished from the refresh that fixes a
+   * stale one.
+   */
+  it('seals the local copy with the content hash of what it verified onto the branch', async () => {
+    const doc = makeDoc();
+    const gh = fakeGh({ files: { 'documents/doc-1.json': '{}\n' } });
+    const store = memoryStore(doc);
+    const body = createPublishBody({ adapter: createGitHubAdapter(gh.exec) })({
+      documentId: 'doc-1',
+      repo,
+      store,
+      document: doc,
+      json: doc.doc,
+      markdown: MARKDOWN,
+    });
+
+    await runBody(body);
+
+    const local = (await store.read('doc-1')) as CollaborationDocument & { github?: { contentSha?: string } };
+    expect(local.github?.contentSha).toBe(documentContentSha(local));
+  });
+
+  it('still publishes when the local write fails — the commits landed and were verified', async () => {
+    const doc = makeDoc();
+    const gh = fakeGh({ files: { 'documents/doc-1.json': '{}\n' } });
+    const store = memoryStore(doc);
+    store.write = async () => {
+      throw new Error('disk full');
+    };
+    const body = createPublishBody({ adapter: createGitHubAdapter(gh.exec) })({
+      documentId: 'doc-1',
+      repo,
+      store,
+      document: doc,
+      json: doc.doc,
+      markdown: MARKDOWN,
+    });
+
+    const run = await runBody(body);
+
+    expect(gh.files.get('documents/doc-1.md')).toBe(MARKDOWN);
+    expect(run.states).toContain('published');
+    expect(run.logs.some((l) => l.includes('the local copy could not be updated'))).toBe(true);
   });
 });
 

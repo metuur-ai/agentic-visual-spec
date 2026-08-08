@@ -22,5 +22,14 @@ const commentsFile = isAbsolute(contentDir)
 export default defineConfig({
   define: { __APP_VERSION__: JSON.stringify(pkgVersion) },
   plugins: [react(), ...visualSpecMarkdown({ contentDir, commentsFile })],
+  // Lexical must be ONE module instance in the page, or every editor is a stranger to
+  // every other one: Lexical stamps `LexicalEditor.version` per module copy and refuses
+  // to talk across copies (error #195), which shows up as an editor that renders and
+  // then ignores every keystroke — no update listener, so `dirty` never flips and
+  // Publish stays disabled forever. Two copies is the default here, not a fluke:
+  // `@lexical/*` and `@lyfie/luthor-headless` sit in the workspace pnpm store and
+  // resolve `lexical` there, while `ui/node-id-extension.ts` resolves it from this
+  // package's own node_modules. Same version, two files, two instances.
+  resolve: { dedupe: ['lexical'] },
   build: { outDir: 'dist/ui', emptyOutDir: true },
 });

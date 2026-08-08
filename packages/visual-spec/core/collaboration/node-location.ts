@@ -90,3 +90,19 @@ export function resolveNodeIn(doc: CollaborationDocument, nodeId: string): NodeR
   if (!root || typeof root !== 'object') return { found: false };
   return walk(root as Record<string, unknown>, []);
 }
+
+/**
+ * Where this store keeps a document, relative to its base directory.
+ *
+ * Split out because a second caller needs the same answer and must not guess it: the
+ * prompt that hands comments to an agent has to name the file the agent will edit, and
+ * the agent runs with the base directory as its cwd. The obvious candidate,
+ * `document.documentPath`, is the path on the BRANCH — the same string today only
+ * because the create form builds it the same way, and a document created through the API
+ * with any other path would send the agent to a file that does not exist locally.
+ *
+ * Pure and node-free on purpose: the browser builds that prompt.
+ */
+export function localDocumentPath(documentId: string, documentsDir = 'documents'): string {
+  return `${documentsDir}/${documentId}.json`;
+}

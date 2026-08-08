@@ -18,6 +18,7 @@ import {
   buildPullRequestBody,
   createLifecycle,
   openCommandFor,
+  documentContentSha,
   readGitHubBinding,
 } from './lifecycle';
 
@@ -188,6 +189,8 @@ describe('createLifecycle.start (R-8.5)', () => {
       pullNumber: 42,
       headSha: '9f8e7d6c5b4a39281706f5e4d3c2b1a098765432',
       resolved: false,
+      // R-11.6 — create commits the document it just wrote, so local and branch agree here.
+      contentSha: documentContentSha((await h.store.read('doc-1')) as CollaborationDocument),
     });
   });
 

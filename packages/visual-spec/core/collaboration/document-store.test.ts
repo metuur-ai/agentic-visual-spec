@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CollaborationDocument } from './document-protocol';
-import { DOCUMENT_ID_RE, type DocumentStore, fsDocumentStore, resolveNodeIn } from './document-store';
+import { DOCUMENT_ID_RE, type DocumentStore, fsDocumentStore, localDocumentPath, resolveNodeIn } from './document-store';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -213,5 +213,36 @@ describe('resolveNodeIn — NodeState `$` key (task 2.1 seam)', () => {
 
   it('still reports an unknown id as unresolved rather than throwing', () => {
     expect(resolveNodeIn(withState(), 'n-missing')).toEqual({ found: false });
+  });
+});
+
+/*
+ * The convention had one definition inline in `fsDocumentStore`, and then a second caller
+ * appeared that must agree with it exactly: the prompt handing comments to an agent has to
+ * name the file the agent will edit, and the agent runs with the store's base directory as
+ * its cwd. The obvious field to reach for, `document.documentPath`, is the path on the
+ * BRANCH — identical today only because the create form builds it the same way. These pin
+ * that the store and the prompt derive from the same function, so they cannot drift.
+ */
+describe('localDocumentPath — one definition of where a document lives', () => {
+  it('is the path fsDocumentStore actually writes to', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'vs-doc-path-'));
+    const store = fsDocumentStore(dir);
+    await store.write({
+      documentId: 'guia',
+      documentPath: 'a/completely/different/path.json',
+      title: 'x',
+      frontmatter: {},
+      nodes: [],
+      doc: { root: {} },
+    } as CollaborationDocument);
+
+    // Written where the convention says, NOT where `documentPath` claims.
+    await expect(readFile(join(dir, localDocumentPath('guia')), 'utf8')).resolves.toContain('"documentId"');
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('honours a non-default documents directory', () => {
+    expect(localDocumentPath('guia', 'specs')).toBe('specs/guia.json');
   });
 });

@@ -56,6 +56,7 @@
  * Node-reachable from the CLI: node builtins and sibling core modules only — no
  * `@lyfie/luthor`, no react (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
  */
+import { createHash } from 'node:crypto';
 import type { ResolvedCollaborationConfig } from '../config';
 import { type ProjectedCommentRecord, formatTrailer, githubCommentStore } from './comment-projection';
 import type { CollaborationDocument, GitHubBinding } from './document-protocol';
@@ -105,9 +106,26 @@ const defaultScheduler: IntervalScheduler = (tick, ms) => {
   return () => clearInterval(handle);
 };
 
+/**
+ * R-11.6 — the document's content hash: what "local and branch agree" is measured against.
+ *
+ * The binding is excluded, and that is the whole trick. The branch carries the binding as
+ * it was published (`resolved`, `headSha`, `pullNumber`); `open` writes a freshly built
+ * one. Their bytes therefore never match even when the prose is identical, so hashing the
+ * envelope whole would report divergence on every document, always. What is compared is
+ * the part a person or an agent can change.
+ *
+ * `serializeCollaborationDocument` is a deterministic stringify, so this is a pure
+ * function of the content and stable across processes.
+ */
+export function documentContentSha(document: CollaborationDocument): string {
+  const { github: _binding, ...content } = document as CollaborationDocument & { github?: unknown };
+  return createHash('sha1').update(serializeCollaborationDocument(content as CollaborationDocument), 'utf8').digest('hex');
+}
+
 export type LifecycleOptions = {
   adapter: GitHubAdapter;
-  /** R-9.4 — owner / repo / base branch. */
+/** R-9.4 — owner / repo / base branch. */
   repo: ResolvedCollaborationConfig;
   store: DocumentStore;
   hubs: JobHubRegistry;
@@ -315,7 +333,8 @@ export function createLifecycleBodies(options: LifecycleBodyOptions): LifecycleJ
         headSha: pr.headSha,
         resolved: false,
       };
-      await store.write({ ...doc, github });
+      // R-11.6 — the branch now holds exactly `doc`, so this is a point of agreement.
+      await store.write({ ...doc, github: { ...github, contentSha: documentContentSha(doc) } });
 
       ctx.log(`pull request #${pr.number} open at ${pr.headSha} — ${pr.htmlUrl}`);
       ctx.setState('pr-open');

@@ -10,6 +10,7 @@
  * This is the STATIC layer (TypeScript sources, no build needed). The complementary
  * BUILD-OUTPUT layer is `npm run check:bundle`, which greps the emitted bundles.
  */
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -46,5 +47,25 @@ describe('Node-reachable import graph (R-12.6, R-3.3)', () => {
   // graph, which legitimately owns Luthor and React, must trip the same check.
   it('detects a forbidden import when one genuinely exists (ui/luthor-bridge.ts)', () => {
     expect(forbiddenPaths('ui/luthor-bridge.ts').join('\n')).toContain('@lyfie/luthor');
+  });
+});
+
+/*
+ * The prompt that hands review comments to an agent names the document as a path relative
+ * to the store's base directory (`localDocumentPath`), and the agent is spawned with the
+ * apply hub's `cwd`. Those are two different expressions in two different hosts, and they
+ * only agree because each host derives both from one variable. Let them drift and the
+ * agent opens a file that is not there — or worse, one that is.
+ */
+describe('the agent runs where the documents are', () => {
+  const HOSTS = ['src/server.ts', 'core/vite/md-plugin.ts'];
+
+  it.each(HOSTS)('%s spawns apply in the same directory it stores documents in', (host) => {
+    const source = readFileSync(resolve(pkgRoot, host), 'utf8');
+    const cwd = /createApplyHub\(\(\) => \(\{ cwd: (\w+)/.exec(source)?.[1];
+    const base = /fsDocumentStore\((\w+)\)/.exec(source)?.[1];
+    expect(cwd).toBeDefined();
+    expect(base).toBeDefined();
+    expect(cwd).toBe(base);
   });
 });

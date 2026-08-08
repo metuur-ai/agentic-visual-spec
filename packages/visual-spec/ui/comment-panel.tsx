@@ -71,13 +71,26 @@ export type CommentPanelSource = {
    */
   reply?: (id: string, text: string) => Promise<void>;
   /**
+   * Undo what `remove` did, from the History tab. Collaboration only, for the same reason
+   * `reply` is: resolution there is a marker reply that accumulates (R-5.14), so reopening
+   * a thread is an ordinary, reversible act. Local mode's `remove` deletes the sidecar
+   * record — there is nothing left to restore — so it leaves this unset and History renders
+   * read-only, exactly as before.
+   */
+  restore?: (id: string) => Promise<void>;
+  /**
    * What `remove` actually does, for the row's label and confirm copy. Local mode
    * deletes the sidecar record, so the default reads "Delete". Collaboration has no
    * delete route — GitHub is the system of record (R-5.2) and `remove` marks the
    * comment applied — so calling that button "Delete" would name an act the system
    * never performs.
+   *
+   * `icon` exists because the wording alone was not enough: the button read "Resolve"
+   * in its tooltip and drew a red trash can, which is the one symbol everybody reads as
+   * "this is gone". A reviewer resolving a thread was being shown a destructive act.
+   * Defaults to the trash, so local mode is untouched.
    */
-  removeVerb?: { action: string; confirm: string };
+  removeVerb?: { action: string; confirm: string; icon?: 'trash' | 'check' };
 };
 
 export function CommentPanel({ file, width, source }: { file?: string; width: number; source?: CommentPanelSource }) {
@@ -162,7 +175,7 @@ function Panel({ width, source }: { width: number; source: CommentPanelSource })
             <CommentList source={source} />
           </>
         ) : (
-          <CommentHistoryList path={path} comments={source.comments} />
+          <CommentHistoryList path={path} comments={source.comments} {...(source.restore ? { restore: source.restore } : {})} />
         )}
       </aside>
     );
@@ -223,7 +236,7 @@ function Panel({ width, source }: { width: number; source: CommentPanelSource })
           <CommentList source={source} />
         </>
       ) : (
-        <CommentHistoryList path={path} comments={source.comments} />
+        <CommentHistoryList path={path} comments={source.comments} {...(source.restore ? { restore: source.restore } : {})} />
       )}
     </aside>
   );
@@ -310,7 +323,7 @@ function CommentList({ source }: { source: CommentPanelSource }) {
   const [replyId, setReplyId] = useState<string | null>(null);
   const [replyText, setReplyText] = useState('');
   const [replyBusy, setReplyBusy] = useState(false);
-  const verb = source.removeVerb ?? { action: 'Delete', confirm: 'Delete?' };
+  const verb = source.removeVerb ?? { action: 'Delete', confirm: 'Delete?', icon: 'trash' as const };
   const { activeId } = useActiveComment();
   const rows = useRef<Record<string, HTMLLIElement | null>>({});
   // When an inline indicator activates a comment, scroll its row into view (R-2.2).
@@ -346,7 +359,7 @@ function CommentList({ source }: { source: CommentPanelSource }) {
                   onClick={() => { setReplyId(replyId === c.id ? null : c.id); setReplyText(''); }}
                   title="Reply to this comment"
                   aria-label="Reply"
-                  style={locateBtn}
+                  style={textBtn}
                 >
                   Reply
                 </button>
@@ -369,9 +382,9 @@ function CommentList({ source }: { source: CommentPanelSource }) {
                   onClick={() => setConfirmId(c.id)}
                   title={`${verb.action} comment`}
                   aria-label={`${verb.action} comment`}
-                  style={delBtn}
+                  style={verb.icon === 'check' ? resolveBtn : delBtn}
                 >
-                  <TrashIcon />
+                  {verb.icon === 'check' ? <CheckIcon /> : <TrashIcon />}
                 </button>
               )}
             </div>
@@ -421,6 +434,15 @@ function TrashIcon() {
   );
 }
 
+/** The non-destructive counterpart to the trash: a thread closed, not a record removed. */
+function CheckIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M20 6L9 17l-5-5" />
+    </svg>
+  );
+}
+
 function LocateIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -451,6 +473,21 @@ const card: React.CSSProperties = { border: '1px solid #f1f5f9', borderRadius: 8
 const cardActive: React.CSSProperties = { border: '1px solid #f59e0b', background: '#fffbeb', boxShadow: '0 0 0 2px rgba(245,158,11,0.25)' };
 const locateBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, width: 22, height: 22, padding: 0, border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer' };
 const delBtn: React.CSSProperties = { ...locateBtn, color: '#ef4444' };
+/** Green, not red: resolving closes a thread and destroys nothing. */
+const resolveBtn: React.CSSProperties = { ...locateBtn, color: '#059669' };
+/*
+ * `locateBtn` is a 22×22 square sized for an icon. A worded button borrowed it and the
+ * label wrapped mid-word — "Reply" rendered as "Re / ply". Text needs to set its own
+ * width, so this drops the square and forbids the break.
+ */
+const textBtn: React.CSSProperties = {
+  ...locateBtn,
+  width: 'auto',
+  height: 22,
+  padding: '0 6px',
+  whiteSpace: 'nowrap',
+  font: '12px system-ui',
+};
 const confirmYes: React.CSSProperties = { padding: '2px 8px', border: '1px solid #ef4444', borderRadius: 4, background: '#ef4444', color: 'white', cursor: 'pointer', fontSize: 12 };
 const notCommentable: React.CSSProperties = { margin: '2px 0 0', padding: 8, border: '1px dashed #cbd5e1', borderRadius: 6, background: '#f8fafc', color: '#64748b', fontSize: 12.5 };
 const orphanCard: React.CSSProperties = { ...card, border: '1px dashed #f59e0b', background: '#fffbeb' };

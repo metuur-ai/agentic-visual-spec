@@ -312,12 +312,45 @@ describe('node-identity — withNodeIdentity', () => {
     const loaded = await store.read('d-11112222');
     expect(loaded?.nodes).toEqual([{ id: 'g1', type: 'paragraph', version: 1, content: 'one' }]);
     expect(loaded?.identity).toBeDefined();
-    // The repair is in memory only — the file on disk is still unidentified.
-    expect((await inner.read('d-11112222'))?.nodes).toEqual([]);
+    /*
+     * The repair is PERSISTED. This used to assert the opposite, with a comment saying the
+     * file on disk stays unidentified — which described the defect in the exact scenario
+     * the line above sets up: a document written out of band, which is what an agent
+     * applying review comments does. Because `randomNodeId` is `crypto.randomUUID()`, an
+     * in-memory-only repair minted DIFFERENT ids on every read, so a comment anchored to
+     * one of those blocks pointed at a node that no longer existed by the next load.
+     * Keeping the first mint is what makes the anchor survive.
+     */
+    expect((await inner.read('d-11112222'))?.nodes).toEqual([{ id: 'g1', type: 'paragraph', version: 1, content: 'one' }]);
+
+    // And the ids are stable across reads, which is the property that failed.
+    const again = await store.read('d-11112222');
+    expect(again?.nodes.map((n) => n.id)).toEqual(loaded?.nodes.map((n) => n.id));
 
     await store.write(envelope({ children: [withId(paragraph('one'), 'g1')] }));
     await store.write(envelope({ children: [withId(paragraph('one EDITED'), 'g1')] }));
     expect(versionOf((await inner.read('d-11112222')) as CollaborationDocument, 'g1')).toBe(2);
+  });
+
+  /*
+   * The whole point, stated as the product property: an agent applies review comments by
+   * writing the JSON directly, and a comment anchored to a block it added must still
+   * resolve on the next load. With an in-memory-only repair this failed on the second
+   * read — different id, `found: false` — and nothing else in the suite could see it,
+   * because each read was internally consistent.
+   */
+  it('an id minted for an out-of-band block still resolves on a later read', async () => {
+    const inner = await tmpStore();
+    // Two independent wrappers, as two requests would be: real ids, not a test sequence.
+    const first = withNodeIdentity(inner);
+    const later = withNodeIdentity(inner);
+
+    await inner.write(envelope({ children: [paragraph('added by the agent')] }));
+
+    const anchored = (await first.read('d-11112222'))?.nodes[0]?.id as string;
+    expect(anchored).toBeTruthy();
+
+    expect((await later.resolveNode('d-11112222', anchored)).found).toBe(true);
   });
 
   it('resolves a backfilled node through the wrapped store (R-3.4 stays intact)', async () => {

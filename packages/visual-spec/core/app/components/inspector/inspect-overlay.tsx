@@ -5,7 +5,7 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import { collectRange, collectSection, headingBlockOf } from '../../lib/inspector/blocks';
-import { findSurfaceSource } from '../../lib/inspector/fiber';
+import { type FindOptions, type SourceLoc, findSurfaceSource } from '../../lib/inspector/fiber';
 import { toSelected, useInspector } from './inspector-provider';
 
 type Rect = { top: number; left: number; width: number; height: number };
@@ -15,7 +15,22 @@ function rectOf(el: HTMLElement): Rect {
   return { top: r.top, left: r.left, width: r.width, height: r.height };
 }
 
-export function InspectOverlay({ rootSelector = '[data-inspector-root]' }: { rootSelector?: string }) {
+/**
+ * How an element under the cursor becomes an anchor. The default walks `data-vs-loc`
+ * and then the React fiber, which is what a local file surface carries.
+ *
+ * A collaboration document carries neither: its blocks are identified by `data-vs-node-id`
+ * and the canonical JSON has no source positions to stamp a `data-vs-loc` from. Without a
+ * seam here the overlay hit-tests, finds nothing, and every click is dropped — which reads
+ * as a comment panel that says "click a block" and never responds. So the resolver is a
+ * parameter, and the surface that knows how its own blocks are identified supplies one.
+ */
+export type AnchorResolver = (el: HTMLElement | null, surfaceId: string, opts?: FindOptions) => SourceLoc | null;
+
+export function InspectOverlay({
+  rootSelector = '[data-inspector-root]',
+  resolveAnchor = findSurfaceSource,
+}: { rootSelector?: string; resolveAnchor?: AnchorResolver }) {
   const { active, surfaceId, selection, setSelection } = useInspector();
   const [hoverRect, setHoverRect] = useState<Rect | null>(null);
   const hoverTarget = useRef<HTMLElement | null>(null);
@@ -33,7 +48,7 @@ export function InspectOverlay({ rootSelector = '[data-inspector-root]' }: { roo
     const onMove = (e: MouseEvent) => {
       const stack = document.elementsFromPoint(e.clientX, e.clientY) as HTMLElement[];
       const el = stack.find((node) => node.closest(rootSelector));
-      const loc = findSurfaceSource(el ?? null, surfaceId, { hostOnly: true });
+      const loc = resolveAnchor(el ?? null, surfaceId, { hostOnly: true });
       if (loc) {
         hoverTarget.current = loc.anchor;
         setHoverRect(rectOf(loc.anchor));
@@ -49,7 +64,7 @@ export function InspectOverlay({ rootSelector = '[data-inspector-root]' }: { roo
       if ((e.target as HTMLElement | null)?.closest?.('[data-vs-action]')) return;
       const stack = document.elementsFromPoint(e.clientX, e.clientY) as HTMLElement[];
       const el = stack.find((node) => node.closest(rootSelector));
-      const loc = findSurfaceSource(el ?? null, surfaceId);
+      const loc = resolveAnchor(el ?? null, surfaceId);
       if (!loc) return;
       e.preventDefault();
       e.stopPropagation();
@@ -82,7 +97,7 @@ export function InspectOverlay({ rootSelector = '[data-inspector-root]' }: { roo
       window.removeEventListener('mousemove', onMove, true);
       window.removeEventListener('click', onClick, true);
     };
-  }, [active, surfaceId, setSelection]);
+  }, [active, surfaceId, setSelection, rootSelector, resolveAnchor]);
 
   // Keep one selection frame glued to each selected block as layout shifts.
   const [selRects, setSelRects] = useState<Rect[]>([]);

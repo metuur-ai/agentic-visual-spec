@@ -116,7 +116,7 @@ export type CreateJobInput = JobInputBase & {
 };
 
 /** `POST /__vs/collab/open` — task 8.2: attach to an already-open Pull Request. */
-export type OpenJobInput = JobInputBase & { pullNumber: number };
+export type OpenJobInput = JobInputBase & { pullNumber: number; discardLocal?: boolean };
 
 /** `POST /__vs/collab/:id/sync` — task 8.2 (R-8.6 / R-8.7). */
 export type SyncJobInput = JobInputBase & { document: CollaborationDocument | null };
@@ -296,8 +296,18 @@ const notFound = (method: string, pathname: string): CollabRouteResult => ({
 /** `c-<hex>` — the id shape `recordIdFor` produces and `handleCommentsRequest` routes on. */
 const COMMENT_ID_RE = /^c-[0-9a-f]+$/;
 
-/** A `CommentDocStore` that implements the intent methods collaboration requires. */
-type CollabCommentStore = CommentDocStore & Required<Pick<CommentDocStore, 'addComment' | 'updateComment'>>;
+/**
+ * A `CommentDocStore` that implements the intent methods collaboration requires.
+ *
+ * `setResolved` is the GitHub-backed store's own (R-5.12): resolution is a reply comment
+ * carrying a marker, not a field, because issue comments are flat and have no resolved
+ * bit to set. It is optional here so a snapshot-only store still satisfies the type; the
+ * PATCH route refuses a resolution rather than silently dropping it when it is absent.
+ */
+type CollabCommentStore = CommentDocStore &
+  Required<Pick<CommentDocStore, 'addComment' | 'updateComment'>> & {
+    setResolved?: (id: string, resolved: boolean) => Promise<CommentRecord | null>;
+  };
 
 function requireString(body: Record<string, unknown>, key: string): string {
   const value = body[key];
@@ -529,12 +539,19 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         const gated = await gate('open', documentId);
         if (!gated.ok) return gated.result;
         const idempotencyKey = optionalKey(body);
+        // `open` is NOT a sync job, however much it rhymes with one. Sync pulls comments;
+        // open fetches the whole document off the branch and rewrites the local copy. The
+        // browser reads the kind off the `job-done` frame to decide what to re-read, and
+        // it correctly skips the document read for comment-only kinds — so labelling this
+        // `sync` left a reviewer looking at the seed document until they reloaded the page.
         return deps.jobs.hub(documentId).start({
-          kind: 'sync',
+          kind: 'open',
           idempotencyKey,
           run: bodies.open({
             documentId,
             pullNumber,
+            // R-11.8 — the discard is a request, so it is read off the request.
+            ...(body.discardLocal === true ? { discardLocal: true } : {}),
             repo: gated.repo,
             store: deps.documents(),
             ...(idempotencyKey ? { idempotencyKey } : {}),
@@ -686,6 +703,14 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
       if (method === 'POST' && tail === '/comments') {
         const text = requireString(body, 'comment');
         const nodeId = typeof body.nodeId === 'string' && body.nodeId ? body.nodeId : undefined;
+        /*
+         * The routing tag the panel's "Apply via" control sets: which skill handles this
+         * comment. It says nothing about whether the comment is worth acting on — both of
+         * its values mean "actionable", they differ on by whom. It reached the browser's
+         * request body and went no further, so every collaborative comment was born with
+         * the default and the control was decorative.
+         */
+        const workflow = typeof body.workflow === 'string' && body.workflow.trim() ? body.workflow.trim() : undefined;
         const gated = await gate('comment', documentId);
         if (!gated.ok) return gated.result;
         const loaded = await load(documentId);
@@ -693,7 +718,10 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         const store = await commentsFor(documentId, loaded.document, gated.repo);
         if (!store.ok) return store.result;
         const saved = await store.store.addComment(
-          commentRecord(loaded.document.documentPath, text, now(), nodeId ? anchorFields(loaded.document, nodeId) : {}),
+          commentRecord(loaded.document.documentPath, text, now(), {
+            ...(nodeId ? anchorFields(loaded.document, nodeId) : {}),
+            ...(workflow ? { workflow } : {}),
+          }),
         );
         return { status: 200, json: { ok: true, id: saved.id, comment: saved } };
       }
@@ -712,12 +740,26 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         if (!store.ok) return store.result;
         const parent = (await store.store.read()).comments.find((c) => c.id === commentId);
         if (!parent) return { status: 404, json: { error: `unknown comment: ${commentId}` } };
-        // The `replyTo` marker rides on the record's `collab` trailer fields. Persisting
-        // it into the GitHub body is the projection layer's job (task 5.2); this layer
-        // only states the intent.
-        const nodeId = (parent as { collab?: { nodeId?: string } }).collab?.nodeId;
+        /*
+         * The `replyTo` marker rides on the record's `collab` trailer fields. Persisting
+         * it into the GitHub body is the projection layer's job (task 5.2); this layer
+         * only states the intent.
+         *
+         * It states it as the parent's GITHUB issue-comment id, not our local `c-…` id.
+         * That is what the trailer's `replyTo` means everywhere else — the resolution
+         * replies write it that way and `markerOf` parses it as a number — and it is the
+         * only id that survives a reader who has never seen this machine's store. Passing
+         * the local id produced a trailer nothing could resolve, so the parent link was
+         * lost the moment it reached GitHub and no reply could ever be threaded again.
+         */
+        const parentTrailer = (parent as { collab?: { nodeId?: string }; github?: { issueCommentId?: number } }).collab;
+        const parentIssueCommentId = (parent as { github?: { issueCommentId?: number } }).github?.issueCommentId;
+        const nodeId = parentTrailer?.nodeId;
         const saved = await store.store.addComment(
-          commentRecord(loaded.document.documentPath, text, now(), { replyTo: commentId, ...(nodeId ? { nodeId } : {}) }),
+          commentRecord(loaded.document.documentPath, text, now(), {
+            replyTo: String(parentIssueCommentId ?? commentId),
+            ...(nodeId ? { nodeId } : {}),
+          }),
         );
         return { status: 200, json: { ok: true, id: saved.id, comment: saved } };
       }
@@ -738,6 +780,34 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
           ...(typeof body.result === 'string' ? { result: body.result } : {}),
           ...(typeof body.comment === 'string' ? { comment: body.comment } : {}),
         };
+
+        /*
+         * A status change is a RESOLUTION, and resolution does not live in the same place
+         * as the text. `updateComment` edits the issue comment's body and says so itself
+         * ("Status/result have no GitHub representation") — so routing a resolve through
+         * it answered 200 with the comment unchanged, and the panel's Resolve button did
+         * nothing at all. Worse than nothing: unresolved comments gate publishing (R-8.15),
+         * so a single comment locked the author out of publishing permanently.
+         * `setResolved` posts the marker reply that R-5.12 specifies; it existed, tested,
+         * with no caller. This is that caller.
+         */
+        if (patch.status !== undefined) {
+          if (!store.store.setResolved) {
+            return { status: 501, json: { error: 'comment store cannot record resolution' } };
+          }
+          const marker = await store.store.setResolved(commentId, patch.status === 'applied');
+          if (!marker) return { status: 404, json: { error: `unknown comment: ${commentId}` } };
+        }
+
+        // Nothing left to edit — a resolve carries no text — so answer with the parent as
+        // it now reads. Resolution is DERIVED from the comment list on read (R-5.14), so
+        // returning the marker reply here would hand the client the wrong record entirely.
+        if (patch.comment === undefined) {
+          const refreshed = (await store.store.read()).comments.find((c) => c.id === commentId);
+          if (!refreshed) return { status: 404, json: { error: `unknown comment: ${commentId}` } };
+          return { status: 200, json: { ok: true, comment: refreshed } };
+        }
+
         const updated = await store.store.updateComment(commentId, patch);
         if (!updated) return { status: 404, json: { error: `unknown comment: ${commentId}` } };
         return { status: 200, json: { ok: true, comment: updated } };

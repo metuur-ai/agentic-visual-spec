@@ -18,7 +18,7 @@
  * node identity instead; nothing about that keying is known to this file, which
  * is why local mode cannot regress through it.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { useComments } from '../core/app';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { resolveCodeAnchors, resolveMarkdownAnchors } from './anchor-resolver';
@@ -81,7 +81,29 @@ function lineTarget(group: IndicatorGroup, mode: 'markdown' | 'code'): Indicator
   };
 }
 
-type Placed = { target: IndicatorTarget; top: number; left: number };
+/**
+ * A tracked target and the block's own viewport box. Both the badge and the shading are
+ * derived from this at render time rather than pre-baked here, so the two stay in the
+ * lanes below instead of one being expressed as an offset from the other.
+ */
+type Placed = { target: IndicatorTarget; top: number; left: number; width: number; height: number };
+
+/*
+ * THE GUTTER HAS TWO LANES, AND THEY MUST NOT SHARE.
+ *
+ * The badge used to sit 16px left of the block while the shading reached 9px back into the
+ * same strip, so the shading's left rule ran underneath the badge and out the bottom of it:
+ * a round marker on a vertical stem, reading as one lollipop-shaped ornament rather than as
+ * a count and a highlighted passage. Each now owns a strip and a gap separates them.
+ *
+ *   [ badge ][ gap ][ rule ][ pad ][ the block itself ]
+ *     14px     4px     3px     9px
+ */
+const BADGE_SIZE = 14;
+const BADGE_INSET = 30;
+const RULE_INSET = 12;
+const RULE_WIDTH = 3;
+const RULE_PAD = RULE_INSET - RULE_WIDTH;
 
 function Markers({ targets }: { targets: IndicatorTarget[] }) {
   const { activeId, setActiveId } = useActiveComment();
@@ -99,7 +121,7 @@ function Markers({ targets }: { targets: IndicatorTarget[] }) {
         if (!el || !el.isConnected) continue; // unresolved target → omit, no error (R-1.9)
         const r = el.getBoundingClientRect();
         if (r.height === 0 && r.width === 0) continue;
-        next.push({ target: t, top: r.top + 2, left: Math.max(2, r.left - 16) });
+        next.push({ target: t, top: r.top, left: r.left, width: r.width, height: r.height });
       }
       setPlaced(next);
       raf = requestAnimationFrame(track);
@@ -111,22 +133,50 @@ function Markers({ targets }: { targets: IndicatorTarget[] }) {
   if (!placed.length) return null;
   return (
     <div style={overlay}>
-      {placed.map(({ target, top, left }) => {
+      {placed.map(({ target, top, left, width, height }) => {
         const first = target.comments[0]!;
         const count = target.comments.length;
         const isActive = target.comments.some((c) => c.id === activeId);
         return (
-          <button
-            key={first.id}
+          <Fragment key={first.id}>
+            {/*
+              * The commented area itself, shaded. Never interactive: the inspector
+              * hit-tests clicks through this layer to start a comment, and a highlight
+              * that swallowed them would make the block underneath uncommentable.
+              */}
+            <div
+              aria-hidden
+              data-vs-comment-area={first.id}
+              style={{
+                ...area,
+                top,
+                left: Math.max(0, left - RULE_INSET),
+                width,
+                height,
+                paddingLeft: RULE_PAD,
+                ...(target.state === 'stale' ? areaStale : {}),
+                ...(isActive ? areaActive : {}),
+              }}
+            />
+            <button
             type="button"
             onClick={() => setActiveId(first.id)}
             title={target.title}
             aria-label={target.ariaLabel}
             data-vs-indicator-state={target.state}
-            style={{ ...mark, top, left, ...(target.state === 'stale' ? markStale : {}), ...(isActive ? markActive : {}) }}
+            style={{
+              ...mark,
+              // Centred on the block rather than pinned to its first line: a marker that
+              // floats at the top of a tall paragraph reads as belonging to the gap above it.
+              top: top + Math.max(0, (height - BADGE_SIZE) / 2),
+              left: Math.max(2, left - BADGE_INSET),
+              ...(target.state === 'stale' ? markStale : {}),
+              ...(isActive ? markActive : {}),
+            }}
           >
             {count > 1 ? count : ''}
           </button>
+          </Fragment>
         );
       })}
     </div>
@@ -145,14 +195,14 @@ const overlay: React.CSSProperties = {
 const mark: React.CSSProperties = {
   position: 'absolute',
   pointerEvents: 'auto',
-  minWidth: 14,
-  height: 14,
+  minWidth: BADGE_SIZE,
+  height: BADGE_SIZE,
   padding: 0,
   border: '1px solid #f59e0b',
-  borderRadius: 7,
+  borderRadius: BADGE_SIZE / 2,
   background: '#fbbf24',
   color: '#78350f',
-  font: '9px/14px ui-monospace, monospace',
+  font: `9px/${BADGE_SIZE}px ui-monospace, monospace`,
   fontWeight: 700,
   textAlign: 'center',
   cursor: 'pointer',
@@ -167,4 +217,30 @@ const markStale: React.CSSProperties = {
   border: '1px dashed #b45309',
   background: '#fef3c7',
   color: '#92400e',
+};
+
+/*
+ * The commented area. Amber like the badge it belongs to (R-1.7 keeps that lane clear of
+ * the inspector's blue), but far weaker: this sits under running prose the reader still
+ * has to read, so it tints rather than covers. The left rule is what carries at a glance —
+ * a block-level "this stretch is under discussion" — and the wash tells you where it ends.
+ */
+const area: React.CSSProperties = {
+  position: 'absolute',
+  pointerEvents: 'none',
+  background: 'rgba(251,191,36,0.13)',
+  borderLeft: `${RULE_WIDTH}px solid rgba(245,158,11,0.55)`,
+  borderRadius: 2,
+  boxSizing: 'content-box',
+  transition: 'background 120ms',
+};
+/** The thread the sidebar has focused: same shape, enough contrast to find by eye. */
+const areaActive: React.CSSProperties = {
+  background: 'rgba(251,191,36,0.28)',
+  borderLeft: `${RULE_WIDTH}px solid #f59e0b`,
+};
+/** Dashed rule, matching the badge: anchored, but the block moved on under it (R-6.3). */
+const areaStale: React.CSSProperties = {
+  background: 'rgba(251,191,36,0.08)',
+  borderLeft: `${RULE_WIDTH}px dashed #b45309`,
 };

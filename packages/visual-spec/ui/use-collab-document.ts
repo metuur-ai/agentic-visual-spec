@@ -106,6 +106,19 @@ export type UseCollabDocumentState = {
    * `applied` status the PATCH route already understands — nothing is destroyed.
    */
   removeComment: (commentId: string) => Promise<void>;
+  /** The inverse of `removeComment` — reopens a resolved thread (R-5.12). */
+  restoreComment: (commentId: string) => Promise<void>;
+  /**
+   * Re-read the canonical document from the server.
+   *
+   * The stream only re-reads after a job this hub started, so a document edited OUT OF
+   * BAND — an agent applying comments against `documents/<id>.json` on disk — is
+   * invisible here until something remounts. Worse than invisible: the editor is seeded
+   * from `fullDocument`, so publishing on top of a stale copy commits the pre-agent
+   * document and drops the agent's work with no warning. This is how the author gets a
+   * current copy to look at before deciding anything.
+   */
+  reload: () => Promise<void>;
 };
 
 export function useCollabDocument(documentId: string, options: UseCollabDocumentOptions = {}): UseCollabDocumentState {
@@ -225,7 +238,13 @@ export function useCollabDocument(documentId: string, options: UseCollabDocument
   // add a round trip and a window in which the panel disagrees with the click.
   const addComment = useCallback(
     async (input: { nodeId: string; comment: string; workflow: string }): Promise<void> => {
-      const result = await client.addComment(documentId, { comment: input.comment, nodeId: input.nodeId });
+      // `workflow` is the routing tag the panel's "Apply via" control sets — which skill
+      // handles this comment, not whether it is worth handling. It used to stop here.
+      const result = await client.addComment(documentId, {
+        comment: input.comment,
+        nodeId: input.nodeId,
+        workflow: input.workflow,
+      });
       if (result.ok) setComments((current) => [...current, result.value.comment]);
       else setCommentsError(result);
     },
@@ -255,6 +274,17 @@ export function useCollabDocument(documentId: string, options: UseCollabDocument
     [patchComment],
   );
 
+  const reload = useCallback(async (): Promise<void> => {
+    const result = await client.document(documentId);
+    if (result.ok) setFullDocument(result.value);
+    else setCommentsError(result);
+  }, [client, documentId]);
+
+  const restoreComment = useCallback(
+    (commentId: string): Promise<void> => patchComment(commentId, { status: 'open' }),
+    [patchComment],
+  );
+
   return {
     snapshot,
     document,
@@ -270,5 +300,7 @@ export function useCollabDocument(documentId: string, options: UseCollabDocument
     replyToComment,
     patchComment,
     removeComment,
+    restoreComment,
+    reload,
   };
 }

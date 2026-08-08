@@ -31,11 +31,11 @@ import {
   parseCollaborationDocument,
   serializeCollaborationDocument,
 } from './document-protocol';
-import { DOCUMENT_ID_RE, type NodeResolution, resolveNodeIn } from './node-location';
+import { DOCUMENT_ID_RE, localDocumentPath, type NodeResolution, resolveNodeIn } from './node-location';
 
 export { DOCUMENT_ID_RE };
 
-export { resolveNodeIn } from './node-location';
+export { localDocumentPath, resolveNodeIn } from './node-location';
 export type { NodeLocation, NodeResolution } from './node-location';
 
 /**
@@ -62,7 +62,7 @@ export interface DocumentStore {
 export function fsDocumentStore(baseDir: string, documentsDir = 'documents'): DocumentStore {
   const filePath = (documentId: string) => {
     if (!DOCUMENT_ID_RE.test(documentId)) throw new Error(`invalid documentId: ${documentId}`);
-    return join(baseDir, documentsDir, `${documentId}.json`);
+    return join(baseDir, localDocumentPath(documentId, documentsDir));
   };
 
   const store: DocumentStore = {

@@ -205,6 +205,10 @@
 | R-11.3 | THE SYSTEM SHALL render a collaboration document for a reviewer whose credential has read access only, and SHALL NOT require write access to view or comment. |
 | R-11.4 | IF a reviewer's credential lacks read access to the repository, THE SYSTEM SHALL report that specific cause rather than a generic failure. |
 | R-11.5 | THE SYSTEM SHALL present the reviewer's own GitHub identity in the UI so the reviewer can confirm which account their comments will be attributed to. |
+| R-11.6 | THE SYSTEM SHALL record, on a document's GitHub binding, a content hash of the document as it stood at the last point the local copy and the branch provably agreed, and SHALL update it when the document is created, opened, or published. |
+| R-11.7 | WHEN opening a collaboration document whose local copy no longer matches that recorded hash, THE SYSTEM SHALL refuse the open with a cause naming the unpublished local work, and SHALL NOT overwrite the local copy, so that work an agent applied but nobody has published yet cannot be destroyed by a refresh. |
+| R-11.8 | THE SYSTEM SHALL provide an explicit way to open such a document by discarding the local copy, and SHALL require that discard to be requested rather than assumed. |
+| R-11.9 | THE SYSTEM SHALL NOT refuse reading, reloading or publishing a document that holds unpublished local work, since those are the paths by which that work is inspected and preserved. |
 
 ## Unit 12: Testability
 

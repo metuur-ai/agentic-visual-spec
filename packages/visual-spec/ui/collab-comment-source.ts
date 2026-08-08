@@ -33,7 +33,7 @@ import {
   resolveCollabAnchor,
 } from '../core/collaboration/anchor-resolution';
 import type { CollaborationDocument } from '../core/collaboration/document-protocol';
-import type { CommentTrailer } from '../core/collaboration/comment-projection';
+import { type CommentTrailer, type ProjectedCommentRecord, isResolutionReply } from '../core/collaboration/comment-projection';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import type { SelectedTarget } from '../core/app';
 import { VS_NODE_ID_ATTR, VS_UNCOMMENTABLE_ATTR } from './collab-document-view';
@@ -159,6 +159,12 @@ export type CollabCommentSourceDeps = {
    * GitHub keeps the thread (R-5.2), so the panel is told to say "Resolve".
    */
   remove: (id: string) => Promise<void>;
+  /**
+   * The inverse of `remove`: reopen a resolved thread. Separate from `remove` rather than
+   * a toggle because the panel calls them from different tabs — Resolve from the open
+   * list, Unresolve from History — and each row knows which state it is in.
+   */
+  restore: (id: string) => Promise<void>;
   /** Where the document is rendered. Defaults to the whole document. */
   root?: ParentNode | null;
 };
@@ -176,11 +182,24 @@ export function collabCommentPanelSource(deps: CollabCommentSourceDeps): Comment
   const orphaned = new Set(orphans.map((o) => o.comment.id));
   return {
     path: doc.documentPath,
-    // Orphans have their own section (R-5.6); listing them twice would double-render them.
-    comments: deps.comments.filter((c) => !orphaned.has(c.id)),
+    /*
+     * Orphans have their own section (R-5.6); listing them twice would double-render them.
+     *
+     * Resolution replies are dropped for a different reason: they are bookkeeping, not
+     * conversation. A resolve posts one, an unresolve posts another and they accumulate
+     * by design (R-5.14), so leaving them in listed rows reading "Resolved this comment:
+     * <url>" as if someone had said it — each with its own Reply and Resolve buttons —
+     * and made the panel's count disagree with the publish gate, which filters them:
+     * one resolve-then-reopen showed "6 open" beside "4 of 4 comments unresolved".
+     * `documentDiscussion` already draws this line for the document-level list and says
+     * why; this is the same line, drawn where the panel reads.
+     */
+    comments: deps.comments.filter((c) => !orphaned.has(c.id) && !isResolutionReply(c as ProjectedCommentRecord)),
     remove: deps.remove,
+    restore: deps.restore,
     reply: deps.reply,
-    removeVerb: { action: 'Resolve', confirm: 'Resolve?' },
+    // A check, not a trash can — resolving closes a thread and deletes nothing (R-5.2).
+    removeVerb: { action: 'Resolve', confirm: 'Resolve?', icon: 'check' },
     orphans,
     supportsSections: false,
     label: (c) => labels.get(c.id) ?? '(document)',

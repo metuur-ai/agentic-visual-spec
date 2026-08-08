@@ -110,6 +110,8 @@ function Probe({ client, factory, documentId = 'doc-1' }: { client: CollabClient
       <button data-testid="add" onClick={() => void state.addComment({ nodeId: 'n-7', comment: 'tighten', workflow: 'visual-spec' })} />
       <button data-testid="reply" onClick={() => void state.replyToComment('c-1', 'agreed')} />
       <button data-testid="remove" onClick={() => void state.removeComment('c-1')} />
+      <button data-testid="restore" onClick={() => void state.restoreComment('c-1')} />
+      <button data-testid="reload" onClick={() => void state.reload()} />
     </div>
   );
 }
@@ -292,9 +294,18 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
 
     screen.getByTestId('add').click();
     await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-9:tighten:open'));
-    // R-7.5 — the nodeId reaches the route; `workflow` is the panel's, and the server
-    // stamps its own on the record, so it is not sent.
-    expect(client.addComment).toHaveBeenCalledWith('doc-1', { comment: 'tighten', nodeId: 'n-7' });
+    /*
+     * R-7.5 — the nodeId reaches the route, and so does the routing tag. This assertion
+     * used to pin the opposite, with a comment explaining that the server stamps its own
+     * workflow "so it is not sent" — which described the defect rather than a decision:
+     * the panel's "Apply via" control was discarded here, and every collaborative comment
+     * was born routed to the default whatever the author picked.
+     */
+    expect(client.addComment).toHaveBeenCalledWith('doc-1', {
+      comment: 'tighten',
+      nodeId: 'n-7',
+      workflow: 'visual-spec',
+    });
     expect(client.comments).toHaveBeenCalledTimes(1);
   });
 
@@ -325,6 +336,47 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
     expect(client.patchComment).toHaveBeenCalledWith('doc-1', 'c-1', { status: 'applied' });
   });
 
+  /*
+   * An agent applying comments edits `documents/<id>.json` on disk, outside every job this
+   * hub knows about, so no frame arrives and nothing re-reads. Without this the author's
+   * copy stays pre-agent — and publishing from a pre-agent copy silently discards the
+   * agent's work, because the editor seeds itself from exactly this value.
+   */
+  it('reload re-reads the document, which is the only way an out-of-band edit becomes visible', async () => {
+    const document = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, value: DOCUMENT })
+      .mockResolvedValue({
+        ok: true,
+        value: { ...DOCUMENT, nodes: [...DOCUMENT.nodes, { ...DOCUMENT.nodes[0]!, id: 'n-agent' }] },
+      });
+    const client = stubClient({ document } as unknown as Partial<CollabClient>);
+    render(<Probe client={client} factory={fakeStream().factory} />);
+    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('1'));
+
+    screen.getByTestId('reload').click();
+
+    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('2'));
+  });
+
+  /*
+   * The inverse, and the half the UI had no way to reach: the route and the store both
+   * served an unresolve, but nothing in the browser could ask for one — a thread resolved
+   * by mistake could only be reopened with curl.
+   */
+  it('restore is a PATCH back to open — the unresolve the History tab now offers', async () => {
+    const client = stubClient({
+      comments: vi.fn(async () => ({ ok: true, value: [comment('c-1', 'tighten', { status: 'applied' })] })),
+      patchComment: vi.fn(async () => ({ ok: true, value: { ok: true, comment: comment('c-1', 'tighten') } })),
+    } as unknown as Partial<CollabClient>);
+    render(<Probe client={client} factory={fakeStream().factory} />);
+    await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-1:tighten:applied'));
+
+    screen.getByTestId('restore').click();
+    await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-1:tighten:open'));
+    expect(client.patchComment).toHaveBeenCalledWith('doc-1', 'c-1', { status: 'open' });
+  });
+
   it('a failed mutation lands on commentsError and leaves the list alone', async () => {
     const client = stubClient({
       comments: vi.fn(async () => ({ ok: true, value: [comment('c-1', 'tighten')] })),
@@ -353,6 +405,7 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
           add: state.addComment,
           reply: state.replyToComment,
           remove: state.removeComment,
+          restore: state.restoreComment,
         };
       }
       return null;
@@ -392,6 +445,32 @@ describe('re-reading what a finished job changed', () => {
 
     expect(client.document).toHaveBeenCalledTimes(1);
     expect(client.status).toHaveBeenCalledTimes(1);
+  });
+
+  /*
+   * R-11.2's whole promise is that opening a PR shows what is on the branch. The open job
+   * fetches that document and writes it locally, but the browser only learns it changed
+   * from the `job-done` frame's kind — and while the route labelled the job `sync`, this
+   * hook classified it comment-only and never re-read. A reviewer therefore stared at the
+   * seed document until they reloaded the page. Behavioural, not a set-membership check:
+   * relabel the job anything comment-only and this goes red.
+   */
+  it('re-reads the document after open, so a reviewer sees the branch and not the seed', async () => {
+    const stream = fakeStream();
+    const document = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, value: DOCUMENT })
+      .mockResolvedValue({
+        ok: true,
+        value: { ...DOCUMENT, nodes: [...DOCUMENT.nodes, { ...DOCUMENT.nodes[0]!, id: 'n-2' }] },
+      });
+    const client = stubClient({ document } as unknown as Partial<CollabClient>);
+    render(<Probe client={client} factory={stream.factory} />);
+    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('1'));
+
+    stream.push({ type: 'job-done', jobId: 'doc-1-1', kind: 'open', ok: true, state: 'draft', finishedAt: 20 });
+
+    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('2'));
   });
 
   it('re-reads identity after create, which is how a PR number first reaches the title bar', async () => {

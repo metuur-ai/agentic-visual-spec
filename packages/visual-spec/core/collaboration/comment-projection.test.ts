@@ -11,6 +11,7 @@ import {
   documentDiscussion,
   findByIdempotencyKey,
   formatCommentBody,
+  hasRoutingDecision,
   formatResolutionReply,
   formatTrailer,
   githubCommentStore,
@@ -179,6 +180,48 @@ describe('githubCommentStore.read — projection (R-5.1)', () => {
     expect(cached.comments).toHaveLength(1);
   });
 
+  /*
+   * The projection used to stamp `workflow: DEFAULT_WORKFLOW` on every comment it read,
+   * inventing a routing decision for people who never saw the control. It is read back
+   * now — and because `CommentRecord` requires the field, the honest signal for "nobody
+   * chose" is the trailer's presence, which is what `hasRoutingDecision` reports.
+   */
+  it('reads the routing tag back off the trailer instead of stamping one', () => {
+    const tagged = projectIssueComment(
+      {
+        id: 900001,
+        body: formatCommentBody('Route this elsewhere.', { documentId: 'doc-1', nodeId: 'n-7', workflow: 'research' }),
+        user: 'octocat', htmlUrl: 'https://x/1', createdAt: 'T0', updatedAt: 'T0',
+      },
+      'docs/spec.md',
+    );
+    expect(tagged.workflow).toBe('research');
+    expect(hasRoutingDecision(tagged)).toBe(true);
+  });
+
+  it('a comment created before the tag was persisted keeps the default — no migration', () => {
+    const legacy = projectIssueComment(
+      {
+        id: 900002,
+        body: formatCommentBody('Tighten this.', { documentId: 'doc-1', nodeId: 'n-7' }),
+        user: 'octocat', htmlUrl: 'https://x/2', createdAt: 'T0', updatedAt: 'T0',
+      },
+      'docs/spec.md',
+    );
+    expect(legacy.workflow).toBe('visual-spec');
+    expect(hasRoutingDecision(legacy)).toBe(true);
+  });
+
+  it('a comment typed on github.com made no routing decision at all (R-5.6)', () => {
+    const driveBy = projectIssueComment(
+      { id: 900003, body: 'Looks good to me 👍', user: 'dana', htmlUrl: 'https://x/3', createdAt: 'T0', updatedAt: 'T0' },
+      'docs/spec.md',
+    );
+    // It is still surfaced — R-5.6 discards nothing — but nobody routed it.
+    expect(driveBy.comment).toBe('Looks good to me 👍');
+    expect(hasRoutingDecision(driveBy)).toBe(false);
+  });
+
   it('surfaces comments authored on github.com, trailer or not (R-5.6)', async () => {
     const { store: s } = store([LIST]);
     const doc = await s.read();
@@ -243,6 +286,109 @@ describe('githubCommentStore intent methods (R-5.4 / R-5.5)', () => {
     expect(JSON.parse(calls[0]?.input ?? '{}').body).toBe(
       'Overall this reads well.\n\n<!-- visual-spec: documentId=doc-1 -->',
     );
+  });
+
+  /*
+   * Issue comments are flat, so the trailer is the only place a reply's parent can live.
+   * `addComment` used to build the trailer from documentId + nodeId + the idempotency key
+   * alone, so `replyTo` was dropped on the way out: a reply reached GitHub indistinguishable
+   * from a new comment, the thread was unrecoverable, and the panel listed it as a fourth
+   * top-level comment. Asserted on the emitted body, which is the only artifact that
+   * outlives this process.
+   */
+  it('addComment carries replyTo into the trailer, so a reply keeps its parent (R-5.12)', async () => {
+    const { store: s, calls } = store([{ stdout: fixture('issue-comment-create.json') }]);
+
+    await s.addComment!({
+      id: 'c-local',
+      workflow: 'visual-spec',
+      target: { path: 'docs/spec.md', kind: 'file' },
+      comment: 'Agreed, rewording now.',
+      status: 'open',
+      ts: '2026-08-07T10:00:00Z',
+      collab: { nodeId: 'n-7', replyTo: '700001' },
+    } as Parameters<NonNullable<typeof s.addComment>>[0]);
+
+    expect(JSON.parse(calls[0]?.input ?? '{}').body).toBe(
+      'Agreed, rewording now.\n\n<!-- visual-spec: documentId=doc-1 nodeId=n-7 replyTo=700001 -->',
+    );
+  });
+
+  /*
+   * A reply is not a resolution. `markerOf` demands `replyTo` AND `resolved`, so carrying
+   * the parent link must not silently mark the thread resolved — that would take a comment
+   * off the open list and open the publish gate on nobody's authority.
+   */
+  it('a reply carrying only replyTo is not read as a resolution marker', async () => {
+    const { store: s, calls } = store([{ stdout: fixture('issue-comment-create.json') }]);
+    await s.addComment!({
+      id: 'c-local',
+      workflow: 'visual-spec',
+      target: { path: 'docs/spec.md', kind: 'file' },
+      comment: 'Agreed.',
+      status: 'open',
+      ts: '2026-08-07T10:00:00Z',
+      collab: { replyTo: '700001' },
+    } as Parameters<NonNullable<typeof s.addComment>>[0]);
+
+    const body = JSON.parse(calls[0]?.input ?? '{}').body as string;
+    expect(body).toContain('replyTo=700001');
+    expect(body).not.toContain('resolved=');
+    const asProjected = projectIssueComment(
+      { id: 900001, body, user: 'octocat', htmlUrl: 'https://x/1', createdAt: 'T0', updatedAt: 'T0' },
+      'docs/spec.md',
+    );
+    expect(isResolutionReply(asProjected)).toBe(false);
+  });
+
+  /*
+   * `addComment` used to rebuild the trailer from a fixed list of keys, which made it the
+   * gatekeeper of the whole vocabulary: anything the caller computed and this list did not
+   * name was dropped, and since issue comments are flat and the trailer is the only durable
+   * channel, dropped meant gone. Two requirements were dead because of it — `nodeVersion`
+   * never reached GitHub, so nothing could ever read as outdated (R-6.3), and the target
+   * text never did either, so an orphan could not say what it was about (R-6.5). This pins
+   * the direction: the caller's fields go out, the store only enforces its own.
+   */
+  it('carries every trailer field the caller set, not a fixed list of them (R-6.3 / R-6.5)', async () => {
+    const { store: s, calls } = store([{ stdout: fixture('issue-comment-create.json') }]);
+
+    await s.addComment!({
+      id: 'c-local',
+      workflow: 'visual-spec',
+      target: { path: 'docs/spec.md', kind: 'file' },
+      comment: 'Tighten this.',
+      status: 'open',
+      ts: '2026-08-07T10:00:00Z',
+      collab: { nodeId: 'n-7', nodeVersion: '4', text: 'The paragraph as it read', workflow: 'research' },
+    } as Parameters<NonNullable<typeof s.addComment>>[0]);
+
+    const body = JSON.parse(calls[0]?.input ?? '{}').body as string;
+    const { trailer } = parseCommentBody(body);
+    expect(trailer).toEqual({
+      documentId: 'doc-1',
+      nodeId: 'n-7',
+      nodeVersion: '4',
+      text: 'The paragraph as it read',
+      workflow: 'research',
+    });
+  });
+
+  it('still imposes its own documentId — a caller cannot address another document', async () => {
+    const { store: s, calls } = store([{ stdout: fixture('issue-comment-create.json') }]);
+    await s.addComment!({
+      id: 'c-local',
+      workflow: 'visual-spec',
+      target: { path: 'docs/spec.md', kind: 'file' },
+      comment: 'x',
+      status: 'open',
+      ts: '2026-08-07T10:00:00Z',
+      collab: { documentId: 'someone-elses-doc', nodeId: 'n-7' },
+    } as Parameters<NonNullable<typeof s.addComment>>[0]);
+
+    expect(parseCommentBody(JSON.parse(calls[0]?.input ?? '{}').body as string).trailer).toMatchObject({
+      documentId: 'doc-1',
+    });
   });
 
   it('NEVER creates a review comment — no /pulls/:n/comments endpoint is reached (R-5.5)', async () => {

@@ -82,6 +82,7 @@ export type JobKind =
   | 'create' // create branch + PR, commit the canonical JSON (R-8.5)
   | 'commit' // commit structured JSON to the PR branch
   | 'sync' // pull PR issue comments from GitHub (R-8.6, R-8.7)
+  | 'open' // fetch a document off its PR branch and write it locally (R-11.2)
   | 'remap' // re-resolve comment anchors after document edits
   | 'resolve' // resolve / unresolve a thread via the reply-marker convention
   | 'publish' // commit the client's final Markdown, then verify it (R-8.9 … R-8.14)

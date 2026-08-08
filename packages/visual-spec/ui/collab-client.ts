@@ -128,7 +128,7 @@ export type StartDocumentInput = Idempotent & {
   doc?: JsonDocument;
 };
 
-export type OpenDocumentInput = Idempotent & { documentId: string; pullNumber: number };
+export type OpenDocumentInput = Idempotent & { documentId: string; pullNumber: number; discardLocal?: boolean };
 
 /** R-8.9 — both fields are required by the route *before* it checks authorization. */
 export type PublishInput = Idempotent & { json: JsonDocument; markdown: string };
@@ -154,7 +154,7 @@ export interface CollabClient {
   /** `POST /__vs/collab/:id/publish` — R-8.9 … R-8.14. */
   publish(documentId: string, input: PublishInput): Promise<CollabResult<JobAccepted>>;
   /** `POST /__vs/collab/:id/comments` — R-7.5, anchored on `nodeId`. */
-  addComment(documentId: string, input: { comment: string; nodeId?: string }): Promise<CollabResult<CommentSaved>>;
+  addComment(documentId: string, input: { comment: string; nodeId?: string; workflow?: string }): Promise<CollabResult<CommentSaved>>;
   /** `POST /__vs/collab/:id/comments/:commentId/reply`. */
   replyToComment(documentId: string, commentId: string, input: { comment: string }): Promise<CollabResult<CommentSaved>>;
   /** `PATCH /__vs/collab/:id/comments/:commentId`. */

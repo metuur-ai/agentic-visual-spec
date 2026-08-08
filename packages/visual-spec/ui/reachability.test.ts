@@ -33,7 +33,7 @@
  * rather than grepping for names, because `.start(` matches `hub.start(` and
  * `applyHub.start(` all over `core/` — a name match would have declared O-10 healthy.
  */
-import { existsSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -135,6 +135,103 @@ describe('the collaboration UI is reachable from the app (task U-1)', () => {
  * ------------------------------------------------------------------------------------ */
 
 /** The module that declares the client, and the interface that is its whole public surface. */
+/*
+ * Reachability's known floor, hit again. `collabIndicatorTargets` builds the markers that
+ * pin a comment to its block (R-6.2); it is exported from `collab-comment-source.ts`,
+ * which the app *does* import — for the panel source — so the module check above was
+ * green while the function had no caller anywhere. The result was visible only in a
+ * screenshot: four comments listed in the sidebar and not one marker on a block.
+ *
+ * A name search is enough here, unlike the interface survey below, because the name is
+ * unique in the tree. The guard is the pairing: whatever mounts the comment panel must
+ * also mount the indicator layer, or a reviewer sees comments that point nowhere.
+ */
+const RENDERED_PAIRS: { produces: string; consumedBy: string }[] = [
+  { produces: 'collabIndicatorTargets', consumedBy: 'IndicatorLayer' },
+];
+
+describe('a produced UI model has something that renders it', () => {
+  const reachable = [...reachableFromApp()].filter((module) => !IS_TEST.test(module));
+
+  it.each(RENDERED_PAIRS)('$produces is passed to $consumedBy somewhere the app reaches', ({ produces, consumedBy }) => {
+    const callers = reachable.filter((module) => {
+      const source = readFileSync(resolve(pkgRoot, module), 'utf8');
+      return source.includes(`${produces}(`) && source.includes(`<${consumedBy}`);
+    });
+    expect(callers).not.toEqual([]);
+  });
+});
+
+/*
+ * `IndicatorLayer` and `CommentPanel` both read the active comment from a context whose
+ * default `setActiveId` is an empty function. Mount them without the provider and every
+ * click on an inline marker does nothing at all — no focused row, no brightened block, no
+ * error. `markdown-editor.tsx` mounted it; `collab-app.tsx` did not, so the whole
+ * document→sidebar direction was dead in collaboration while the suite stayed green.
+ */
+describe('whatever renders inline indicators also provides the active-comment context', () => {
+  const reachable = [...reachableFromApp()].filter((module) => !IS_TEST.test(module));
+
+  const hosts = reachable.filter((module) => readFileSync(resolve(pkgRoot, module), 'utf8').includes('<IndicatorLayer'));
+
+  it('finds the modules that mount it (guards against a vacuous pass)', () => {
+    expect(hosts.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it.each(hosts)('%s mounts ActiveCommentProvider', (module) => {
+    expect(readFileSync(resolve(pkgRoot, module), 'utf8')).toContain('<ActiveCommentProvider');
+  });
+});
+
+/*
+ * `buildApplyPrompt(..., { mode: 'collab' })` sat finished and tested with no caller for
+ * the whole life of the collaboration feature: nothing in the running app could ask an
+ * agent to act on a pull request's comments. Module reachability could not see it — the
+ * module is imported for the local surface — so this pins the mode itself.
+ */
+describe("the collab apply prompt has a caller in the app", () => {
+  const reachable = [...reachableFromApp()].filter((module) => !IS_TEST.test(module));
+
+  // Callers, not the definition: `apply-prompt.ts` names the mode in its own option type.
+  const callersOf = () =>
+    reachable.filter((module) => {
+      const source = readFileSync(resolve(pkgRoot, module), 'utf8');
+      // Skip the module that defines it — it names the mode in its own option type.
+      if (source.includes('export function buildApplyPrompt')) return false;
+      return source.includes('buildApplyPrompt(') && source.includes("mode: 'collab'");
+    });
+
+  it("something the app reaches builds a prompt with mode 'collab'", () => {
+    expect(callersOf()).not.toEqual([]);
+  });
+
+  /*
+   * And it must hand over the same set the panel lists. A resolve posts a marker reply and
+   * an unresolve posts another; they accumulate by design (R-5.14). The panel filters them
+   * and the handoff did not, so a prompt claimed six comments where the sidebar showed
+   * four — two of them the sentence "Resolved this comment: <url>", offered to an agent as
+   * something to act on.
+   */
+  it('it excludes resolution markers, exactly as the panel does', () => {
+    for (const module of callersOf()) {
+      expect(readFileSync(resolve(pkgRoot, module), 'utf8')).toContain('isResolutionReply(');
+    }
+  });
+
+  /*
+   * And it must name the file the AGENT will edit. `document.documentPath` is the path on
+   * the branch; the agent runs against the local store, whose convention is
+   * `localDocumentPath`. They coincide today only by accident of the create form.
+   */
+  it('it derives the path from the store convention, not from documentPath', () => {
+    for (const module of callersOf()) {
+      const source = readFileSync(resolve(pkgRoot, module), 'utf8');
+      expect(source).toContain('localDocumentPath(');
+      expect(source).not.toMatch(/documentPath:\s*\w*\.?documentPath/);
+    }
+  });
+});
+
 const CLIENT_MODULE = 'ui/collab-client.ts';
 const CLIENT_INTERFACE = 'CollabClient';
 

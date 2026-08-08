@@ -30,17 +30,21 @@
  * `CollabDocumentView` already walks.
  */
 import { useCallback, useMemo, useRef, useState } from 'react';
-import { InspectorProvider } from '../core/app';
-import type { ProjectedCommentRecord } from '../core/collaboration/comment-projection';
+import { InspectOverlay, InspectorProvider, type SourceLoc } from '../core/app';
+import { type ProjectedCommentRecord, isResolutionReply } from '../core/collaboration/comment-projection';
 // From the pure module, not `failure-states`: that one reaches `cache-lifecycle` and
 // `node:fs/promises`, which the browser bundle cannot resolve.
 import { deriveReadiness, type ReadinessVerdict } from '../core/collaboration/readiness';
+import { buildApplyPrompt } from '../core/editing/apply-prompt';
+import { localDocumentPath } from '../core/collaboration/node-location';
 import type { CommentRecord } from '../core/editing/comment-doc';
-import { collabCommentPanelSource } from './collab-comment-source';
-import { CollabDocumentView } from './collab-document-view';
+import { collabCommentPanelSource, collabIndicatorTargets } from './collab-comment-source';
+import { CollabDocumentView, VS_NODE_ID_ATTR } from './collab-document-view';
 import { CollabEditor, type CollabEditorHandle } from './collab-editor';
 import { CollabOpenPanel } from './collab-open-panel';
+import { ActiveCommentProvider } from './active-comment';
 import { CommentPanel, type CommentPanelSource } from './comment-panel';
+import { IndicatorLayer } from './indicator-layer';
 import type { PublishLoss, PublishPayload } from './publish-payload';
 import { useCollabDocument } from './use-collab-document';
 
@@ -58,8 +62,37 @@ import { useCollabDocument } from './use-collab-document';
  */
 type PaneMode = 'review' | 'edit';
 
+/**
+ * The open document, kept in the URL rather than only in memory.
+ *
+ * It was `useState` alone, so any reload — F5, a crashed tab, the dev server restarting —
+ * lost it, and the only route back to the document was `open`, which refreshes from the
+ * branch. That is fine for a stale copy and catastrophic while an agent's applied changes
+ * are still unpublished, since they live nowhere else. The refusal in `open` (R-11.7) is
+ * what makes that safe; this is what makes it rare, by not forcing the trip in the first
+ * place.
+ */
+const DOCUMENT_PARAM = 'vsdoc';
+
+function documentFromUrl(): string | null {
+  if (typeof window === 'undefined') return null;
+  return new URLSearchParams(window.location.search).get(DOCUMENT_PARAM);
+}
+
+function rememberInUrl(documentId: string | null): void {
+  if (typeof window === 'undefined') return;
+  const url = new URL(window.location.href);
+  if (documentId) url.searchParams.set(DOCUMENT_PARAM, documentId);
+  else url.searchParams.delete(DOCUMENT_PARAM);
+  window.history.replaceState(null, '', url);
+}
+
 export function CollabApp({ onExit }: { onExit: () => void }) {
-  const [documentId, setDocumentId] = useState<string | null>(null);
+  const [documentId, setDocumentIdState] = useState<string | null>(documentFromUrl);
+  const setDocumentId = useCallback((id: string | null) => {
+    setDocumentIdState(id);
+    rememberInUrl(id);
+  }, []);
 
   return (
     <>
@@ -81,7 +114,7 @@ export function CollabApp({ onExit }: { onExit: () => void }) {
 }
 
 function CollabDocumentPane({ documentId }: { documentId: string }) {
-  const { document, fullDocument, comments, loading, error, addComment, replyToComment, removeComment, publish } =
+  const { document, fullDocument, comments, loading, error, addComment, replyToComment, removeComment, restoreComment, reload, publish } =
     useCollabDocument(documentId);
   // `locate` scopes its query to the rendered document rather than the whole page.
   const docRoot = useRef<HTMLDivElement | null>(null);
@@ -127,6 +160,45 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
     setMode('review');
   }, [publish, staged]);
 
+  const [handoff, setHandoff] = useState<string | null>(null);
+
+  /*
+   * R-5.10 — hand the open comments to an agent, and stop there.
+   *
+   * The prompt itself has existed and been tested since task 5.x with no caller at all,
+   * so nothing in the app could ever ask an agent to act on a pull request's comments.
+   * This is the caller, and it is deliberately the smallest one that closes the loop:
+   * the prompt goes to the clipboard and the author runs it in their own session, the
+   * way the local surface's "Copy prompt" already works. No route, no process, no
+   * activity stream — those are worth building once the prompt is known to be good.
+   *
+   * THE PATH IS THE STORE'S CONVENTION, NOT `documentPath`. `fsDocumentStore` always
+   * writes `<contentDir>/documents/<id>.json`, and the agent runs with that directory as
+   * its cwd. `documentPath` is the path on the BRANCH, which is the same string today
+   * only because the create form happens to build it that way — a document created
+   * through the API with any other path would send the agent looking for a file that is
+   * not there. The prompt already forbids editing the generated Markdown; pointing it at
+   * the wrong JSON would be the same class of mistake, and silent.
+   */
+  const copyHandoff = useCallback(async () => {
+    /*
+     * Resolution markers are bookkeeping, not conversation: a resolve posts one, an
+     * unresolve posts another, and they accumulate by design (R-5.14). The panel already
+     * keeps them out of the list; handing them to an agent as instructions would ask it to
+     * act on the sentence "Resolved this comment: <url>". Same predicate, so the two
+     * surfaces cannot disagree about what counts as a comment — they did: the panel showed
+     * four and the prompt claimed six.
+     */
+    const open = comments.filter((c) => c.status === 'open' && !isResolutionReply(c as ProjectedCommentRecord));
+    const prompt = buildApplyPrompt(open, { mode: 'collab', documentPath: localDocumentPath(documentId) });
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setHandoff(`Copied — ${open.length} open comment${open.length === 1 ? '' : 's'}. Run it where the specs directory is.`);
+    } catch (err) {
+      setHandoff((err as Error).message);
+    }
+  }, [comments, documentId]);
+
   const source = useMemo<CommentPanelSource | null>(
     () =>
       fullDocument
@@ -136,10 +208,11 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
             add: addComment,
             reply: replyToComment,
             remove: removeComment,
+            restore: restoreComment,
             root: docRoot.current,
           })
         : null,
-    [fullDocument, comments, addComment, replyToComment, removeComment],
+    [fullDocument, comments, addComment, replyToComment, removeComment, restoreComment],
   );
 
   if (loading) {
@@ -157,6 +230,14 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
     // `surfaceId` namespaces the inspector's selection state. A collaboration document
     // is not a local file, so it gets its own scheme rather than borrowing `toSurfaceId`.
     <InspectorProvider key={documentId} surfaceId={`collab:${documentId}`} pageIndex={0}>
+      {/*
+        * Clicking an inline indicator is supposed to focus its row in the sidebar, and the
+        * shaded area is supposed to brighten with it (R-2.1 / R-2.2). Both read the active
+        * id from this context, and only `markdown-editor.tsx` was mounting the provider —
+        * so collaboration ran on the default context, whose `setActiveId` is an empty
+        * function. Every click on a marker did precisely nothing, silently.
+        */}
+      <ActiveCommentProvider>
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
         <main style={docPane}>
           <div style={docTitleBar}>
@@ -177,6 +258,24 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
             >
               {mode === 'review' ? 'Edit' : 'Review'}
             </button>
+            {mode === 'review' && (
+              <>
+                {/*
+                  * Review mode only, and that is a safety property rather than a layout
+                  * choice. The editor seeds its tree from `fullDocument` on mount, so an
+                  * author sitting in edit mode while an agent rewrites the JSON on disk
+                  * would publish the copy they loaded and drop the agent's work without
+                  * a word. Handing work out from the read-only view, and reloading into
+                  * it, keeps those two writers apart.
+                  */}
+                <button type="button" onClick={() => void copyHandoff()} style={backBtn} title="Copy the prompt that hands the open comments to an agent">
+                  Copy agent prompt
+                </button>
+                <button type="button" onClick={() => void reload()} style={backBtn} title="Re-read the document from disk — an agent's edits land there">
+                  Reload
+                </button>
+              </>
+            )}
             {mode === 'edit' && (
               <button
                 type="button"
@@ -189,12 +288,41 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
               </button>
             )}
           </div>
+          {handoff && (
+            <div style={handoffNote} data-vs-handoff>
+              {handoff}
+            </div>
+          )}
           {mode === 'edit' && !readiness.ready && (
             <div style={blockedBanner}>
               {readiness.unresolved} of {readiness.total} comment
               {readiness.total === 1 ? '' : 's'} unresolved — resolve them before publishing.
             </div>
           )}
+          {/*
+            * R-7.5's create path ends here. `CommentPanel` reads the inspector's selection
+            * and `collabCommentPanelSource` turns the selected element into a `nodeId`, but
+            * nothing was ever putting a selection there: the overlay that hit-tests clicks
+            * is mounted by the local markdown surface only, so the panel sat on "Click a
+            * block in the spec to comment on it" forever and no reviewer could open a
+            * thread from the browser. Review mode only — in edit mode the blocks belong to
+            * Lexical and a click is a caret move, not a selection.
+            */}
+          {mode === 'review' && <InspectOverlay rootSelector={COLLAB_ROOT_SELECTOR} resolveAnchor={collabAnchorOf} />}
+          {/*
+            * R-6.2 — the markers that show which blocks carry a comment. `collabIndicatorTargets`
+            * was built and tested against a real `IndicatorLayer`, but only `markdown-editor.tsx`
+            * ever mounted that layer, so in the running app a collaboration document showed none:
+            * the sidebar listed four comments and not one of them pointed at a block. Review mode
+            * only, because the markers pin to `[data-vs-node-id]` and Lexical never puts those in
+            * the DOM — the same reason the two modes are a toggle (see the note at the top).
+            *
+            * No root is passed on purpose. `docRoot.current` is null on the first render, and
+            * `findCollabBlock` treats an explicit null as "nowhere" rather than falling back, so
+            * every marker would resolve to null until something re-rendered. The default searches
+            * the document, which is safe here because the selector carries the document id.
+            */}
+          {mode === 'review' && <IndicatorLayer targets={collabIndicatorTargets(fullDocument, comments)} />}
           <div ref={docRoot} style={{ maxWidth: 1200, margin: '0 auto', padding: '32px 56px 120px' }}>
             {mode === 'review' ? (
               <CollabDocumentView document={fullDocument} />
@@ -211,6 +339,7 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
         </main>
         {mode === 'review' && <CommentPanel width={340} source={source} />}
       </div>
+      </ActiveCommentProvider>
       {staged && (
         <PublishConfirm
           losses={staged.losses}
@@ -239,6 +368,28 @@ function isProjected(comment: CommentRecord): comment is ProjectedCommentRecord 
   // additions — so the check reads them through a widened view.
   const candidate = comment as Partial<ProjectedCommentRecord>;
   return typeof candidate.github?.issueCommentId === 'number' && candidate.collab !== undefined;
+}
+
+/** The element `CollabDocumentView` wraps every rendered block in. */
+const COLLAB_ROOT_SELECTOR = '[data-vs-collab-root]';
+
+/**
+ * A collaboration block's anchor, for the overlay's hit-testing.
+ *
+ * The default resolver wants `data-vs-loc` or a React fiber `_debugSource`. This document
+ * has neither and deliberately so — its blocks are identified by `data-vs-node-id`, and
+ * the canonical JSON carries no source positions to stamp a line from (see the comment
+ * over `identityAttrs` in `collab-document-view.tsx`). `line`/`column` are what the panel
+ * prints beside a selection, so they are reported as 0 rather than invented: the panel's
+ * collaboration source describes a selection by its block, never by a line number.
+ *
+ * Returning null for anything outside an identified block is the point. Images and embeds
+ * lose their `nodeId` on serialization and are stamped `data-vs-uncommentable`; refusing
+ * to anchor there is what keeps a comment from pointing at the wrong paragraph later.
+ */
+function collabAnchorOf(el: HTMLElement | null): SourceLoc | null {
+  const block = el?.closest(`[${VS_NODE_ID_ATTR}]`) as HTMLElement | null;
+  return block ? { line: 0, column: 0, anchor: block } : null;
 }
 
 /** Names the blocking reason rather than leaving a disabled control unexplained. */
@@ -368,3 +519,14 @@ const dialogBody: React.CSSProperties = { fontSize: 13, lineHeight: 1.5 };
 const dialogList: React.CSSProperties = { fontSize: 12, lineHeight: 1.6, paddingLeft: 20 };
 const dialogError: React.CSSProperties = { fontSize: 12, color: '#b91c1c' };
 const dialogActions: React.CSSProperties = { display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 };
+
+/** The one-line receipt after handing work to an agent. Same lane as the blocked banner. */
+const handoffNote: React.CSSProperties = {
+  margin: '0 56px',
+  padding: '6px 10px',
+  border: '1px solid #c7d2fe',
+  borderRadius: 6,
+  background: '#eef2ff',
+  color: '#3730a3',
+  font: '12px system-ui',
+};

@@ -147,7 +147,20 @@ export function projectIssueComment(comment: IssueComment, documentPath: string)
   const { text, trailer } = parseCommentBody(comment.body);
   return {
     id: recordIdFor(comment.id),
-    workflow: DEFAULT_WORKFLOW,
+    /*
+     * Read back rather than stamped. A comment written through visual-spec carries its
+     * routing tag in the trailer; before that tag was persisted it carried none, and
+     * falls back to the default — that is the population the tag was always implicitly
+     * `visual-spec` for, so nothing shifts underneath it and no migration is needed
+     * (rewriting someone else's comment body would take their token anyway).
+     *
+     * A comment typed on github.com has no trailer and never chose anything. The field
+     * still reads `visual-spec`, because `CommentRecord` requires a workflow and every
+     * sentinel would collide with a namespace that is free text. `hasRoutingDecision`
+     * below is the honest signal, and the ONE consumer that must not confuse the two is
+     * whatever hands work to an agent — see the note there.
+     */
+    workflow: trailer?.workflow ?? DEFAULT_WORKFLOW,
     target: { path: documentPath, kind: 'file' },
     comment: text,
     status: 'open',
@@ -235,6 +248,25 @@ function markerOf(record: ProjectedCommentRecord): ResolutionMarker | null {
     createdAt: record.github.createdAt,
     issueCommentId: record.github.issueCommentId,
   };
+}
+
+/**
+ * R-5.6 — did anyone actually choose how this comment should be routed?
+ *
+ * `record.workflow` cannot answer that. It is required by `CommentRecord`, so a comment
+ * typed straight into the PR conversation on github.com — no trailer, no control ever
+ * seen — still reads `visual-spec`, and a sentinel value is not available either because
+ * the workflow namespace is free text a user can type. The trailer's presence is the
+ * signal: it is written by this tool and by nothing else.
+ *
+ * READ THE SCOPE. This says a routing decision exists, NOT that the comment is worth
+ * acting on. Both workflow values mean actionable; they differ on by whom. Whether a
+ * given comment is a sensible instruction, an aside, a question or noise is a judgement
+ * about its text — a person makes that call, and the apply flow already lets them: a run
+ * is scoped to the comment ids they picked. Do not grow this into a validity gate.
+ */
+export function hasRoutingDecision(record: ProjectedCommentRecord): boolean {
+  return Object.keys(record.collab ?? {}).length > 0;
 }
 
 /** R-5.12 — true when this comment is a resolution reply rather than a comment of its own. */
@@ -409,7 +441,6 @@ export function githubCommentStore(options: GitHubCommentStoreOptions): GitHubCo
     /** R-5.4 — post an issue comment with a trailer and return the record carrying GitHub's id. */
     async addComment(record) {
       const collab = (record as Partial<ProjectedCommentRecord>).collab;
-      const nodeId = collab?.nodeId;
       const key = collab?.[IDEMPOTENCY_KEY];
       if (key) {
         // R-5.11 — read-before-write against GitHub. A retry of a create that already
@@ -417,9 +448,31 @@ export function githubCommentStore(options: GitHubCommentStoreOptions): GitHubCo
         const existing = findByIdempotencyKey((await read()).comments as ProjectedCommentRecord[], key);
         if (existing) return existing;
       }
+      /*
+       * CARRY THE TRAILER THE CALLER BUILT, DO NOT REBUILD IT FROM A LIST.
+       *
+       * This used to name the keys it would write — documentId, nodeId, and the
+       * idempotency key — which quietly made it the gatekeeper of the whole trailer
+       * vocabulary. Every other key the caller computed was dropped on the floor, and
+       * because issue comments are flat and this trailer is the only durable channel
+       * (see the RESOLUTION note above), dropped means gone for good.
+       *
+       * Two requirements were dead in the water for exactly that reason, both of them
+       * silently: `anchorFields` computes `nodeVersion` and the target text on every
+       * anchored comment, and neither ever reached GitHub. Without `nodeVersion` no
+       * comment can ever read as outdated (R-6.3) — everything resolves `exact`
+       * forever. Without the text an orphan cannot say what it was about (R-6.5).
+       * `replyTo` was the third, fixed earlier by adding it to the list, which treated
+       * the symptom and left the mechanism.
+       *
+       * So the direction is inverted: the caller's fields go through, and this layer
+       * only enforces what is genuinely its own.
+       */
       const body = formatCommentBody(record.comment, {
+        ...collab,
+        // The store knows which document it serves; a caller must not be able to
+        // address a comment at a different one.
         documentId,
-        ...(nodeId ? { nodeId } : {}),
         ...(key ? { [IDEMPOTENCY_KEY]: key } : {}),
       });
       // R-5.5 — issue comments only. The adapter has no review-comment method at all.

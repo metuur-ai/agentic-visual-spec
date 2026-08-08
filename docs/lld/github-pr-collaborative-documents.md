@@ -359,6 +359,26 @@ Issue comments have no resolve state, and reviewers cannot push, so resolution m
 
 GitHub is the system of record. The sidecar is a read cache for agent consumption and is deleted after merge, so it can never drift into being a competing source of truth.
 
+**With one bounded exception, and every writer of the local copy must know it.** An agent
+applying review comments edits the canonical JSON in the local store directly, and it is
+forbidden to publish — the run ends at `READY TO PUBLISH:`. Between that edit and the
+author's publish, the local copy holds work that exists **nowhere else**: not on the
+branch, not in any commit. During that window the local copy is not a cache, and anything
+that overwrites it without asking destroys work with no way back.
+
+This is a property of the document, not of whoever is about to write it. Two writers hit
+it before it was named — the editor, which seeds its tree on mount and would publish a
+pre-agent copy over the agent's (separated by making apply review-mode only), and `open`,
+which refreshes from the branch and overwrote silently. A third will appear. So the
+question "does this document hold unpublished local work?" belongs to the store, and every
+overwriting path asks it rather than each one rediscovering the hazard.
+
+The anchor is `github.contentSha` on the binding: the blob hash of the document as it stood
+at the last point local and branch provably agreed — written by create, by open, and by
+publish once its bytes are verified. Local content that no longer hashes to it means the
+copy moved on since that point. `headSha` cannot serve: it is a commit-level pointer, it is
+not updated on publish, and it is blind to a local edit that never became a commit.
+
 ## Out of Scope
 
 - Real-time collaborative editing, live cursors, presence indicators

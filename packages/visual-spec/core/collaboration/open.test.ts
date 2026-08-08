@@ -16,7 +16,7 @@ import { resolveNodeIn } from './document-store';
 import { createGitHubAdapter } from './github-adapter';
 import type { GhExecutor, GhResult } from './github-executor';
 import { type JobContext, type LifecycleState } from './job-hub';
-import { buildPullRequestBody, openCommandFor } from './lifecycle';
+import { buildPullRequestBody, openCommandFor, documentContentSha } from './lifecycle';
 import {
   OpenDocumentError,
   type OpenFailureReason,
@@ -141,7 +141,7 @@ type RunResult = {
 
 async function run(
   responses: Array<Partial<GhResult>>,
-  options: { seed?: CollaborationDocument; documentId?: string; pullNumber?: number } = {},
+  options: { seed?: CollaborationDocument; documentId?: string; pullNumber?: number; discardLocal?: boolean } = {},
 ): Promise<RunResult> {
   const { exec, endpoints, methods } = recorder(responses);
   const { store, docs } = memoryStore(options.seed);
@@ -150,6 +150,7 @@ async function run(
     repo: { ...REPO },
     store,
     pullNumber: options.pullNumber ?? 42,
+    ...(options.discardLocal ? { discardLocal: true } : {}),
   });
   const ctx = context();
   let err: unknown;
@@ -285,14 +286,59 @@ describe('R-11.2 — opening by pull request reference', () => {
   it('binds the fetched document to the pull request so comments and sync work', async () => {
     const doc = makeDoc();
     const r = await run([{ stdout: pullResponse(doc) }, { stdout: contentsResponse(doc) }]);
-    expect((r.docs.get('doc-1') as { github?: unknown }).github).toEqual({
+    const bound = r.docs.get('doc-1') as CollaborationDocument;
+    expect(bound.github).toEqual({
       owner: 'acme',
       repo: 'docs',
       branch: BRANCH,
       pullNumber: 42,
       headSha: '9f8e7d6c5b4a39281706f5e4d3c2b1a098765432',
       resolved: false,
+      // R-11.6 — what was fetched IS the branch, so this open is a point of agreement.
+      // Recorded here so a later open can tell a stale copy from one that moved on.
+      contentSha: documentContentSha(bound),
     });
+    expect(r.ctx.states).toEqual(['pr-open']);
+  });
+
+  /*
+   * R-11.7 — the whole point. An agent applying review comments edits the local copy and
+   * is forbidden to publish, so until a human publishes, that work exists in exactly one
+   * place. Opening used to overwrite it from the branch without a word, and `open` is not
+   * an exotic path: the browser keeps the document id in memory with no URL, so after any
+   * reload it is the only way back to the document — under a button labelled "Open".
+   */
+  it('refuses to open over local work that is not on the branch', async () => {
+    const doc = makeDoc();
+    const sealed = { ...doc, github: { owner: 'acme', repo: 'docs', branch: BRANCH, pullNumber: 42, resolved: false, contentSha: documentContentSha(doc) } };
+    // What an agent leaves behind: the same document with a block it added.
+    const edited = { ...sealed, nodes: [...(doc.nodes ?? []), { id: 'n-agent', type: 'paragraph', version: 1, content: 'applied by the agent' }] };
+
+    const r = await run([{ stdout: pullResponse(doc) }, { stdout: contentsResponse(doc) }], { seed: edited });
+
+    expect(reasonOf(r.err)).toBe('local_diverged');
+    expect(String((r.err as Error).message)).toContain('not on');
+    // And the local copy is untouched — the agent's block is still there.
+    expect((r.docs.get('doc-1') as CollaborationDocument).nodes).toHaveLength(2);
+  });
+
+  it('opens normally when the local copy still matches its seal — the stale-copy case', async () => {
+    const doc = makeDoc();
+    const sealed = { ...doc, github: { owner: 'acme', repo: 'docs', branch: BRANCH, pullNumber: 42, resolved: false, contentSha: documentContentSha(doc) } };
+
+    const r = await run([{ stdout: pullResponse(doc) }, { stdout: contentsResponse(doc) }], { seed: sealed });
+
+    expect(r.ctx.states).toEqual(['pr-open']);
+  });
+
+  /* R-11.8 — the branch version is still reachable, but only by asking for it. */
+  it('discards the local copy when the caller explicitly says so', async () => {
+    const doc = makeDoc();
+    const sealed = { ...doc, github: { owner: 'acme', repo: 'docs', branch: BRANCH, pullNumber: 42, resolved: false, contentSha: documentContentSha(doc) } };
+    const edited = { ...sealed, nodes: [...(doc.nodes ?? []), { id: 'n-agent', type: 'paragraph', version: 1, content: 'applied by the agent' }] };
+
+    const r = await run([{ stdout: pullResponse(doc) }, { stdout: contentsResponse(doc) }], { seed: edited, discardLocal: true });
+
     expect(r.ctx.states).toEqual(['pr-open']);
   });
 

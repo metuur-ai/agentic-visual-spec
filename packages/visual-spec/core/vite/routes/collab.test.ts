@@ -107,7 +107,21 @@ function memoryComments(seed: CommentRecord[] = []) {
       comments = comments.filter((c) => c.id !== id);
     },
   };
-  return { store, all: () => comments };
+  /*
+   * `setResolved` is what the route uses for a status change, because on GitHub a
+   * resolution is a marker reply rather than a field (R-5.12). The stub stood in for
+   * `githubCommentStore` without it, so these tests passed while the real Resolve button
+   * did nothing — the stub was more capable than production in exactly the wrong place.
+   * Modelled the same way the real one behaves on read-back: the parent reads resolved.
+   */
+  const setResolved = async (id: string, resolved: boolean): Promise<CommentRecord | null> => {
+    const found = comments.find((c) => c.id === id);
+    if (!found) return null;
+    const next = { ...found, status: resolved ? 'applied' : 'open' } as CommentRecord;
+    comments = comments.map((c) => (c.id === id ? next : c));
+    return next;
+  };
+  return { store: Object.assign(store, { setResolved }), all: () => comments };
 }
 
 /** An `SseSink` that records what the hub wrote. */
@@ -398,12 +412,19 @@ describe('R-7.1 — POST /start', () => {
 });
 
 describe('R-7.1 — POST /open', () => {
-  it('starts a sync-kind job carrying the pull number', async () => {
+  /*
+   * The kind is not cosmetic. `use-collab-document.ts` reads it off the `job-done` frame
+   * to decide what to re-read, and skips the document for comment-only kinds — `sync` is
+   * one of those. While open wore that label a reviewer sat looking at the seed document
+   * until they reloaded the page, which is the one thing R-11.2 exists to prevent. The
+   * browser half of this pairing is pinned in `use-collab-document.test.ts`.
+   */
+  it('starts an open-kind job carrying the pull number', async () => {
     const open = vi.fn<CollabJobBodies['open']>(() => async () => {});
     const r = router({ bodies: { open } });
     const res = await call(r, 'POST', '/open', { documentId: 'doc-1', pullNumber: 42 });
     expect(res.status).toBe(200);
-    expect(res.json).toMatchObject({ ok: true, kind: 'sync' });
+    expect(res.json).toMatchObject({ ok: true, kind: 'open' });
     expect(open.mock.calls[0]![0]).toMatchObject({ documentId: 'doc-1', pullNumber: 42 });
   });
 
@@ -560,6 +581,29 @@ describe('R-7.1 / R-7.5 — comment routes', () => {
     return { mem, r: router({ commentStore: () => mem.store }) };
   };
 
+  /*
+   * The panel's "Apply via" control picks which skill handles a comment. Its value made it
+   * into the request body and stopped there: the route never read it and `commentRecord`
+   * stamped the default, so the control was decorative and every collaborative comment was
+   * born routed to `visual-spec`. Pinned on the trailer, because that is the only part
+   * that survives a round trip through GitHub.
+   */
+  it('carries the routing tag through to the trailer', async () => {
+    const { mem, r } = withComments();
+    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'hand this off', nodeId: 'n-7', workflow: 'research' });
+    expect(res.status).toBe(200);
+    expect((mem.all()[0]! as CommentRecord & { collab?: Record<string, string> }).collab).toMatchObject({
+      nodeId: 'n-7',
+      workflow: 'research',
+    });
+  });
+
+  it('omits the tag when the caller sent none, rather than inventing one', async () => {
+    const { mem, r } = withComments();
+    await call(r, 'POST', '/doc-1/comments', { comment: 'no tag', nodeId: 'n-7' });
+    expect((mem.all()[0]! as CommentRecord & { collab?: Record<string, string> }).collab?.workflow).toBeUndefined();
+  });
+
   it('persists a comment against nodeId as its primary identity', async () => {
     const { mem, r } = withComments();
     const res = await call(r, 'POST', '/doc-1/comments', { comment: 'tighten this', nodeId: 'n-7' });
@@ -636,6 +680,38 @@ describe('R-7.1 / R-7.5 — comment routes', () => {
     expect(mem.all()[0]!.comment).toBe('new');
     expect(mem.all()[0]!.status).toBe('applied');
     expect((await call(r, 'PATCH', '/doc-1/comments/c-000000ff', { comment: 'x' })).status).toBe(404);
+  });
+
+  /*
+   * The panel's Resolve button sends exactly this — a status and no text. It used to be
+   * served by `updateComment`, which documents that it cannot express status and returns
+   * the record untouched, so the route answered 200 and nothing resolved. Since unresolved
+   * comments gate publishing (R-8.15), one comment locked the author out for good. Pinned
+   * on the store call, not just the response, because a 200 was exactly the wrong signal.
+   */
+  it('routes a status-only PATCH through setResolved — the resolve the panel actually sends', async () => {
+    const parent = {
+      id: 'c-00000001',
+      workflow: 'visual-spec',
+      target: { path: 'docs/spec.md', kind: 'file' },
+      comment: 'needs work',
+      status: 'open',
+      ts: 'T0',
+    } as unknown as CommentRecord;
+    const { mem, r } = withComments([parent]);
+    const setResolved = vi.spyOn(mem.store as { setResolved: (id: string, r: boolean) => unknown }, 'setResolved');
+
+    const res = await call(r, 'PATCH', '/doc-1/comments/c-00000001', { status: 'applied' });
+
+    expect(res.status).toBe(200);
+    expect(setResolved).toHaveBeenCalledWith('c-00000001', true);
+    expect(mem.all()[0]!.status).toBe('applied');
+    // The answer is the parent as it now reads, never the marker reply resolution creates.
+    expect((res.json as { comment: CommentRecord }).comment.id).toBe('c-00000001');
+
+    await call(r, 'PATCH', '/doc-1/comments/c-00000001', { status: 'open' });
+    expect(setResolved).toHaveBeenLastCalledWith('c-00000001', false);
+    expect(mem.all()[0]!.status).toBe('open');
   });
 });
 

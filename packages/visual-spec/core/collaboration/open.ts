@@ -61,15 +61,18 @@
  */
 import type { ResolvedCollaborationConfig, VisualSpecConfig } from '../config';
 import { parseCommentBody } from './comment-projection';
-import type { GitHubBinding } from './document-protocol';
+import type { CollaborationDocument, GitHubBinding } from './document-protocol';
 import { parseCollaborationDocument } from './document-protocol';
 import type { DocumentStore } from './document-store';
 import { GitHubError, type GitHubAdapter, type PullRequestDetail, type RepoRef } from './github-adapter';
 import type { JobBody } from './job-hub';
 import type { BoundCollaborationDocument } from './lifecycle';
+import { documentContentSha } from './lifecycle';
 
 /** Why an open failed. Each maps to one message; none of them is "something went wrong". */
 export type OpenFailureReason =
+  /** R-11.7 — the local copy moved on since the last agreement; opening would destroy it. */
+  | 'local_diverged'
   /** The repository or the PR is not there, or this credential cannot read it (404/403). */
   | 'no_access'
   /** GitHub rejected the credential outright (401). */
@@ -266,6 +269,12 @@ export type OpenBodyInput = {
   repo: ResolvedCollaborationConfig;
   store: DocumentStore;
   pullNumber: number;
+  /**
+   * R-11.8 — take the branch version even though the local copy holds unpublished work.
+   * Requested explicitly, never inferred: the default has to be the safe one, because the
+   * work it would discard exists in no other place.
+   */
+  discardLocal?: boolean;
 };
 
 export type OpenBodyOptions = { adapter: GitHubAdapter };
@@ -316,6 +325,34 @@ export function createOpenBody(options: OpenBodyOptions): (input: OpenBodyInput)
       );
     }
 
+    /*
+     * R-11.7 — refuse when the local copy holds work that is not on the branch.
+     *
+     * Opening overwrites the local copy, which is the right thing for the case this body
+     * was written for: a reviewer with a stale copy, or none. But an agent applying review
+     * comments edits that copy directly and is forbidden to publish, so between its run
+     * and the author's publish the local file is the ONLY place that work exists. A
+     * refresh there destroys it with nothing to recover from — and `open` is not an
+     * exotic path to reach: the browser holds the document id in memory with no URL, so
+     * after any reload the only way back to the document is this operation, named "Open",
+     * which reads as though it could not possibly delete anything.
+     *
+     * `contentSha` is what makes the two cases distinguishable at all. Content differing
+     * from the branch is true of a stale copy as well; content differing from the hash
+     * recorded at the last agreement is only true of a copy that moved on since.
+     *
+     * The discard is offered, never assumed (R-11.8) — the author may genuinely want the
+     * branch version, and a hard refusal would strand them.
+     */
+    const sealed = local?.github?.contentSha;
+    if (local && typeof sealed === 'string' && !input.discardLocal && documentContentSha(local) !== sealed) {
+      throw new OpenDocumentError(
+        'local_diverged',
+        `the local copy of "${documentId}" has changes that are not on ${reference.branch} — an agent applying comments writes there. ` +
+          'Reload the document to see them and publish, or open again with "discard local changes" to take the branch version instead.',
+      );
+    }
+
     ctx.log(`fetching ${reference.documentPath} from ${reference.branch}`, 'progress');
     let file: Awaited<ReturnType<GitHubAdapter['getFile']>>;
     try {
@@ -345,7 +382,9 @@ export function createOpenBody(options: OpenBodyOptions): (input: OpenBodyInput)
     };
     // The local write is what makes the document readable with no prior copy: the store
     // the routes read (`GET /__vs/collab/:id`) is the store written here.
-    await store.write({ ...fetched, documentId, github });
+    // R-11.6 — what was just fetched IS the branch, so this is a point of agreement.
+    const opened = { ...fetched, documentId } as CollaborationDocument;
+    await store.write({ ...opened, github: { ...github, contentSha: documentContentSha(opened) } });
 
     ctx.log(`opened ${documentId} from ${where} at ${reference.branch} — ${pr.htmlUrl}`);
     ctx.setState('pr-open');

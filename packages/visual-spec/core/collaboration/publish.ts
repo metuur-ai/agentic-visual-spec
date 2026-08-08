@@ -109,6 +109,7 @@ import { ensureLinguistGeneratedEntry } from './gitattributes';
 import type { GitHubAdapter, RepoRef } from './github-adapter';
 import type { JobBody } from './job-hub';
 import type { BoundCollaborationDocument } from './lifecycle';
+import { documentContentSha } from './lifecycle';
 
 /**
  * Git's blob object hash: `sha1("blob " + byteLength + "\0" + content)`. Computed here,
@@ -208,11 +209,13 @@ export function createPublishBody(options: PublishBodyOptions): (input: PublishB
     if (!branch) throw new Error(`no collaboration branch for ${documentId}`);
 
     const markdownPath = markdownPathFor(doc.documentPath);
+    /** What the branch will hold. Committed below, and — once verified — stored locally. */
+    const published = { ...doc, doc: input.json as JsonDocument };
     const artifacts: Artifact[] = [
       // The canonical JSON keeps its envelope — the 3.1 stores parse it — with the
       // client's payload installed as `doc`. `serializeCollaborationDocument` is a
       // deterministic stringify, so the bytes are still a pure function of what arrived.
-      { label: 'json', path: doc.documentPath, content: serializeCollaborationDocument({ ...doc, doc: input.json as JsonDocument }) },
+      { label: 'json', path: doc.documentPath, content: serializeCollaborationDocument(published) },
       { label: 'markdown', path: markdownPath, content: input.markdown },
     ];
 
@@ -249,6 +252,29 @@ export function createPublishBody(options: PublishBodyOptions): (input: PublishB
         });
       }
       ctx.log(`verified ${artifact.label} at ${artifact.path} — blob ${expectedSha}`, 'progress');
+    }
+
+    /*
+     * The local copy has to become what the branch now holds. Publish took the payload
+     * straight from the editor to GitHub and never told the store, so `store.read` kept
+     * answering with the pre-publish envelope: the reviewer pane, which renders the store
+     * and not the branch, showed an empty document immediately after a successful publish,
+     * and stayed that way until an `open` refetched. The bytes are already decided — this
+     * writes the same `published` value the verified JSON artifact was serialized from,
+     * so the local copy cannot drift from what was committed.
+     *
+     * A failure here does not fail the publish. The commits landed and were byte-verified;
+     * saying "publish failed" because a local write did would be false, and the next open
+     * or sync repairs the copy from the branch. It is logged rather than swallowed, so the
+     * divergence is visible instead of silent.
+     */
+    try {
+      // R-11.6 — the bytes were verified onto the branch above, so local and branch agree
+      // here and nowhere else in this body. The hash is over the same value that was
+      // serialized into the committed artifact.
+      await store.write({ ...published, github: { ...published.github, contentSha: documentContentSha(published) } });
+    } catch (err) {
+      ctx.log(`published, but the local copy could not be updated: ${(err as Error).message}`, 'error');
     }
 
     // O-2 — best effort, never allowed to fail the publish (see gitattributes.ts).

@@ -344,9 +344,38 @@ export function withNodeIdentity(
   options: { generateNodeId?: () => string; now?: () => Date } = {},
 ): DocumentStore {
   const wrapped: DocumentStore = {
+    /*
+     * READ REPAIRS, AND THAT IS DELIBERATE.
+     *
+     * A document is not only written through this wrapper. An agent applying review
+     * comments edits `documents/<id>.json` with ordinary file writes, so blocks arrive
+     * with no `nodeId` at all. Reconciling on read already minted ids for them — but only
+     * in the returned value, and `randomNodeId` is `crypto.randomUUID()`, so EVERY read
+     * minted different ones. A comment anchored to such a block resolved to a node that
+     * no longer existed by the next load: the anchor rotted between one page view and the
+     * next, silently, and nothing in the suite could see it because each read was
+     * internally consistent.
+     *
+     * Persisting the backfill makes the first read the one that decides, and every read
+     * after it agrees. Only when something was actually minted, so an untouched document
+     * is still a pure read.
+     *
+     * A failed repair does not fail the read: the caller asked for a document, the
+     * document is correct in memory, and the next read tries again. What it must not do
+     * is hand back ids it did not keep.
+     */
     async read(documentId) {
       const doc = await store.read(documentId);
-      return doc === null ? null : reconcileDocumentIdentity(doc, options).document;
+      if (doc === null) return null;
+      const reconciled = reconcileDocumentIdentity(doc, options);
+      if (reconciled.backfilledNodeIds.length > 0) {
+        try {
+          await store.write(reconciled.document);
+        } catch {
+          // Left deliberately silent: see above. The in-memory document is still correct.
+        }
+      }
+      return reconciled.document;
     },
 
     async write(doc) {

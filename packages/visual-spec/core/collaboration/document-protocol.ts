@@ -47,6 +47,17 @@ export type GitHubBinding = {
   branch: string;
   pullNumber?: number; // absent until the PR is opened
   headSha?: string;
+  /**
+   * R-11.6 — the blob hash of this document as it stood at the last point the local copy
+   * and the branch provably agreed: written by create, by open, and by publish once the
+   * committed bytes are verified.
+   *
+   * It exists because nothing else can answer "does the local copy hold work that is not
+   * on the branch?". `headSha` is a commit pointer, is not updated on publish, and cannot
+   * see a local edit that never became a commit — and an agent applying review comments
+   * produces exactly that: an edit that lives only locally until a human publishes it.
+   */
+  contentSha?: string;
   issueCommentId?: number; // absent until the comment is posted
   replyToId?: number; // set on replies only
   resolved: boolean;
