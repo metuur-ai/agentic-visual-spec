@@ -73,7 +73,10 @@ async function ladder(): Promise<Array<{ rung: string; message: string }>> {
   const readOnly = createCollabAuthorizer({ exec: constant({ stdout: fixture('repo-read-only.json') }), documents: noDocuments });
   say('read-only', await readOnly.writeAccess?.({ ...repo }));
 
-  // 5. Fully credentialled, but the repository is not there to be seen.
+  // 5. Fully credentialled, but the repository is not there to be seen. The `(HTTP nnn)`
+  //    suffix `statusFromGhError` parses is `gh`'s real format, not a guess: verified
+  //    against live `gh` on 2026-08-07, which printed
+  //    `gh: Must have push access to view collaborator permission. (HTTP 403)`.
   const missingRepo = createCollabAuthorizer({ exec: constant({ stderr: 'gh: Not Found (HTTP 404)', exitCode: 1 }), documents: noDocuments });
   say('no repo', await missingRepo.writeAccess?.({ ...repo }));
 

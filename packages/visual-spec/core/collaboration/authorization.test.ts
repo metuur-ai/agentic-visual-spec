@@ -566,6 +566,50 @@ describe('R-9.6 — comments are attributed to the acting account, never in the 
  * R-12.5 — a `false` also carries which "no" it is, because a missing write grant and
  * a repo that cannot be found need different words from the panel.
  */
+/*
+ * O-6, first half — recorded against real GitHub on 2026-08-07 with the `javierhbr`
+ * credential (`gh` keyring, scopes: gist, project, read:org, repo, write:packages).
+ *
+ * The objection O-6 raises is that single-writer is enforced by GitHub permissions rather
+ * than by convention, so every permission response in this file being hand-written makes
+ * the enforcement an assertion about a fixture. These two pin the fixtures to responses
+ * actually observed, so a "tidied" fixture that no longer resembles GitHub fails here
+ * rather than passing quietly everywhere else.
+ *
+ * STILL OPEN: that GitHub *refuses the write itself*. Observing that needs a genuinely
+ * read-only credential attempting a write on a repo its owner controls — see the tracker.
+ */
+describe('the permission fixtures match real GitHub responses (O-6)', () => {
+  const permissionsOf = (name: string) => (JSON.parse(fixture(name)) as { permissions: unknown }).permissions;
+
+  it('read-only is the shape GitHub returns for a repo the credential cannot push to', () => {
+    // GET /repos/cli/cli — a public repo the credential has no relationship with.
+    expect(permissionsOf('repo-read-only.json')).toEqual({
+      admin: false,
+      maintain: false,
+      push: false,
+      triage: false,
+      pull: true,
+    });
+  });
+
+  /*
+   * Load-bearing: write access arrived through `push` alone, with `admin` and `maintain`
+   * both false. A classifier that only looked at `admin || maintain` would call this
+   * account a reviewer on its own repository.
+   */
+  it('write access can come from `push` alone', () => {
+    // GET /repos/aurattus/social-trends — a private repo the credential can push to.
+    expect(permissionsOf('repo-write-access.json')).toEqual({
+      admin: false,
+      maintain: false,
+      push: true,
+      triage: true,
+      pull: true,
+    });
+  });
+});
+
 describe('writeAccess — the availability hint', () => {
   it('reports true for a login with push permission', async () => {
     const authorize = createCollabAuthorizer({ exec: asAuthor().exec, documents: () => memoryDocuments([document()]) });
