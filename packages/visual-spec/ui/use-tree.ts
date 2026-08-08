@@ -3,7 +3,7 @@
  *   useTree()      → the whole visible tree (dirs + files) from /__vs/tree
  *   useFile(path)  → one file's content/metadata from /__vs/tree/file
  */
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 export type FileKind = 'markdown' | 'code' | 'text' | 'image' | 'binary';
 
@@ -52,9 +52,13 @@ export function invalidateTree(): void {
   treeCache = null;
 }
 
-export function useTree(): { entries: TreeEntry[]; loading: boolean } {
+export function useTree(): { entries: TreeEntry[]; loading: boolean; reload: () => void } {
   const [entries, setEntries] = useState<TreeEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  // Bumped by reload(). invalidateTree() alone only clears the cache — a mounted
+  // consumer never re-reads, so a file created from the tree would stay missing
+  // from the sidebar until something else remounted the hook.
+  const [generation, setGeneration] = useState(0);
   useEffect(() => {
     let live = true;
     fetchTree()
@@ -64,8 +68,9 @@ export function useTree(): { entries: TreeEntry[]; loading: boolean } {
     return () => {
       live = false;
     };
-  }, []);
-  return { entries, loading };
+  }, [generation]);
+  const reload = useCallback(() => setGeneration((g) => g + 1), []);
+  return { entries, loading, reload };
 }
 
 export function useFile(path: string, kind?: FileKind): { file: FileContent | null; loading: boolean } {

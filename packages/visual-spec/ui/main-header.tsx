@@ -3,6 +3,7 @@ import { memo, useEffect, useReducer, useRef, useState } from 'react';
 import { HelpButton } from './help-page';
 import { CommentHistoryList } from './comment-history-list';
 import { toPath } from './md-path';
+import { branchOf, useGitContext } from './use-git-context';
 
 function CommentIcon({ size = 14 }: { size?: number }) {
   return (
@@ -44,6 +45,136 @@ function CopyIcon({ size = 12 }: { size?: number }) {
       <rect x="9" y="9" width="11" height="11" rx="2" />
       <path d="M5 15V5a2 2 0 0 1 2-2h10" />
     </svg>
+  );
+}
+
+/**
+ * The three chip icons. Each state gets its own glyph rather than a shared icon
+ * with a colour swap, because colour alone is not a distinction a colour-blind
+ * user can read, and these three states are the whole point of the chip.
+ */
+
+/** State `none`: a branch symbol struck through — "there is no repository here". */
+function BranchOffIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }} aria-hidden>
+      <line x1="6" y1="3" x2="6" y2="15" />
+      <circle cx="18" cy="6" r="3" />
+      <circle cx="6" cy="18" r="3" />
+      <line x1="3" y1="21" x2="21" y2="3" />
+    </svg>
+  );
+}
+
+/** State `local`: an unplugged connector — a repository, but no remote we can follow. */
+function UnplugIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }} aria-hidden>
+      <path d="M18.5 3.5 15 7l2 2-3.5 3.5" />
+      <path d="M10.5 20.5 14 17l-2-2 3.5-3.5" />
+      <line x1="3" y1="21" x2="6" y2="18" />
+      <line x1="18" y1="6" x2="21" y2="3" />
+    </svg>
+  );
+}
+
+/** State `remote`: a chain link — the repository is connected to a known host. */
+function LinkIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }} aria-hidden>
+      <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" />
+      <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" />
+    </svg>
+  );
+}
+
+/**
+ * The branch slot. A detached HEAD's "branch" is a 7-character hex string, and
+ * rendered bare it reads as a branch literally called `a1b2c3d` (R-3.9). The sha
+ * is still shown — it is the useful fact — but it is labelled as what it is.
+ */
+function BranchLabel({ branch, detached }: { branch: string; detached: boolean }) {
+  if (!detached) return <span style={gitBranchText}>{branch}</span>;
+  return (
+    <span style={gitBranchText} title="detached HEAD">
+      detached HEAD @ {branch}
+    </span>
+  );
+}
+
+/**
+ * The git context chip (R-3.1 … R-3.9). Lives beside the served path because the
+ * directory and the branch checked out in it are one fact, not two.
+ *
+ * The `null` case is not a fourth cosmetic state — it is the requirement (R-3.2).
+ * Before the first read returns, the chip asserts none of the three states; if it
+ * defaulted to "not a git repo" it would flash a falsehood and then correct
+ * itself, which is exactly the confusion the three states exist to prevent.
+ */
+function GitChip() {
+  const ctx = useGitContext();
+
+  if (ctx == null) {
+    return (
+      <span style={{ ...gitChip, ...gitTonePending }} data-testid="git-chip" title="Reading git context…" aria-busy="true">
+        <span style={gitPlaceholderBar} aria-hidden />
+      </span>
+    );
+  }
+
+  if (ctx.state === 'none') {
+    return (
+      <span style={{ ...gitChip, ...gitToneNone }} data-testid="git-chip" title="This directory is not inside a git repository">
+        <BranchOffIcon />
+        <span>not a git repo</span>
+      </span>
+    );
+  }
+
+  if (ctx.state === 'local') {
+    // Two different situations land here and they are NOT the same claim. No
+    // `origin` at all (R-3.4) versus an `origin` whose URL matched none of the
+    // supported shapes (R-3.5) — saying "no remote" in the second case denies a
+    // remote the user can see in their own git config.
+    const unrecognised = Boolean(ctx.url);
+    return (
+      <span
+        style={{ ...gitChip, ...gitToneLocal }}
+        data-testid="git-chip"
+        title={unrecognised ? `Remote not recognised · ${ctx.url}` : 'No remote is configured for this repository'}
+      >
+        <UnplugIcon />
+        <BranchLabel branch={ctx.branch} detached={ctx.detached} />
+        <span style={gitDot}>·</span>
+        <span>{unrecognised ? 'unrecognised remote' : 'no remote'}</span>
+      </span>
+    );
+  }
+
+  // Owner, repository and branch are host-independent facts, so they render the
+  // same everywhere; only the URL *shape* for a link is GitHub-specific, so only
+  // the link is conditional (R-3.7 / R-3.8). A GitLab user still sees who owns
+  // the repository they are commenting on.
+  const label = `${ctx.owner}/${ctx.repo}`;
+  const linkable = ctx.host === 'github.com';
+  return (
+    <span style={{ ...gitChip, ...gitToneRemote }} data-testid="git-chip" title={ctx.url}>
+      <LinkIcon />
+      {linkable ? (
+        <a
+          href={`https://github.com/${ctx.owner}/${ctx.repo}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={gitRepoLink}
+        >
+          {label}
+        </a>
+      ) : (
+        <span style={gitRepoText}>{label}</span>
+      )}
+      <span style={gitDot}>·</span>
+      <BranchLabel branch={ctx.branch} detached={ctx.detached} />
+    </span>
   );
 }
 
@@ -94,6 +225,9 @@ function Brand({ file }: { file: string }) {
               {pathCopied ? '✓' : <CopyIcon />}
             </span>
           </button>
+          {/* R-3.1 — adjacent to the served path, in both headers: `Brand` is what
+              `MainHeader` and `BrandHeader` share, so one placement covers both. */}
+          <GitChip />
           <ChangeDirButton />
         </div>
       </div>
@@ -424,6 +558,12 @@ function ScopeChooser({
   const [picking, setPicking] = useState(false);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const fileName = file ? basename(file) : '';
+  // R-4.1 — the branch belongs HERE, not only in the header corner. The failure
+  // this feature exists to fix is "comment, run apply, and the edits land on
+  // whichever branch happened to be checked out", and this popover is where the
+  // user commits to the run. R-4.2: where no branch is known — state `none`, or
+  // the first read has not come back — nothing is shown and nothing is blocked.
+  const branch = branchOf(useGitContext());
   const toggle = (id: string) =>
     setChecked((prev) => {
       const next = new Set(prev);
@@ -435,7 +575,14 @@ function ScopeChooser({
   return (
     <div style={applyPop}>
       <div style={applyPopHead}>
-        <span style={{ fontWeight: 700 }}>Apply comments…</span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          <span style={{ fontWeight: 700 }}>Apply comments…</span>
+          {branch && (
+            <span style={scopeBranch} data-testid="scope-branch" title="Edits will land on this branch">
+              on {branch}
+            </span>
+          )}
+        </span>
         <button type="button" onClick={onClose} style={closeBtn} title="Close" aria-label="Close">
           ✕
         </button>
@@ -881,6 +1028,35 @@ const changeBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'ce
 const pathText: React.CSSProperties = { font: '11.5px ui-monospace, "SF Mono", monospace', color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 };
 const pathSep: React.CSSProperties = { color: '#cbd5e1', fontSize: 13, flexShrink: 0 };
 const pathFile: React.CSSProperties = { font: '600 11.5px ui-monospace, "SF Mono", monospace', color: '#7c3aed', flexShrink: 0 };
+// ---- The git context chip. One shape, four tones — the tone carries the state
+// alongside the icon, never instead of it.
+const gitChip: React.CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 5,
+  flexShrink: 0,
+  maxWidth: 280,
+  overflow: 'hidden',
+  padding: '2px 8px',
+  borderRadius: 999,
+  border: '1px solid transparent',
+  font: '11px system-ui',
+  fontWeight: 600,
+  whiteSpace: 'nowrap',
+};
+// Pending: no colour that reads as a verdict, because no verdict has been reached.
+const gitTonePending: React.CSSProperties = { background: '#f8fafc', border: '1px solid #eef2f7', color: '#cbd5e1' };
+const gitToneNone: React.CSSProperties = { background: '#f1f5f9', border: '1px solid #e2e8f0', color: '#64748b' };
+const gitToneLocal: React.CSSProperties = { background: '#fffbeb', border: '1px solid #fde68a', color: '#b45309' };
+const gitToneRemote: React.CSSProperties = { background: '#f0fdf4', border: '1px solid #bbf7d0', color: '#15803d' };
+// A bar rather than a spinner or an ellipsis: it occupies the chip's width so the
+// header does not reflow when the first read lands.
+const gitPlaceholderBar: React.CSSProperties = { display: 'inline-block', width: 68, height: 8, borderRadius: 999, background: '#e2e8f0' };
+const gitBranchText: React.CSSProperties = { font: '600 11px ui-monospace, "SF Mono", monospace', overflow: 'hidden', textOverflow: 'ellipsis' };
+const gitRepoText: React.CSSProperties = { font: '700 11px ui-monospace, "SF Mono", monospace' };
+const gitRepoLink: React.CSSProperties = { ...gitRepoText, color: 'inherit', textDecoration: 'underline', textUnderlineOffset: 2 };
+const gitDot: React.CSSProperties = { opacity: 0.5 };
+const scopeBranch: React.CSSProperties = { flexShrink: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', font: '600 11px ui-monospace, "SF Mono", monospace', color: '#15803d', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 999, padding: '1px 8px' };
 const cart: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 5, background: '#f1f5f9', borderRadius: 99, padding: '3px 10px', fontSize: 13, color: '#475569' };
 const segWrap: React.CSSProperties = { display: 'inline-flex', padding: 2, gap: 2, background: '#f1f5f9', border: '1px solid #e5e7eb', borderRadius: 9 };
 const segBtn: React.CSSProperties = { padding: '5px 12px', border: 'none', borderRadius: 7, background: 'transparent', color: '#64748b', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };

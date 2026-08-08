@@ -7,7 +7,7 @@ import { BrandHeader, MainHeader, type ViewMode } from './main-header';
 import { MarkdownEditor } from './markdown-editor';
 import { MarkdownDocEditor } from './markdown-doc-editor';
 import { toSurfaceId } from './md-path';
-import { type TreeEntry, useTree } from './use-tree';
+import { type TreeEntry, invalidateTree, useTree } from './use-tree';
 
 const MIN_W = 180;
 const MAX_W = 680;
@@ -15,7 +15,7 @@ const CMT_MIN_W = 260;
 const CMT_MAX_W = 720;
 
 export function App() {
-  const { entries, loading } = useTree();
+  const { entries, loading, reload } = useTree();
   const [selected, setSelected] = useState<TreeEntry | null>(null);
   const [mode, setMode] = useState<ViewMode>('view');
   // A collaboration document has no local-file entry (ui/use-tree.ts enumerates the
@@ -95,6 +95,32 @@ export function App() {
     [selected, doPick],
   );
 
+  // R-5.4 — a file that was just created is not in `entries` yet (the walk that
+  // would list it has not run), so the pane is pointed at the path the server
+  // confirmed rather than looked up. Created files are always markdown, and
+  // landing in Edit is what "ready to edit" means.
+  const onCreated = useCallback(
+    (path: string) => {
+      invalidateTree();
+      reload();
+      editorState.current = { dirty: false, save: async () => true };
+      setSelected({ path, name: baseName(path), type: 'file', kind: 'markdown' });
+      setMode('edit');
+    },
+    [reload],
+  );
+
+  // R-5.5 — the pane follows the document it is showing to its new path; a pane on
+  // any other file is left alone.
+  const onRenamed = useCallback(
+    (from: string, to: string) => {
+      invalidateTree();
+      reload();
+      setSelected((cur) => (cur && cur.path === from ? { ...cur, path: to, name: baseName(to) } : cur));
+    },
+    [reload],
+  );
+
   // Jump to a path from the cart dropdown.
   const navigate = (path: string) => {
     const e = entries.find((x) => x.path === path);
@@ -114,7 +140,7 @@ export function App() {
         <BrandHeader />
       )}
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-        <Sidebar entries={entries} current={current} loading={loading} onPick={pick} width={width} onOpenCollab={() => setCollabOpen(true)} />
+        <Sidebar entries={entries} current={current} loading={loading} onPick={pick} width={width} onOpenCollab={() => setCollabOpen(true)} onCreated={onCreated} onRenamed={onRenamed} />
         <Splitter onResize={resize} />
         {selected ? (
           editing ? (
@@ -233,6 +259,8 @@ function Splitter({ onResize, fromRight = false }: { onResize: (w: number) => vo
   );
 }
 
+const baseName = (path: string): string => path.slice(path.lastIndexOf('/') + 1);
+
 function Sidebar({
   entries,
   current,
@@ -240,6 +268,8 @@ function Sidebar({
   onPick,
   width,
   onOpenCollab,
+  onCreated,
+  onRenamed,
 }: {
   entries: TreeEntry[];
   current: string;
@@ -247,6 +277,8 @@ function Sidebar({
   onPick: (e: TreeEntry) => void;
   width: number;
   onOpenCollab: () => void;
+  onCreated: (path: string) => void;
+  onRenamed: (from: string, to: string) => void;
 }) {
   const [q, setQ] = useState('');
   const { comments } = useComments(); // all → to flag which paths have open comments
@@ -269,7 +301,7 @@ function Sidebar({
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="filter…" style={filter} />
       </div>
       <div style={{ padding: 8, flex: 1, overflow: 'auto' }}>
-        {loading ? <div style={{ opacity: 0.6, padding: 8 }}>Loading…</div> : <FileTree entries={entries} current={current} filter={q} onPick={onPick} commentCounts={commentCounts} />}
+        {loading ? <div style={{ opacity: 0.6, padding: 8 }}>Loading…</div> : <FileTree entries={entries} current={current} filter={q} onPick={onPick} commentCounts={commentCounts} onCreated={onCreated} onRenamed={onRenamed} />}
       </div>
       <SidebarFooter onOpenCollab={onOpenCollab} />
     </nav>

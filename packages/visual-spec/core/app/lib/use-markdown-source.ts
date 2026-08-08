@@ -28,7 +28,11 @@ export function useSpecsRoot(): string {
   useEffect(() => {
     fetch('/__vs/source/root')
       .then((r) => json<{ root: string }>(r))
-      .then((d) => setRoot(d.root))
+      // `json<T>` is an unchecked cast, so a response without `root` puts
+      // `undefined` behind a `string` type and every consumer that calls a string
+      // method on it throws — `Brand` in main-header.tsx takes the whole header
+      // down that way. The type is the contract; make the runtime honour it.
+      .then((d) => setRoot(d.root ?? ''))
       .catch(() => setRoot(''));
   }, []);
   return root;
