@@ -48,7 +48,13 @@ export type CommentPanelSource = {
   path: string;
   /** Every comment on this surface, already filtered to it. */
   comments: CommentRecord[];
-  remove: (id: string) => Promise<void>;
+  /**
+   * Take the comment off the open list. Optional because collaboration no longer offers
+   * one: a GitHub review thread is closed by resolving it on github.com (R-5.13), and a
+   * control here that pretended otherwise would write a resolution this system must not
+   * write. Local mode deletes its sidecar record and supplies this.
+   */
+  remove?: (id: string) => Promise<void>;
   /**
    * Describe the current selection. Returning `{ uncommentable }` withdraws the
    * compose form — a block with no durable identity (`data-vs-uncommentable`,
@@ -71,26 +77,11 @@ export type CommentPanelSource = {
    */
   reply?: (id: string, text: string) => Promise<void>;
   /**
-   * Undo what `remove` did, from the History tab. Collaboration only, for the same reason
-   * `reply` is: resolution there is a marker reply that accumulates (R-5.14), so reopening
-   * a thread is an ordinary, reversible act. Local mode's `remove` deletes the sidecar
-   * record — there is nothing left to restore — so it leaves this unset and History renders
-   * read-only, exactly as before.
+   * R-5.14 — where this comment's thread lives on github.com, or `undefined` when it has
+   * no such home. Collaboration supplies it because resolving happens there and nowhere
+   * else; the row renders it as a link out rather than as a control that writes.
    */
-  restore?: (id: string) => Promise<void>;
-  /**
-   * What `remove` actually does, for the row's label and confirm copy. Local mode
-   * deletes the sidecar record, so the default reads "Delete". Collaboration has no
-   * delete route — GitHub is the system of record (R-5.2) and `remove` marks the
-   * comment applied — so calling that button "Delete" would name an act the system
-   * never performs.
-   *
-   * `icon` exists because the wording alone was not enough: the button read "Resolve"
-   * in its tooltip and drew a red trash can, which is the one symbol everybody reads as
-   * "this is gone". A reviewer resolving a thread was being shown a destructive act.
-   * Defaults to the trash, so local mode is untouched.
-   */
-  removeVerb?: { action: string; confirm: string; icon?: 'trash' | 'check' };
+  link?: (c: CommentRecord) => string | undefined;
 };
 
 export function CommentPanel({ file, width, source }: { file?: string; width: number; source?: CommentPanelSource }) {
@@ -175,7 +166,7 @@ function Panel({ width, source }: { width: number; source: CommentPanelSource })
             <CommentList source={source} />
           </>
         ) : (
-          <CommentHistoryList path={path} comments={source.comments} {...(source.restore ? { restore: source.restore } : {})} />
+          <CommentHistoryList path={path} comments={source.comments} />
         )}
       </aside>
     );
@@ -236,7 +227,7 @@ function Panel({ width, source }: { width: number; source: CommentPanelSource })
           <CommentList source={source} />
         </>
       ) : (
-        <CommentHistoryList path={path} comments={source.comments} {...(source.restore ? { restore: source.restore } : {})} />
+        <CommentHistoryList path={path} comments={source.comments} />
       )}
     </aside>
   );
@@ -319,11 +310,11 @@ function InfoIcon() {
 function CommentList({ source }: { source: CommentPanelSource }) {
   // Only open comments: once the apply-comments skill marks one "applied", it drops off the list.
   const mine = source.comments.filter((c) => c.status === 'open');
+  const link = source.link ?? (() => undefined);
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [replyId, setReplyId] = useState<string | null>(null);
   const [replyText, setReplyText] = useState('');
   const [replyBusy, setReplyBusy] = useState(false);
-  const verb = source.removeVerb ?? { action: 'Delete', confirm: 'Delete?', icon: 'trash' as const };
   const { activeId } = useActiveComment();
   const rows = useRef<Record<string, HTMLLIElement | null>>({});
   // When an inline indicator activates a comment, scroll its row into view (R-2.2).
@@ -364,29 +355,46 @@ function CommentList({ source }: { source: CommentPanelSource }) {
                   Reply
                 </button>
               )}
-              {confirmId === c.id ? (
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ fontSize: 12, color: '#475569' }}>{verb.confirm}</span>
+              {/*
+                * R-5.14 — the way out to github.com. It replaced a Resolve button: a
+                * review thread's resolution is GitHub's, read and never written (R-5.13),
+                * so the honest affordance is a link to the place the act happens.
+                */}
+              {link(c) && (
+                <a
+                  href={link(c)}
+                  target="_blank"
+                  rel="noreferrer"
+                  title="Open this thread on github.com — resolve it there"
+                  style={textBtn}
+                >
+                  Open on GitHub
+                </a>
+              )}
+              {source.remove &&
+                (confirmId === c.id ? (
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ fontSize: 12, color: '#475569' }}>Delete?</span>
+                    <button
+                      type="button"
+                      onClick={() => { void source.remove!(c.id); setConfirmId(null); }}
+                      style={confirmYes}
+                    >
+                      Yes
+                    </button>
+                    <button type="button" onClick={() => setConfirmId(null)} style={confirmNo}>No</button>
+                  </span>
+                ) : (
                   <button
                     type="button"
-                    onClick={() => { void source.remove(c.id); setConfirmId(null); }}
-                    style={confirmYes}
+                    onClick={() => setConfirmId(c.id)}
+                    title="Delete comment"
+                    aria-label="Delete comment"
+                    style={delBtn}
                   >
-                    Yes
+                    <TrashIcon />
                   </button>
-                  <button type="button" onClick={() => setConfirmId(null)} style={confirmNo}>No</button>
-                </span>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setConfirmId(c.id)}
-                  title={`${verb.action} comment`}
-                  aria-label={`${verb.action} comment`}
-                  style={verb.icon === 'check' ? resolveBtn : delBtn}
-                >
-                  {verb.icon === 'check' ? <CheckIcon /> : <TrashIcon />}
-                </button>
-              )}
+                ))}
             </div>
             {source.reply && replyId === c.id && (
               <div style={{ display: 'grid', gap: 6, marginTop: 6 }}>
@@ -434,14 +442,6 @@ function TrashIcon() {
   );
 }
 
-/** The non-destructive counterpart to the trash: a thread closed, not a record removed. */
-function CheckIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M20 6L9 17l-5-5" />
-    </svg>
-  );
-}
 
 function LocateIcon() {
   return (
@@ -474,7 +474,6 @@ const cardActive: React.CSSProperties = { border: '1px solid #f59e0b', backgroun
 const locateBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, width: 22, height: 22, padding: 0, border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer' };
 const delBtn: React.CSSProperties = { ...locateBtn, color: '#ef4444' };
 /** Green, not red: resolving closes a thread and destroys nothing. */
-const resolveBtn: React.CSSProperties = { ...locateBtn, color: '#059669' };
 /*
  * `locateBtn` is a 22×22 square sized for an icon. A worded button borrowed it and the
  * label wrapped mid-word — "Reply" rendered as "Re / ply". Text needs to set its own

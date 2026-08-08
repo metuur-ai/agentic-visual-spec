@@ -116,20 +116,11 @@ function memoryComments(seed: CommentRecord[] = []) {
     },
   };
   /*
-   * `setResolved` is what the route uses for a status change, because on GitHub a
-   * resolution is a marker reply rather than a field (R-5.12). The stub stood in for
-   * `githubCommentStore` without it, so these tests passed while the real Resolve button
-   * did nothing — the stub was more capable than production in exactly the wrong place.
-   * Modelled the same way the real one behaves on read-back: the parent reads resolved.
+   * Deliberately no resolution method. There was one — `setResolved`, which posted a
+   * marker reply — and R-5.13 forbids this system writing resolution at all, so the
+   * double must not be more capable than production in that direction either.
    */
-  const setResolved = async (id: string, resolved: boolean): Promise<CommentRecord | null> => {
-    const found = comments.find((c) => c.id === id);
-    if (!found) return null;
-    const next = { ...found, status: resolved ? 'applied' : 'open' } as CommentRecord;
-    comments = comments.map((c) => (c.id === id ? next : c));
-    return next;
-  };
-  return { store: Object.assign(store, { setResolved }), all: () => comments };
+  return { store, all: () => comments };
 }
 
 /* ------------------------------------------------------------------ *
@@ -849,15 +840,13 @@ describe('R-7.1 / R-7.5 — comment routes', () => {
   });
 
   /*
-   * The panel's Resolve button sends exactly this — a status and no text. It used to be
-   * served by `updateComment`, which documents that it cannot express status and returns
-   * the record untouched, so the route answered 200 and nothing resolved.
-   *
-   * R-5.13 draws the line this test sits on: `status` is the LOCAL apply-agent flag
-   * (R-5.21), and nothing on this path writes resolution to GitHub. The review-comment
-   * routes have no resolve call at all — resolving happens on github.com.
+   * A status-only PATCH — no text. `status` is the LOCAL apply-agent flag (R-5.21): it
+   * records that this machine's agent acted, it is never derived from GitHub and never
+   * written back to it. This route used to divert it into `setResolved`, which posted a
+   * resolution marker reply; that protocol is gone, and with it the one path by which a
+   * local flag could turn into a remote write (R-5.13).
    */
-  it('routes a status-only PATCH through setResolved — the resolve the panel actually sends', async () => {
+  it('a status-only PATCH stays local — nothing writes resolution to GitHub', async () => {
     const parent = {
       id: 'c-00000001',
       workflow: 'visual-spec',
@@ -868,19 +857,14 @@ describe('R-7.1 / R-7.5 — comment routes', () => {
     } as unknown as CommentRecord;
     const mem = memoryComments([parent]);
     const r = router({ commentStore: () => mem.store });
-    const setResolved = vi.spyOn(mem.store as { setResolved: (id: string, r: boolean) => unknown }, 'setResolved');
 
     const res = await call(r, 'PATCH', '/doc-1/comments/c-00000001', { status: 'applied' });
 
     expect(res.status).toBe(200);
-    expect(setResolved).toHaveBeenCalledWith('c-00000001', true);
-    expect(mem.all()[0]!.status).toBe('applied');
-    // The answer is the parent as it now reads, never the marker reply resolution creates.
     expect((res.json as { comment: CommentRecord }).comment.id).toBe('c-00000001');
-
-    await call(r, 'PATCH', '/doc-1/comments/c-00000001', { status: 'open' });
-    expect(setResolved).toHaveBeenLastCalledWith('c-00000001', false);
-    expect(mem.all()[0]!.status).toBe('open');
+    expect(mem.all()[0]!.status).toBe('applied');
+    // The store carries no resolution method at all — there is nothing to have called.
+    expect('setResolved' in mem.store).toBe(false);
   });
 
   /*
@@ -890,7 +874,7 @@ describe('R-7.1 / R-7.5 — comment routes', () => {
    */
   it('never writes resolution state to GitHub (R-5.13)', () => {
     const source = src('core/vite/routes/collab.ts');
-    expect(source).not.toMatch(/resolveReviewThread|unresolveReviewThread|isResolved\s*:/);
+    expect(source).not.toMatch(/resolveReviewThread|unresolveReviewThread|isResolved\s*:|setResolved/);
   });
 });
 

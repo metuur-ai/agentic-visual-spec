@@ -210,7 +210,7 @@ describe('R-6.2 … R-6.5 — indicators are placed by resolveCollabAnchor', () 
     const comments = [comment('c-orphan', { nodeId: 'n-gone', text: 'A paragraph that was deleted.' }, 'still relevant')];
     render(
       <InspectorProvider surfaceId="docs/spec.md" pageIndex={0}>
-        <CommentPanel width={320} source={collabCommentPanelSource({ document: doc, comments, add: async () => {}, reply: async () => {}, remove: async () => {}, restore: async () => {} })} />
+        <CommentPanel width={320} source={collabCommentPanelSource({ document: doc, comments, add: async () => {}, reply: async () => {} })} />
       </InspectorProvider>,
     );
     const card = document.querySelector('[data-vs-orphan="c-orphan"]')!;
@@ -222,40 +222,45 @@ describe('R-6.2 … R-6.5 — indicators are placed by resolveCollabAnchor', () 
   });
 
   /*
-   * A resolve posts a marker reply and an unresolve posts another; they accumulate by
-   * design (R-5.14). They were reaching the panel as ordinary comments, so a single
-   * resolve-then-reopen produced two rows reading "Resolved this comment: <url>" — each
-   * with its own Reply and Resolve buttons — and the panel's count contradicted the
-   * publish gate, which filters them: "6 open" beside "4 of 4 comments unresolved".
+   * R-5.13 / R-5.14 — a thread carries a link out and no control that writes. The panel
+   * used to draw a Resolve button here (and an Unresolve in History); both wrote a
+   * resolution this system must not write, so both are gone and the link replaced them.
    */
-  it('resolution markers are bookkeeping, not conversation — the panel does not list them', () => {
+  it('offers a link to the thread on github.com and no control that resolves it', () => {
     const doc = fixture();
-    const github = (id: number) => ({
-      issueCommentId: id,
-      user: 'octocat',
-      htmlUrl: `https://github.com/acme/docs/pull/42#issuecomment-${id}`,
-      createdAt: '2026-08-07T00:00:00Z',
-      updatedAt: '2026-08-07T00:00:00Z',
-    });
-    const real = { ...comment('c-real', { nodeId: 'n-1' }, 'a real remark'), github: github(700001) } as CommentRecord;
-    const resolved = {
-      ...comment('c-mark-1', { replyTo: '700001', resolved: 'true' }, 'Resolved this comment: https://x/1'),
-      github: github(700002),
-    } as CommentRecord;
-    const reopened = {
-      ...comment('c-mark-2', { replyTo: '700001', resolved: 'false' }, 'Reopened this comment: https://x/1'),
-      github: github(700003),
-    } as CommentRecord;
+    const open = {
+      ...comment('c-open', { nodeId: 'n-1' }, 'a real remark'),
+      github: { reviewCommentId: 700001, isOutdated: false, isResolved: false, htmlUrl: 'https://github.com/acme/docs/pull/42#discussion_r700001', user: 'octocat', updatedAt: 'T0' },
+      replies: [],
+    } as unknown as CommentRecord;
 
-    const source = collabCommentPanelSource({
-      document: doc,
-      comments: [real, resolved, reopened],
-      add: async () => {},
-      reply: async () => {},
-      remove: async () => {}, restore: async () => {},
-    });
+    render(
+      <InspectorProvider surfaceId="docs/spec.md" pageIndex={0}>
+        <CommentPanel width={320} source={collabCommentPanelSource({ document: doc, comments: [open], add: async () => {}, reply: async () => {} })} />
+      </InspectorProvider>,
+    );
 
-    expect(source.comments.map((c) => c.id)).toEqual(['c-real']);
+    const link = screen.getByText('Open on GitHub') as HTMLAnchorElement;
+    expect(link.getAttribute('href')).toBe('https://github.com/acme/docs/pull/42#discussion_r700001');
+    expect(screen.queryByLabelText('Resolve comment')).toBeNull();
+    expect(screen.queryByLabelText('Delete comment')).toBeNull();
+  });
+
+  /* R-5.15 — "we could not read it" is not "it is done", so the way out is still offered. */
+  it('links a thread whose resolution could not be read, and not one GitHub says is resolved', () => {
+    const doc = fixture();
+    const withGithub = (id: string, isResolved?: boolean) =>
+      ({
+        ...comment(id, { nodeId: 'n-1' }),
+        github: { reviewCommentId: 700002, isOutdated: false, ...(isResolved === undefined ? {} : { isResolved }), htmlUrl: 'https://x/t', user: 'octocat', updatedAt: 'T0' },
+        replies: [],
+      }) as unknown as CommentRecord;
+
+    const link = (c: CommentRecord) =>
+      collabCommentPanelSource({ document: doc, comments: [c], add: async () => {}, reply: async () => {} }).link?.(c);
+
+    expect(link(withGithub('c-unknown'))).toBe('https://x/t');
+    expect(link(withGithub('c-resolved', true))).toBeUndefined();
   });
 
   it('several comments on one block collapse into one marker; different blocks get their own', () => {
@@ -321,7 +326,7 @@ function SelectBlock({ selector }: { selector: string }) {
 }
 
 function mountPanel(doc: CollaborationDocument, selector: string, add = vi.fn(async () => {})) {
-  const source = collabCommentPanelSource({ document: doc, comments: [], add, reply: async () => {}, remove: async () => {}, restore: async () => {} });
+  const source = collabCommentPanelSource({ document: doc, comments: [], add, reply: async () => {} });
   render(
     <InspectorProvider surfaceId="docs/spec.md" pageIndex={0}>
       <CollabDocumentView document={doc} />
@@ -354,7 +359,7 @@ describe('R-7.3/R-7.5 — a block with no durable identity offers no comment aff
     const doc = fixture();
     const { source } = mountPanel(doc, '[data-vs-uncommentable]');
     const add = vi.fn(async () => {});
-    const guarded = collabCommentPanelSource({ document: doc, comments: [], add, reply: async () => {}, remove: async () => {}, restore: async () => {} });
+    const guarded = collabCommentPanelSource({ document: doc, comments: [], add, reply: async () => {} });
     const el = document.querySelector('[data-vs-uncommentable]') as HTMLElement;
     await guarded.create([{ line: 1, column: 0, anchor: el }], 'hello', 'visual-spec');
     expect(add).not.toHaveBeenCalled();
@@ -364,7 +369,7 @@ describe('R-7.3/R-7.5 — a block with no durable identity offers no comment aff
   it('R-7.5 — creating on an identified block persists against its nodeId', async () => {
     const doc = fixture();
     const add = vi.fn(async () => {});
-    const source = collabCommentPanelSource({ document: doc, comments: [], add, reply: async () => {}, remove: async () => {}, restore: async () => {} });
+    const source = collabCommentPanelSource({ document: doc, comments: [], add, reply: async () => {} });
     render(<CollabDocumentView document={doc} />);
     const el = document.querySelector('[data-vs-node-id="n-2"]') as HTMLElement;
     await source.create([{ line: 1, column: 0, anchor: el }], 'hello', 'visual-spec');
@@ -389,24 +394,20 @@ describe('the row controls say what the system actually does', () => {
             comments,
             add: async () => {},
             reply: async () => {},
-            remove: async () => {},
-            restore: async () => {},
           })}
         />
       </InspectorProvider>,
     );
 
   /*
-   * The button's tooltip read "Resolve comment" while it drew a red trash can — the one
-   * symbol everyone reads as "this is gone". Resolving deletes nothing: GitHub keeps the
-   * thread (R-5.2) and the record is only marked applied.
+   * R-5.13 — the row draws no destructive control and no resolving one. It drew a red
+   * trash can labelled "Resolve comment" once; the act it named is not one this system
+   * performs at all, and a collaboration row now offers a link out instead.
    */
-  it('resolve is not drawn as a delete', () => {
+  it('draws neither a delete nor a resolve', () => {
     mount([comment('c-1', { nodeId: 'n-1' })]);
-    const button = screen.getByLabelText('Resolve comment');
-    // The trash outline's give-away path, absent from the check mark.
-    expect(button.innerHTML).not.toContain('3 6 5 6 21 6');
-    expect(button.innerHTML).toContain('M20 6L9 17l-5-5');
+    expect(screen.queryByLabelText('Delete comment')).toBeNull();
+    expect(screen.queryByLabelText('Resolve comment')).toBeNull();
   });
 
   /* "Reply" borrowed a 22×22 icon square and rendered as "Re / ply". */
@@ -419,52 +420,34 @@ describe('the row controls say what the system actually does', () => {
 });
 
 /* ================================================================== *
- * R-5.12 — reopening a resolved thread, from the History tab
+ * R-5.13 — History writes nothing, in either mode
  * ================================================================== */
-describe('R-5.12 — History offers Unresolve in collaboration and nothing in local mode', () => {
+describe('R-5.13 — the History tab offers no way to change resolution', () => {
   const resolved = (id: string): CommentRecord =>
     ({ ...comment(id, { nodeId: 'n-1' }, 'was addressed'), status: 'applied' }) as CommentRecord;
 
   /*
-   * The route and the store both served an unresolve — `setResolved(id, false)` posts the
-   * reopening marker — but no surface in the browser could ask for one, so a thread
-   * resolved by mistake could only be reopened with curl.
+   * History briefly offered "Unresolve", which posted the reopening marker of a protocol
+   * this package invented. Resolution is GitHub's now, read and never written, so there
+   * is nothing here to undo — a reviewer reopens the thread on github.com.
    */
-  it('a resolved comment can be reopened from History, and asks first', async () => {
+  it('a collaboration document lists applied comments read-only', async () => {
     const doc = fixture();
-    const restore = vi.fn(async () => {});
     render(
       <InspectorProvider surfaceId="docs/spec.md" pageIndex={0}>
         <CommentPanel
           width={320}
-          source={collabCommentPanelSource({
-            document: doc,
-            comments: [resolved('c-done')],
-            add: async () => {},
-            reply: async () => {},
-            remove: async () => {},
-            restore,
-          })}
+          source={collabCommentPanelSource({ document: doc, comments: [resolved('c-done')], add: async () => {}, reply: async () => {} })}
         />
       </InspectorProvider>,
     );
 
     fireEvent.click(screen.getByText('History'));
-    const button = await waitFor(() => document.querySelector('[data-vs-unresolve="c-done"]') as HTMLButtonElement);
-
-    // It confirms rather than firing: reopening posts a reply every participant sees.
-    fireEvent.click(button);
-    expect(restore).not.toHaveBeenCalled();
-
-    const yes = await waitFor(() => document.querySelector('[data-vs-unresolve-confirm="c-done"]') as HTMLButtonElement);
-    fireEvent.click(yes);
-    await waitFor(() => expect(restore).toHaveBeenCalledWith('c-done'));
+    await waitFor(() => expect(screen.getByText('was addressed')).toBeTruthy());
+    expect(document.querySelector('[data-vs-unresolve]')).toBeNull();
   });
 
-  /*
-   * Local mode's remove deletes the sidecar record outright, so there is nothing to
-   * reopen. The seam is optional precisely so this list stays read-only there.
-   */
+  /* R-10.1 — local mode is untouched: its History was always read-only. */
   it('local mode leaves History read-only — its remove destroys the record', async () => {
     vi.stubGlobal('fetch', vi.fn(async () =>
       new Response(JSON.stringify([{

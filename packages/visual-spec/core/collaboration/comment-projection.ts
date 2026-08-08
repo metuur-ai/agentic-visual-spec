@@ -31,13 +31,11 @@
  *   percent-encoded with `encodeURIComponent`, so no space, newline or `-->` can
  *   appear inside one. `parseCommentBody(formatCommentBody(text, fields))` returns
  *   the original `text` and `fields` byte-for-byte.
- * - **Extensible.** Unknown keys are carried through untouched, so 5.2 can add a
- *   `resolved=` / `replyTo=` marker and 5.3 an idempotency `key=` without a format
- *   change and without breaking older readers.
+ * - **Extensible.** Unknown keys are carried through untouched, so 5.3 could add an
+ *   idempotency `key=` without a format change and without breaking older readers.
  *
  * Known keys today: `documentId` (always written), `nodeId` (omitted for
- * document-level comments), the resolution pair `replyTo` + `resolved`
- * (task 5.2 — see "RESOLUTION" below), and `key`, the idempotency key
+ * document-level comments), and `key`, the idempotency key
  * (task 5.3 — see "IDEMPOTENT CREATION" below). A comment with no trailer at all — anything
  * authored on github.com — is preserved and lands in the document-level bucket
  * (R-5.6 / R-5.7); nothing is ever discarded.
@@ -72,14 +70,6 @@ export type ProjectedCommentRecord = CommentRecord & {
   };
   /** The trailer as parsed. `nodeId` absent ⇒ document-level discussion (R-5.7). */
   collab: CommentTrailer;
-  /**
-   * R-5.14 — resolution as derived from the latest marker among this comment's
-   * replies. Absent when no reply ever carried a marker: absence means "never
-   * toggled", which reads the same as `false` but is not a claim anyone made.
-   * Mirrored onto `status` (`applied` when resolved) so the existing
-   * `openByPath` / `openByWorkflow` groupings drop resolved comments for free.
-   */
-  resolved?: boolean;
 };
 
 const SENTINEL = 'visual-spec:';
@@ -176,13 +166,9 @@ export function projectIssueComment(comment: IssueComment, documentPath: string)
   };
 }
 
-/**
- * R-5.7 — comments with no `nodeId`, in GitHub order. Never discarded, always shown.
- * Resolution replies are excluded: they belong to the thread they reply to, not to
- * the document-level discussion. They stay in `doc.comments` regardless (R-5.6).
- */
+/** R-5.7 — comments with no `nodeId`, in GitHub order. Never discarded, always shown. */
 export function documentDiscussion(doc: CommentDoc): ProjectedCommentRecord[] {
-  return (doc.comments as ProjectedCommentRecord[]).filter((c) => !c.collab?.nodeId && !isResolutionReply(c));
+  return (doc.comments as ProjectedCommentRecord[]).filter((c) => !c.collab?.nodeId);
 }
 
 /** Comments grouped by the `nodeId` they anchor to. Document-level ones are excluded. */
@@ -196,59 +182,20 @@ export function commentsByNode(doc: CommentDoc): Record<string, ProjectedComment
 }
 
 // ---------------------------------------------------------------------------
-// RESOLUTION (task 5.2 — R-5.12 … R-5.15)
+// RESOLUTION IS NOT HERE ANY MORE (R-5.12 / R-5.13)
 // ---------------------------------------------------------------------------
 //
-// Issue comments have no native resolve state and reviewers cannot push, so
-// resolution is a **convention**: a reply issue comment carrying a marker in the
-// same trailer (R-5.12) — no second encoding exists.
+// This module used to carry a reply-marker protocol — a reply comment whose trailer
+// held `replyTo` + `resolved`, with the latest marker winning — because a PR *issue*
+// comment has no resolve bit to read. Review comments do: GitHub's review threads
+// expose `isResolved`, and that is now the only source (R-5.12). It is READ and never
+// written (R-5.13); resolving happens on github.com.
 //
-// Two keys are added, both reserved by 5.1:
-//   `replyTo`  the parent's GitHub issue-comment id. Issue comments are a FLAT
-//              list with no native threading, so the link has to be carried here.
-//   `resolved` `true` | `false`.
-//
-// The body of a resolve reply is, exactly:
-//
-//     Resolved this comment: https://github.com/acme/docs/pull/42#issuecomment-700001
-//
-//     <!-- visual-spec: documentId=doc-1 replyTo=700001 resolved=true -->
-//
-// and of an unresolve reply the same with `Reopened` and `resolved=false`.
-// GitHub's renderer HIDES the trailer, so the visible sentence is all a reader on
-// github.com gets — it is a plain English statement plus a link straight to the
-// comment it is about, legible to someone who has never heard of visual-spec
-// (R-5.15). No participant identity is written into the body (R-5.13): the reply
-// is created through the ordinary `createIssueComment` path, so GitHub attributes
-// it to whichever credential the acting participant's own instance is using.
-//
-// Markers ACCUMULATE — an unresolve is a new reply, never an edit of the resolve.
-// Editing would rewrite another participant's comment (which needs their token) and
-// would erase the history the reply convention exists to provide. State is therefore
-// the LATEST marker (R-5.14), ordered by `createdAt` ascending with the GitHub
-// comment id ascending as the tie-break. `createdAt` is GitHub-assigned ISO-8601
-// UTC, so lexicographic comparison is chronological; it has one-second granularity,
-// so two replies posted in the same second can tie, and the id — monotonic per
-// GitHub and unique — settles it. Derivation reads only the list just fetched from
-// GitHub; the cache is never consulted.
-
-/** A resolution marker as carried by one reply comment. */
-type ResolutionMarker = { replyTo: number; resolved: boolean; createdAt: string; issueCommentId: number };
-
-/** Read a marker off a projected record, or `null` when it carries none. */
-function markerOf(record: ProjectedCommentRecord): ResolutionMarker | null {
-  const replyTo = record.collab?.replyTo;
-  const resolved = record.collab?.resolved;
-  if (!replyTo || (resolved !== 'true' && resolved !== 'false')) return null;
-  const parentId = Number(replyTo);
-  if (!Number.isSafeInteger(parentId)) return null;
-  return {
-    replyTo: parentId,
-    resolved: resolved === 'true',
-    createdAt: record.github.createdAt,
-    issueCommentId: record.github.issueCommentId,
-  };
-}
+// So the marker protocol is gone rather than kept alongside. Two encodings of the same
+// fact is exactly the drift R-5.12 forbids — a thread resolved on github.com would have
+// disagreed with a marker written here, and nothing could say which was right. The
+// projection of resolution now lives in `review-comments.ts` (`github.isResolved`), and
+// the Ready gate reads it in `readiness.ts`.
 
 /**
  * R-5.6 — did anyone actually choose how this comment should be routed?
@@ -267,66 +214,6 @@ function markerOf(record: ProjectedCommentRecord): ResolutionMarker | null {
  */
 export function hasRoutingDecision(record: ProjectedCommentRecord): boolean {
   return Object.keys(record.collab ?? {}).length > 0;
-}
-
-/** R-5.12 — true when this comment is a resolution reply rather than a comment of its own. */
-export function isResolutionReply(record: ProjectedCommentRecord): boolean {
-  return markerOf(record) !== null;
-}
-
-/** `a` is later than `b` under the documented ordering: createdAt, then id. */
-function isLater(a: ResolutionMarker, b: ResolutionMarker): boolean {
-  return a.createdAt === b.createdAt ? a.issueCommentId > b.issueCommentId : a.createdAt > b.createdAt;
-}
-
-/**
- * R-5.14 — parent issue-comment id → resolution state, taken from the LATEST marker
- * among its replies. Pure over the list handed in; nothing else is read.
- */
-export function resolutionByComment(records: ProjectedCommentRecord[]): Map<number, boolean> {
-  const latest = new Map<number, ResolutionMarker>();
-  for (const record of records) {
-    const marker = markerOf(record);
-    if (!marker) continue;
-    const previous = latest.get(marker.replyTo);
-    if (!previous || isLater(marker, previous)) latest.set(marker.replyTo, marker);
-  }
-  const out = new Map<number, boolean>();
-  for (const [parentId, marker] of latest) out.set(parentId, marker.resolved);
-  return out;
-}
-
-/**
- * R-5.14 — stamp derived resolution onto the records it belongs to. Records with no
- * marker among their replies come back untouched, so "never toggled" stays distinct
- * from an explicit unresolve.
- */
-export function withResolutionState(records: ProjectedCommentRecord[]): ProjectedCommentRecord[] {
-  const state = resolutionByComment(records);
-  return records.map((record) => {
-    const resolved = state.get(record.github.issueCommentId);
-    return resolved === undefined ? record : { ...record, resolved, status: resolved ? 'applied' : 'open' };
-  });
-}
-
-/**
- * R-5.12 / R-5.15 — the exact body of a resolution reply: a human-visible sentence
- * linking the comment it is about, then the hidden marker trailer.
- */
-export function formatResolutionReply(input: {
-  documentId: string;
-  parent: ProjectedCommentRecord;
-  resolved: boolean;
-}): string {
-  const { documentId, parent, resolved } = input;
-  const verb = resolved ? 'Resolved' : 'Reopened';
-  // R-5.13 — the sentence names the comment, never the person. Authorship is
-  // GitHub's, taken from the credential the reply is posted with.
-  return formatCommentBody(`${verb} this comment: ${parent.github.htmlUrl}`, {
-    documentId,
-    replyTo: String(parent.github.issueCommentId),
-    resolved: String(resolved),
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -392,16 +279,11 @@ export type GitHubCommentStoreOptions = {
 };
 
 /**
- * The GitHub-backed store. A `CommentDocStore` plus `setResolved`, which has no
- * place on the local interface — the sidecar has no reply comments to carry a marker.
+ * The GitHub-backed store. Exactly a `CommentDocStore` and nothing more: it used to
+ * carry `setResolved`, and it does not any more (R-5.13). Resolution is GitHub's own
+ * review-thread state, read in `review-comments.ts` and never written from here.
  */
-export type GitHubCommentStore = CommentDocStore & {
-  /**
-   * R-5.12 / R-5.13 — toggle resolution by posting a reply as the acting user.
-   * Resolves the created reply record, or `null` when GitHub does not know `id`.
-   */
-  setResolved(id: string, resolved: boolean): Promise<ProjectedCommentRecord | null>;
-};
+export type GitHubCommentStore = CommentDocStore;
 
 /**
  * A `CommentDocStore` backed by a PR's issue comments (R-5.1).
@@ -418,9 +300,7 @@ export function githubCommentStore(options: GitHubCommentStoreOptions): GitHubCo
   async function read(): Promise<CommentDoc> {
     // R-5.2 / R-5.9 — always GitHub, never the cache.
     const comments = await adapter.listIssueComments(repo, pullNumber);
-    // R-5.14 — resolution is derived from the list just fetched, never from the cache.
-    const projected = withResolutionState(comments.map((c) => projectIssueComment(c, documentPath)));
-    const doc: CommentDoc = { version: 1, comments: projected };
+    const doc: CommentDoc = { version: 1, comments: comments.map((c) => projectIssueComment(c, documentPath)) };
     await cache?.write(doc);
     return doc;
   }
@@ -483,25 +363,16 @@ export function githubCommentStore(options: GitHubCommentStoreOptions): GitHubCo
     async updateComment(id, patch) {
       const current = await find(id);
       if (!current) return null;
-      // Status/result have no GitHub representation yet — resolution markers are task 5.2.
+      /*
+       * Only the text reaches GitHub. `status` is the LOCAL apply-agent flag (R-5.21) and
+       * has no GitHub representation by design: resolution lives on the review thread and
+       * is never written from here (R-5.13). A status-only patch is therefore answered
+       * with the record as it stands, not with a write.
+       */
       if (patch.comment === undefined) return current;
       const issueCommentId = current.github.issueCommentId;
       const body = formatCommentBody(patch.comment, current.collab);
       return projectIssueComment(await adapter.updateIssueComment(repo, issueCommentId, body), documentPath);
-    },
-
-    /**
-     * R-5.12 / R-5.13 — resolution is a reply comment, created through the same
-     * `createIssueComment` path as any other comment, so it carries no push
-     * requirement and is authored by whichever credential this instance runs with.
-     * Markers accumulate: an unresolve posts a second reply, it never edits the first.
-     */
-    async setResolved(id, resolved) {
-      const parent = await find(id);
-      if (!parent) return null;
-      const body = formatResolutionReply({ documentId, parent, resolved });
-      const created = await adapter.createIssueComment(repo, pullNumber, body);
-      return projectIssueComment(created, documentPath);
     },
 
     async deleteComment(id) {

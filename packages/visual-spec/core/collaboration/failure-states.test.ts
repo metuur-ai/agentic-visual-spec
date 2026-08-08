@@ -20,7 +20,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import type { ProjectedCommentRecord } from './comment-projection';
+import { type ReviewThreadRecord, groupIntoThreads, projectReviewThread } from './review-comments';
 import type { CollaborationDocument } from './document-protocol';
 import type { DocumentStore } from './document-store';
 import {
@@ -59,23 +59,18 @@ type Call = { args: string[]; input?: string };
  * The replayed GitHub
  * ------------------------------------------------------------------ */
 
-/** One raw issue comment, in GitHub's own shape — the projection parses these. */
-function ghComment(id: number, body: string, createdAt = '2026-08-06T09:00:00Z'): Record<string, unknown> {
-  return {
-    id,
-    body,
-    user: { login: 'reviewer-rita' },
-    created_at: createdAt,
-    updated_at: createdAt,
-    html_url: `https://github.com/acme/docs/pull/42#issuecomment-${id}`,
-  };
-}
+/**
+ * One review THREAD as the fake serves it, in the two places GitHub keeps it: a REST
+ * review comment on `/pulls/:n/comments`, and a GraphQL review-thread node carrying
+ * `isResolved`. Resolution is read from the second and written nowhere (R-5.12 / R-5.13),
+ * so a test states it here rather than by posting anything.
+ */
+type FakeThread = { id: number; isResolved?: boolean };
 
-/** A top-level comment on `n-7`. */
-const thread = (id: number) => ghComment(id, `Tighten this.\n\n<!-- visual-spec: documentId=doc-1 nodeId=n-7 -->`);
-/** The reply that resolves `parent`, in the exact 5.2 convention. */
-const resolves = (id: number, parent: number, createdAt = '2026-08-06T10:00:00Z') =>
-  ghComment(id, `Resolved this comment: x\n\n<!-- visual-spec: documentId=doc-1 replyTo=${parent} resolved=true -->`, createdAt);
+/** An unresolved thread — GitHub answers `isResolved: false` for it. */
+const thread = (id: number): FakeThread => ({ id });
+/** The same thread, resolved by a reviewer on github.com. */
+const resolvedThread = (id: number): FakeThread => ({ id, isResolved: true });
 
 type Fault =
   | 'getBranch'
@@ -85,6 +80,9 @@ type Fault =
   | 'createPullRequest'
   | 'getPullRequest'
   | 'listIssueComments'
+  | 'listReviewComments'
+  /** R-4.12 — the GraphQL resolution read fails on its own; REST still answers. */
+  | 'listThreadResolution'
   | 'compareCommits'
   | 'merge';
 
@@ -94,20 +92,23 @@ type FakeOptions = {
   /** The pull request `GET /pulls/:n` reports. Absent ⇒ no PR exists yet. */
   pull?: { number: number; state: string; merged: boolean; mergeable: boolean | null; mergeableState?: string };
   comments?: Array<Record<string, unknown>>;
+  /** The PR's review threads, and GitHub's own resolution state for each (R-5.12). */
+  threads?: FakeThread[];
   /** R-8.22 — the paths `compare/branch...base` reports as changed on base. */
   baseChanged?: string[];
   /** Named operations that fail with a 422. One row of the matrix each. */
   fail?: Fault[];
   /** Corrupt what a read hands back, per path — a blob that is not what we wrote. */
   corruptOnRead?: (path: string) => string | null;
-  /** Fired after every `listIssueComments` page-1 read, so a test can inject a comment. */
-  afterListComments?: (comments: Array<Record<string, unknown>>) => void;
+  /** Fired after every review-comment page-1 read, so a test can inject a thread. */
+  afterListThreads?: (threads: FakeThread[]) => void;
 };
 
 function fakeGitHub(options: FakeOptions = {}) {
   const branches = new Set(options.branches ?? []);
   const files = new Map<string, string>(Object.entries(options.files ?? {}));
   const comments = [...(options.comments ?? [])];
+  const threads = [...(options.threads ?? [])];
   const faults = new Set<Fault>(options.fail ?? []);
   const calls: Call[] = [];
   let pull = options.pull ? { ...options.pull } : null;
@@ -124,6 +125,32 @@ function fakeGitHub(options: FakeOptions = {}) {
 
   const exec: GhExecutor = async (args, input) => {
     calls.push(input === undefined ? { args } : { args, input });
+
+    /*
+     * The one GraphQL read: review-thread resolution (R-4.15). It carries no Accept
+     * header, so it has to be matched before `endpointOf` is asked anything. Failing it
+     * alone is the R-4.12 case — REST still answers and resolution reads as unknown.
+     */
+    if (args[0] === 'api' && args[1] === 'graphql') {
+      if (faults.has('listThreadResolution')) return err(500, 'GraphQL failed');
+      return ok({
+        data: {
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: threads.map((t) => ({
+                  isResolved: t.isResolved === true,
+                  isOutdated: false,
+                  comments: { nodes: [{ databaseId: t.id }] },
+                })),
+              },
+            },
+          },
+        },
+      });
+    }
+
     const endpoint = endpointOf(args);
     const method = methodOf(args);
     const path = endpoint.split('?')[0] as string;
@@ -191,13 +218,39 @@ function fakeGitHub(options: FakeOptions = {}) {
       });
     }
 
+    if (/^\/pulls\/\d+\/comments$/.test(rest) && method === 'GET') {
+      if (faults.has('listReviewComments')) return boom();
+      const page = Number(/[?&]page=(\d+)/.exec(endpoint)?.[1] ?? '1');
+      if (page > 1) return ok([]);
+      const served = ok(
+        threads.map((t) => ({
+          id: t.id,
+          in_reply_to_id: null,
+          path: MD_PATH,
+          line: 3,
+          start_line: null,
+          original_line: 3,
+          side: 'RIGHT',
+          subject_type: 'line',
+          commit_id: 'head0000',
+          original_commit_id: 'head0000',
+          diff_hunk: '@@ -1 +1 @@',
+          body: 'Tighten this.',
+          user: { login: 'reviewer-rita' },
+          created_at: '2026-08-06T09:00:00Z',
+          updated_at: '2026-08-06T09:00:00Z',
+          html_url: `https://github.com/acme/docs/pull/42#discussion_r${t.id}`,
+        })),
+      );
+      options.afterListThreads?.(threads);
+      return served;
+    }
+
     if (/^\/issues\/\d+\/comments$/.test(rest)) {
       if (faults.has('listIssueComments')) return boom();
       const page = Number(/[?&]page=(\d+)/.exec(endpoint)?.[1] ?? '1');
       if (page > 1) return ok([]);
-      const served = ok([...comments]);
-      options.afterListComments?.(comments);
-      return served;
+      return ok([...comments]);
     }
 
     if (rest.startsWith('/compare/')) {
@@ -219,6 +272,7 @@ function fakeGitHub(options: FakeOptions = {}) {
     branches,
     files,
     comments,
+    threads,
     get pull() {
       return pull;
     },
@@ -293,58 +347,91 @@ const statesIn = (frames: JobEvent[]): LifecycleState[] =>
  * R-8.15 / R-8.16 — Ready is DERIVED
  * ================================================================== */
 
-/** Project a raw comment list the way `githubCommentStore.read()` does. */
-async function project(comments: Array<Record<string, unknown>>): Promise<ProjectedCommentRecord[]> {
-  const gh = fakeGitHub({ comments, pull: { number: 42, state: 'open', merged: false, mergeable: true } });
-  const { githubCommentStore } = await import('./comment-projection');
-  const doc = await githubCommentStore({
-    adapter: createGitHubAdapter(gh.exec),
-    repo: { owner: repo.owner, repo: repo.repo },
-    pullNumber: 42,
-    documentId: 'doc-1',
-    documentPath: DOC_PATH,
-  }).read();
-  return doc.comments as ProjectedCommentRecord[];
+/** Project review threads the way the comment route and the Ready gate both do. */
+function project(threads: FakeThread[], options: { resolutionRead?: boolean } = {}): ReviewThreadRecord[] {
+  const grouped = groupIntoThreads(
+    threads.map((t) => ({
+      id: t.id,
+      inReplyToId: null,
+      path: MD_PATH,
+      line: 3,
+      startLine: null,
+      originalLine: 3,
+      side: 'RIGHT' as const,
+      subjectType: 'line' as const,
+      commitId: 'head0000',
+      originalCommitId: 'head0000',
+      diffHunk: '@@ -1 +1 @@',
+      body: 'Tighten this.',
+      user: 'reviewer-rita',
+      createdAt: '2026-08-06T09:00:00Z',
+      updatedAt: '2026-08-06T09:00:00Z',
+      htmlUrl: `https://github.com/acme/docs/pull/42#discussion_r${t.id}`,
+    })),
+  );
+  // `resolutionRead: false` is R-4.12's world: REST answered, GraphQL did not.
+  const read = options.resolutionRead !== false;
+  return grouped.map((g) =>
+    projectReviewThread(g, {
+      ...(read
+        ? { resolution: { rootCommentId: g.root.id, isResolved: threads.find((t) => t.id === g.root.id)?.isResolved === true, isOutdated: false } }
+        : {}),
+    }),
+  );
 }
 
-describe('deriveReadiness — Ready is derived, never stored (R-8.15)', () => {
-  it('a conversation with nothing to resolve is ready', async () => {
-    expect(deriveReadiness(await project([]))).toEqual({ ready: true, total: 0, unresolved: 0, unresolvedCommentIds: [] });
+const EMPTY_VERDICT = { ready: true, total: 0, unresolved: 0, unknown: 0, unresolvedCommentIds: [], unknownCommentIds: [] };
+
+describe('deriveReadiness — Ready is derived from GitHub, never stored (R-8.15)', () => {
+  it('a conversation with nothing to resolve is ready', () => {
+    expect(deriveReadiness(project([]))).toEqual(EMPTY_VERDICT);
   });
 
-  it('one unresolved thread is enough to refuse Ready, and it is named', async () => {
-    const verdict = deriveReadiness(await project([thread(700001), thread(700002), resolves(800001, 700001)]));
-    expect(verdict).toEqual({ ready: false, total: 2, unresolved: 1, unresolvedCommentIds: [700002] });
+  it('one unresolved thread is enough to refuse Ready, and it is named', () => {
+    const verdict = deriveReadiness(project([resolvedThread(700001), thread(700002)]));
+    expect(verdict).toMatchObject({ ready: false, total: 2, unresolved: 1, unknown: 0, unresolvedCommentIds: [700002] });
+    expect(verdict.reason).toContain('1 of 2 thread(s) unresolved');
   });
 
-  it('is ready once every thread carries a resolution marker', async () => {
-    const verdict = deriveReadiness(await project([thread(700001), thread(700002), resolves(800001, 700001), resolves(800002, 700002)]));
+  it('is ready once GitHub reports every thread resolved', () => {
+    const verdict = deriveReadiness(project([resolvedThread(700001), resolvedThread(700002)]));
     expect(verdict.ready).toBe(true);
     expect(verdict.total).toBe(2);
+    expect(verdict.reason).toBeUndefined();
   });
 
-  it('does not gate on replies — a reply belongs to its parent thread, not to itself', async () => {
-    // Both the resolution markers and an ordinary reply are excluded from `total`.
-    const comments = await project([thread(700001), resolves(800001, 700001)]);
-    expect(comments).toHaveLength(2); // the reply IS projected — it is just not gated
-    expect(deriveReadiness(comments).total).toBe(1);
+  /*
+   * R-8.25 / R-8.26 — the third answer. `isResolved: undefined` means the GraphQL read
+   * did not run or failed, and flattening it to `false` would be a claim nobody made
+   * while flattening it to `true` would mark a document Ready on local state alone.
+   */
+  it('refuses Ready when resolution could not be read, and names the unknown state', () => {
+    const verdict = deriveReadiness(project([resolvedThread(700001)], { resolutionRead: false }));
+    expect(verdict).toMatchObject({ ready: false, total: 1, unresolved: 0, unknown: 1, unknownCommentIds: [700001] });
+    expect(verdict.reason).toContain('resolution unknown for 1 of 1 thread(s)');
+    // The unknown thread is NOT reported as unresolved — that would be a different fact.
+    expect(verdict.unresolvedCommentIds).toEqual([]);
   });
 
-  it('R-8.16 — the same derivation returns a Ready document to PR-open when a comment arrives', async () => {
+  it('does not gate on replies — a reply rides on its thread, and is not a thread', () => {
+    const projected = project([thread(700001)]);
+    expect(deriveReadiness(projected).total).toBe(1);
+  });
+
+  it('R-8.16 — the same derivation returns a Ready document to PR-open when a comment arrives', () => {
     const pull = { state: 'open', merged: false, mergeable: true };
-    const resolved = await project([thread(700001), resolves(800001, 700001)]);
-    expect(deriveLifecycleState({ pull, readiness: deriveReadiness(resolved) })).toBe<LifecycleState>('ready');
+    expect(deriveLifecycleState({ pull, readiness: deriveReadiness(project([resolvedThread(700001)])) })).toBe<LifecycleState>('ready');
 
-    // Exactly the same inputs plus one new, unresolved comment. Nothing had to notice
+    // Exactly the same inputs plus one new, unresolved thread. Nothing had to notice
     // the arrival and demote anything: `ready` was never stored to be demoted.
-    const withNew = await project([thread(700001), resolves(800001, 700001), thread(700009)]);
+    const withNew = project([resolvedThread(700001), thread(700009)]);
     expect(deriveLifecycleState({ pull, readiness: deriveReadiness(withNew) })).toBe<LifecycleState>('pr-open');
   });
 });
 
 describe('deriveLifecycleState (R-8.19 / R-8.20)', () => {
   const ready = deriveReadiness([]);
-  const notReady = { ready: false, total: 1, unresolved: 1, unresolvedCommentIds: [700001] };
+  const notReady = deriveReadiness(project([thread(700001)]));
 
   for (const [name, pull, readiness, expected] of [
     ['merged wins over everything', { state: 'closed', merged: true, mergeable: null }, notReady, 'merged'],
@@ -366,7 +453,7 @@ describe('deriveLifecycleState (R-8.19 / R-8.20)', () => {
 
 describe('markReady (R-8.15)', () => {
   it('refuses, names the unresolved threads and records pr-open', async () => {
-    const gh = fakeGitHub({ comments: [thread(700001), thread(700002), resolves(800001, 700001)], pull: { number: 42, state: 'open', merged: false, mergeable: true } });
+    const gh = fakeGitHub({ threads: [resolvedThread(700001), thread(700002)], pull: { number: 42, state: 'open', merged: false, mergeable: true } });
     const { hub, frames } = hubRig();
     const bodies = createRecoveryBodies({ adapter: createGitHubAdapter(gh.exec) });
     hub.start({ kind: 'commit', run: bodies.markReady({ documentId: 'doc-1', repo, store: memoryStore(BOUND()) }) });
@@ -374,12 +461,12 @@ describe('markReady (R-8.15)', () => {
 
     expect(hub.snapshot().state).toBe<LifecycleState>('pr-open');
     const error = frames.find((f) => f.type === 'job-error');
-    expect(error).toMatchObject({ message: 'doc-1 is not ready: 1 of 2 comment(s) unresolved' });
+    expect(error).toMatchObject({ message: expect.stringContaining('doc-1 is not ready: 1 of 2 thread(s) unresolved') });
     expect(frames.some((f) => f.type === 'log' && f.text.includes('700002'))).toBe(true);
   });
 
   it('permits Ready once every comment is resolved', async () => {
-    const gh = fakeGitHub({ comments: [thread(700001), resolves(800001, 700001)], pull: { number: 42, state: 'open', merged: false, mergeable: true } });
+    const gh = fakeGitHub({ threads: [resolvedThread(700001)], pull: { number: 42, state: 'open', merged: false, mergeable: true } });
     const { hub } = hubRig();
     const bodies = createRecoveryBodies({ adapter: createGitHubAdapter(gh.exec) });
     hub.start({ kind: 'commit', run: bodies.markReady({ documentId: 'doc-1', repo, store: memoryStore(BOUND()) }) });
@@ -389,7 +476,7 @@ describe('markReady (R-8.15)', () => {
 
   it('stores nothing — asking twice runs two independent derivations', async () => {
     const store = memoryStore(BOUND());
-    const gh = fakeGitHub({ comments: [thread(700001), resolves(800001, 700001)], pull: { number: 42, state: 'open', merged: false, mergeable: true } });
+    const gh = fakeGitHub({ threads: [resolvedThread(700001)], pull: { number: 42, state: 'open', merged: false, mergeable: true } });
     const bodies = createRecoveryBodies({ adapter: createGitHubAdapter(gh.exec) });
     const { hub } = hubRig();
     hub.start({ kind: 'commit', run: bodies.markReady({ documentId: 'doc-1', repo, store }) });
@@ -397,7 +484,7 @@ describe('markReady (R-8.15)', () => {
     expect(hub.snapshot().state).toBe<LifecycleState>('ready');
 
     // Nothing about readiness was persisted, so the second ask sees the new comment.
-    gh.comments.push(thread(700009));
+    gh.threads.push(thread(700009));
     hub.start({ kind: 'commit', run: bodies.markReady({ documentId: 'doc-1', repo, store }) });
     await settled();
     expect(hub.snapshot().state).toBe<LifecycleState>('pr-open');
@@ -412,17 +499,17 @@ describe('markReady (R-8.15)', () => {
 describe('merge re-verifies at merge time (R-8.17)', () => {
   it('refuses when a comment arrives between the readiness check and the merge', async () => {
     // The conversation is fully resolved when readiness is first computed. The
-    // `afterListComments` hook fires the instant that read returns, injecting a new
+    // `afterListThreads` hook fires the instant that read returns, injecting a new
     // unresolved comment — i.e. exactly inside the window a poll-derived answer would
     // have missed. Merge reads again itself, so it sees it.
     let injected = false;
     const gh = fakeGitHub({
-      comments: [thread(700001), resolves(800001, 700001)],
+      threads: [resolvedThread(700001)],
       pull: { number: 42, state: 'open', merged: false, mergeable: true },
-      afterListComments: (comments) => {
+      afterListThreads: (served) => {
         if (injected) return;
         injected = true;
-        comments.push(thread(700099));
+        served.push(thread(700099));
       },
     });
     const adapter = createGitHubAdapter(gh.exec);
@@ -447,7 +534,7 @@ describe('merge re-verifies at merge time (R-8.17)', () => {
   });
 
   it('merges when the re-read still says every comment is resolved', async () => {
-    const gh = fakeGitHub({ comments: [thread(700001), resolves(800001, 700001)], pull: { number: 42, state: 'open', merged: false, mergeable: true } });
+    const gh = fakeGitHub({ threads: [resolvedThread(700001)], pull: { number: 42, state: 'open', merged: false, mergeable: true } });
     const bodies = createRecoveryBodies({ adapter: createGitHubAdapter(gh.exec) });
     const { hub } = hubRig();
     hub.start({ kind: 'merge', run: bodies.merge({ documentId: 'doc-1', repo, store: memoryStore(BOUND()) }) });
@@ -457,7 +544,7 @@ describe('merge re-verifies at merge time (R-8.17)', () => {
   });
 
   it('reads the comments itself rather than trusting the state the hub holds', async () => {
-    const gh = fakeGitHub({ comments: [thread(700001)], pull: { number: 42, state: 'open', merged: false, mergeable: true } });
+    const gh = fakeGitHub({ threads: [thread(700001)], pull: { number: 42, state: 'open', merged: false, mergeable: true } });
     const bodies = createRecoveryBodies({ adapter: createGitHubAdapter(gh.exec) });
     const { hub } = hubRig();
     // Declare `ready` out of band — a stale answer merge must not honour.
@@ -479,7 +566,7 @@ describe('merge re-verifies at merge time (R-8.17)', () => {
 describe('base conflict (R-8.20)', () => {
   it('refuses the merge, records `conflicted` and attempts no resolution', async () => {
     const gh = fakeGitHub({
-      comments: [thread(700001), resolves(800001, 700001)],
+      threads: [resolvedThread(700001)],
       pull: { number: 42, state: 'open', merged: false, mergeable: false, mergeableState: 'dirty' },
     });
     const bodies = createRecoveryBodies({ adapter: createGitHubAdapter(gh.exec) });
@@ -734,7 +821,7 @@ describe('verification failure (R-8.21)', () => {
   it('leaves a state a later sync reconciles rather than a dead end (R-8.24)', async () => {
     const gh = fakeGitHub({
       files: { [DOC_PATH]: '{}\n' },
-      comments: [thread(700001)],
+      threads: [thread(700001)],
       pull: { number: 42, state: 'open', merged: false, mergeable: true },
       corruptOnRead: (p) => (p === MD_PATH ? '# tampered\n' : null),
     });
@@ -1006,10 +1093,10 @@ const FAILURE_MATRIX: MatrixRow[] = [
   {
     step: 'merge — an unresolved comment exists at merge time',
     requirement: 'R-8.17',
-    run: () => runMerge({ comments: [thread(700001)] }),
+    run: () => runMerge({ threads: [thread(700001)] }),
     state: 'pr-open',
     reconciled: 'pr-open',
-    reconcileWorld: { comments: [thread(700001)], pull: { ...OPEN_PULL } },
+    reconcileWorld: { threads: [thread(700001)], pull: { ...OPEN_PULL } },
     forbidden: ['PUT /repos/acme/docs/pulls/42/merge'],
   },
   {
@@ -1131,7 +1218,7 @@ describe('R-5.8 — the local comment cache is deleted when, and only when, the 
   it('deletes the cache after a successful merge', async () => {
     let existsAfter = true;
     const path = await withCache(async (cachePath) => {
-      const { hub } = await runMerge({ comments: [thread(700001), resolves(800001, 700001)] }, cachePath);
+      const { hub } = await runMerge({ threads: [resolvedThread(700001)] }, cachePath);
       expect(await flushed(hub)).toBe('merged');
       existsAfter = existsSync(cachePath());
     });
@@ -1151,7 +1238,7 @@ describe('R-5.8 — the local comment cache is deleted when, and only when, the 
 
   it('a merge with no cache on disk still merges — deletion is best-effort, not a gate', async () => {
     const { hub } = await runMerge(
-      { comments: [thread(700001), resolves(800001, 700001)] },
+      { threads: [resolvedThread(700001)] },
       () => join(tmpdir(), 'vs-cache-absent', 'nope.json'),
     );
     expect(await flushed(hub)).toBe('merged');
@@ -1206,9 +1293,10 @@ describe('adapter additions', () => {
 
 describe('typed failures', () => {
   it('each carries the facts a client needs, so nothing has to parse a message', () => {
-    const gate = new ReadyGateError('doc-1', { ready: false, total: 3, unresolved: 2, unresolvedCommentIds: [1, 2] });
+    const gate = new ReadyGateError('doc-1', deriveReadiness(project([thread(1), thread(2), resolvedThread(3)])));
     expect(gate).toMatchObject({ name: 'ReadyGateError', documentId: 'doc-1' });
     expect(gate.verdict.unresolvedCommentIds).toEqual([1, 2]);
+    expect(gate.message).toContain('2 of 3 thread(s) unresolved');
 
     const refused = new MergeRefusedError('doc-1', 'base-conflict', 'nope');
     expect(refused).toMatchObject({ name: 'MergeRefusedError', reason: 'base-conflict', verdict: null });

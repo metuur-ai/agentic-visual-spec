@@ -12,16 +12,12 @@ import {
   findByIdempotencyKey,
   formatCommentBody,
   hasRoutingDecision,
-  formatResolutionReply,
   formatTrailer,
   githubCommentStore,
-  isResolutionReply,
   issueCommentIdFor,
   parseCommentBody,
   projectIssueComment,
   recordIdFor,
-  resolutionByComment,
-  withResolutionState,
 } from './comment-projection';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -315,33 +311,6 @@ describe('githubCommentStore intent methods (R-5.4 / R-5.5)', () => {
   });
 
   /*
-   * A reply is not a resolution. `markerOf` demands `replyTo` AND `resolved`, so carrying
-   * the parent link must not silently mark the thread resolved — that would take a comment
-   * off the open list and open the publish gate on nobody's authority.
-   */
-  it('a reply carrying only replyTo is not read as a resolution marker', async () => {
-    const { store: s, calls } = store([{ stdout: fixture('issue-comment-create.json') }]);
-    await s.addComment!({
-      id: 'c-local',
-      workflow: 'visual-spec',
-      target: { path: 'docs/spec.md', kind: 'file' },
-      comment: 'Agreed.',
-      status: 'open',
-      ts: '2026-08-07T10:00:00Z',
-      collab: { replyTo: '700001' },
-    } as Parameters<NonNullable<typeof s.addComment>>[0]);
-
-    const body = JSON.parse(calls[0]?.input ?? '{}').body as string;
-    expect(body).toContain('replyTo=700001');
-    expect(body).not.toContain('resolved=');
-    const asProjected = projectIssueComment(
-      { id: 900001, body, user: 'octocat', htmlUrl: 'https://x/1', createdAt: 'T0', updatedAt: 'T0' },
-      'docs/spec.md',
-    );
-    expect(isResolutionReply(asProjected)).toBe(false);
-  });
-
-  /*
    * `addComment` used to rebuild the trailer from a fixed list of keys, which made it the
    * gatekeeper of the whole vocabulary: anything the caller computed and this list did not
    * name was dropped, and since issue comments are flat and the trailer is the only durable
@@ -455,8 +424,8 @@ describe('the extended CommentDocStore seam', () => {
     const added = await handleCommentsRequest(s, 'POST', '/add', {}, { path: 'docs/spec.md', comment: 'Hi' });
     expect(added.json).toEqual({ ok: true, id: recordIdFor(900001) });
 
-    // Status has no GitHub representation in 5.1 (resolution markers are task 5.2), so
-    // the PATCH resolves against GitHub and writes nothing.
+    // R-5.21 — `status` is the local apply-agent flag and has no GitHub representation,
+    // so the PATCH resolves against GitHub and writes nothing.
     const patched = await handleCommentsRequest(s, 'PATCH', `/${recordIdFor(700001)}`, {}, { status: 'applied' });
     expect(patched.json).toEqual({ ok: true });
 
@@ -488,7 +457,7 @@ describe('the extended CommentDocStore seam', () => {
 
   it('a GitHub-backed store is still usable wherever a CommentDocStore is expected', () => {
     const { store: s } = store([]);
-    const asPlain: CommentDocStore = s; // must type-check with setResolved added
+    const asPlain: CommentDocStore = s;
     expect(typeof asPlain.read).toBe('function');
   });
 
@@ -511,210 +480,13 @@ describe('the extended CommentDocStore seam', () => {
 });
 
 // ---------------------------------------------------------------------------
-// R-5.12 … R-5.15 — resolution as a reply-comment convention (task 5.2)
-// ---------------------------------------------------------------------------
-
-/** The four resolution replies of `resolution-replies.json`, in fixture order. */
-const REPLIES = JSON.parse(fixture('resolution-replies.json')) as unknown[];
-const RESOLVE_700001 = REPLIES[0];
-const UNRESOLVE_700001 = REPLIES[1];
-const RESOLVED_CREATED = { stdout: fixture('resolution-reply-create.json') };
-
-/** A `listIssueComments` response: the base fixture plus whichever replies a test needs. */
-const listWith = (...replies: unknown[]) => ({
-  stdout: JSON.stringify([...(JSON.parse(fixture('projection-comments.json')) as unknown[]), ...replies]),
-});
-
-const recordOf = (doc: CommentDoc, issueCommentId: number): ProjectedCommentRecord =>
-  (doc.comments as ProjectedCommentRecord[]).find((c) => c.github.issueCommentId === issueCommentId) as ProjectedCommentRecord;
-
-describe('resolution reply body (R-5.12 / R-5.15)', () => {
-  it('resolve writes a visible sentence plus the hidden marker, and nothing else', async () => {
-    const { store: s, calls } = store([LIST, RESOLVED_CREATED]);
-    await s.setResolved(recordIdFor(700001), true);
-
-    expect(JSON.parse(calls[1]?.input ?? '{}')).toEqual({
-      body:
-        'Resolved this comment: https://github.com/acme/docs/pull/42#issuecomment-700001\n\n' +
-        '<!-- visual-spec: documentId=doc-1 replyTo=700001 resolved=true -->',
-    });
-  });
-
-  it('unresolve is a SECOND reply with resolved=false — the first is never edited', async () => {
-    const { store: s, calls } = store([LIST, RESOLVED_CREATED]);
-    await s.setResolved(recordIdFor(700001), false);
-
-    expect(JSON.parse(calls[1]?.input ?? '{}')).toEqual({
-      body:
-        'Reopened this comment: https://github.com/acme/docs/pull/42#issuecomment-700001\n\n' +
-        '<!-- visual-spec: documentId=doc-1 replyTo=700001 resolved=false -->',
-    });
-    // POST to the comment collection, not PATCH of the existing marker.
-    expect(calls[1]?.args).toContain('POST');
-    expect(endpointOf(calls[1]?.args ?? [])).toBe('/repos/acme/docs/issues/42/comments');
-  });
-
-  it('reuses the 5.1 trailer — no second encoding (R-5.12)', () => {
-    const parent = projectIssueComment(
-      { id: 700001, body: 'x', user: 'u', createdAt: 't', updatedAt: 't', htmlUrl: 'https://example.invalid/#c' },
-      'docs/spec.md',
-    );
-    const body = formatResolutionReply({ documentId: 'doc-1', parent, resolved: true });
-    expect(parseCommentBody(body).trailer).toEqual({ documentId: 'doc-1', replyTo: '700001', resolved: 'true' });
-  });
-
-  it('is legible on github.com: the trailer is hidden, the sentence is not (R-5.15)', () => {
-    const parent = projectIssueComment(
-      { id: 700001, body: 'x', user: 'u', createdAt: 't', updatedAt: 't', htmlUrl: 'https://example.invalid/#c' },
-      'docs/spec.md',
-    );
-    // What GitHub's renderer leaves behind once the HTML comment is dropped.
-    const visible = parseCommentBody(formatResolutionReply({ documentId: 'doc-1', parent, resolved: true })).text;
-    expect(visible).toBe('Resolved this comment: https://example.invalid/#c');
-    expect(visible).not.toContain('<!--');
-    expect(visible).not.toContain('visual-spec');
-  });
-
-  it('never writes a participant identity into the body (R-5.13)', async () => {
-    const { store: s, calls } = store([LIST, RESOLVED_CREATED]);
-    await s.setResolved(recordIdFor(700001), true);
-    const body = JSON.parse(calls[1]?.input ?? '{}').body as string;
-
-    // The parent was authored by reviewer-rita; the acting user is whoever the
-    // credential belongs to. Neither is encoded — authorship is GitHub's to assign.
-    for (const login of ['reviewer-rita', 'author-alice', 'drive-by-dana']) expect(body).not.toContain(login);
-    expect(body).not.toContain('@');
-    expect(body).not.toMatch(/\buser=|\bauthor=|\bby=/);
-  });
-
-  it('resolves null for an id GitHub does not know, posting nothing', async () => {
-    const { store: s, calls } = store([LIST]);
-    expect(await s.setResolved('c-deadbeef', true)).toBeNull();
-    expect(calls).toHaveLength(1);
-  });
-});
-
-describe('deriving resolution state (R-5.14)', () => {
-  it('takes the LATEST marker by createdAt, whatever order the replies arrive in', async () => {
-    // 800102 (09:20, resolved) has the HIGHER id but the EARLIER timestamp;
-    // 800101 (09:30, reopened) is later and therefore wins.
-    const { store: s } = store([listWith(RESOLVE_700001, UNRESOLVE_700001)]);
-    const doc = await s.read();
-
-    expect(recordOf(doc, 700001).resolved).toBe(false);
-    expect(recordOf(doc, 700001).status).toBe('open');
-  });
-
-  it('breaks a createdAt tie on the higher GitHub comment id', async () => {
-    // 800103 (reopened) and 800104 (resolved) share 09:40 exactly; 800104 wins.
-    const { store: s } = store([listWith(...REPLIES)]);
-    const doc = await s.read();
-
-    expect(recordOf(doc, 700003).resolved).toBe(true);
-    expect(recordOf(doc, 700003).status).toBe('applied');
-  });
-
-  it('leaves a comment with no marker untouched — absent, not false', async () => {
-    const { store: s } = store([listWith(...REPLIES)]);
-    const doc = await s.read();
-
-    expect(recordOf(doc, 700002).resolved).toBeUndefined();
-    expect(recordOf(doc, 700002).status).toBe('open');
-  });
-
-  it('DOES NOT consult the cache — a cache claiming the opposite changes nothing (R-5.14)', async () => {
-    let reads = 0;
-    let cached: CommentDoc = {
-      version: 1,
-      comments: [
-        // A stale cache asserting the exact opposite of what GitHub says.
-        { id: recordIdFor(700001), status: 'applied', resolved: true } as unknown as CommentRecord,
-        { id: recordIdFor(700003), status: 'open', resolved: false } as unknown as CommentRecord,
-      ],
-    };
-    const cache: CommentDocStore = {
-      async read() {
-        reads += 1;
-        return cached;
-      },
-      async write(doc) {
-        cached = doc;
-      },
-    };
-
-    const { store: s } = store([listWith(...REPLIES)], cache);
-    const doc = await s.read();
-
-    expect(reads).toBe(0);
-    expect(recordOf(doc, 700001).resolved).toBe(false); // cache said true
-    expect(recordOf(doc, 700003).resolved).toBe(true); // cache said false
-  });
-
-  it('is a pure derivation over the fetched list', () => {
-    const records = (JSON.parse(fixture('resolution-replies.json')) as Array<Record<string, unknown>>).map((raw) =>
-      projectIssueComment(
-        {
-          id: raw.id as number,
-          body: raw.body as string,
-          user: (raw.user as { login: string }).login,
-          createdAt: raw.created_at as string,
-          updatedAt: raw.updated_at as string,
-          htmlUrl: raw.html_url as string,
-        },
-        'docs/spec.md',
-      ),
-    );
-    expect([...resolutionByComment(records)]).toEqual([
-      [700001, false],
-      [700003, true],
-    ]);
-    // Nothing is stamped: the parents are not in this list.
-    expect(withResolutionState(records).every((r) => r.resolved === undefined)).toBe(true);
-  });
-});
-
-describe('resolve/unresolve round-trip (R-5.12 / R-5.14)', () => {
-  it('goes open → resolved → open across three syncs', async () => {
-    const before = await store([LIST]).store.read();
-    expect(recordOf(before, 700001).resolved).toBeUndefined();
-
-    const resolving = store([LIST, RESOLVED_CREATED]);
-    const reply = await resolving.store.setResolved(recordIdFor(700001), true);
-    expect(reply?.collab).toEqual({ documentId: 'doc-1', replyTo: '700001', resolved: 'true' });
-    expect(reply?.github.issueCommentId).toBe(900102);
-
-    const afterResolve = await store([listWith(RESOLVE_700001)]).store.read();
-    expect(recordOf(afterResolve, 700001).resolved).toBe(true);
-    expect(recordOf(afterResolve, 700001).status).toBe('applied');
-
-    const afterUnresolve = await store([listWith(RESOLVE_700001, UNRESOLVE_700001)]).store.read();
-    expect(recordOf(afterUnresolve, 700001).resolved).toBe(false);
-    expect(recordOf(afterUnresolve, 700001).status).toBe('open');
-  });
-
-  it('keeps the replies in the document but out of the document-level discussion (R-5.6 / R-5.7)', async () => {
-    const { store: s } = store([listWith(...REPLIES)]);
-    const doc = await s.read();
-
-    expect(doc.comments).toHaveLength(8); // 4 comments + 4 replies, nothing discarded
-    expect((doc.comments as ProjectedCommentRecord[]).filter(isResolutionReply)).toHaveLength(4);
-    expect(documentDiscussion(doc).map((c) => c.github.issueCommentId)).toEqual([700003, 700004]);
-  });
-
-  it('creates the reply through the issue-comment path only — never a review comment (R-5.5)', async () => {
-    const { store: s, calls } = store([LIST, RESOLVED_CREATED]);
-    await s.setResolved(recordIdFor(700001), true);
-
-    for (const call of calls) {
-      expect(endpointOf(call.args)).toMatch(/\/issues\//);
-      expect(endpointOf(call.args)).not.toMatch(/\/pulls\/\d+\/comments/);
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
 // R-5.11 — idempotent comment creation (task 5.3)
 // ---------------------------------------------------------------------------
+
+/** A `listIssueComments` response: the base fixture plus whichever extras a test needs. */
+const listWith = (...extra: unknown[]) => ({
+  stdout: JSON.stringify([...(JSON.parse(fixture('projection-comments.json')) as unknown[]), ...extra]),
+});
 
 /** GitHub's response to the create that the first attempt never saw. */
 const KEYED_CREATED = { stdout: fixture('idempotent-create.json') };

@@ -206,15 +206,17 @@ describe("the collab apply prompt has a caller in the app", () => {
   });
 
   /*
-   * And it must hand over the same set the panel lists. A resolve posts a marker reply and
-   * an unresolve posts another; they accumulate by design (R-5.14). The panel filters them
-   * and the handoff did not, so a prompt claimed six comments where the sidebar showed
-   * four — two of them the sentence "Resolved this comment: <url>", offered to an agent as
-   * something to act on.
+   * And it must hand over the same set the panel lists — the OPEN comments. `status` is
+   * the local apply-agent flag (R-5.21), never GitHub's resolution, so the handoff must
+   * filter on it and on nothing else. A prompt once claimed six comments where the sidebar
+   * showed four, because the two surfaces disagreed about what counted.
    */
-  it('it excludes resolution markers, exactly as the panel does', () => {
+  it("it hands over the open comments, on `status` alone (R-5.21)", () => {
     for (const module of callersOf()) {
-      expect(readFileSync(resolve(pkgRoot, module), 'utf8')).toContain('isResolutionReply(');
+      const source = readFileSync(resolve(pkgRoot, module), 'utf8');
+      expect(source).toContain("c.status === 'open'");
+      // R-5.13 — nothing on this path may consult or write GitHub's resolution.
+      expect(source).not.toMatch(/isResolved|resolveReviewThread|unresolveReviewThread/);
     }
   });
 

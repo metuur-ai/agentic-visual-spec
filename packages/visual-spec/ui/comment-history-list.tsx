@@ -1,4 +1,3 @@
-import { useState } from 'react';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { anchorLabelOf, historyFor } from '../core/editing/comment-doc';
 import { resolveMarkdownAnchors } from './anchor-resolver';
@@ -34,20 +33,13 @@ export function locate(target: { heading?: string | null; startLine?: number; en
 const EMPTY_STATE = 'No applied comments yet.';
 
 /**
- * `restore` is collaboration's, and optional for the same reason `reply` is on the panel
- * source: resolving there posts a marker reply and markers accumulate (R-5.14), so
- * reopening is an ordinary act with a route behind it. Local mode's remove deletes the
- * sidecar record outright — there is nothing to restore — so it passes nothing and this
- * list stays read-only. Confirm-then-act mirrors Resolve in the open list, because both
- * write a comment to the pull request that every participant sees.
+ * Read-only, both modes. It briefly carried an Unresolve control for collaboration, back
+ * when resolution was a marker reply this package wrote. Resolution is now GitHub's
+ * review-thread state, read and never written (R-5.13) — there is nothing here to undo,
+ * and the open list links out to github.com for the act itself (R-5.14).
  */
-export function CommentHistoryList({
-  path,
-  comments,
-  restore,
-}: { path: string; comments: CommentRecord[]; restore?: (id: string) => Promise<void> }) {
+export function CommentHistoryList({ path, comments }: { path: string; comments: CommentRecord[] }) {
   const entries = historyFor(comments, path);
-  const [confirmId, setConfirmId] = useState<string | null>(null);
   if (!entries.length) {
     return <p style={emptyState}>{EMPTY_STATE}</p>;
   }
@@ -74,32 +66,6 @@ export function CommentHistoryList({
               >
                 <LocateIcon />
               </button>
-              {restore &&
-                (confirmId === c.id ? (
-                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                    <span style={{ fontSize: 12, color: '#475569' }}>Unresolve?</span>
-                    <button
-                      type="button"
-                      data-vs-unresolve-confirm={c.id}
-                      onClick={() => { void restore(c.id); setConfirmId(null); }}
-                      style={confirmYes}
-                    >
-                      Yes
-                    </button>
-                    <button type="button" onClick={() => setConfirmId(null)} style={confirmNo}>No</button>
-                  </span>
-                ) : (
-                  <button
-                    type="button"
-                    data-vs-unresolve={c.id}
-                    onClick={() => setConfirmId(c.id)}
-                    title="Reopen this comment — posts a reply on the pull request"
-                    aria-label="Unresolve comment"
-                    style={textBtn}
-                  >
-                    Unresolve
-                  </button>
-                ))}
             </div>
           </li>
         ))}
@@ -125,29 +91,3 @@ const emptyState: React.CSSProperties = { padding: 12, opacity: 0.6, fontSize: 1
 const card: React.CSSProperties = { border: '1px solid #f1f5f9', borderRadius: 8, padding: 8, overflowWrap: 'anywhere' };
 const locateBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, width: 22, height: 22, padding: 0, border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer' };
 
-/*
- * Local rather than imported from `comment-panel.tsx`: that module imports this one, so
- * reaching back would close a cycle. Deliberately not the panel's red confirm either —
- * that red says "destructive", and reopening a thread destroys nothing. It posts a reply
- * the other participants will see, which is worth a confirm, not a warning.
- */
-const confirmYes: React.CSSProperties = {
-  padding: '2px 8px',
-  border: '1px solid #2563eb',
-  borderRadius: 4,
-  background: '#eff6ff',
-  color: '#1d4ed8',
-  font: '12px system-ui',
-  cursor: 'pointer',
-};
-const confirmNo: React.CSSProperties = {
-  padding: '2px 8px',
-  border: '1px solid #d1d5db',
-  borderRadius: 4,
-  background: 'white',
-  color: '#475569',
-  font: '12px system-ui',
-  cursor: 'pointer',
-};
-/** Same reason as the panel's: a worded button cannot live in a 22×22 icon square. */
-const textBtn: React.CSSProperties = { ...locateBtn, width: 'auto', height: 22, padding: '0 6px', whiteSpace: 'nowrap', font: '12px system-ui' };

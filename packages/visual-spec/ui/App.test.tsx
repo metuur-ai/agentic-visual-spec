@@ -42,6 +42,16 @@ const ANCHORED_COMMENT: CommentRecord = {
   ts: '2026-08-07T00:00:00.000Z',
   // trailer carries the nodeId the comment resolves against (collab-comment-source.ts)
   collab: { nodeId: 'n-1' },
+  // The projected review thread: unresolved on GitHub, so the row links out to it (R-5.14).
+  github: {
+    reviewCommentId: 700001,
+    isOutdated: false,
+    isResolved: false,
+    htmlUrl: 'https://github.com/acme/docs/pull/42#discussion_r700001',
+    user: 'reviewer-rita',
+    updatedAt: '2026-08-07T00:00:00.000Z',
+  },
+  replies: [],
 } as CommentRecord;
 
 const ORPHAN_COMMENT: CommentRecord = {
@@ -149,7 +159,11 @@ describe('the collaboration UI is mounted from App.tsx (task U-1)', () => {
     expect(screen.getByText(/this block used to say something else/)).toBeTruthy();
     expect(screen.getByText(/the paragraph that got deleted/)).toBeTruthy();
     expect(screen.getAllByLabelText('Reply').length).toBeGreaterThan(0);
-    expect(screen.getAllByLabelText('Resolve comment').length).toBeGreaterThan(0);
+    // R-5.13 / R-5.14 — the way to resolve is a link to github.com, not a control here.
+    expect(screen.getByText('Open on GitHub').getAttribute('href')).toBe(
+      'https://github.com/acme/docs/pull/42#discussion_r700001',
+    );
+    expect(screen.queryByLabelText('Resolve comment')).toBeNull();
 
     // The route swap is reversible.
     fireEvent.click(screen.getByText('← Files'));

@@ -31,7 +31,7 @@
  */
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { InspectOverlay, InspectorProvider, type SourceLoc } from '../core/app';
-import { type ProjectedCommentRecord, isResolutionReply } from '../core/collaboration/comment-projection';
+import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 // From the pure module, not `failure-states`: that one reaches `cache-lifecycle` and
 // `node:fs/promises`, which the browser bundle cannot resolve.
 import { deriveReadiness, type ReadinessVerdict } from '../core/collaboration/readiness';
@@ -114,7 +114,7 @@ export function CollabApp({ onExit }: { onExit: () => void }) {
 }
 
 function CollabDocumentPane({ documentId }: { documentId: string }) {
-  const { document, fullDocument, comments, loading, error, addComment, replyToComment, removeComment, restoreComment, reload, publish } =
+  const { document, fullDocument, comments, loading, error, addComment, replyToComment, reload, publish } =
     useCollabDocument(documentId);
   // `locate` scopes its query to the rendered document rather than the whole page.
   const docRoot = useRef<HTMLDivElement | null>(null);
@@ -127,12 +127,14 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
   const [publishError, setPublishError] = useState<string | null>(null);
 
   /**
-   * R-8.15 — unresolved comments block publishing. `deriveLifecycleState` also decides
-   * `merged` / `closed` / `conflicted`, but those arms need the Pull Request's
-   * `state` / `merged` / `mergeable`, which no route hands the browser today. Gating on
-   * the half we can actually derive is honest; claiming the other half would not be.
+   * R-8.15 / R-8.25 — unresolved threads block publishing, and so do threads whose
+   * resolution GitHub could not tell us (R-8.26 — nothing local may declare Ready).
+   * `deriveLifecycleState` also decides `merged` / `closed` / `conflicted`, but those arms
+   * need the Pull Request's `state` / `merged` / `mergeable`, which no route hands the
+   * browser today. Gating on the half we can actually derive is honest; claiming the other
+   * half would not be.
    */
-  const readiness = useMemo(() => deriveReadiness(comments.filter(isProjected)), [comments]);
+  const readiness = useMemo(() => deriveReadiness(comments.filter(isThread)), [comments]);
 
   /** R-5.10 — publishing is initiated by a person. This runs from a click, never a hook. */
   const stagePublish = useCallback(() => {
@@ -182,14 +184,12 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
    */
   const copyHandoff = useCallback(async () => {
     /*
-     * Resolution markers are bookkeeping, not conversation: a resolve posts one, an
-     * unresolve posts another, and they accumulate by design (R-5.14). The panel already
-     * keeps them out of the list; handing them to an agent as instructions would ask it to
-     * act on the sentence "Resolved this comment: <url>". Same predicate, so the two
-     * surfaces cannot disagree about what counts as a comment — they did: the panel showed
-     * four and the prompt claimed six.
+     * `status` is the LOCAL apply-agent flag (R-5.21) — whether this agent has already
+     * acted — and is deliberately NOT GitHub's resolution. A thread resolved on github.com
+     * still reads `open` here, because nothing local has acted on it yet. That is the same
+     * predicate the panel lists on, so the two surfaces cannot disagree about what counts.
      */
-    const open = comments.filter((c) => c.status === 'open' && !isResolutionReply(c as ProjectedCommentRecord));
+    const open = comments.filter((c) => c.status === 'open');
     const prompt = buildApplyPrompt(open, { mode: 'collab', documentPath: localDocumentPath(documentId) });
     try {
       await navigator.clipboard.writeText(prompt);
@@ -207,12 +207,10 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
             comments,
             add: addComment,
             reply: replyToComment,
-            remove: removeComment,
-            restore: restoreComment,
             root: docRoot.current,
           })
         : null,
-    [fullDocument, comments, addComment, replyToComment, removeComment, restoreComment],
+    [fullDocument, comments, addComment, replyToComment],
   );
 
   if (loading) {
@@ -293,12 +291,8 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
               {handoff}
             </div>
           )}
-          {mode === 'edit' && !readiness.ready && (
-            <div style={blockedBanner}>
-              {readiness.unresolved} of {readiness.total} comment
-              {readiness.total === 1 ? '' : 's'} unresolved — resolve them before publishing.
-            </div>
-          )}
+          {/* R-8.25 — the verdict names its own reason, unknown resolution included. */}
+          {mode === 'edit' && !readiness.ready && <div style={blockedBanner}>{readiness.reason}</div>}
           {/*
             * R-7.5's create path ends here. `CommentPanel` reads the inspector's selection
             * and `collabCommentPanelSource` turns the selected element into a `nodeId`, but
@@ -357,17 +351,16 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
 type StagedPublish = Pick<PublishPayload, 'json' | 'markdown' | 'losses'>;
 
 /**
- * The comment routes answer projected records, but `CollabClient` types them as the wider
- * `CommentRecord`, so the narrowing has to happen somewhere. It happens here rather than
- * with a cast because the predicate is also the right product rule: a record with no
- * `github` was never posted, so no reviewer can have resolved it and it cannot be the
+ * The comment route answers projected review threads, but `CollabClient` types them as the
+ * wider `CommentRecord`, so the narrowing has to happen somewhere. It happens here rather
+ * than with a cast because the predicate is also the right product rule: a record with no
+ * `github` is not a GitHub review thread, so it has no resolution state and cannot be the
  * thing standing between an author and a publish.
  */
-function isProjected(comment: CommentRecord): comment is ProjectedCommentRecord {
-  // The base record does not declare these at all — they are the projection's own
-  // additions — so the check reads them through a widened view.
-  const candidate = comment as Partial<ProjectedCommentRecord>;
-  return typeof candidate.github?.issueCommentId === 'number' && candidate.collab !== undefined;
+function isThread(comment: CommentRecord): comment is ReviewThreadRecord {
+  // The base record does not declare this at all — it is the projection's own addition —
+  // so the check reads it through a widened view.
+  return typeof (comment as Partial<ReviewThreadRecord>).github?.reviewCommentId === 'number';
 }
 
 /** The element `CollabDocumentView` wraps every rendered block in. */
@@ -394,9 +387,8 @@ function collabAnchorOf(el: HTMLElement | null): SourceLoc | null {
 
 /** Names the blocking reason rather than leaving a disabled control unexplained. */
 function publishBlockedReason(dirty: boolean, readiness: ReadinessVerdict): string | undefined {
-  if (!readiness.ready) {
-    return `${readiness.unresolved} of ${readiness.total} comment(s) unresolved`;
-  }
+  // R-8.25 — including "resolution unknown", which must never read as "unresolved".
+  if (!readiness.ready) return readiness.reason;
   if (!dirty) return 'No changes to publish';
   return undefined;
 }

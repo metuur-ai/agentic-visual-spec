@@ -109,8 +109,7 @@ function Probe({ client, factory, documentId = 'doc-1' }: { client: CollabClient
       <span data-testid="comments-error">{state.commentsError?.kind ?? '—'}</span>
       <button data-testid="add" onClick={() => void state.addComment({ nodeId: 'n-7', comment: 'tighten', workflow: 'visual-spec' })} />
       <button data-testid="reply" onClick={() => void state.replyToComment('c-1', 'agreed')} />
-      <button data-testid="remove" onClick={() => void state.removeComment('c-1')} />
-      <button data-testid="restore" onClick={() => void state.restoreComment('c-1')} />
+      <button data-testid="patch" onClick={() => void state.patchComment('c-1', { status: 'applied' })} />
       <button data-testid="reload" onClick={() => void state.reload()} />
     </div>
   );
@@ -323,7 +322,12 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
     expect(client.replyToComment).toHaveBeenCalledWith('doc-1', 'c-1', { comment: 'agreed' });
   });
 
-  it('remove is a PATCH to applied — nothing is destroyed, GitHub stays the record (R-5.2)', async () => {
+  /*
+   * R-5.21 — `status` is the LOCAL apply-agent flag, not a resolution. The pair of
+   * `removeComment` / `restoreComment` helpers this used to exercise wrote a resolution
+   * marker, and went with the protocol (R-5.13).
+   */
+  it('patchComment folds the saved record in — status is local bookkeeping (R-5.21)', async () => {
     const client = stubClient({
       comments: vi.fn(async () => ({ ok: true, value: [comment('c-1', 'tighten')] })),
       patchComment: vi.fn(async () => ({ ok: true, value: { ok: true, comment: comment('c-1', 'tighten', { status: 'applied' }) } })),
@@ -331,7 +335,7 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
     render(<Probe client={client} factory={fakeStream().factory} />);
     await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-1:tighten:open'));
 
-    screen.getByTestId('remove').click();
+    screen.getByTestId('patch').click();
     await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-1:tighten:applied'));
     expect(client.patchComment).toHaveBeenCalledWith('doc-1', 'c-1', { status: 'applied' });
   });
@@ -359,24 +363,6 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
     await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('2'));
   });
 
-  /*
-   * The inverse, and the half the UI had no way to reach: the route and the store both
-   * served an unresolve, but nothing in the browser could ask for one — a thread resolved
-   * by mistake could only be reopened with curl.
-   */
-  it('restore is a PATCH back to open — the unresolve the History tab now offers', async () => {
-    const client = stubClient({
-      comments: vi.fn(async () => ({ ok: true, value: [comment('c-1', 'tighten', { status: 'applied' })] })),
-      patchComment: vi.fn(async () => ({ ok: true, value: { ok: true, comment: comment('c-1', 'tighten') } })),
-    } as unknown as Partial<CollabClient>);
-    render(<Probe client={client} factory={fakeStream().factory} />);
-    await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-1:tighten:applied'));
-
-    screen.getByTestId('restore').click();
-    await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-1:tighten:open'));
-    expect(client.patchComment).toHaveBeenCalledWith('doc-1', 'c-1', { status: 'open' });
-  });
-
   it('a failed mutation lands on commentsError and leaves the list alone', async () => {
     const client = stubClient({
       comments: vi.fn(async () => ({ ok: true, value: [comment('c-1', 'tighten')] })),
@@ -390,7 +376,7 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
     expect(screen.getByTestId('comments').textContent).toBe('c-1:tighten:open');
   });
 
-  it('the hook’s document + comments + add + remove satisfy CollabCommentSourceDeps', async () => {
+  it('the hook’s document + comments + add + reply satisfy CollabCommentSourceDeps', async () => {
     let deps: CollabCommentSourceDeps | null = null;
     const client = stubClient();
     const { factory } = fakeStream();
@@ -404,8 +390,6 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
           comments: state.comments,
           add: state.addComment,
           reply: state.replyToComment,
-          remove: state.removeComment,
-          restore: state.restoreComment,
         };
       }
       return null;

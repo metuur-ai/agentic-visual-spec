@@ -46,7 +46,7 @@ import {
   type ReviewThreadRecord,
   type ThreadResolution,
 } from '../../collaboration/review-comments';
-import type { CommentRecord, CommentStatus } from '../../editing/comment-doc';
+import type { CommentStatus } from '../../editing/comment-doc';
 import type { CommentDocStore, CommentPatch } from './comments';
 
 /**
@@ -316,15 +316,11 @@ const COMMENT_ID_RE = /^c-[0-9a-f]+$/;
 /**
  * A `CommentDocStore` that implements the intent methods collaboration requires.
  *
- * `setResolved` is the GitHub-backed store's own (R-5.12): resolution is a reply comment
- * carrying a marker, not a field, because issue comments are flat and have no resolved
- * bit to set. It is optional here so a snapshot-only store still satisfies the type; the
- * PATCH route refuses a resolution rather than silently dropping it when it is absent.
+ * There is deliberately no resolution method on it (R-5.13). Resolution is GitHub's own
+ * review-thread state, read on `GET /:id/comments` and written nowhere — resolving a
+ * thread happens on github.com.
  */
-type CollabCommentStore = CommentDocStore &
-  Required<Pick<CommentDocStore, 'addComment' | 'updateComment'>> & {
-    setResolved?: (id: string, resolved: boolean) => Promise<CommentRecord | null>;
-  };
+type CollabCommentStore = CommentDocStore & Required<Pick<CommentDocStore, 'addComment' | 'updateComment'>>;
 
 function requireString(body: Record<string, unknown>, key: string): string {
   const value = body[key];
@@ -1065,32 +1061,17 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         };
 
         /*
-         * A status change is a RESOLUTION, and resolution does not live in the same place
-         * as the text. `updateComment` edits the issue comment's body and says so itself
-         * ("Status/result have no GitHub representation") — so routing a resolve through
-         * it answered 200 with the comment unchanged, and the panel's Resolve button did
-         * nothing at all. Worse than nothing: unresolved comments gate publishing (R-8.15),
-         * so a single comment locked the author out of publishing permanently.
-         * `setResolved` posts the marker reply that R-5.12 specifies; it existed, tested,
-         * with no caller. This is that caller.
+         * A `status` change is NOT a resolution (R-5.21). It records whether the local
+         * apply agent has acted on a comment, it stays local, and it is never written back
+         * to GitHub. Resolution is GitHub's review-thread `isResolved`: read on
+         * `GET /:id/comments`, never written from anywhere in this package (R-5.13), and
+         * changed by a reviewer on github.com. This route used to post a marker reply here;
+         * that protocol is gone, and with it the second, disagreeing source of truth.
+         *
+         * So everything goes through `updateComment`, which is the store's own business:
+         * a local store records the status, and the GitHub-backed store answers with the
+         * record unchanged because the text is what it can express.
          */
-        if (patch.status !== undefined) {
-          if (!store.store.setResolved) {
-            return { status: 501, json: { error: 'comment store cannot record resolution' } };
-          }
-          const marker = await store.store.setResolved(commentId, patch.status === 'applied');
-          if (!marker) return { status: 404, json: { error: `unknown comment: ${commentId}` } };
-        }
-
-        // Nothing left to edit — a resolve carries no text — so answer with the parent as
-        // it now reads. Resolution is DERIVED from the comment list on read (R-5.14), so
-        // returning the marker reply here would hand the client the wrong record entirely.
-        if (patch.comment === undefined) {
-          const refreshed = (await store.store.read()).comments.find((c) => c.id === commentId);
-          if (!refreshed) return { status: 404, json: { error: `unknown comment: ${commentId}` } };
-          return { status: 200, json: { ok: true, comment: refreshed } };
-        }
-
         const updated = await store.store.updateComment(commentId, patch);
         if (!updated) return { status: 404, json: { error: `unknown comment: ${commentId}` } };
         return { status: 200, json: { ok: true, comment: updated } };

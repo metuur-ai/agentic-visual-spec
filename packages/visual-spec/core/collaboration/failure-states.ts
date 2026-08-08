@@ -24,12 +24,15 @@
  * and demote anything, because nothing was ever promoted.
  *
  * And it is what closes R-8.17's TOCTOU window. `merge` does not consult the state the
- * hub last recorded, nor the result of the last poll: it calls
- * `githubCommentStore(...).read()` itself, immediately before the merge, and refuses on
- * what *that* returns. A comment that arrives after the poll said "ready" and before
- * the merge request is therefore seen. The window that remains is the one round trip
- * between that read and GitHub's merge — irreducible without a lock GitHub does not
- * offer for issue comments, and orders of magnitude narrower than a 30s poll interval.
+ * hub last recorded, nor the result of the last poll: it re-reads the review threads and
+ * their resolution from GitHub itself, immediately before the merge, and refuses on what
+ * *that* returns. A comment that arrives after the poll said "ready" and before the merge
+ * request is therefore seen. The window that remains is the one round trip between that
+ * read and GitHub's merge — irreducible without a lock GitHub does not offer, and orders
+ * of magnitude narrower than a 30s poll interval.
+ *
+ * Resolution itself is GitHub's, read and never written (R-5.12 / R-5.13). A thread whose
+ * resolution could not be read counts as unknown, and unknown is not Ready (R-8.25).
  *
  * ---------------------------------------------------------------------------
  * WHY THE FAILURES ARE FOUR STATES AND NOT ONE (R-8.20 … R-8.22)
@@ -65,7 +68,8 @@
  */
 import type { ResolvedCollaborationConfig } from '../config';
 import { mergeAndDropCommentCache } from './cache-lifecycle';
-import { type ProjectedCommentRecord, githubCommentStore } from './comment-projection';
+import { githubCommentStore } from './comment-projection';
+import { type ThreadResolution, groupIntoThreads, projectReviewThread } from './review-comments';
 import type { GitHubBinding } from './document-protocol';
 import type { DocumentStore } from './document-store';
 import type { GitHubAdapter, MergeMethod, PullRequestStatus, RepoRef } from './github-adapter';
@@ -112,7 +116,8 @@ export class ReadyGateError extends Error {
   readonly verdict: ReadinessVerdict;
 
   constructor(documentId: string, verdict: ReadinessVerdict) {
-    super(`${documentId} is not ready: ${verdict.unresolved} of ${verdict.total} comment(s) unresolved`);
+    // R-8.25 — the verdict names its own reason, unknown resolution included.
+    super(`${documentId} is not ready: ${verdict.reason ?? 'no reason recorded'}`);
     this.documentId = documentId;
     this.verdict = verdict;
   }
@@ -397,24 +402,38 @@ async function requireBinding(
 }
 
 /**
- * The freshest possible readiness, read at the moment of asking (R-8.17). Always
- * through the 5.1 projection — there is no second way to read comments in this package,
- * and no cache is consulted anywhere on this path (R-5.9).
+ * The freshest possible readiness, read at the moment of asking (R-8.17). Straight from
+ * GitHub: the review comments over REST, grouped into threads (R-5.17), with the
+ * review-thread resolution joined on by the root's `databaseId` (R-4.15). No cache is
+ * consulted anywhere on this path (R-5.9), and nothing here writes resolution (R-5.13).
+ *
+ * The GraphQL half is allowed to fail on its own (R-4.12): every thread then carries no
+ * `isResolved`, `deriveReadiness` counts it as unknown, and the document is NOT Ready
+ * with the unknown state named (R-8.25). Refusing on a failed read is the whole point —
+ * a caught error that fell through to "resolved" would be R-8.26 exactly.
  */
 async function readReadiness(
   adapter: GitHubAdapter,
   repo: ResolvedCollaborationConfig,
-  doc: BoundCollaborationDocument,
   pullNumber: number,
 ): Promise<ReadinessVerdict> {
-  const comments = (await githubCommentStore({
-    adapter,
-    repo: { owner: repo.owner, repo: repo.repo },
-    pullNumber,
-    documentId: doc.documentId,
-    documentPath: doc.documentPath,
-  }).read()).comments as ProjectedCommentRecord[];
-  return deriveReadiness(comments);
+  const repoRef: RepoRef = { owner: repo.owner, repo: repo.repo };
+  const threads = groupIntoThreads(await adapter.listReviewComments(repoRef, pullNumber));
+
+  let resolutions: Map<number, ThreadResolution> | null = null;
+  try {
+    const read = await adapter.listThreadResolution(repoRef, pullNumber);
+    resolutions = new Map(read.map((r) => [r.rootCommentId, r]));
+  } catch {
+    resolutions = null;
+  }
+
+  return deriveReadiness(
+    threads.map((thread) => {
+      const resolution = resolutions?.get(thread.root.id);
+      return projectReviewThread(thread, { ...(resolution ? { resolution } : {}) });
+    }),
+  );
 }
 
 export function createRecoveryBodies(options: RecoveryBodyOptions): RecoveryJobBodies {
@@ -460,11 +479,11 @@ export function createRecoveryBodies(options: RecoveryBodyOptions): RecoveryJobB
       }
 
       const pull = await adapter.getPullRequest({ owner: repo.owner, repo: repo.repo }, pullNumber);
-      const readiness = await readReadiness(adapter, repo, doc, pullNumber);
+      const readiness = await readReadiness(adapter, repo, pullNumber);
       const state = deriveLifecycleState({ pull, readiness });
       ctx.log(
         `reconciled ${documentId}: #${pullNumber} is ${pull.state}${pull.merged ? ' (merged)' : ''}, ` +
-          `${readiness.unresolved} of ${readiness.total} comment(s) unresolved — ${state}`,
+          `${readiness.unresolved} of ${readiness.total} thread(s) unresolved, ${readiness.unknown} unknown — ${state}`,
       );
       // R-8.20 — a conflict is reported and nothing else. No rebase, no force push, no
       // regenerated content: this package never resolves a conflict on anyone's behalf.
@@ -481,17 +500,19 @@ export function createRecoveryBodies(options: RecoveryBodyOptions): RecoveryJobB
      */
     markReady: (input) => async (ctx) => {
       const { documentId, repo, store } = input;
-      const { doc, binding } = await requireBinding(store, documentId);
-      const readiness = await readReadiness(adapter, repo, doc, binding.pullNumber);
+      const { binding } = await requireBinding(store, documentId);
+      const readiness = await readReadiness(adapter, repo, binding.pullNumber);
       if (!readiness.ready) {
+        // R-8.25 — the reason names the unknown state when the resolution read failed.
+        // The ids follow it so an operator can go straight to the threads in question.
         ctx.log(
-          `not ready: ${readiness.unresolved} unresolved comment(s) — ${readiness.unresolvedCommentIds.join(', ')}`,
+          `not ready: ${readiness.reason} — ${[...readiness.unresolvedCommentIds, ...readiness.unknownCommentIds].join(', ')}`,
           'error',
         );
         ctx.setState('pr-open');
         throw new ReadyGateError(documentId, readiness);
       }
-      ctx.log(`all ${readiness.total} comment(s) resolved — ready`);
+      ctx.log(`all ${readiness.total} thread(s) resolved on GitHub — ready`);
       ctx.setState('ready');
     },
 
@@ -513,10 +534,11 @@ export function createRecoveryBodies(options: RecoveryBodyOptions): RecoveryJobB
       }
 
       // The re-verification. Fetched now, not recalled.
-      const readiness = await readReadiness(adapter, repo, doc, binding.pullNumber);
+      const readiness = await readReadiness(adapter, repo, binding.pullNumber);
       if (!readiness.ready) {
+        // R-8.25 — same reason string at merge time; unknown resolution refuses too.
         ctx.log(
-          `merge refused: ${readiness.unresolved} unresolved comment(s) at merge time — ${readiness.unresolvedCommentIds.join(', ')}`,
+          `merge refused at merge time: ${readiness.reason} — ${[...readiness.unresolvedCommentIds, ...readiness.unknownCommentIds].join(', ')}`,
           'error',
         );
         // R-8.16 — back to PR-open, because that is what it derives to now.

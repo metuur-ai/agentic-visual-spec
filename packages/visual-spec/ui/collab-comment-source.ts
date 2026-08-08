@@ -33,7 +33,8 @@ import {
   resolveCollabAnchor,
 } from '../core/collaboration/anchor-resolution';
 import type { CollaborationDocument } from '../core/collaboration/document-protocol';
-import { type CommentTrailer, type ProjectedCommentRecord, isResolutionReply } from '../core/collaboration/comment-projection';
+import type { CommentTrailer } from '../core/collaboration/comment-projection';
+import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import type { SelectedTarget } from '../core/app';
 import { VS_NODE_ID_ATTR, VS_UNCOMMENTABLE_ATTR } from './collab-document-view';
@@ -133,6 +134,23 @@ export function collabOrphans(
   return out;
 }
 
+/**
+ * R-5.14 — where this thread lives on github.com.
+ *
+ * A resolved thread is deliberately not linked: R-5.14 asks for the way to the act, and
+ * for a thread already resolved there is no act left. A thread whose `isResolved` could
+ * not be read (`undefined`) IS linked — "we could not tell" is not "it is done" (R-5.15),
+ * and github.com is exactly where a reader settles it.
+ *
+ * A record with no `github` was never posted — a hand-built one in a test, say — so it
+ * has no thread to open and gets no link.
+ */
+function threadLink(comment: CommentRecord): string | undefined {
+  const github = (comment as Partial<ReviewThreadRecord>).github;
+  if (!github?.htmlUrl || github.isResolved === true) return undefined;
+  return github.htmlUrl;
+}
+
 /** The block a selection sits in, and whether it can be commented on at all. */
 function blockOf(anchor: HTMLElement): { nodeId: string } | { uncommentable: string } {
   const blocked = anchor.closest(`[${VS_UNCOMMENTABLE_ATTR}]`) as HTMLElement | null;
@@ -153,18 +171,12 @@ export type CollabCommentSourceDeps = {
    * R-9.8 — post a threaded reply. Goes to `POST /__vs/collab/:id/comments/:cid/reply`.
    */
   reply: (id: string, text: string) => Promise<void>;
-  /**
-   * Marks the comment applied. Named `remove` because that is the `CommentPanelSource`
-   * seam it fills — it takes the comment off the open list — but nothing is deleted:
-   * GitHub keeps the thread (R-5.2), so the panel is told to say "Resolve".
+  /*
+   * There is deliberately no `remove` and no `restore` here. Both used to write a
+   * resolution — `remove` posted a "resolved" marker reply, `restore` posted its inverse —
+   * and R-5.13 forbids this system writing resolution at all. A thread is resolved by a
+   * reviewer on github.com, and `threadLink` below is how a reader gets there (R-5.14).
    */
-  remove: (id: string) => Promise<void>;
-  /**
-   * The inverse of `remove`: reopen a resolved thread. Separate from `remove` rather than
-   * a toggle because the panel calls them from different tabs — Resolve from the open
-   * list, Unresolve from History — and each row knows which state it is in.
-   */
-  restore: (id: string) => Promise<void>;
   /** Where the document is rendered. Defaults to the whole document. */
   root?: ParentNode | null;
 };
@@ -182,24 +194,10 @@ export function collabCommentPanelSource(deps: CollabCommentSourceDeps): Comment
   const orphaned = new Set(orphans.map((o) => o.comment.id));
   return {
     path: doc.documentPath,
-    /*
-     * Orphans have their own section (R-5.6); listing them twice would double-render them.
-     *
-     * Resolution replies are dropped for a different reason: they are bookkeeping, not
-     * conversation. A resolve posts one, an unresolve posts another and they accumulate
-     * by design (R-5.14), so leaving them in listed rows reading "Resolved this comment:
-     * <url>" as if someone had said it — each with its own Reply and Resolve buttons —
-     * and made the panel's count disagree with the publish gate, which filters them:
-     * one resolve-then-reopen showed "6 open" beside "4 of 4 comments unresolved".
-     * `documentDiscussion` already draws this line for the document-level list and says
-     * why; this is the same line, drawn where the panel reads.
-     */
-    comments: deps.comments.filter((c) => !orphaned.has(c.id) && !isResolutionReply(c as ProjectedCommentRecord)),
-    remove: deps.remove,
-    restore: deps.restore,
+    // Orphans have their own section (R-5.6); listing them twice would double-render them.
+    comments: deps.comments.filter((c) => !orphaned.has(c.id)),
     reply: deps.reply,
-    // A check, not a trash can — resolving closes a thread and deletes nothing (R-5.2).
-    removeVerb: { action: 'Resolve', confirm: 'Resolve?', icon: 'check' },
+    link: threadLink,
     orphans,
     supportsSections: false,
     label: (c) => labels.get(c.id) ?? '(document)',

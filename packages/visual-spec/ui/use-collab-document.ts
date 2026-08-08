@@ -87,9 +87,9 @@ export type UseCollabDocumentState = {
   /** The failure that stopped seeding, if it did. Action failures are returned, not stored. */
   error: CollabFailure | null;
   /**
-   * The last comment read or mutation that failed. These four actions answer
-   * `Promise<void>` because that is the shape `CollabCommentSourceDeps.add` / `.remove`
-   * require, so a failure has nowhere to be returned to and is surfaced here instead.
+   * The last comment read or mutation that failed. These actions answer `Promise<void>`
+   * because that is the shape `CollabCommentSourceDeps.add` / `.reply` require, so a
+   * failure has nowhere to be returned to and is surfaced here instead.
    */
   commentsError: CollabFailure | null;
   /** Whether the hub reports a job in flight — what a component disables its buttons on. */
@@ -99,15 +99,13 @@ export type UseCollabDocumentState = {
   /** Assignable straight to `CollabCommentSourceDeps.add` (R-7.5). */
   addComment: (input: { nodeId: string; comment: string; workflow: string }) => Promise<void>;
   replyToComment: (commentId: string, comment: string) => Promise<void>;
-  patchComment: (commentId: string, patch: CommentPatch) => Promise<void>;
   /**
-   * Assignable straight to `CollabCommentSourceDeps.remove`. There is no delete route
-   * and GitHub is the system of record (R-5.2), so "remove from the panel" is the
-   * `applied` status the PATCH route already understands — nothing is destroyed.
+   * `PATCH /:id/comments/:cid`. `status` here is the LOCAL apply-agent flag (R-5.21), not
+   * a resolution: a review thread is resolved on github.com and this system never writes
+   * that (R-5.13). The pair of `removeComment` / `restoreComment` helpers that used to sit
+   * here posted resolution markers, and went with the protocol.
    */
-  removeComment: (commentId: string) => Promise<void>;
-  /** The inverse of `removeComment` — reopens a resolved thread (R-5.12). */
-  restoreComment: (commentId: string) => Promise<void>;
+  patchComment: (commentId: string, patch: CommentPatch) => Promise<void>;
   /**
    * Re-read the canonical document from the server.
    *
@@ -269,21 +267,11 @@ export function useCollabDocument(documentId: string, options: UseCollabDocument
     [client, documentId],
   );
 
-  const removeComment = useCallback(
-    (commentId: string): Promise<void> => patchComment(commentId, { status: 'applied' }),
-    [patchComment],
-  );
-
   const reload = useCallback(async (): Promise<void> => {
     const result = await client.document(documentId);
     if (result.ok) setFullDocument(result.value);
     else setCommentsError(result);
   }, [client, documentId]);
-
-  const restoreComment = useCallback(
-    (commentId: string): Promise<void> => patchComment(commentId, { status: 'open' }),
-    [patchComment],
-  );
 
   return {
     snapshot,
@@ -299,8 +287,6 @@ export function useCollabDocument(documentId: string, options: UseCollabDocument
     addComment,
     replyToComment,
     patchComment,
-    removeComment,
-    restoreComment,
     reload,
   };
 }

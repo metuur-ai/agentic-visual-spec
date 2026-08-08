@@ -147,18 +147,6 @@ function memoryComments(): CommentDocStore {
       if (!found) return null;
       return { ...found, ...patch } as CommentRecord;
     },
-    /*
-     * Resolution is a marker reply on GitHub, not a field (R-5.12), so a status PATCH is
-     * served by `setResolved` rather than `updateComment`. What this file cares about is
-     * unchanged: a reviewer may resolve, and it costs no permission probe.
-     */
-    async setResolved(id: string, resolved: boolean) {
-      const found = comments.find((c) => c.id === id);
-      if (!found) return null;
-      const next = { ...found, status: resolved ? 'applied' : 'open' } as CommentRecord;
-      comments = comments.map((c) => (c.id === id ? next : c));
-      return next;
-    },
   } as CommentDocStore;
 }
 
