@@ -346,11 +346,8 @@ export function reanchorBySnippet(documentText: string, snippet: string): number
 /**
  * R-6.7 — character budget for a captured snippet.
  *
- * Deliberately the same 160 as `anchor-resolution.ts`'s `TARGET_TEXT_MAX`, which is
- * itself local mode's `snippet` budget: one product, one idea of how much text a
- * comment carries. It is copied rather than imported because `anchor-resolution.ts`
- * serves the retired JSON document format and is slated for deletion; an import would
- * turn a scheduled removal into a breakage.
+ * The same 160 local mode already uses for a comment's `snippet`: one product, one idea
+ * of how much text a comment carries.
  */
 export const SNIPPET_MAX = 160;
 

@@ -9,7 +9,7 @@
  *
  * WHY THREE READS. The stream carries the job snapshot and nothing else, so everything
  * a component actually renders comes from a plain GET: `GET /:id` for identity + the
- * R-8.4 snapshot, `GET /:id/document` for the canonical document, `GET /:id/comments`
+ * R-8.4 snapshot, `GET /:id/document` for the Markdown, `GET /:id/comments`
  * for the conversation. They are separate requests because `GET /:id`'s body doubles as
  * the SSE `sync` frame and must not grow.
  *
@@ -30,7 +30,7 @@
  * tests drive real frames through a fake rather than standing up a server.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { CollaborationDocument } from '../core/collaboration/document-protocol';
+import type { CollaborationRecord } from '../core/collaboration/document-record';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import type { JobEvent, JobKind, JobSnapshot, JobSync } from '../core/collaboration/job-hub';
 import type { CommentPatch } from '../core/vite/routes/comments';
@@ -67,6 +67,20 @@ export type UseCollabDocumentOptions = {
   eventSourceImpl?: (url: string) => EventSourceLike;
 };
 
+/**
+ * R-0.3 / R-7.5 — what a new comment is anchored by: a line range in the document under
+ * review. `startLine` absent means a document-level comment, which the server posts
+ * against the file by intent rather than by degradation.
+ */
+export type AddCommentRequest = {
+  comment: string;
+  workflow: string;
+  startLine?: number;
+  endLine?: number;
+  /** R-7.12 — quoted back into the body when the comment degrades to file-level. */
+  selectedText?: string;
+};
+
 /** The outcome of a job-starting action a component triggers. */
 export type JobActionResult = { ok: true; value: JobAccepted } | CollabFailure;
 
@@ -76,10 +90,10 @@ export type UseCollabDocumentState = {
   /** Identity of the document, from `GET /:id`. Null when the server has no such document. */
   document: CollabDocumentSummary | null;
   /**
-   * The whole document, from `GET /:id/document` — what `CollabDocumentView` renders and
-   * what `collabCommentPanelSource` resolves anchors against. Null until it lands.
+   * The whole record, from `GET /:id/document` — the Markdown the review surface renders
+   * (R-7.3) and `collabCommentPanelSource` resolves anchors against. Null until it lands.
    */
-  fullDocument: CollaborationDocument | null;
+  fullDocument: CollaborationRecord | null;
   /** The conversation, from `GET /:id/comments`, kept current by the mutations below. */
   comments: CommentRecord[];
   /** True while the seeding `GET /:id` is in flight. */
@@ -97,7 +111,7 @@ export type UseCollabDocumentState = {
   sync: () => Promise<JobActionResult>;
   publish: (input: PublishInput) => Promise<JobActionResult>;
   /** Assignable straight to `CollabCommentSourceDeps.add` (R-7.5). */
-  addComment: (input: { nodeId: string; comment: string; workflow: string }) => Promise<void>;
+  addComment: (input: AddCommentRequest) => Promise<void>;
   replyToComment: (commentId: string, comment: string) => Promise<void>;
   /**
    * `PATCH /:id/comments/:cid`. `status` here is the LOCAL apply-agent flag (R-5.21), not
@@ -107,11 +121,11 @@ export type UseCollabDocumentState = {
    */
   patchComment: (commentId: string, patch: CommentPatch) => Promise<void>;
   /**
-   * Re-read the canonical document from the server.
+   * Re-read the document from the server.
    *
    * The stream only re-reads after a job this hub started, so a document edited OUT OF
-   * BAND — an agent applying comments against `documents/<id>.json` on disk — is
-   * invisible here until something remounts. Worse than invisible: the editor is seeded
+   * BAND — an agent applying comments to the `.md` on disk — is invisible here until
+   * something remounts. Worse than invisible: the editor is seeded
    * from `fullDocument`, so publishing on top of a stale copy commits the pre-agent
    * document and drops the agent's work with no warning. This is how the author gets a
    * current copy to look at before deciding anything.
@@ -124,7 +138,7 @@ export function useCollabDocument(documentId: string, options: UseCollabDocument
   const client = useMemo(() => injectedClient ?? createCollabClient(), [injectedClient]);
   const [snapshot, setSnapshot] = useState<JobSnapshot | null>(null);
   const [document, setDocument] = useState<CollabDocumentSummary | null>(null);
-  const [fullDocument, setFullDocument] = useState<CollaborationDocument | null>(null);
+  const [fullDocument, setFullDocument] = useState<CollaborationRecord | null>(null);
   const [comments, setComments] = useState<CommentRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<CollabFailure | null>(null);
@@ -235,13 +249,15 @@ export function useCollabDocument(documentId: string, options: UseCollabDocument
   // re-reading the list: the route answers with what it persisted, so a refetch would
   // add a round trip and a window in which the panel disagrees with the click.
   const addComment = useCallback(
-    async (input: { nodeId: string; comment: string; workflow: string }): Promise<void> => {
+    async (input: AddCommentRequest): Promise<void> => {
       // `workflow` is the routing tag the panel's "Apply via" control sets — which skill
       // handles this comment, not whether it is worth handling. It used to stop here.
       const result = await client.addComment(documentId, {
         comment: input.comment,
-        nodeId: input.nodeId,
         workflow: input.workflow,
+        ...(input.startLine !== undefined ? { startLine: input.startLine } : {}),
+        ...(input.endLine !== undefined ? { endLine: input.endLine } : {}),
+        ...(input.selectedText ? { selectedText: input.selectedText } : {}),
       });
       if (result.ok) setComments((current) => [...current, result.value.comment]);
       else setCommentsError(result);

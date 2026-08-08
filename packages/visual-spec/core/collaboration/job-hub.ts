@@ -24,7 +24,7 @@
  * Node-reachable from the CLI: node builtin types only, no `@lyfie/luthor`, no react
  * (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
  */
-import { DOCUMENT_ID_RE } from './node-location';
+import { DOCUMENT_ID_RE } from './document-record';
 
 /**
  * LLD §7 — the collaboration lifecycle states, as a closed vocabulary every later task

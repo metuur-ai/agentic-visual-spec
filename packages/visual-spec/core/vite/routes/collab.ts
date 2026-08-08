@@ -3,7 +3,7 @@
  *
  * THIS IS THE ROUTE LAYER AND NOTHING ELSE. It parses and validates a request,
  * resolves configuration / availability / the document, and then either calls a
- * landed module (`DocumentStore`, `CommentDocStore`) or hands a **job body** to
+ * landed module (`CollaborationStore`, `CommentDocStore`) or hands a **job body** to
  * `jobs.hub(id).start(...)`. It performs no GitHub work of its own: the bodies for
  * create / open / sync / publish are injected (`CollabJobBodies`), so tasks 8.2 and
  * 8.3 plug real behaviour in without reshaping a single route.
@@ -33,13 +33,12 @@ import type { ResolvedCollaborationConfig, ResolvedVisualSpecConfig } from '../.
 import { type CollaborationPreflight, credentialFingerprint, preflightCollaboration } from '../../collaboration/credentials';
 import { githubCommentStore } from '../../collaboration/comment-projection';
 import { createGitHubAdapter, GitHubError, type GitHubAdapter, type RepoRef } from '../../collaboration/github-adapter';
-import type { GitHubBinding } from '../../collaboration/document-protocol';
-import type { CollaborationDocument, DocumentFrontmatter, JsonDocument } from '../../collaboration/document-protocol';
-import { newCollaborationDocument } from '../../collaboration/document-protocol';
-import { DOCUMENT_ID_RE, type DocumentStore } from '../../collaboration/document-store';
+import type { CollaborationRecord, GitHubBinding } from '../../collaboration/document-record';
+import { DOCUMENT_ID_RE, newCollaborationRecord } from '../../collaboration/document-record';
+import type { CollaborationStore } from '../../collaboration/record-store';
+import { loadReviewThreadRecords } from '../../collaboration/review-anchoring';
 import type { JobBody, JobHubRegistry, SseSink } from '../../collaboration/job-hub';
 import {
-  groupIntoThreads,
   projectReviewThread,
   reviewCommentIdFor,
   type ReviewComment,
@@ -109,7 +108,7 @@ const NOT_CONFIGURED: CollabAvailability = {
 type JobInputBase = {
   documentId: string;
   repo: ResolvedCollaborationConfig;
-  store: DocumentStore;
+  store: CollaborationStore;
   idempotencyKey?: string;
 };
 
@@ -117,19 +116,19 @@ type JobInputBase = {
 export type CreateJobInput = JobInputBase & {
   documentPath: string;
   title?: string;
-  frontmatter?: DocumentFrontmatter;
-  doc?: JsonDocument;
+  /** R-0.1 — the document. Seeded by the route; the body commits what the store holds. */
+  markdown?: string;
 };
 
 /** `POST /__vs/collab/open` — task 8.2: attach to an already-open Pull Request. */
 export type OpenJobInput = JobInputBase & { pullNumber: number; discardLocal?: boolean };
 
 /** `POST /__vs/collab/:id/sync` — task 8.2 (R-8.6 / R-8.7). */
-export type SyncJobInput = JobInputBase & { document: CollaborationDocument | null };
+export type SyncJobInput = JobInputBase & { document: CollaborationRecord | null };
 
 /** `POST /__vs/collab/:id/publish` — task 8.3 (R-8.9 … R-8.14). */
 export type PublishJobInput = JobInputBase & {
-  document: CollaborationDocument | null;
+  document: CollaborationRecord | null;
   /**
    * R-8.9 — the whole publish payload. Markdown is the document (LLD §2), so there is
    * one artifact and no second, structured half to carry beside it.
@@ -158,7 +157,7 @@ export type CollabJobBodies = {
 export type RecoveryJobInput = {
   documentId: string;
   repo: ResolvedCollaborationConfig;
-  store: DocumentStore;
+  store: CollaborationStore;
 };
 
 /**
@@ -243,7 +242,7 @@ export type CollabDeps = {
   /** Read per request, so a runtime re-root takes effect on the next call. */
   config: () => ResolvedVisualSpecConfig;
   /** Where collaboration documents are cached locally (task 3.1). */
-  documents: () => DocumentStore;
+  documents: () => CollaborationStore;
   /**
    * The comment store for one document. Defaults to `githubCommentStore` built from the
    * document's own GitHub binding, so comments are server-side by construction (R-7.7).
@@ -251,7 +250,7 @@ export type CollabDeps = {
    */
   commentStore?: (ctx: {
     documentId: string;
-    document: CollaborationDocument;
+    document: CollaborationRecord;
     repo: ResolvedCollaborationConfig;
   }) => Promise<CommentDocStore | null> | CommentDocStore | null;
   /** Tasks 8.2 / 8.3. Partial: anything missing uses the failing stub. */
@@ -264,7 +263,7 @@ export type CollabDeps = {
    */
   adapter?: (ctx: {
     documentId: string;
-    document: CollaborationDocument;
+    document: CollaborationRecord;
     repo: ResolvedCollaborationConfig;
   }) => GitHubAdapter;
   /** Injectable so tests never exec `gh`. Memoized by the router, successes only. */
@@ -336,7 +335,7 @@ function optionalKey(body: Record<string, unknown>): string | undefined {
 }
 
 /** The document's GitHub binding, if it carries one an issue-comment store can use. */
-function bindingOf(document: CollaborationDocument): GitHubBinding | null {
+function bindingOf(document: CollaborationRecord): GitHubBinding | null {
   const raw = (document as { github?: unknown }).github;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const binding = raw as Partial<GitHubBinding>;
@@ -349,7 +348,7 @@ function bindingOf(document: CollaborationDocument): GitHubBinding | null {
  * through the adapter (R-7.7). Built per request from the document's own binding so a
  * re-synced document that moved PRs is picked up without restarting the server.
  */
-function defaultCommentStore(documentId: string, document: CollaborationDocument): CommentDocStore | null {
+function defaultCommentStore(documentId: string, document: CollaborationRecord): CommentDocStore | null {
   const binding = bindingOf(document);
   if (!binding) return null;
   return githubCommentStore({
@@ -575,7 +574,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   /** Load a document, or the response to send when it is unknown. */
   async function load(
     documentId: string,
-  ): Promise<{ ok: true; document: CollaborationDocument } | { ok: false; result: CollabRouteResult }> {
+  ): Promise<{ ok: true; document: CollaborationRecord } | { ok: false; result: CollabRouteResult }> {
     const document = await deps.documents().read(documentId);
     if (!document) return { ok: false, result: { status: 404, json: { error: `unknown document: ${documentId}` } } };
     return { ok: true, document };
@@ -584,7 +583,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   /** Resolve the comment store for a document, or the response to send instead. */
   async function commentsFor(
     documentId: string,
-    document: CollaborationDocument,
+    document: CollaborationRecord,
     repo: ResolvedCollaborationConfig,
   ): Promise<{ ok: true; store: CollabCommentStore } | { ok: false; result: CollabRouteResult }> {
     const store = deps.commentStore
@@ -612,7 +611,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
    */
   function reviewFor(
     documentId: string,
-    document: CollaborationDocument,
+    document: CollaborationRecord,
     repo: ResolvedCollaborationConfig,
   ): { ok: true; ctx: ReviewContext } | { ok: false; result: CollabRouteResult } {
     const binding = bindingOf(document);
@@ -719,12 +718,11 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         const store = deps.documents();
         if (!(await store.read(documentId))) {
           await store.write(
-            newCollaborationDocument({
+            newCollaborationRecord({
               documentId,
               documentPath,
               ...(typeof body.title === 'string' ? { title: body.title } : {}),
-              ...(body.frontmatter ? { frontmatter: body.frontmatter as DocumentFrontmatter } : {}),
-              ...(body.doc ? { doc: body.doc as JsonDocument } : {}),
+              ...(typeof body.markdown === 'string' ? { markdown: body.markdown } : {}),
             }),
           );
         }
@@ -738,8 +736,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
             repo: gated.repo,
             store: deps.documents(),
             ...(typeof body.title === 'string' ? { title: body.title } : {}),
-            ...(body.frontmatter ? { frontmatter: body.frontmatter as DocumentFrontmatter } : {}),
-            ...(body.doc ? { doc: body.doc as JsonDocument } : {}),
+            ...(typeof body.markdown === 'string' ? { markdown: body.markdown } : {}),
             ...(idempotencyKey ? { idempotencyKey } : {}),
           }),
         });
@@ -800,9 +797,9 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
       }
 
       /*
-       * GET /__vs/collab/:id/document — R-7.3 / R-7.4. The canonical JSON the document
-       * view stamps `data-vs-node-id` / `data-vs-node-version` from, and the anchor
-       * resolver (R-6.1) looks `nodeId` up in. Deliberately NOT folded into `GET /:id`:
+       * GET /__vs/collab/:id/document — R-7.3 / R-7.9. The Markdown as it stands on the
+       * Pull Request branch, which the review surface renders and the anchor resolver
+       * locates `data-vs-loc` blocks in. Deliberately NOT folded into `GET /:id`:
        * that body is also the SSE `sync` frame (`JobSync = { type:'sync' } & JobSnapshot`,
        * `collaboration/job-hub.ts`), so widening it would push the whole document down
        * the stream on every job transition. Served from our own store, so the browser
@@ -833,12 +830,6 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         if (!review.ok) return review.result;
         const { adapter, repoRef, pullNumber } = review.ctx;
 
-        // R-5.17 — the adapter accumulates every page before returning, and threads are
-        // grouped over that whole list. Grouping a page at a time would turn a reply whose
-        // root sits on the previous page into an orphan thread.
-        const comments = await adapter.listReviewComments(repoRef, pullNumber);
-        const threads = groupIntoThreads(comments);
-
         /*
          * R-4.12 / R-5.15 — resolution is a GraphQL read alongside a REST one, and it can
          * fail on its own. When it does the conversation is still served; every thread
@@ -846,19 +837,23 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
          * one answer forbidden here is `false`: "nobody resolved it" and "we could not ask"
          * drive different UI and a different Ready gate (R-8.25).
          */
-        let resolutions: Map<number, ThreadResolution> | null = null;
+        let resolutions: ThreadResolution[] | undefined;
         try {
-          const read = await adapter.listThreadResolution(repoRef, pullNumber);
-          resolutions = new Map(read.map((r) => [r.rootCommentId, r]));
+          resolutions = [...(await adapter.listThreadResolution(repoRef, pullNumber))];
         } catch {
-          resolutions = null;
+          resolutions = undefined;
         }
 
-        // R-4.15 — joined on the thread root's REST integer id, which is GraphQL's
-        // `databaseId` and the same integer the `c-<8hex>` record id encodes.
-        const projected = threads.map((thread) => {
-          const resolution = resolutions?.get(thread.root.id);
-          return projectReviewThread(thread, { ...(resolution ? { resolution } : {}) });
+        /*
+         * R-5.17 accumulates every page before grouping, R-6.3 / R-6.7 capture the text an
+         * outdated thread was written about and re-anchor it on an exact unique match, and
+         * R-4.15 joins resolution on the root's REST integer id. All three live in
+         * `loadReviewThreadRecords`, which is handed the document text so re-anchoring has
+         * something to search — the Markdown this document *is* (R-0.1).
+         */
+        const projected = await loadReviewThreadRecords(adapter, repoRef, pullNumber, loaded.document.markdown, {
+          documentPath: loaded.document.documentPath,
+          ...(resolutions ? { resolutions } : {}),
         });
         return { status: 200, json: projected };
       }

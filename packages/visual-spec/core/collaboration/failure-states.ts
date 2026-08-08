@@ -70,11 +70,11 @@ import type { ResolvedCollaborationConfig } from '../config';
 import { mergeAndDropCommentCache } from './cache-lifecycle';
 import { githubCommentStore } from './comment-projection';
 import { type ThreadResolution, groupIntoThreads, projectReviewThread } from './review-comments';
-import type { GitHubBinding } from './document-protocol';
-import type { DocumentStore } from './document-store';
+import type { CollaborationRecord, GitHubBinding } from './document-record';
+import type { CollaborationStore } from './record-store';
 import type { GitHubAdapter, MergeMethod, PullRequestStatus, RepoRef } from './github-adapter';
 import { type JobBody, type LifecycleState, markStateDecided } from './job-hub';
-import { type BoundCollaborationDocument, branchNameFor } from './lifecycle';
+import { branchNameFor } from './lifecycle';
 import { PublishVerificationError } from './publish';
 
 import { type ReadinessVerdict, deriveReadiness } from './readiness';
@@ -192,7 +192,7 @@ export type OrphanCleanupResult = {
 export type OrphanCleanupInput = {
   adapter: GitHubAdapter;
   repo: ResolvedCollaborationConfig;
-  store: DocumentStore;
+  store: CollaborationStore;
   documentId: string;
   /** Optional progress sink, so the cleanup is visible on the SSE stream (R-8.24). */
   log?: (text: string) => void;
@@ -215,7 +215,7 @@ export type OrphanCleanupInput = {
 export async function cleanupOrphanedBranch(input: OrphanCleanupInput): Promise<OrphanCleanupResult> {
   const { adapter, repo, store, documentId, log } = input;
   const repoRef: RepoRef = { owner: repo.owner, repo: repo.repo };
-  const doc = (await store.read(documentId)) as BoundCollaborationDocument | null;
+  const doc = await store.read(documentId);
   const binding = doc?.github ?? null;
 
   if (binding && typeof binding.pullNumber === 'number') {
@@ -231,7 +231,7 @@ export async function cleanupOrphanedBranch(input: OrphanCleanupInput): Promise<
   if (doc && binding) {
     // Clear the binding, not the document: the draft itself is still the user's work.
     const { github: _dropped, ...rest } = doc;
-    await store.write(rest as BoundCollaborationDocument);
+    await store.write(rest as CollaborationRecord);
     bindingCleared = true;
   }
   return { orphaned: binding !== null || branchDeleted, branch, branchDeleted, bindingCleared };
@@ -249,7 +249,7 @@ export async function cleanupOrphanedBranch(input: OrphanCleanupInput): Promise<
  */
 export function withOrphanCleanup(
   body: JobBody,
-  input: { adapter: GitHubAdapter; repo: ResolvedCollaborationConfig; store: DocumentStore; documentId: string },
+  input: { adapter: GitHubAdapter; repo: ResolvedCollaborationConfig; store: CollaborationStore; documentId: string },
 ): JobBody {
   return async (ctx) => {
     try {
@@ -321,7 +321,7 @@ export function withPublishFailureStates(
   input: {
     adapter: GitHubAdapter;
     repo: ResolvedCollaborationConfig;
-    store: DocumentStore;
+    store: CollaborationStore;
     documentId: string;
     /** R-8.22 — run the pre-commit base-divergence check. Off by default. */
     checkBaseDivergence?: boolean;
@@ -329,7 +329,7 @@ export function withPublishFailureStates(
 ): JobBody {
   return async (ctx) => {
     if (input.checkBaseDivergence) {
-      const doc = (await input.store.read(input.documentId)) as BoundCollaborationDocument | null;
+      const doc = await input.store.read(input.documentId);
       const branch = doc?.github?.branch;
       if (doc && branch) {
         // Publish commits one artifact, at the document's own path (LLD §7), so that
@@ -365,7 +365,7 @@ export function withPublishFailureStates(
 export type RecoveryBodyInput = {
   documentId: string;
   repo: ResolvedCollaborationConfig;
-  store: DocumentStore;
+  store: CollaborationStore;
 };
 
 /** `merge` additionally chooses how (R-4.7). Defaults to a merge commit. */
@@ -393,10 +393,10 @@ export type RecoveryJobBodies = {
 
 /** The binding, or a rejection naming what is missing. */
 async function requireBinding(
-  store: DocumentStore,
+  store: CollaborationStore,
   documentId: string,
-): Promise<{ doc: BoundCollaborationDocument; binding: GitHubBinding & { pullNumber: number } }> {
-  const doc = (await store.read(documentId)) as BoundCollaborationDocument | null;
+): Promise<{ doc: CollaborationRecord; binding: GitHubBinding & { pullNumber: number } }> {
+  const doc = await store.read(documentId);
   if (!doc) throw new Error(`no collaboration document: ${documentId}`);
   const binding = doc.github;
   if (!binding || typeof binding.pullNumber !== 'number') throw new Error(`no open pull request for ${documentId}`);
@@ -457,7 +457,7 @@ export function createRecoveryBodies(options: RecoveryBodyOptions): RecoveryJobB
      */
     reconcile: (input) => async (ctx) => {
       const { documentId, repo, store } = input;
-      const doc = (await store.read(documentId)) as BoundCollaborationDocument | null;
+      const doc = await store.read(documentId);
       if (!doc) throw new Error(`no collaboration document: ${documentId}`);
 
       const pullNumber = doc.github?.pullNumber;

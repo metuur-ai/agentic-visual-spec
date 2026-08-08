@@ -9,7 +9,7 @@
  */
 import { render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import type { CollaborationDocument } from '../core/collaboration/document-protocol';
+import type { CollaborationRecord } from '../core/collaboration/document-record';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import type { JobEvent, JobSnapshot, JobSync } from '../core/collaboration/job-hub';
 import type { CollabCommentSourceDeps } from './collab-comment-source';
@@ -32,14 +32,12 @@ const STATUS: CollabDocumentStatus = {
 
 const ACCEPTED: JobAccepted = { ok: true, jobId: 'doc-1-1', kind: 'sync' };
 
-/** The whole document `GET /:id/document` serves — what `status()` cannot give. */
-const DOCUMENT: CollaborationDocument = {
+/** The whole record `GET /:id/document` serves — what `status()` cannot give. */
+const DOCUMENT: CollaborationRecord = {
   documentId: 'doc-1',
   documentPath: 'docs/spec.md',
   title: 'Spec',
-  frontmatter: { status: 'draft' },
-  nodes: [{ id: 'n-7', type: 'paragraph', version: 3, content: 'a claim' }],
-  doc: { root: {} },
+  markdown: '# Spec\n\na claim\n',
 };
 
 const comment = (id: string, text: string, over: Partial<CommentRecord> = {}): CommentRecord =>
@@ -104,10 +102,10 @@ function Probe({ client, factory, documentId = 'doc-1' }: { client: CollabClient
       <span data-testid="running">{String(state.running)}</span>
       <span data-testid="events">{state.snapshot?.events.length ?? -1}</span>
       <span data-testid="error">{state.error?.kind ?? '—'}</span>
-      <span data-testid="nodes">{state.fullDocument?.nodes.length ?? -1}</span>
+      <span data-testid="markdown">{state.fullDocument ? String(state.fullDocument.markdown.length) : '-1'}</span>
       <span data-testid="comments">{state.comments.map((c) => `${c.id}:${c.comment}:${c.status}`).join('|') || '—'}</span>
       <span data-testid="comments-error">{state.commentsError?.kind ?? '—'}</span>
-      <button data-testid="add" onClick={() => void state.addComment({ nodeId: 'n-7', comment: 'tighten', workflow: 'visual-spec' })} />
+      <button data-testid="add" onClick={() => void state.addComment({ startLine: 3, comment: 'tighten', workflow: 'visual-spec' })} />
       <button data-testid="reply" onClick={() => void state.replyToComment('c-1', 'agreed')} />
       <button data-testid="patch" onClick={() => void state.patchComment('c-1', { status: 'applied' })} />
       <button data-testid="reload" onClick={() => void state.reload()} />
@@ -247,7 +245,7 @@ describe('GET /:id/document and GET /:id/comments', () => {
   it('exposes the whole document alongside the identity summary', async () => {
     const client = stubClient();
     render(<Probe client={client} factory={fakeStream().factory} />);
-    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('1'));
+    await waitFor(() => expect(screen.getByTestId('markdown').textContent).toBe(String(DOCUMENT.markdown.length)));
     // Both reads happen, once each, and neither replaces the other.
     expect(client.document).toHaveBeenCalledWith('doc-1');
     expect(client.document).toHaveBeenCalledTimes(1);
@@ -268,7 +266,7 @@ describe('GET /:id/document and GET /:id/comments', () => {
     } as unknown as Partial<CollabClient>);
     render(<Probe client={client} factory={fakeStream().factory} />);
     await waitFor(() => expect(screen.getByTestId('error').textContent).toBe('not-found'));
-    expect(screen.getByTestId('nodes').textContent).toBe('-1');
+    expect(screen.getByTestId('markdown').textContent).toBe('-1');
   });
 
   it('a failed comments read lands on commentsError and leaves the document renderable', async () => {
@@ -277,32 +275,32 @@ describe('GET /:id/document and GET /:id/comments', () => {
     } as unknown as Partial<CollabClient>);
     render(<Probe client={client} factory={fakeStream().factory} />);
     await waitFor(() => expect(screen.getByTestId('comments-error').textContent).toBe('conflict'));
-    expect(screen.getByTestId('nodes').textContent).toBe('1');
+    expect(screen.getByTestId('markdown').textContent).toBe(String(DOCUMENT.markdown.length));
     expect(screen.getByTestId('error').textContent).toBe('—');
   });
 });
 
 describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
-  it('add posts the nodeId and folds the saved record in without re-reading', async () => {
+  it('add posts the line range and folds the saved record in without re-reading', async () => {
     const saved = comment('c-9', 'tighten', { collab: { nodeId: 'n-7' } } as Partial<CommentRecord>);
     const client = stubClient({
       addComment: vi.fn(async () => ({ ok: true, value: { ok: true, id: 'c-9', comment: saved } })),
     } as unknown as Partial<CollabClient>);
     render(<Probe client={client} factory={fakeStream().factory} />);
-    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('1'));
+    await waitFor(() => expect(screen.getByTestId('markdown').textContent).toBe(String(DOCUMENT.markdown.length)));
 
     screen.getByTestId('add').click();
     await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-9:tighten:open'));
     /*
-     * R-7.5 — the nodeId reaches the route, and so does the routing tag. This assertion
-     * used to pin the opposite, with a comment explaining that the server stamps its own
-     * workflow "so it is not sent" — which described the defect rather than a decision:
-     * the panel's "Apply via" control was discarded here, and every collaborative comment
-     * was born routed to the default whatever the author picked.
+     * R-0.3 / R-7.5 — the line range reaches the route, and so does the routing tag. This
+     * assertion used to pin a `nodeId`, and before that pinned the workflow being dropped
+     * — which described the defect rather than a decision: the panel's "Apply via" control
+     * was discarded here, and every collaborative comment was born routed to the default
+     * whatever the author picked.
      */
     expect(client.addComment).toHaveBeenCalledWith('doc-1', {
       comment: 'tighten',
-      nodeId: 'n-7',
+      startLine: 3,
       workflow: 'visual-spec',
     });
     expect(client.comments).toHaveBeenCalledTimes(1);
@@ -352,15 +350,15 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
       .mockResolvedValueOnce({ ok: true, value: DOCUMENT })
       .mockResolvedValue({
         ok: true,
-        value: { ...DOCUMENT, nodes: [...DOCUMENT.nodes, { ...DOCUMENT.nodes[0]!, id: 'n-agent' }] },
+        value: { ...DOCUMENT, markdown: `${DOCUMENT.markdown}\napplied by the agent\n` },
       });
     const client = stubClient({ document } as unknown as Partial<CollabClient>);
     render(<Probe client={client} factory={fakeStream().factory} />);
-    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('1'));
+    await waitFor(() => expect(screen.getByTestId('markdown').textContent).toBe(String(DOCUMENT.markdown.length)));
 
     screen.getByTestId('reload').click();
 
-    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('2'));
+    await waitFor(() => expect(Number(screen.getByTestId('markdown').textContent)).toBeGreaterThan(DOCUMENT.markdown.length));
   });
 
   it('a failed mutation lands on commentsError and leaves the list alone', async () => {
@@ -421,7 +419,7 @@ describe('re-reading what a finished job changed', () => {
     const stream = fakeStream();
     const client = stubClient();
     render(<Probe client={client} factory={stream.factory} />);
-    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('1'));
+    await waitFor(() => expect(screen.getByTestId('markdown').textContent).toBe(String(DOCUMENT.markdown.length)));
     expect(client.document).toHaveBeenCalledTimes(1);
 
     stream.push({ type: 'job-done', jobId: 'doc-1-1', kind: 'sync', ok: true, state: 'draft', finishedAt: 20 });
@@ -446,15 +444,15 @@ describe('re-reading what a finished job changed', () => {
       .mockResolvedValueOnce({ ok: true, value: DOCUMENT })
       .mockResolvedValue({
         ok: true,
-        value: { ...DOCUMENT, nodes: [...DOCUMENT.nodes, { ...DOCUMENT.nodes[0]!, id: 'n-2' }] },
+        value: { ...DOCUMENT, markdown: `${DOCUMENT.markdown}\nsecond paragraph\n` },
       });
     const client = stubClient({ document } as unknown as Partial<CollabClient>);
     render(<Probe client={client} factory={stream.factory} />);
-    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('1'));
+    await waitFor(() => expect(screen.getByTestId('markdown').textContent).toBe(String(DOCUMENT.markdown.length)));
 
     stream.push({ type: 'job-done', jobId: 'doc-1-1', kind: 'open', ok: true, state: 'draft', finishedAt: 20 });
 
-    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('2'));
+    await waitFor(() => expect(Number(screen.getByTestId('markdown').textContent)).toBeGreaterThan(DOCUMENT.markdown.length));
   });
 
   it('re-reads identity after create, which is how a PR number first reaches the title bar', async () => {
@@ -499,13 +497,13 @@ describe('re-reading what a finished job changed', () => {
         .mockResolvedValue({ ok: false, kind: 'network', message: 'connection reset' }),
     } as unknown as Partial<CollabClient>);
     render(<Probe client={client} factory={stream.factory} />);
-    await waitFor(() => expect(screen.getByTestId('nodes').textContent).toBe('1'));
+    await waitFor(() => expect(screen.getByTestId('markdown').textContent).toBe(String(DOCUMENT.markdown.length)));
 
     stream.push({ type: 'job-done', jobId: 'doc-1-1', kind: 'publish', ok: true, state: 'published', finishedAt: 20 });
     await waitFor(() => expect(client.document).toHaveBeenCalledTimes(2));
 
     // `error` would blank the document view; the document itself is still rendered.
     expect(screen.getByTestId('error').textContent).toBe('—');
-    expect(screen.getByTestId('nodes').textContent).toBe('1');
+    expect(screen.getByTestId('markdown').textContent).toBe(String(DOCUMENT.markdown.length));
   });
 });

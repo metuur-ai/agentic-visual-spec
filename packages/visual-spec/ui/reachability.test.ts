@@ -67,7 +67,18 @@ const IS_TEST = /\.test\.tsx?$/;
  *
  * Every entry must name the decision, not merely restate the fact.
  */
-const DELIBERATELY_UNMOUNTED: Record<string, string> = {};
+const DELIBERATELY_UNMOUNTED: Record<string, string> = {
+  'ui/collab-document-view.tsx':
+    'Retired with the JSON document format (R-0.1/R-0.2). It walked a canonical `doc.root` and stamped ' +
+    '`data-vs-node-id` on every block; the review surface now renders the Markdown through `MarkdownSurface` ' +
+    'and anchors on `data-vs-loc` (R-7.3), so there is no tree to walk and no id to stamp. Left on disk ' +
+    'pending deletion, unmounted so nothing can grow a second renderer against it.',
+  'ui/collab-anchor-resolver.ts':
+    'Retired with `nodeId` identity (Unit 2). It located a block by `[data-vs-node-id]`, which no rendered ' +
+    'document carries any more; R-6.6 now requires collaboration and local mode to share one resolver, and ' +
+    'that resolver is `resolveMarkdownAnchors`. Left on disk pending deletion, unmounted so a second anchor ' +
+    'path cannot come back through it.',
+};
 
 function collabUiModules(): string[] {
   return readdirSync(resolve(pkgRoot, 'ui'))
@@ -125,7 +136,7 @@ describe('the collaboration UI is reachable from the app (task U-1)', () => {
     // naming a production module does the moment someone mounts it.
     expect(existsSync(resolve(pkgRoot, 'ui/collab-editor.test.tsx'))).toBe(true);
     expect(reached.has('ui/collab-editor.test.tsx')).toBe(false);
-    expect(reached.has('ui/collab-document-view.tsx')).toBe(true);
+    expect(reached.has('ui/collab-app.tsx')).toBe(true);
     expect(reached.size).toBeGreaterThan(modules.length);
   });
 });
@@ -221,15 +232,18 @@ describe("the collab apply prompt has a caller in the app", () => {
   });
 
   /*
-   * And it must name the file the AGENT will edit. `document.documentPath` is the path on
-   * the branch; the agent runs against the local store, whose convention is
-   * `localDocumentPath`. They coincide today only by accident of the create form.
+   * And it must name the file the AGENT will edit — which is now `documentPath` and only
+   * `documentPath`. Under the retired JSON format the local store kept the document at a
+   * path of its own (`documents/<id>.json`), so the prompt had to be built from that
+   * convention rather than from the path on the branch; with Markdown canonical the two
+   * are one path, and `fsCollaborationStore` writes the file at `<contentDir>/<documentPath>`
+   * with the agent's cwd at `<contentDir>` (`core/bundle-guard.test.ts` pins that pairing).
    */
-  it('it derives the path from the store convention, not from documentPath', () => {
+  it('it names the document by its own path, which is where the agent will find it', () => {
     for (const module of callersOf()) {
       const source = readFileSync(resolve(pkgRoot, module), 'utf8');
-      expect(source).toContain('localDocumentPath(');
-      expect(source).not.toMatch(/documentPath:\s*\w*\.?documentPath/);
+      expect(source).toMatch(/documentPath:\s*\w+\.documentPath/);
+      expect(source).not.toContain('localDocumentPath(');
     }
   });
 });

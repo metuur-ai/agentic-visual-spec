@@ -2,9 +2,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { parseCommentBody } from './comment-projection';
-import type { CollaborationDocument } from './document-protocol';
-import type { DocumentStore } from './document-store';
-import { resolveNodeIn } from './document-store';
+import type { CollaborationRecord } from './document-record';
+import type { CollaborationStore } from './record-store';
 import { createGitHubAdapter } from './github-adapter';
 import type { GhExecutor, GhResult } from './github-executor';
 import { type JobEvent, createJobHubRegistry } from './job-hub';
@@ -44,37 +43,31 @@ function recorder(responses: Array<Partial<GhResult>>): { exec: GhExecutor; call
 const ACCEPT_FLAG_VALUE = 'Accept: application/vnd.github+json';
 const endpointOf = (args: string[]): string => args[args.indexOf(ACCEPT_FLAG_VALUE) + 1] as string;
 
-function makeDoc(overrides: Partial<CollaborationDocument> = {}): CollaborationDocument {
+function makeDoc(overrides: Partial<CollaborationRecord> = {}): CollaborationRecord {
   return {
     documentId: 'doc-1',
     documentPath: 'documents/doc-1.json',
     title: 'Onboarding guide',
-    frontmatter: {},
-    nodes: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'hello' }],
-    doc: { root: { children: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'hello' }] } },
+    markdown: '# Onboarding guide\n\nhello\n',
     ...overrides,
   };
 }
 
-/** In-memory `DocumentStore`. Writes are recorded so "what sync writes" is observable. */
-function memoryStore(seed?: CollaborationDocument) {
-  const docs = new Map<string, CollaborationDocument>();
+/** In-memory `CollaborationStore`. Writes are recorded so "what sync writes" is observable. */
+function memoryStore(seed?: CollaborationRecord) {
+  const docs = new Map<string, CollaborationRecord>();
   if (seed) docs.set(seed.documentId, seed);
-  const writes: CollaborationDocument[] = [];
-  const store: DocumentStore = {
+  const writes: CollaborationRecord[] = [];
+  const store: CollaborationStore = {
     async read(id) {
       return docs.get(id) ?? null;
     },
     async write(doc) {
-      writes.push(JSON.parse(JSON.stringify(doc)) as CollaborationDocument);
+      writes.push(JSON.parse(JSON.stringify(doc)) as CollaborationRecord);
       docs.set(doc.documentId, doc);
     },
     async list() {
       return [...docs.keys()].sort();
-    },
-    async resolveNode(id, nodeId) {
-      const doc = docs.get(id);
-      return doc ? resolveNodeIn(doc, nodeId) : { found: false };
     },
   };
   return { store, writes };
@@ -99,15 +92,15 @@ function fakeScheduler() {
 type Harness = {
   lifecycle: Lifecycle;
   calls: Call[];
-  writes: CollaborationDocument[];
-  store: DocumentStore;
+  writes: CollaborationRecord[];
+  store: CollaborationStore;
   events: JobEvent[];
   syncs: SyncResult[];
   fire: () => void;
   ticks: Array<{ fn: () => void; ms: number; cancelled: boolean }>;
 };
 
-function harness(responses: Array<Partial<GhResult>>, seed?: CollaborationDocument | null): Harness {
+function harness(responses: Array<Partial<GhResult>>, seed?: CollaborationRecord | null): Harness {
   const { exec, calls } = recorder(responses);
   const { store, writes } = memoryStore(seed === null ? undefined : (seed ?? makeDoc()));
   const hubs = createJobHubRegistry({ now: () => 1_700_000_000_000 });
@@ -190,7 +183,7 @@ describe('createLifecycle.start (R-8.5)', () => {
       headSha: '9f8e7d6c5b4a39281706f5e4d3c2b1a098765432',
       resolved: false,
       // R-11.6 — create commits the document it just wrote, so local and branch agree here.
-      contentSha: documentContentSha((await h.store.read('doc-1')) as CollaborationDocument),
+      contentSha: documentContentSha((await h.store.read('doc-1')) as CollaborationRecord),
     });
   });
 
@@ -207,14 +200,15 @@ describe('createLifecycle.start (R-8.5)', () => {
     expect(done).toMatchObject({ ok: true, state: 'pr-open', kind: 'create' });
   });
 
-  it('commits the serialized envelope byte-for-byte, not a re-derived form', async () => {
+  it('commits the Markdown byte-for-byte, with nothing re-derived or wrapped around it', async () => {
     const doc = makeDoc();
     const h = harness(CREATE_OK, doc);
     h.lifecycle.start({ documentId: 'doc-1' });
     await settled();
 
     const body = JSON.parse(h.calls[2]?.input ?? '{}') as { content: string; branch: string; message: string };
-    expect(Buffer.from(body.content, 'base64').toString('utf8')).toBe(`${JSON.stringify(doc, null, 2)}\n`);
+    // R-0.1 — the document is the Markdown, so the artifact is the Markdown.
+    expect(Buffer.from(body.content, 'base64').toString('utf8')).toBe(doc.markdown);
     expect(body.branch).toBe('visual-spec/doc-1');
   });
 

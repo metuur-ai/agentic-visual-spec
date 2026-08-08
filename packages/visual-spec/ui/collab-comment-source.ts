@@ -1,135 +1,129 @@
 /**
- * collab-comment-source.ts — task 7.3. The collaboration half of the shared comment UI.
+ * collab-comment-source.ts — the collaboration half of the shared comment UI.
  *
- * This is the module that makes `resolveCollabAnchor` (task 6.1) *live*: it turns the
- * comments projected off a Pull Request into the two shapes the shared components take —
- * `IndicatorTarget[]` for `IndicatorLayer` and a `CommentPanelSource` for `CommentPanel`
- * — so collaboration reuses those components rather than forking them (R-7.4).
+ * It turns the review threads projected off a Pull Request into the two shapes the shared
+ * components take — `IndicatorTarget[]` for `IndicatorLayer` and a `CommentPanelSource`
+ * for `CommentPanel` — so collaboration reuses those components rather than forking them
+ * (R-7.4).
  *
- * Everything here keys on `nodeId` and nothing else (R-6.1 / R-6.7): no line, no snippet,
- * no heading. The three resolution states are presented, not flattened:
+ * R-6.6 — THERE IS ONE ANCHOR RESOLVER, AND IT IS THE LOCAL ONE. A projected thread is a
+ * `CommentRecord` with an ordinary `CommentTarget` (`path` + `startLine`/`endLine`, or
+ * `kind: 'file'`), and the review surface renders Markdown stamped with `data-vs-loc`
+ * (R-7.3). So `resolveMarkdownAnchors` — the resolver local mode already uses — locates a
+ * collaborative comment too. The second resolver this module used to carry, keyed on
+ * `nodeId`, went with the format that issued the ids.
  *
- *   exact     → a marker on the block, plain.
- *   outdated  → a marker on the same block, rendered `state: 'stale'` (R-6.3 anchors it
- *               exactly and flags it; the flag changes presentation, never placement).
- *   orphaned  → NO marker. It goes to `orphans`, which the panel renders document-level
- *               with its last-known target text and an explicit marker (R-6.4 / R-6.5).
+ * The three states are presented, not flattened:
  *
- * **Uncommentable blocks (R-7.3).** `image`, `iframe-embed` and `youtube-embed` reach the
- * store without a durable `nodeId`, so task 7.1 stamps them `data-vs-uncommentable`.
- * `describe()` returns `{ uncommentable }` for a selection inside one, which withdraws the
- * panel's compose form. Offering a comment there would promise an anchor the store cannot
- * keep — the comment would be born orphaned.
+ *   anchored          → a marker on the block, plain.
+ *   anchored, outdated → a marker on the same block, rendered `state: 'stale'` (R-6.3
+ *                       anchors it and flags it; the flag changes presentation, never
+ *                       placement — R-6.10).
+ *   unanchored        → NO marker. It goes to `orphans`, which the panel renders
+ *                       document-level with the text it was written about (R-6.4 / R-6.9).
  *
- * **R-6.6 / R-10.6 — the local resolver is not involved.** `resolveMarkdownAnchors` is
- * neither imported nor reachable from here; blocks are located with `findCollabBlock`,
- * which queries the identity attributes only. `flash` is reused from the history list
- * because it is pure scroll-and-highlight styling with no anchoring in it.
+ * Nothing here re-anchors anything. `projectReviewThreadInDocument` already decided, on
+ * the server, whether an outdated thread's snippet matched exactly once (R-6.8), and a
+ * second opinion in the browser could only disagree with it.
  */
-import {
-  COLLAB_TARGET_TEXT_KEY,
-  type CollabAnchorRef,
-  type CollabAnchorResolution,
-  resolveCollabAnchor,
-} from '../core/collaboration/anchor-resolution';
-import type { CollaborationDocument } from '../core/collaboration/document-protocol';
-import type { CommentTrailer } from '../core/collaboration/comment-projection';
+import type { CollaborationRecord } from '../core/collaboration/document-record';
 import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import type { SelectedTarget } from '../core/app';
-import { VS_NODE_ID_ATTR, VS_UNCOMMENTABLE_ATTR } from './collab-document-view';
-import { findCollabBlock } from './collab-anchor-resolver';
+import { resolveMarkdownAnchors } from './anchor-resolver';
 import { flash } from './comment-history-list';
 import type { IndicatorTarget } from './indicator-layer';
 import type { CommentPanelSource } from './comment-panel';
 
-/** The trailer a projected comment carries (task 5.1). Absent on a hand-built record. */
-function trailerOf(comment: CommentRecord): CommentTrailer {
-  return ((comment as { collab?: CommentTrailer }).collab ?? {}) as CommentTrailer;
+/** R-6.10 — a thread GitHub reports as having lost its line. */
+function isOutdated(comment: CommentRecord): boolean {
+  return (comment as Partial<ReviewThreadRecord>).github?.isOutdated === true;
 }
 
 /**
- * The anchor a comment claims, or `null` when it claims none — a comment with no
- * `nodeId` is a document-level discussion (R-5.7), not an orphan.
+ * The line a comment anchors to, or `null` when it anchors to none.
+ *
+ * `kind: 'file'` covers both R-6.12's file-level thread and R-6.4's unanchored one: in
+ * neither case is there a line, and the document-level list is where both belong.
  */
-export function collabAnchorRefOf(documentId: string, comment: CommentRecord): CollabAnchorRef | null {
-  const trailer = trailerOf(comment);
-  const nodeId = trailer.nodeId;
-  if (!nodeId) return null;
-  const version = Number(trailer.nodeVersion);
-  return {
-    documentId,
-    nodeId,
-    ...(Number.isFinite(version) && trailer.nodeVersion !== undefined ? { nodeVersion: version } : {}),
-    ...(trailer[COLLAB_TARGET_TEXT_KEY] ? { targetText: trailer[COLLAB_TARGET_TEXT_KEY] as string } : {}),
-  };
+function lineOf(comment: CommentRecord): number | null {
+  const { target } = comment;
+  if (target.kind === 'file' || typeof target.startLine !== 'number') return null;
+  return target.startLine;
 }
 
-/** One node's open comments plus the single resolution they share. */
-type NodeGroup = { nodeId: string; comments: CommentRecord[]; resolution: CollabAnchorResolution };
+/** One line's open comments, plus whether the block moved on under them. */
+type LineGroup = { line: number; comments: CommentRecord[]; heading: string | null; endLine?: number; stale: boolean };
 
-/**
- * Group open, node-anchored comments by `nodeId` and resolve each group once. Comments
- * with no `nodeId` are skipped — they have no block to point at by construction.
- */
-function groupByNode(doc: CollaborationDocument, comments: readonly CommentRecord[]): NodeGroup[] {
-  const byNode = new Map<string, CommentRecord[]>();
+function groupByLine(record: CollaborationRecord, comments: readonly CommentRecord[]): LineGroup[] {
+  const byLine = new Map<number, LineGroup>();
   for (const comment of comments) {
     if (comment.status !== 'open') continue;
-    const ref = collabAnchorRefOf(doc.documentId, comment);
-    if (!ref) continue;
-    const bucket = byNode.get(ref.nodeId);
-    if (bucket) bucket.push(comment);
-    else byNode.set(ref.nodeId, [comment]);
+    if (comment.target.path !== record.documentPath) continue;
+    const line = lineOf(comment);
+    if (line === null) continue;
+    const group = byLine.get(line);
+    if (group) {
+      group.comments.push(comment);
+      group.stale = group.stale && isOutdated(comment);
+    } else {
+      byLine.set(line, {
+        line,
+        comments: [comment],
+        heading: comment.target.heading ?? null,
+        ...(typeof comment.target.endLine === 'number' ? { endLine: comment.target.endLine } : {}),
+        stale: isOutdated(comment),
+      });
+    }
   }
-  return [...byNode.entries()].map(([nodeId, group]) => ({
-    nodeId,
-    comments: group,
-    resolution: resolveCollabAnchor(collabAnchorRefOf(doc.documentId, group[0]!)!, doc),
-  }));
+  return [...byLine.values()].sort((a, b) => a.line - b.line);
 }
 
-/**
- * R-6.2 / R-6.3 — the markers `IndicatorLayer` places in collaboration mode. Orphans are
- * deliberately absent: an unanchored comment has no block to sit on (R-6.4).
- */
+/** R-6.2 / R-6.3 — the markers `IndicatorLayer` places in collaboration mode. */
 export function collabIndicatorTargets(
-  doc: CollaborationDocument,
+  record: CollaborationRecord,
   comments: readonly CommentRecord[],
   root?: ParentNode | null,
 ): IndicatorTarget[] {
-  const targets: IndicatorTarget[] = [];
-  for (const group of groupByNode(doc, comments)) {
-    if (!group.resolution.anchored) continue;
+  return groupByLine(record, comments).map((group) => {
     const count = group.comments.length;
-    const stale = group.resolution.state === 'outdated';
-    const suffix = stale ? ' (block edited since)' : '';
-    targets.push({
+    const suffix = group.stale ? ' (the text moved since)' : '';
+    return {
       comments: group.comments,
       title:
         count > 1
-          ? `${count} comments on this block${suffix} — show in sidebar`
-          : `Comment on this block${suffix} — show in sidebar`,
-      ariaLabel: `${count} pending comment${count > 1 ? 's' : ''} on this block${suffix}`,
-      ...(stale ? { state: 'stale' as const } : {}),
-      element: () => findCollabBlock(doc.documentId, group.nodeId, root),
-    });
-  }
-  return targets;
+          ? `${count} comments on line ${group.line}${suffix} — show in sidebar`
+          : `Comment on line ${group.line}${suffix} — show in sidebar`,
+      ariaLabel: `${count} pending comment${count > 1 ? 's' : ''} on line ${group.line}${suffix}`,
+      ...(group.stale ? { state: 'stale' as const } : {}),
+      element: () =>
+        resolveMarkdownAnchors(
+          {
+            startLine: group.line,
+            heading: group.heading,
+            ...(group.endLine !== undefined ? { endLine: group.endLine } : {}),
+          },
+          root === undefined ? undefined : root,
+        )[0] ?? null,
+    };
+  });
 }
 
-/** R-6.5 — the comments whose block is gone, paired with what they remember of it. */
+/**
+ * R-6.4 / R-6.9 — the comments that carry no line, paired with what they were written
+ * about. Includes a comment on another file, which is a real thing to receive on a Pull
+ * Request and must not be hidden just because it is not about this document.
+ */
 export function collabOrphans(
-  doc: CollaborationDocument,
+  record: CollaborationRecord,
   comments: readonly CommentRecord[],
 ): { comment: CommentRecord; targetText: string }[] {
   const out: { comment: CommentRecord; targetText: string }[] = [];
   for (const comment of comments) {
     if (comment.status !== 'open') continue;
-    const ref = collabAnchorRefOf(doc.documentId, comment);
-    if (!ref) continue;
-    const resolution = resolveCollabAnchor(ref, doc);
-    if (resolution.state === 'orphaned') out.push({ comment, targetText: resolution.targetText });
+    if (comment.target.path === record.documentPath && lineOf(comment) !== null) continue;
+    const other = comment.target.path !== record.documentPath ? `${comment.target.path} — ` : '';
+    out.push({ comment, targetText: `${other}${comment.target.snippet ?? ''}`.trim() });
   }
   return out;
 }
@@ -151,31 +145,25 @@ function threadLink(comment: CommentRecord): string | undefined {
   return github.htmlUrl;
 }
 
-/** The block a selection sits in, and whether it can be commented on at all. */
-function blockOf(anchor: HTMLElement): { nodeId: string } | { uncommentable: string } {
-  const blocked = anchor.closest(`[${VS_UNCOMMENTABLE_ATTR}]`) as HTMLElement | null;
-  if (blocked) return { uncommentable: blocked.getAttribute(VS_UNCOMMENTABLE_ATTR) || 'it carries no durable identity' };
-  const block = anchor.closest(`[${VS_NODE_ID_ATTR}]`) as HTMLElement | null;
-  const nodeId = block?.getAttribute(VS_NODE_ID_ATTR);
-  if (!nodeId) return { uncommentable: 'it is not an identified block of this document' };
-  return { nodeId };
-}
-
 export type CollabCommentSourceDeps = {
-  document: CollaborationDocument;
-  /** Comments projected off the Pull Request (task 5.1). */
+  document: CollaborationRecord;
+  /** Threads projected off the Pull Request. */
   comments: CommentRecord[];
-  /** R-7.5 — persist against `nodeId`. Goes to `POST /__vs/collab/:id/comments`. */
-  add: (input: { nodeId: string; comment: string; workflow: string }) => Promise<void>;
-  /**
-   * R-9.8 — post a threaded reply. Goes to `POST /__vs/collab/:id/comments/:cid/reply`.
-   */
+  /** R-7.5 — persist against the selected line range. Goes to `POST /:id/comments`. */
+  add: (input: {
+    comment: string;
+    workflow: string;
+    startLine?: number;
+    endLine?: number;
+    selectedText?: string;
+  }) => Promise<void>;
+  /** R-9.8 — post a threaded reply. Goes to `POST /:id/comments/:cid/reply`. */
   reply: (id: string, text: string) => Promise<void>;
   /*
    * There is deliberately no `remove` and no `restore` here. Both used to write a
    * resolution — `remove` posted a "resolved" marker reply, `restore` posted its inverse —
    * and R-5.13 forbids this system writing resolution at all. A thread is resolved by a
-   * reviewer on github.com, and `threadLink` below is how a reader gets there (R-5.14).
+   * reviewer on github.com, and `threadLink` above is how a reader gets there (R-5.14).
    */
   /** Where the document is rendered. Defaults to the whole document. */
   root?: ParentNode | null;
@@ -183,42 +171,62 @@ export type CollabCommentSourceDeps = {
 
 /** The `CommentPanel` source for a collaboration document. */
 export function collabCommentPanelSource(deps: CollabCommentSourceDeps): CommentPanelSource {
-  const doc = deps.document;
-  const labels = new Map<string, string>();
-  for (const group of groupByNode(doc, deps.comments)) {
-    const text = group.resolution.anchored ? group.resolution.targetText : '';
-    const flag = group.resolution.state === 'outdated' ? ' · outdated' : '';
-    for (const c of group.comments) labels.set(c.id, `${text || group.nodeId}${flag}`);
-  }
-  const orphans = collabOrphans(doc, deps.comments);
+  const record = deps.document;
+  const orphans = collabOrphans(record, deps.comments);
   const orphaned = new Set(orphans.map((o) => o.comment.id));
   return {
-    path: doc.documentPath,
-    // Orphans have their own section (R-5.6); listing them twice would double-render them.
+    path: record.documentPath,
+    // Orphans have their own section (R-5.7); listing them twice would double-render them.
     comments: deps.comments.filter((c) => !orphaned.has(c.id)),
     reply: deps.reply,
     link: threadLink,
     orphans,
+    // Section selection reaches into the local sidecar's heading model; collaboration
+    // posts a line range and has no use for it.
     supportsSections: false,
-    label: (c) => labels.get(c.id) ?? '(document)',
+    label: (c) => {
+      const line = lineOf(c);
+      const head = c.target.heading ?? '(top)';
+      const range = line === null ? '(document)' : `L${line}${c.target.endLine ? `–${c.target.endLine}` : ''}`;
+      return `${head} · ${range}${isOutdated(c) ? ' · outdated' : ''}`;
+    },
     locate: (c) => {
-      const ref = collabAnchorRefOf(doc.documentId, c);
-      const el = ref ? findCollabBlock(doc.documentId, ref.nodeId, deps.root) : null;
-      if (el) flash([el]);
+      const line = lineOf(c);
+      if (line === null) return;
+      const els = resolveMarkdownAnchors(
+        {
+          startLine: line,
+          heading: c.target.heading ?? null,
+          ...(typeof c.target.endLine === 'number' ? { endLine: c.target.endLine } : {}),
+        },
+        deps.root === undefined ? undefined : deps.root,
+      );
+      if (els.length) flash(els);
     },
     describe: (selection: SelectedTarget[]) => {
-      const block = blockOf(selection[0]!.anchor);
-      if ('uncommentable' in block) return block;
-      const resolution = resolveCollabAnchor({ documentId: doc.documentId, nodeId: block.nodeId }, doc);
+      const selected = selection[0]!;
+      const last = selection[selection.length - 1]!;
       return {
-        title: (resolution.anchored ? resolution.targetText : '') || '(block)',
-        detail: ` · block ${block.nodeId}`,
+        title: (selected.anchor.textContent ?? '').trim().slice(0, 80) || '(block)',
+        detail:
+          selection.length > 1
+            ? ` · lines ${selected.line}–${last.line} · ${selection.length} blocks`
+            : ` · line ${selected.line}`,
       };
     },
     create: async (selection, text, workflow) => {
-      const block = blockOf(selection[0]!.anchor);
-      if ('uncommentable' in block) return; // no anchor to persist against (R-7.5)
-      await deps.add({ nodeId: block.nodeId, comment: text, workflow: workflow || 'visual-spec' });
+      const selected = selection[0]!;
+      const last = selection[selection.length - 1]!;
+      await deps.add({
+        comment: text,
+        workflow: workflow || 'visual-spec',
+        startLine: selected.line,
+        ...(selection.length > 1 ? { endLine: last.line } : {}),
+        // R-7.12 — quoted back into the body if the line is outside the PR's diff and the
+        // comment has to degrade to file-level. The browser holds the selection; the
+        // server re-reading the branch for it would be a second, disagreeing answer.
+        selectedText: (selected.anchor.textContent ?? '').trim().slice(0, 400),
+      });
     },
   };
 }

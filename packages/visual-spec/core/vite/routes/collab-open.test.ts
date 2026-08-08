@@ -24,9 +24,8 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { githubCommentStore } from '../../collaboration/comment-projection';
 import { preflightCollaboration } from '../../collaboration/credentials';
-import type { CollaborationDocument } from '../../collaboration/document-protocol';
-import { serializeCollaborationDocument } from '../../collaboration/document-protocol';
-import type { DocumentStore } from '../../collaboration/document-store';
+import type { CollaborationRecord } from '../../collaboration/document-record';
+import type { CollaborationStore } from '../../collaboration/record-store';
 import { createGitHubAdapter } from '../../collaboration/github-adapter';
 import type { GhExecutor } from '../../collaboration/github-executor';
 import type { SseSink } from '../../collaboration/job-hub';
@@ -52,13 +51,11 @@ const endpointOf = (args: string[]): string => args[args.indexOf(ACCEPT_FLAG_VAL
 const methodOf = (args: string[]): string => args[args.indexOf('--method') + 1] as string;
 
 /** The document as it exists **only on the branch** — never on the reviewer's disk. */
-const REMOTE_DOC: CollaborationDocument = {
+const REMOTE_DOC: CollaborationRecord = {
   documentId: 'doc-1',
-  documentPath: 'documents/doc-1.json',
+  documentPath: 'documents/doc-1.md',
   title: 'Onboarding guide',
-  frontmatter: { title: 'Onboarding guide' },
-  nodes: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'Install the CLI first.' }],
-  doc: { root: { children: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'Install the CLI first.' }] } },
+  markdown: '# Onboarding guide\n\nhello\n',
 };
 
 const PULL = JSON.stringify({
@@ -82,7 +79,7 @@ const CONTENTS = JSON.stringify({
   sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678',
   type: 'file',
   encoding: 'base64',
-  content: Buffer.from(serializeCollaborationDocument(REMOTE_DOC), 'utf8').toString('base64'),
+  content: Buffer.from(REMOTE_DOC.markdown, 'utf8').toString('base64'),
 });
 
 const FORBIDDEN = JSON.stringify({ message: 'Resource not accessible by personal access token', status: '403' });
@@ -123,7 +120,7 @@ function readOnlyGh() {
 
     if (endpoint === '/user') return ok(fixture('user-inclusive-reviewer.txt'));
     if (method === 'GET' && endpoint === '/repos/acme/docs/pulls/42') return ok(PULL);
-    if (method === 'GET' && endpoint.startsWith('/repos/acme/docs/contents/documents/doc-1.json')) return ok(CONTENTS);
+    if (method === 'GET' && endpoint.startsWith('/repos/acme/docs/contents/documents/doc-1.md')) return ok(CONTENTS);
     if (method === 'GET' && endpoint.startsWith('/repos/acme/docs/issues/42/comments')) return ok('[]');
     if (method === 'POST' && endpoint === '/repos/acme/docs/issues/42/comments') return ok(fixture('issue-comment-create.json'));
     // The conversation is PR **review** comments now. Creating one is a read-access
@@ -141,8 +138,8 @@ function readOnlyGh() {
 }
 
 /** The reviewer's machine: the document store starts **empty** (R-11.2). */
-function emptyDocuments(): DocumentStore & { docs: Map<string, CollaborationDocument> } {
-  const docs = new Map<string, CollaborationDocument>();
+function emptyDocuments(): CollaborationStore & { docs: Map<string, CollaborationRecord> } {
+  const docs = new Map<string, CollaborationRecord>();
   return {
     docs,
     async read(id) {
@@ -153,9 +150,6 @@ function emptyDocuments(): DocumentStore & { docs: Map<string, CollaborationDocu
     },
     async list() {
       return [...docs.keys()].sort();
-    },
-    async resolveNode() {
-      return { found: false };
     },
   };
 }
@@ -241,7 +235,7 @@ describe('SC-4 (simulated) — a read-only reviewer completes open → read → 
     expect(read.json.state).toBe('pr-open');
     expect(read.json.document).toMatchObject({
       documentId: 'doc-1',
-      documentPath: 'documents/doc-1.json',
+      documentPath: 'documents/doc-1.md',
       github: { branch: BRANCH, pullNumber: 42 },
     });
 

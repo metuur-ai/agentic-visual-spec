@@ -101,11 +101,10 @@
  */
 import { createHash } from 'node:crypto';
 import type { ResolvedCollaborationConfig } from '../config';
-import type { CollaborationDocument } from './document-protocol';
-import type { DocumentStore } from './document-store';
+import type { CollaborationRecord } from './document-record';
+import type { CollaborationStore } from './record-store';
 import type { GitHubAdapter, RepoRef } from './github-adapter';
 import type { JobBody } from './job-hub';
-import type { BoundCollaborationDocument } from './lifecycle';
 
 /**
  * Git's blob object hash: `sha1("blob " + byteLength + "\0" + content)`. Computed here,
@@ -154,9 +153,9 @@ export type PublishBodyInput = {
   documentId: string;
   /** R-9.4 — owner / repo / base branch, supplied per call rather than per instance. */
   repo: ResolvedCollaborationConfig;
-  store: DocumentStore;
+  store: CollaborationStore;
   /** The route's already-loaded document. Re-read from `store` when absent or null. */
-  document?: CollaborationDocument | null;
+  document?: CollaborationRecord | null;
   /** R-8.9 / R-8.12 — the whole payload: opaque bytes, committed verbatim. */
   markdown: string;
 };
@@ -182,9 +181,7 @@ export function createPublishBody(options: PublishBodyOptions): (input: PublishB
 
     ctx.setState('publishing');
 
-    const doc = (input.document ?? ((await store.read(documentId)) as BoundCollaborationDocument | null)) as
-      | BoundCollaborationDocument
-      | null;
+    const doc = input.document ?? (await store.read(documentId));
     if (!doc) throw new Error(`no collaboration document: ${documentId}`);
     const branch = doc.github?.branch;
     if (!branch) throw new Error(`no collaboration branch for ${documentId}`);

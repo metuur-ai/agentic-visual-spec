@@ -16,8 +16,8 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { createCollabAuthorizer } from './authorization';
 import { preflightCollaboration } from './credentials';
-import type { CollaborationDocument } from './document-protocol';
-import type { DocumentStore } from './document-store';
+import type { CollaborationRecord } from './document-record';
+import type { CollaborationStore } from './record-store';
 import type { GhExecutor } from './github-executor';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -26,12 +26,12 @@ const fixture = (name: string): string => readFileSync(`${here}fixtures/${name}`
 const repo = { owner: 'acme', repo: 'docs', baseBranch: 'main' };
 
 /** The authorizer needs a store; no rung below reaches a document. */
-const noDocuments = (): DocumentStore =>
+const noDocuments = (): CollaborationStore =>
   ({
-    read: async (): Promise<CollaborationDocument | null> => null,
+    read: async (): Promise<CollaborationRecord | null> => null,
     write: async () => undefined,
     list: async () => [],
-  }) as unknown as DocumentStore;
+  }) as unknown as CollaborationStore;
 
 /** `exitCode` is load-bearing and `null` is a real value here, so it is not defaulted away. */
 const constant =

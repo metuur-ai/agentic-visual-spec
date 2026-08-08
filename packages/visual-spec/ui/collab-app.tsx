@@ -2,9 +2,9 @@
  * collab-app.tsx — task U-1, mounts the collaboration surface App.tsx swaps to.
  *
  * SCOPE. The reviewer half of the round trip. A reviewer pastes a PR reference +
- * document id (`CollabOpenPanel`), the document renders with its identity attributes
- * (`CollabDocumentView`), and the real `CommentPanel` runs beside it: read, create,
- * reply, resolve. Authoring and publish are the author's surface, not this one.
+ * document id (`CollabOpenPanel`), the Markdown on the Pull Request branch renders
+ * through the shared `MarkdownSurface` (R-7.3), and the real `CommentPanel` runs beside
+ * it: read, create, reply. Authoring and publish are the author's surface, not this one.
  *
  * WHY THIS IS ITS OWN TOP-LEVEL ROUTE, NOT A `TreeEntry`. App.tsx's `selected` is a
  * `TreeEntry` enumerated by `ui/use-tree.ts` from the local file tree; a collaboration
@@ -12,53 +12,42 @@
  * assumes local-file semantics. So App.tsx swaps its whole shell for this component
  * instead of stretching `selected`/`mode` to cover a second kind of thing.
  *
- * WHY THE DOCUMENT IS `CollabDocumentView` AND NOT AN EDITOR. `CommentPanel`'s
- * "show in document" resolves a comment's `nodeId` to a DOM element through
- * `[data-vs-node-id]`, and `CollabDocumentView` is what stamps that attribute.
- * Luthor's editor keeps `nodeId` in Lexical `NodeState`, never in the DOM, so
- * rendering the reviewer's copy through the editor would silently break locate.
- * The reviewer does not edit, so read-only rendering is also the honest surface.
+ * WHY THE REVIEW SURFACE IS THE MARKDOWN SURFACE (R-7.3 / R-6.6). It stamps every
+ * rendered block with `data-vs-loc`, which is the position a review comment is anchored
+ * by (R-0.3), so the shared resolver locates a collaborative comment exactly as it
+ * locates a local one. Rendering it any other way would need a second resolver, and the
+ * two would disagree the first time a block moved.
  *
  * An earlier revision hand-rolled a read-only comment list here, on the reasoning that
  * `CommentPanel` calls `useInspector()` and would drag in comment creation. Creation is
  * now wanted, and `InspectorProvider` turns out to be document-agnostic — it needs only
  * a `surfaceId` — so the real panel is mounted and the parallel list is gone.
  *
- * Named `collab-app.tsx` so `core/collaboration/import-boundary.test.ts` (R-2.13)
- * covers it: nothing here may reach `markdownToInjectable` / `canonicalizeMarkdown` /
- * `markdownToJSON`, and nothing here does — it only renders the canonical JSON
- * `CollabDocumentView` already walks.
  */
 import { useCallback, useMemo, useRef, useState } from 'react';
-import { InspectOverlay, InspectorProvider, type SourceLoc } from '../core/app';
+import { InspectOverlay, InspectorProvider } from '../core/app';
 import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 // From the pure module, not `failure-states`: that one reaches `cache-lifecycle` and
 // `node:fs/promises`, which the browser bundle cannot resolve.
 import { deriveReadiness, type ReadinessVerdict } from '../core/collaboration/readiness';
 import { buildApplyPrompt } from '../core/editing/apply-prompt';
-import { localDocumentPath } from '../core/collaboration/node-location';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { collabCommentPanelSource, collabIndicatorTargets } from './collab-comment-source';
-import { CollabDocumentView, VS_NODE_ID_ATTR } from './collab-document-view';
 import { CollabEditor, type CollabEditorHandle } from './collab-editor';
 import { CollabOpenPanel } from './collab-open-panel';
 import { ActiveCommentProvider } from './active-comment';
 import { CommentPanel, type CommentPanelSource } from './comment-panel';
 import { IndicatorLayer } from './indicator-layer';
-import type { PublishLoss, PublishPayload } from './publish-payload';
+import { MarkdownSurface } from './markdown-surface';
 import { useCollabDocument } from './use-collab-document';
 
 /**
  * WHY THE TWO MODES ARE A TOGGLE AND NOT ONE SURFACE.
  *
- * `CommentPanel` anchors on `[data-vs-node-id]`, which `CollabDocumentView` stamps onto
- * the rendered DOM. A live Lexical tree does not carry those attributes, so mounting the
- * editor and the comment panel side by side would present a panel whose every anchor
- * silently fails to locate. Rather than ship a half-working anchor, the author edits in
- * one mode and works comments in the other — the same document, two views of it.
- *
- * Closing this properly means teaching the editor to stamp node ids onto its rendered
- * DOM, which is a real piece of work in Luthor's reconciler and is not this task.
+ * Comments are anchored to rendered blocks by `data-vs-loc`, and the source editor shows
+ * Markdown text rather than rendered blocks — so a panel mounted beside it would have
+ * nothing to point at. The author edits in one mode and works comments in the other: the
+ * same document, two views of it.
  */
 type PaneMode = 'review' | 'edit';
 
@@ -116,13 +105,15 @@ export function CollabApp({ onExit }: { onExit: () => void }) {
 function CollabDocumentPane({ documentId }: { documentId: string }) {
   const { document, fullDocument, comments, loading, error, addComment, replyToComment, reload, publish } =
     useCollabDocument(documentId);
-  // `locate` scopes its query to the rendered document rather than the whole page.
+  // The rendered document, for layout only: anchor resolution finds the markdown surface
+  // by `[data-inspector-root]`, which is inside this element and stable across renders —
+  // whereas `docRoot.current` is null on the first one.
   const docRoot = useRef<HTMLDivElement | null>(null);
   const [mode, setMode] = useState<PaneMode>('review');
   const editor = useRef<CollabEditorHandle | null>(null);
   const [dirty, setDirty] = useState(false);
   /** Non-null while a publish is staged and awaiting the author's confirmation. */
-  const [staged, setStaged] = useState<StagedPublish | null>(null);
+  const [staged, setStaged] = useState<string | null>(null);
   const [publishing, setPublishing] = useState(false);
   const [publishError, setPublishError] = useState<string | null>(null);
 
@@ -141,15 +132,14 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
     setPublishError(null);
     const handle = editor.current;
     if (!handle) return;
-    const payload = handle.publish();
-    setStaged({ json: payload.json, markdown: payload.markdown, losses: payload.losses });
+    setStaged(handle.publish().markdown);
   }, []);
 
   const confirmPublish = useCallback(async () => {
-    if (!staged) return;
+    if (staged === null) return;
     setPublishing(true);
     setPublishError(null);
-    const result = await publish({ json: staged.json, markdown: staged.markdown });
+    const result = await publish({ markdown: staged });
     setPublishing(false);
     if (!result.ok) {
       // R-11.4 — the server's own words.
@@ -174,13 +164,12 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
    * way the local surface's "Copy prompt" already works. No route, no process, no
    * activity stream — those are worth building once the prompt is known to be good.
    *
-   * THE PATH IS THE STORE'S CONVENTION, NOT `documentPath`. `fsDocumentStore` always
-   * writes `<contentDir>/documents/<id>.json`, and the agent runs with that directory as
-   * its cwd. `documentPath` is the path on the BRANCH, which is the same string today
-   * only because the create form happens to build it that way — a document created
-   * through the API with any other path would send the agent looking for a file that is
-   * not there. The prompt already forbids editing the generated Markdown; pointing it at
-   * the wrong JSON would be the same class of mistake, and silent.
+   * THE PATH IS `documentPath`, and under Markdown-canonical that is the only path there
+   * is. `fsCollaborationStore` writes the document at `<contentDir>/<documentPath>` and
+   * the agent runs with that directory as its cwd, so the file it opens is the file under
+   * review — the same bytes the branch holds. `core/bundle-guard.test.ts` asserts the two
+   * directories are one variable in each host, because a drift there sends the agent to a
+   * file that is not there — or worse, to one that is.
    */
   const copyHandoff = useCallback(async () => {
     /*
@@ -189,15 +178,16 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
      * still reads `open` here, because nothing local has acted on it yet. That is the same
      * predicate the panel lists on, so the two surfaces cannot disagree about what counts.
      */
+    if (!fullDocument) return;
     const open = comments.filter((c) => c.status === 'open');
-    const prompt = buildApplyPrompt(open, { mode: 'collab', documentPath: localDocumentPath(documentId) });
+    const prompt = buildApplyPrompt(open, { mode: 'collab', documentPath: fullDocument.documentPath });
     try {
       await navigator.clipboard.writeText(prompt);
       setHandoff(`Copied — ${open.length} open comment${open.length === 1 ? '' : 's'}. Run it where the specs directory is.`);
     } catch (err) {
       setHandoff((err as Error).message);
     }
-  }, [comments, documentId]);
+  }, [comments, fullDocument]);
 
   const source = useMemo<CommentPanelSource | null>(
     () =>
@@ -207,7 +197,6 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
             comments,
             add: addComment,
             reply: replyToComment,
-            root: docRoot.current,
           })
         : null,
     [fullDocument, comments, addComment, replyToComment],
@@ -302,7 +291,7 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
             * thread from the browser. Review mode only — in edit mode the blocks belong to
             * Lexical and a click is a caret move, not a selection.
             */}
-          {mode === 'review' && <InspectOverlay rootSelector={COLLAB_ROOT_SELECTOR} resolveAnchor={collabAnchorOf} />}
+          {mode === 'review' && <InspectOverlay />}
           {/*
             * R-6.2 — the markers that show which blocks carry a comment. `collabIndicatorTargets`
             * was built and tested against a real `IndicatorLayer`, but only `markdown-editor.tsx`
@@ -319,7 +308,7 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
           {mode === 'review' && <IndicatorLayer targets={collabIndicatorTargets(fullDocument, comments)} />}
           <div ref={docRoot} style={{ maxWidth: 1200, margin: '0 auto', padding: '32px 56px 120px' }}>
             {mode === 'review' ? (
-              <CollabDocumentView document={fullDocument} />
+              <MarkdownSurface source={fullDocument.markdown} />
             ) : (
               <CollabEditor
                 document={fullDocument}
@@ -334,21 +323,12 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
         {mode === 'review' && <CommentPanel width={340} source={source} />}
       </div>
       </ActiveCommentProvider>
-      {staged && (
-        <PublishConfirm
-          losses={staged.losses}
-          busy={publishing}
-          error={publishError}
-          onCancel={() => setStaged(null)}
-          onConfirm={confirmPublish}
-        />
+      {staged !== null && (
+        <PublishConfirm busy={publishing} error={publishError} onCancel={() => setStaged(null)} onConfirm={confirmPublish} />
       )}
     </InspectorProvider>
   );
 }
-
-/** The payload held between staging a publish and the author confirming it. */
-type StagedPublish = Pick<PublishPayload, 'json' | 'markdown' | 'losses'>;
 
 /**
  * The comment route answers projected review threads, but `CollabClient` types them as the
@@ -363,28 +343,6 @@ function isThread(comment: CommentRecord): comment is ReviewThreadRecord {
   return typeof (comment as Partial<ReviewThreadRecord>).github?.reviewCommentId === 'number';
 }
 
-/** The element `CollabDocumentView` wraps every rendered block in. */
-const COLLAB_ROOT_SELECTOR = '[data-vs-collab-root]';
-
-/**
- * A collaboration block's anchor, for the overlay's hit-testing.
- *
- * The default resolver wants `data-vs-loc` or a React fiber `_debugSource`. This document
- * has neither and deliberately so — its blocks are identified by `data-vs-node-id`, and
- * the canonical JSON carries no source positions to stamp a line from (see the comment
- * over `identityAttrs` in `collab-document-view.tsx`). `line`/`column` are what the panel
- * prints beside a selection, so they are reported as 0 rather than invented: the panel's
- * collaboration source describes a selection by its block, never by a line number.
- *
- * Returning null for anything outside an identified block is the point. Images and embeds
- * lose their `nodeId` on serialization and are stamped `data-vs-uncommentable`; refusing
- * to anchor there is what keeps a comment from pointing at the wrong paragraph later.
- */
-function collabAnchorOf(el: HTMLElement | null): SourceLoc | null {
-  const block = el?.closest(`[${VS_NODE_ID_ATTR}]`) as HTMLElement | null;
-  return block ? { line: 0, column: 0, anchor: block } : null;
-}
-
 /** Names the blocking reason rather than leaving a disabled control unexplained. */
 function publishBlockedReason(dirty: boolean, readiness: ReadinessVerdict): string | undefined {
   // R-8.25 — including "resolution unknown", which must never read as "unresolved".
@@ -394,18 +352,20 @@ function publishBlockedReason(dirty: boolean, readiness: ReadinessVerdict): stri
 }
 
 /**
- * R-2.10 — publishing is lossy by construction for node types Markdown cannot express.
- * `generatePublishPayload` already computes exactly what will be lost; this is the surface
- * that tells the author before the commit rather than after it.
+ * The confirmation before an irreversible-ish remote write.
+ *
+ * There is deliberately no "these things cannot be expressed in Markdown" list. That
+ * panel existed because publish *derived* Markdown from a canonical JSON document and
+ * some node types did not survive the trip. Markdown is now the document (R-0.1): the
+ * bytes committed are the bytes the author edited, so there is no derivation and nothing
+ * to lose in it. A loss list here would be reporting a step that no longer happens.
  */
 function PublishConfirm({
-  losses,
   busy,
   error,
   onCancel,
   onConfirm,
 }: {
-  losses: readonly PublishLoss[];
   busy: boolean;
   error: string | null;
   onCancel: () => void;
@@ -415,24 +375,7 @@ function PublishConfirm({
     <div role="dialog" aria-label="Confirm publish" style={dialogScrim}>
       <div style={dialogCard}>
         <strong>Publish to the branch?</strong>
-        {losses.length === 0 ? (
-          <p style={dialogBody}>The Markdown carries everything in this document.</p>
-        ) : (
-          <>
-            <p style={dialogBody}>
-              {losses.length} {losses.length === 1 ? 'thing' : 'things'} cannot be expressed in Markdown and will not
-              survive the round trip. The canonical JSON keeps {losses.length === 1 ? 'it' : 'them'}.
-            </p>
-            <ul style={dialogList}>
-              {losses.map((loss, i) => (
-                <li key={`${loss.source}:${loss.subject}:${loss.nodeId ?? i}`}>
-                  <code>{loss.subject}</code> ({loss.source}) —{' '}
-                  {loss.visibility === 'placeholder' ? `replaced by ${loss.fallback ?? 'a placeholder'}` : 'dropped'}
-                </li>
-              ))}
-            </ul>
-          </>
-        )}
+        <p style={dialogBody}>The Markdown you edited is committed to the pull request branch, byte for byte.</p>
         {error && <p style={dialogError}>{error}</p>}
         <div style={dialogActions}>
           <button type="button" onClick={onCancel} disabled={busy} style={backBtn}>
@@ -508,7 +451,6 @@ const dialogCard: React.CSSProperties = {
 };
 
 const dialogBody: React.CSSProperties = { fontSize: 13, lineHeight: 1.5 };
-const dialogList: React.CSSProperties = { fontSize: 12, lineHeight: 1.6, paddingLeft: 20 };
 const dialogError: React.CSSProperties = { fontSize: 12, color: '#b91c1c' };
 const dialogActions: React.CSSProperties = { display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 };
 

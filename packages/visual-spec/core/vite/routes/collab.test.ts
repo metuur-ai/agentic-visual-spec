@@ -19,9 +19,9 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import type { CollaborationDocument } from '../../collaboration/document-protocol';
+import type { CollaborationRecord } from '../../collaboration/document-record';
 import type { CollaborationPreflight } from '../../collaboration/credentials';
-import type { DocumentStore } from '../../collaboration/document-store';
+import type { CollaborationStore } from '../../collaboration/record-store';
 import { GitHubError, type CreateReviewCommentInput, type GitHubAdapter } from '../../collaboration/github-adapter';
 import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { JobEvent, JobSync, SseSink } from '../../collaboration/job-hub';
@@ -56,20 +56,18 @@ const OK_PREFLIGHT: CollaborationPreflight = {
   repo: { ...REPO },
 };
 
-function document(overrides: Partial<CollaborationDocument> = {}): CollaborationDocument {
+function document(overrides: Partial<CollaborationRecord> = {}): CollaborationRecord {
   return {
     documentId: 'doc-1',
     documentPath: 'docs/spec.md',
     title: 'Spec',
-    frontmatter: {},
-    nodes: [],
-    doc: { root: {} },
+    markdown: '# Onboarding guide\n\nhello\n',
     github: { owner: 'acme', repo: 'specs', branch: 'vs/doc-1', pullNumber: 7, resolved: false },
     ...overrides,
   };
 }
 
-function memoryDocuments(docs: CollaborationDocument[] = []): DocumentStore {
+function memoryDocuments(docs: CollaborationRecord[] = []): CollaborationStore {
   const map = new Map(docs.map((d) => [d.documentId, d]));
   return {
     async read(id) {
@@ -80,9 +78,6 @@ function memoryDocuments(docs: CollaborationDocument[] = []): DocumentStore {
     },
     async list() {
       return [...map.keys()].sort();
-    },
-    async resolveNode() {
-      return { found: false };
     },
   };
 }
@@ -165,6 +160,8 @@ function reviewAdapter(
   options: {
     list?: ReviewComment[];
     resolution?: ThreadResolution[] | Error;
+    /** `"<ref>:<path>" -> content`, for the R-6.7 snippet capture. */
+    blobs?: Record<string, string>;
     createFails?: (Error | null)[];
     replyFails?: (Error | null)[];
   } = {},
@@ -210,6 +207,17 @@ function reviewAdapter(
     async listThreadResolution() {
       if (options.resolution instanceof Error) throw options.resolution;
       return options.resolution ?? [];
+    },
+    /*
+     * R-6.7 — the read path captures the text an outdated thread was written about, from
+     * the blob at its `original_commit_id`. `null` is the "could not read it" answer, and
+     * R-6.9 says that costs the comment its snippet and nothing else: it still projects,
+     * still renders, and lands document-level. `options.blobs` supplies one where a test
+     * wants the capture to succeed.
+     */
+    async getFile(_repo: unknown, path: string, ref: string) {
+      const content = options.blobs?.[`${ref}:${path}`];
+      return content === undefined ? null : { content, sha: 'b'.repeat(40), path };
     },
   } as unknown as GitHubAdapter;
 
@@ -461,7 +469,7 @@ describe('R-7.1 — POST /start', () => {
 
     const res = await call(r, 'POST', '/start', {
       documentId: 'doc-new',
-      documentPath: 'documents/doc-new.json',
+      documentPath: 'documents/doc-new.md',
       title: 'Payment rules',
     });
     expect(res.status).toBe(200);
@@ -469,14 +477,11 @@ describe('R-7.1 — POST /start', () => {
     const seeded = await store.read('doc-new');
     expect(seeded).toMatchObject({
       documentId: 'doc-new',
-      documentPath: 'documents/doc-new.json',
+      documentPath: 'documents/doc-new.md',
       title: 'Payment rules',
-      nodes: [],
+      // R-0.1 — an empty document is empty bytes, not an envelope around nothing.
+      markdown: '',
     });
-    // Not `{ root: {} }` — that root has no `type` and `injectJSON` throws on it, which
-    // would strand the author in an editor that never loaded.
-    expect((seeded?.doc.root as { type?: string }).type).toBe('root');
-    expect((seeded?.doc.root as { children?: unknown[] }).children).toHaveLength(1);
   });
 
   it('leaves an existing document alone, so a retried start cannot blank it', async () => {
@@ -484,7 +489,7 @@ describe('R-7.1 — POST /start', () => {
     const store = memoryDocuments([existing]);
     const r = router({ documents: () => store, bodies: { create: () => async () => {} } });
 
-    await call(r, 'POST', '/start', { documentId: 'doc-1', documentPath: 'documents/doc-1.json', title: 'Blank' });
+    await call(r, 'POST', '/start', { documentId: 'doc-1', documentPath: 'documents/doc-1.md', title: 'Blank' });
 
     expect(await store.read('doc-1')).toBe(existing);
   });
@@ -875,20 +880,16 @@ describe('R-7.1 / R-7.5 — comment routes', () => {
 /* ================================================================== *
  * R-7.3 / R-7.4 / R-5.7 / R-6.5 — the two read routes the UI mounts on
  * ================================================================== */
-describe('GET /:id/document — the whole CollaborationDocument (R-7.3 / R-7.4)', () => {
-  it('serves the full document, not the `GET /:id` summary', async () => {
-    const node = { id: 'n-1', type: 'paragraph', version: 3, content: 'a claim' };
-    const doc = document({ frontmatter: { status: 'draft' }, nodes: [node] });
+describe('GET /:id/document — the whole CollaborationRecord (R-7.3 / R-7.4)', () => {
+  it('serves the whole record, not the `GET /:id` summary', async () => {
+    const doc = document({ markdown: '# A claim\n\nand its evidence.\n' });
     const r = router({ documents: () => memoryDocuments([doc]) });
     const res = await call(r, 'GET', '/doc-1/document');
     expect(res.status).toBe(200);
     expect(res.json).toEqual(doc);
-    // The four fields `GET /:id` projects are not the whole story — these are the ones
-    // it drops, and the reason this route exists.
-    const body = res.json as CollaborationDocument;
-    expect(body.doc).toEqual({ root: {} });
-    expect(body.nodes).toEqual([node]);
-    expect(body.frontmatter).toEqual({ status: 'draft' });
+    // The field `GET /:id` drops is the one this route exists for: the Markdown the
+    // review surface renders (R-7.3) and the anchor resolver locates blocks in.
+    expect((res.json as CollaborationRecord).markdown).toBe('# A claim\n\nand its evidence.\n');
   });
 
   it('leaves `GET /:id` a summary — the SSE `sync` frame body must not grow', async () => {
@@ -985,6 +986,28 @@ describe('GET /:id/comments — the conversation (R-5.7 / R-5.12 / R-5.20)', () 
     expect(threads[0]!.github.isOutdated).toBe(true);
     // `original_line` is a line in a different commit and is never used as a position.
     expect(threads[0]!.target).toEqual({ path: 'docs/spec.md', kind: 'file' });
+  });
+
+  /*
+   * R-6.3 / R-6.7 — the route hands the document's own Markdown to the read path, which is
+   * the only reason an outdated comment can find its text again. Without it the snippet
+   * has nothing to be searched in and every outdated thread stays document-level.
+   */
+  it('re-anchors an outdated thread whose captured snippet occurs exactly once (R-6.3)', async () => {
+    const doc = document({ markdown: '# Spec\n\nthe original sentence\n' });
+    const outdated = reviewComment({ id: 900006, line: null, originalLine: 3, originalCommitId: 'a'.repeat(40) });
+    const r = router({
+      documents: () => memoryDocuments([doc]),
+      adapter: () =>
+        reviewAdapter({
+          list: [outdated],
+          blobs: { [`${'a'.repeat(40)}:docs/spec.md`]: '# Spec\n\nthe original sentence\n' },
+        }).adapter,
+    });
+    const threads = (await call(r, 'GET', '/doc-1/comments')).json as ReviewThreadRecord[];
+    // Anchored at the match — and still reported outdated (R-6.10).
+    expect(threads[0]!.target).toMatchObject({ path: 'docs/spec.md', kind: 'range', startLine: 3 });
+    expect(threads[0]!.github.isOutdated).toBe(true);
   });
 
   it('answers an empty list, not a 404, when nothing has been said yet', async () => {

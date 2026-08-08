@@ -51,11 +51,17 @@ describe('Node-reachable import graph (R-12.6, R-3.3)', () => {
 });
 
 /*
- * The prompt that hands review comments to an agent names the document as a path relative
- * to the store's base directory (`localDocumentPath`), and the agent is spawned with the
- * apply hub's `cwd`. Those are two different expressions in two different hosts, and they
- * only agree because each host derives both from one variable. Let them drift and the
- * agent opens a file that is not there — or worse, one that is.
+ * The prompt that hands review comments to an agent names the document by its own
+ * `documentPath`, and the agent is spawned with the apply hub's `cwd`. `documentPath` is
+ * only resolvable from there because `fsCollaborationStore` writes the Markdown at
+ * `<baseDir>/<documentPath>` — so the two directories have to be the same one. They are
+ * two different expressions in two different hosts, and they only agree because each host
+ * derives both from one variable. Let them drift and the agent opens a file that is not
+ * there — or worse, one that is.
+ *
+ * The store this reads used to be `fsDocumentStore`, which held the document as JSON at a
+ * path of its own choosing; the invariant did not change with the format, only the name
+ * of the thing that establishes the root.
  */
 describe('the agent runs where the documents are', () => {
   const HOSTS = ['src/server.ts', 'core/vite/md-plugin.ts'];
@@ -63,7 +69,7 @@ describe('the agent runs where the documents are', () => {
   it.each(HOSTS)('%s spawns apply in the same directory it stores documents in', (host) => {
     const source = readFileSync(resolve(pkgRoot, host), 'utf8');
     const cwd = /createApplyHub\(\(\) => \(\{ cwd: (\w+)/.exec(source)?.[1];
-    const base = /fsDocumentStore\((\w+)\)/.exec(source)?.[1];
+    const base = /fsCollaborationStore\((\w+)\)/.exec(source)?.[1];
     expect(cwd).toBeDefined();
     expect(base).toBeDefined();
     expect(cwd).toBe(base);

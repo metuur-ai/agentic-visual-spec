@@ -8,11 +8,11 @@
  * ---------------------------------------------------------------------------
  * WHY THIS IS THE FEATURE, NOT A CONVENIENCE
  * ---------------------------------------------------------------------------
- * The branch artifact is canonical JSON (LLD "Luthor JsonDocument as canonical"), so a
- * reviewer who opens the Pull Request on github.com sees a payload, not prose. This is
- * the only path from a PR reference to a rendered document, and it must work for someone
- * who has never had a local copy of the document (R-11.2) and whose credential can only
- * read (R-11.3).
+ * A reviewer handed a PR link has no local copy of the document, and this is the only
+ * path from that reference to a rendered one. It must work for someone who has never
+ * had the file (R-11.2) and whose credential can only read (R-11.3). The Markdown is
+ * fetched off the branch and written to the local content directory, which is what makes
+ * it renderable — and what the apply agent later edits.
  *
  * ---------------------------------------------------------------------------
  * ONE FORMAT, WRITTEN BY 8.2 AND READ BACK HERE (R-11.1)
@@ -61,12 +61,10 @@
  */
 import type { ResolvedCollaborationConfig, VisualSpecConfig } from '../config';
 import { parseCommentBody } from './comment-projection';
-import type { CollaborationDocument, GitHubBinding } from './document-protocol';
-import { parseCollaborationDocument } from './document-protocol';
-import type { DocumentStore } from './document-store';
+import { type GitHubBinding, titleFromMarkdown } from './document-record';
+import type { CollaborationStore } from './record-store';
 import { GitHubError, type GitHubAdapter, type PullRequestDetail, type RepoRef } from './github-adapter';
 import type { JobBody } from './job-hub';
-import type { BoundCollaborationDocument } from './lifecycle';
 import { documentContentSha } from './lifecycle';
 
 /** Why an open failed. Each maps to one message; none of them is "something went wrong". */
@@ -267,7 +265,7 @@ export type OpenBodyInput = {
   documentId: string;
   /** R-9.4 — owner / repo / base branch. */
   repo: ResolvedCollaborationConfig;
-  store: DocumentStore;
+  store: CollaborationStore;
   pullNumber: number;
   /**
    * R-11.8 — take the branch version even though the local copy holds unpublished work.
@@ -316,7 +314,7 @@ export function createOpenBody(options: OpenBodyOptions): (input: OpenBodyInput)
 
     // Refuse to re-point a document that is already attached elsewhere; refresh anything
     // else. See the header.
-    const local = (await store.read(documentId)) as BoundCollaborationDocument | null;
+    const local = await store.read(documentId);
     const attachedTo = local?.github?.pullNumber;
     if (typeof attachedTo === 'number' && attachedTo !== pullNumber) {
       throw new OpenDocumentError(
@@ -371,7 +369,8 @@ export function createOpenBody(options: OpenBodyOptions): (input: OpenBodyInput)
       );
     }
 
-    const fetched = parseCollaborationDocument(file.content);
+    // R-0.1 — the branch artifact is the Markdown. Nothing is parsed on the way in.
+    const markdown = file.content;
     const github: GitHubBinding = {
       owner: reference.owner,
       repo: reference.repo,
@@ -383,8 +382,13 @@ export function createOpenBody(options: OpenBodyOptions): (input: OpenBodyInput)
     // The local write is what makes the document readable with no prior copy: the store
     // the routes read (`GET /__vs/collab/:id`) is the store written here.
     // R-11.6 — what was just fetched IS the branch, so this is a point of agreement.
-    const opened = { ...fetched, documentId } as CollaborationDocument;
-    await store.write({ ...opened, github: { ...github, contentSha: documentContentSha(opened) } });
+    await store.write({
+      documentId,
+      documentPath: reference.documentPath,
+      title: titleFromMarkdown(markdown, local?.title || reference.documentId),
+      markdown,
+      github: { ...github, contentSha: documentContentSha({ markdown }) },
+    });
 
     ctx.log(`opened ${documentId} from ${where} at ${reference.branch} — ${pr.htmlUrl}`);
     ctx.setState('pr-open');

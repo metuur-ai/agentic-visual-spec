@@ -21,8 +21,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { type ReviewThreadRecord, groupIntoThreads, projectReviewThread } from './review-comments';
-import type { CollaborationDocument } from './document-protocol';
-import type { DocumentStore } from './document-store';
+import type { CollaborationRecord } from './document-record';
+import type { CollaborationStore } from './record-store';
 import {
   BaseDivergedError,
   FAILURE_STATES,
@@ -40,7 +40,7 @@ import {
 import { createGitHubAdapter } from './github-adapter';
 import type { GhExecutor, GhResult } from './github-executor';
 import { type JobEvent, type LifecycleState, createJobHubRegistry } from './job-hub';
-import { type BoundCollaborationDocument, createLifecycleBodies } from './lifecycle';
+import { createLifecycleBodies } from './lifecycle';
 import { createPublishBody, gitBlobSha } from './publish';
 
 const repo = { owner: 'acme', repo: 'docs', baseBranch: 'main' };
@@ -284,14 +284,12 @@ function fakeGitHub(options: FakeOptions = {}) {
  * Documents, stores, hubs
  * ------------------------------------------------------------------ */
 
-function makeDoc(github?: BoundCollaborationDocument['github']): BoundCollaborationDocument {
+function makeDoc(github?: CollaborationRecord['github']): CollaborationRecord {
   return {
     documentId: 'doc-1',
     documentPath: DOC_PATH,
     title: 'Onboarding guide',
-    frontmatter: {},
-    nodes: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'hello' }],
-    doc: { root: { children: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'hello' }] } },
+    markdown: '# Onboarding guide\n\nhello\n',
     ...(github ? { github } : {}),
   };
 }
@@ -300,21 +298,18 @@ const BOUND = () => makeDoc({ owner: repo.owner, repo: repo.repo, branch: BRANCH
 /** The durable partial-create signal 8.2 leaves: a branch, and no `pullNumber`. */
 const ORPHANED = () => makeDoc({ owner: repo.owner, repo: repo.repo, branch: BRANCH, resolved: false });
 
-function memoryStore(seed?: CollaborationDocument): DocumentStore {
-  const docs = new Map<string, CollaborationDocument>();
+function memoryStore(seed?: CollaborationRecord): CollaborationStore {
+  const docs = new Map<string, CollaborationRecord>();
   if (seed) docs.set(seed.documentId, seed);
   return {
     async read(id) {
       return docs.get(id) ?? null;
     },
     async write(doc) {
-      docs.set(doc.documentId, JSON.parse(JSON.stringify(doc)) as CollaborationDocument);
+      docs.set(doc.documentId, JSON.parse(JSON.stringify(doc)) as CollaborationRecord);
     },
     async list() {
       return [...docs.keys()].sort();
-    },
-    async resolveNode() {
-      return { found: false };
     },
   };
 }
@@ -659,7 +654,7 @@ describe('orphaned branch cleanup (R-8.18)', () => {
     expect(result).toEqual({ orphaned: true, branch: BRANCH, branchDeleted: true, bindingCleared: true });
     expect(gh.endpoints()).toContain(`DELETE /repos/acme/docs/git/refs/heads/${BRANCH}`);
     expect(gh.branches.has(BRANCH)).toBe(false);
-    expect((await store.read('doc-1')) as BoundCollaborationDocument).not.toHaveProperty('github');
+    expect((await store.read('doc-1')) as CollaborationRecord).not.toHaveProperty('github');
     // The draft itself survives — only the binding went.
     expect((await store.read('doc-1'))?.title).toBe('Onboarding guide');
   });
@@ -985,7 +980,7 @@ type MatrixRow = {
   step: string;
   requirement: string;
   /** Build the rig, run the job, return the hub + the fake GitHub. */
-  run: () => Promise<{ state: LifecycleState; frames: JobEvent[]; gh: ReturnType<typeof fakeGitHub>; store: DocumentStore }>;
+  run: () => Promise<{ state: LifecycleState; frames: JobEvent[]; gh: ReturnType<typeof fakeGitHub>; store: CollaborationStore }>;
   state: LifecycleState;
   /** What `reconcile` derives afterwards — proof the document is not stranded. */
   reconciled: LifecycleState;

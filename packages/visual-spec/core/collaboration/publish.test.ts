@@ -14,12 +14,11 @@
  *   - exactly one path is written, and it is the document's own (LLD §7).
  */
 import { describe, expect, it, vi } from 'vitest';
-import type { CollaborationDocument } from './document-protocol';
-import type { DocumentStore } from './document-store';
+import type { CollaborationRecord } from './document-record';
+import type { CollaborationStore } from './record-store';
 import { createGitHubAdapter } from './github-adapter';
 import type { GhExecutor, GhResult } from './github-executor';
 import { type JobEvent, type LifecycleState, type SseSink, createJobHubRegistry } from './job-hub';
-import type { BoundCollaborationDocument } from './lifecycle';
 import { PublishVerificationError, createPublishBody, gitBlobSha } from './publish';
 
 const repo = { owner: 'acme', repo: 'docs', baseBranch: 'main' };
@@ -84,23 +83,21 @@ function fakeGh(options: FakeOptions = {}): { exec: GhExecutor; calls: Call[]; f
   return { exec, calls, files };
 }
 
-function makeDoc(overrides: Partial<BoundCollaborationDocument> = {}): BoundCollaborationDocument {
+function makeDoc(overrides: Partial<CollaborationRecord> = {}): CollaborationRecord {
   return {
     documentId: 'doc-1',
     // Markdown is the document (LLD §2) — the document's path *is* the published path.
     documentPath: 'documents/doc-1.md',
     title: 'Onboarding guide',
-    frontmatter: {},
-    nodes: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'hello' }],
-    doc: { root: { children: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'hello' }] } },
+    markdown: '# Onboarding guide\n\nhello\n',
     github: { owner: repo.owner, repo: repo.repo, branch: BRANCH, pullNumber: 42, headSha: 'abc123', resolved: false },
     ...overrides,
   };
 }
 
 /** A store that must not be needed when the route already supplied the document. */
-function memoryStore(seed?: CollaborationDocument): DocumentStore & { reads: string[] } {
-  const docs = new Map<string, CollaborationDocument>();
+function memoryStore(seed?: CollaborationRecord): CollaborationStore & { reads: string[] } {
+  const docs = new Map<string, CollaborationRecord>();
   if (seed) docs.set(seed.documentId, seed);
   const reads: string[] = [];
   return {
@@ -114,9 +111,6 @@ function memoryStore(seed?: CollaborationDocument): DocumentStore & { reads: str
     },
     async list() {
       return [...docs.keys()].sort();
-    },
-    async resolveNode() {
-      return { found: false };
     },
   };
 }

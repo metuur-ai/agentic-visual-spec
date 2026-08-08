@@ -28,7 +28,7 @@ export default defineConfig({
   // then ignores every keystroke — no update listener, so `dirty` never flips and
   // Publish stays disabled forever. Two copies is the default here, not a fluke:
   // `@lexical/*` and `@lyfie/luthor-headless` sit in the workspace pnpm store and
-  // resolve `lexical` there, while `ui/node-id-extension.ts` resolves it from this
+  // resolve `lexical` there, while `ui/wysiwyg-editor.tsx` resolves it from this
   // package's own node_modules. Same version, two files, two instances.
   resolve: { dedupe: ['lexical'] },
   build: { outDir: 'dist/ui', emptyOutDir: true },

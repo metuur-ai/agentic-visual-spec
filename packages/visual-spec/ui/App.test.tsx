@@ -3,8 +3,8 @@
  * App.test.tsx — task U-1: the collaboration UI must be *reachable* from the app
  * shell, not merely correct in isolation.
  *
- * Every collaboration module (`collab-open-panel`, `collab-document-view`,
- * `collab-comment-source`, `use-collab-document`) already has its own unit suite
+ * Every collaboration module (`collab-open-panel`, `collab-comment-source`,
+ * `use-collab-document`) already has its own unit suite
  * mounting it directly. None of that proves App.tsx ever renders them — and before
  * this task it did not: `App.tsx` had zero references to `collab`. This suite drives
  * the whole thing through `<App />`, exactly as a browser would load it, and checks
@@ -14,34 +14,26 @@
 import './prism-global'; // must precede @lyfie/luthor
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { CollaborationDocument } from '../core/collaboration/document-protocol';
+import type { CollaborationRecord } from '../core/collaboration/document-record';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { App } from './App';
 
-/** A minimal but real collaboration document — one anchored paragraph, one orphan target. */
-const DOCUMENT: CollaborationDocument = {
+/** A minimal but real collaboration document: line 3 is what the anchored comment names. */
+const DOCUMENT: CollaborationRecord = {
   documentId: 'doc-1',
   documentPath: 'docs/spec.md',
   title: 'The Spec',
-  frontmatter: {},
-  nodes: [{ id: 'n-1', type: 'paragraph', version: 2, content: 'First paragraph.' }],
-  doc: {
-    root: {
-      type: 'root',
-      children: [{ type: 'paragraph', version: 1, $: { nodeId: 'n-1' }, children: [{ type: 'text', text: 'First paragraph.' }] }],
-    },
-  },
+  markdown: '# The Spec\n\nFirst paragraph.\n',
 };
 
 const ANCHORED_COMMENT: CommentRecord = {
   id: 'c-anchored',
   workflow: 'visual-spec',
-  target: { path: 'docs/spec.md', kind: 'file' },
+  // R-0.3 — anchored by path and line, resolved against the rendered `data-vs-loc`.
+  target: { path: 'docs/spec.md', kind: 'range', startLine: 3, heading: 'The Spec' },
   comment: 'needs a citation',
   status: 'open',
   ts: '2026-08-07T00:00:00.000Z',
-  // trailer carries the nodeId the comment resolves against (collab-comment-source.ts)
-  collab: { nodeId: 'n-1' },
   // The projected review thread: unresolved on GitHub, so the row links out to it (R-5.14).
   github: {
     reviewCommentId: 700001,
@@ -57,11 +49,11 @@ const ANCHORED_COMMENT: CommentRecord = {
 const ORPHAN_COMMENT: CommentRecord = {
   id: 'c-orphan',
   workflow: 'visual-spec',
-  target: { path: 'docs/spec.md', kind: 'file' },
+  // R-6.4 — no current line, so it is presented document-level with its captured text.
+  target: { path: 'docs/spec.md', kind: 'file', snippet: 'the paragraph that got deleted' },
   comment: 'this block used to say something else',
   status: 'open',
   ts: '2026-08-07T00:00:00.000Z',
-  collab: { nodeId: 'n-gone', text: 'the paragraph that got deleted' },
 } as CommentRecord;
 
 const AVAILABILITY = { available: true, login: 'reviewer-rita', repo: { owner: 'acme', repo: 'docs' } };
@@ -145,13 +137,11 @@ describe('the collaboration UI is mounted from App.tsx (task U-1)', () => {
     fireEvent.change(screen.getByPlaceholderText('doc-1'), { target: { value: 'doc-1' } });
     fireEvent.click(screen.getByText('Open'));
 
-    // The canonical JSON renders, identity attributes stamped (R-7.3). The text also
-    // appears in the panel as the anchored comment's quoted target, so the document
-    // copy is the one carrying the identity attributes.
-    const rendered = await screen.findAllByText('First paragraph.');
-    const paragraph = rendered.find((el) => el.closest('[data-vs-node-id="n-1"]'));
-    expect(paragraph).toBeTruthy();
-    expect(paragraph!.closest('[data-vs-document-id="doc-1"]')).toBeTruthy();
+    // R-7.3 — the Markdown renders through the shared surface, with every block stamped
+    // `data-vs-loc`, which is the position a review comment is anchored by (R-0.3).
+    const paragraph = await screen.findByText('First paragraph.');
+    expect(paragraph.getAttribute('data-vs-loc')).toBe('3:0');
+    expect(paragraph.closest('[data-inspector-root]')).toBeTruthy();
 
     // Its existing comments are listed — anchored and orphaned alike — and the real
     // panel is mounted, so the reviewer can also write one (U-1 round trip).

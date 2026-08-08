@@ -17,8 +17,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import type { CollaborationPreflight } from '../../collaboration/credentials';
-import type { CollaborationDocument } from '../../collaboration/document-protocol';
-import type { DocumentStore } from '../../collaboration/document-store';
+import type { CollaborationRecord } from '../../collaboration/document-record';
+import type { CollaborationStore } from '../../collaboration/record-store';
 import type { GhExecutor, GhResult } from '../../collaboration/github-executor';
 import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { JobEvent, JobSync, SseSink } from '../../collaboration/job-hub';
@@ -62,19 +62,17 @@ function recorder(responses: Array<Partial<GhResult>>) {
   return { exec, calls, endpoints: () => calls.map((c) => endpointOf(c.args)) };
 }
 
-function makeDoc(overrides: Partial<CollaborationDocument> = {}): CollaborationDocument {
+function makeDoc(overrides: Partial<CollaborationRecord> = {}): CollaborationRecord {
   return {
     documentId: 'doc-1',
     documentPath: 'documents/doc-1.json',
     title: 'Onboarding guide',
-    frontmatter: {},
-    nodes: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'hello' }],
-    doc: { root: { children: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'hello' }] } },
+    markdown: '# Onboarding guide\n\nhello\n',
     ...overrides,
   };
 }
 
-function memoryDocuments(seed: CollaborationDocument[]): DocumentStore {
+function memoryDocuments(seed: CollaborationRecord[]): CollaborationStore {
   const map = new Map(seed.map((d) => [d.documentId, d]));
   return {
     async read(id) {
@@ -85,9 +83,6 @@ function memoryDocuments(seed: CollaborationDocument[]): DocumentStore {
     },
     async list() {
       return [...map.keys()].sort();
-    },
-    async resolveNode() {
-      return { found: false };
     },
   };
 }
@@ -438,7 +433,7 @@ describe('R-9.19 — collaboration unconfigured builds no adapter at all', () =>
  * opt-in with no caller — so backfill and version bumping silently did not run.
  * Both hosts must decorate the store they hand to the collaboration routes.
  */
-describe('both hosts decorate the document store with withNodeIdentity (task 2.2 seam)', () => {
+describe('both hosts hand the collab layer the same undecorated store', () => {
   const hostSource = (rel: string): string => {
     const here = dirname(fileURLToPath(import.meta.url));
     return readFileSync(resolve(here, rel), 'utf8');
@@ -448,13 +443,15 @@ describe('both hosts decorate the document store with withNodeIdentity (task 2.2
     ['src/server.ts', '../../../src/server.ts'],
     ['core/vite/md-plugin.ts', '../md-plugin.ts'],
   ] as const) {
-    it(`${label} wraps fsDocumentStore in withNodeIdentity`, () => {
+    it(`${label} hands the collab layer the store undecorated`, () => {
       const src = hostSource(rel);
-      expect(src).toContain('withNodeIdentity');
-      // Every store handed to the collab layer must be decorated — a bare
-      // fsDocumentStore(...) reaching `documents:` is the regression.
-      expect(src).not.toMatch(/documents:\s*\(\)\s*=>\s*fsDocumentStore\(/);
-      expect(src).toMatch(/documents:\s*\(\)\s*=>\s*withNodeIdentity\(fsDocumentStore\(/);
+      // The decorator this used to require was `withNodeIdentity`, which backfilled and
+      // versioned `nodeId`s on every read. Identity is retired with the JSON format
+      // (Unit 2), so a decorator here would be a layer with nothing to do — and the one
+      // thing it must not become is a place where a second representation of the document
+      // grows back. Both hosts therefore pass `fsCollaborationStore` straight through.
+      expect(src).not.toContain('withNodeIdentity');
+      expect(src).toMatch(/documents:\s*\(\)\s*=>\s*fsCollaborationStore\(/);
     });
   }
 });
@@ -492,7 +489,7 @@ describe('7.2 routes run the 8.3 publish body (integration)', () => {
   }
 
   it('POST /:id/publish commits the payload to the branch and verifies it, with no merge', async () => {
-    const doc: CollaborationDocument & { github: Record<string, unknown> } = {
+    const doc: CollaborationRecord & { github: Record<string, unknown> } = {
       // Markdown is the document (LLD §2): publish writes the document's own path.
       ...makeDoc({ documentPath: 'documents/doc-1.md' }),
       github: { owner: 'acme', repo: 'docs', branch: 'visual-spec/doc-1', pullNumber: 42, resolved: false },

@@ -18,7 +18,7 @@
  * A `JobBody` returns `void`, and the hub snapshot carries only `state` / `job` /
  * `events` — deliberately, since it is a generic runner. So the create job persists
  * the `GitHubBinding` (`owner`, `repo`, `branch`, `pullNumber`, `headSha`) onto the
- * stored document through the 3.1 `DocumentStore`, and `readGitHubBinding()` reads it
+ * stored record through the `CollaborationStore`, and `readGitHubBinding()` reads it
  * back. The store is the right channel because it is the only **durable** one: a
  * client that was not subscribed when the PR opened — or that reconnects after a
  * server restart — still finds the binding, which an in-memory job result could never
@@ -40,10 +40,10 @@
  * ---------------------------------------------------------------------------
  * WHAT SYNC WRITES (R-8.6 / R-8.7)
  * ---------------------------------------------------------------------------
- * Sync writes **nothing** to the collaboration document. It reads PR issue comments
- * through the 5.1 projection and hands them to the `onSync` observer. It never touches
- * `doc`, `nodes`, `frontmatter`, `title` or the `GitHubBinding` — all of which are
- * owned by create (this module) and publish (8.3), and none of which sync fetched. A
+ * Sync writes **nothing** to the collaboration record. It reads PR comments through the
+ * 5.1 projection and hands them to the `onSync` observer. It never touches the Markdown,
+ * the title or the `GitHubBinding` — all of which are owned by create (this module),
+ * open (11.1) and publish (8.3), and none of which sync fetched. A
  * poll that raced an in-flight edit therefore cannot clobber it.
  *
  * The interval poller is owned by this module and driven by an **injected** scheduler,
@@ -59,14 +59,10 @@
 import { createHash } from 'node:crypto';
 import type { ResolvedCollaborationConfig } from '../config';
 import { type ProjectedCommentRecord, formatTrailer, githubCommentStore } from './comment-projection';
-import type { CollaborationDocument, GitHubBinding } from './document-protocol';
-import { resolveDocumentTitle, serializeCollaborationDocument } from './document-protocol';
-import type { DocumentStore } from './document-store';
+import type { CollaborationRecord, GitHubBinding } from './document-record';
+import type { CollaborationStore } from './record-store';
 import type { GitHubAdapter, RepoRef } from './github-adapter';
 import type { JobBody, JobContext, JobHubRegistry, JobRouteResult } from './job-hub';
-
-/** A stored document that has been through `start` at least once. */
-export type BoundCollaborationDocument = CollaborationDocument & { github?: GitHubBinding };
 
 /**
  * R-8.7 — who asked for a sync. The three triggers run **identical** code; this is
@@ -109,25 +105,20 @@ const defaultScheduler: IntervalScheduler = (tick, ms) => {
 /**
  * R-11.6 — the document's content hash: what "local and branch agree" is measured against.
  *
- * The binding is excluded, and that is the whole trick. The branch carries the binding as
- * it was published (`resolved`, `headSha`, `pullNumber`); `open` writes a freshly built
- * one. Their bytes therefore never match even when the prose is identical, so hashing the
- * envelope whole would report divergence on every document, always. What is compared is
- * the part a person or an agent can change.
- *
- * `serializeCollaborationDocument` is a deterministic stringify, so this is a pure
- * function of the content and stable across processes.
+ * With Markdown canonical (R-0.1) the content *is* the bytes, so this hashes them and
+ * nothing else. The binding never enters — the branch carries the binding as it was
+ * published while `open` writes a freshly built one, so including it would report
+ * divergence on every document, always.
  */
-export function documentContentSha(document: CollaborationDocument): string {
-  const { github: _binding, ...content } = document as CollaborationDocument & { github?: unknown };
-  return createHash('sha1').update(serializeCollaborationDocument(content as CollaborationDocument), 'utf8').digest('hex');
+export function documentContentSha(document: Pick<CollaborationRecord, 'markdown'>): string {
+  return createHash('sha1').update(document.markdown, 'utf8').digest('hex');
 }
 
 export type LifecycleOptions = {
   adapter: GitHubAdapter;
 /** R-9.4 — owner / repo / base branch. */
   repo: ResolvedCollaborationConfig;
-  store: DocumentStore;
+  store: CollaborationStore;
   hubs: JobHubRegistry;
   /** Called with every sync result, whatever the trigger. 5.3 plugs the cache in here. */
   onSync?: (result: SyncResult) => void | Promise<void>;
@@ -174,8 +165,8 @@ export function branchNameFor(documentId: string): string {
 }
 
 /** The `GitHubBinding` persisted by `start`, or `null` when there is none yet. */
-export async function readGitHubBinding(store: DocumentStore, documentId: string): Promise<GitHubBinding | null> {
-  const doc = (await store.read(documentId)) as BoundCollaborationDocument | null;
+export async function readGitHubBinding(store: CollaborationStore, documentId: string): Promise<GitHubBinding | null> {
+  const doc = await store.read(documentId);
   return doc?.github ?? null;
 }
 
@@ -205,7 +196,7 @@ export function buildPullRequestBody(input: PullRequestBodyInput): string {
   const { repo, branch, documentId, documentPath, title } = input;
   const command = openCommandFor(repo, branch, documentId);
   const text = [
-    `**${title}** is a visual-spec collaboration document. Review it as a rendered document, not as a JSON diff.`,
+    `**${title}** is a visual-spec collaboration document — the Markdown below is the document itself.`,
     '',
     '| | |',
     '| --- | --- |',
@@ -245,7 +236,7 @@ export type CreateBodyInput = {
   documentId: string;
   /** R-9.4 — owner / repo / base branch, supplied per call rather than per instance. */
   repo: ResolvedCollaborationConfig;
-  store: DocumentStore;
+  store: CollaborationStore;
   /** Defaults to `branchNameFor(documentId)`. */
   branch?: string;
   /** Defaults to the document's resolved title. */
@@ -256,7 +247,7 @@ export type CreateBodyInput = {
 export type SyncBodyInput = {
   documentId: string;
   repo: ResolvedCollaborationConfig;
-  store: DocumentStore;
+  store: CollaborationStore;
   /** R-8.7 — reporting only. Defaults to `user`, which is what the HTTP route is. */
   trigger?: SyncTrigger;
 };
@@ -290,11 +281,11 @@ export function createLifecycleBodies(options: LifecycleBodyOptions): LifecycleJ
     create: (input) => async (ctx) => {
       const { documentId, repo, store } = input;
       const repoRef: RepoRef = { owner: repo.owner, repo: repo.repo };
-      const doc = (await store.read(documentId)) as BoundCollaborationDocument | null;
+      const doc = await store.read(documentId);
       if (!doc) throw new Error(`no collaboration document: ${documentId}`);
 
       const branch = input.branch ?? branchNameFor(documentId);
-      const title = input.title || resolveDocumentTitle(doc) || documentId;
+      const title = input.title || doc.title || documentId;
 
       ctx.log(`resolving ${repo.baseBranch}`, 'progress');
       const base = await adapter.getBranch(repoRef, repo.baseBranch);
@@ -311,7 +302,8 @@ export function createLifecycleBodies(options: LifecycleBodyOptions): LifecycleJ
       ctx.log(`committing ${doc.documentPath}`, 'progress');
       await adapter.commitFile(repoRef, {
         path: doc.documentPath,
-        content: serializeCollaborationDocument(doc),
+        // R-0.1 — the Markdown is the artifact. There is nothing else to commit.
+        content: doc.markdown,
         message: `visual-spec: create ${documentId}`,
         branch,
       });
@@ -345,7 +337,7 @@ export function createLifecycleBodies(options: LifecycleBodyOptions): LifecycleJ
       const { documentId, repo, store } = input;
       const trigger: SyncTrigger = input.trigger ?? 'user';
       const repoRef: RepoRef = { owner: repo.owner, repo: repo.repo };
-      const doc = (await store.read(documentId)) as BoundCollaborationDocument | null;
+      const doc = await store.read(documentId);
       if (!doc) throw new Error(`no collaboration document: ${documentId}`);
       const pullNumber = doc.github?.pullNumber;
       if (typeof pullNumber !== 'number') throw new Error(`no open pull request for ${documentId}`);

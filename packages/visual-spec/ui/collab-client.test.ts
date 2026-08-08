@@ -71,25 +71,21 @@ describe('every wired route, on its success path', () => {
     expect(result.ok && result.value.document?.documentPath).toBe('docs/spec.md');
   });
 
-  it('GET /:id/document returns the whole document, not the summary (R-7.3 / R-7.4)', async () => {
+  it('GET /:id/document returns the whole record, not the summary (R-7.3 / R-7.9)', async () => {
     const doc = {
       documentId: 'doc-1',
       documentPath: 'docs/spec.md',
       title: 'Spec',
-      frontmatter: { status: 'draft' },
-      nodes: [{ id: 'n-1', type: 'paragraph', version: 3, content: 'a claim' }],
-      doc: { root: {} },
+      markdown: '# Spec\n\na claim\n',
       github: { owner: 'acme', repo: 'docs', branch: 'vs/doc-1', pullNumber: 7, resolved: false },
     };
     const { impl, calls } = stubFetch({ json: doc });
     const result = await createCollabClient(impl).document('doc-1');
     expect(calls).toEqual([{ url: '/__vs/collab/doc-1/document', method: 'GET' }]);
     expect(result).toEqual({ ok: true, value: doc });
-    // The three fields `status()` cannot give the caller.
-    expect(result.ok && [result.value.doc, result.value.nodes.length, result.value.frontmatter]).toEqual([
-      { root: {} },
-      1,
-      { status: 'draft' },
+    // The field `status()` cannot give the caller — the Markdown itself.
+    expect(result.ok && [result.value.markdown]).toEqual([
+      '# Spec\n\na claim\n',
     ]);
   });
 
@@ -116,14 +112,13 @@ describe('every wired route, on its success path', () => {
     expect(calls[0]?.body).toEqual({});
   });
 
-  it('POST /:id/publish sends both json and markdown, which R-8.9 validates first', async () => {
+  it('POST /:id/publish sends the markdown, which is the whole payload (R-8.9)', async () => {
     const { impl, calls } = stubFetch({ json: { ...ACCEPTED, kind: 'publish' } });
-    const json = { root: { children: [] } } as never;
-    await createCollabClient(impl).publish('doc-1', { json, markdown: '# Spec\n' });
+    await createCollabClient(impl).publish('doc-1', { markdown: '# Spec\n' });
     expect(calls[0]).toEqual({
       url: '/__vs/collab/doc-1/publish',
       method: 'POST',
-      body: { json: { root: { children: [] } }, markdown: '# Spec\n' },
+      body: { markdown: '# Spec\n' },
     });
   });
 
@@ -219,7 +214,7 @@ describe('the failures that are ordinary states of a working system', () => {
   it('503 hands back the whole availability snapshot, not a flattened message (R-7.8)', async () => {
     const off = { available: false, reason: 'not_configured', message: 'collaboration is not configured' };
     const { impl } = stubFetch({ status: 503, json: off });
-    const result = await createCollabClient(impl).publish('doc-1', { json: {} as never, markdown: '' });
+    const result = await createCollabClient(impl).publish('doc-1', { markdown: '' });
     expect(result).toEqual({
       ok: false,
       kind: 'unavailable',
@@ -231,7 +226,7 @@ describe('the failures that are ordinary states of a working system', () => {
 
   it('403 from the authorizer is a forbidden result carrying the verdict text', async () => {
     const { impl } = stubFetch({ status: 403, json: { error: 'reviewer-rita may not publish doc-1' } });
-    const result = await createCollabClient(impl).publish('doc-1', { json: {} as never, markdown: '# x' });
+    const result = await createCollabClient(impl).publish('doc-1', { markdown: '# x' });
     expect(result).toEqual({ ok: false, kind: 'forbidden', status: 403, message: 'reviewer-rita may not publish doc-1' });
   });
 
@@ -244,7 +239,7 @@ describe('the failures that are ordinary states of a working system', () => {
 
   it('400 from the route layer’s own validation is a bad request', async () => {
     const { impl } = stubFetch({ status: 400, json: { error: 'missing markdown' } });
-    const result = await createCollabClient(impl).publish('doc-1', { json: {} as never, markdown: '' });
+    const result = await createCollabClient(impl).publish('doc-1', { markdown: '' });
     expect(!result.ok && result.kind).toBe('bad-request');
   });
 

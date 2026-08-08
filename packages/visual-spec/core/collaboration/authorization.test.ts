@@ -22,8 +22,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { CollaborationPreflight } from './credentials';
-import type { CollaborationDocument } from './document-protocol';
-import type { DocumentStore } from './document-store';
+import type { CollaborationRecord } from './document-record';
+import type { CollaborationStore } from './record-store';
 import { createJobHubRegistry } from './job-hub';
 import type { GhExecutor } from './github-executor';
 import { createGitHubAdapter } from './github-adapter';
@@ -87,19 +87,17 @@ const asAuthor = () =>
  * Router harness
  * ------------------------------------------------------------------ */
 
-function document(): CollaborationDocument {
+function document(): CollaborationRecord {
   return {
     documentId: 'doc-1',
     documentPath: 'docs/spec.md',
     title: 'Spec',
-    frontmatter: {},
-    nodes: [],
-    doc: { root: {} },
+    markdown: '# Onboarding guide\n\nhello\n',
     github: { owner: 'acme', repo: 'specs', branch: 'vs/doc-1', pullNumber: 7, resolved: false },
   };
 }
 
-function memoryDocuments(docs: CollaborationDocument[]): DocumentStore {
+function memoryDocuments(docs: CollaborationRecord[]): CollaborationStore {
   const map = new Map(docs.map((d) => [d.documentId, d]));
   return {
     async read(id) {
@@ -110,9 +108,6 @@ function memoryDocuments(docs: CollaborationDocument[]): DocumentStore {
     },
     async list() {
       return [...map.keys()].sort();
-    },
-    async resolveNode() {
-      return { found: false };
     },
   };
 }
@@ -441,16 +436,13 @@ describe('an undeterminable role fails closed', () => {
   }
 
   it('a document store that throws is undeterminable, not permitted', async () => {
-    const broken: DocumentStore = {
+    const broken: CollaborationStore = {
       async read() {
         throw new Error('disk gone');
       },
       async write() {},
       async list() {
         return [];
-      },
-      async resolveNode() {
-        return { found: false };
       },
     };
     const verdict = await createCollabAuthorizer({ exec: asAuthor().exec, documents: () => broken })('publish', {

@@ -25,9 +25,9 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import type { CollaborationDocument } from '../../collaboration/document-protocol';
+import type { CollaborationRecord } from '../../collaboration/document-record';
 import type { CollaborationPreflight } from '../../collaboration/credentials';
-import type { DocumentStore } from '../../collaboration/document-store';
+import type { CollaborationStore } from '../../collaboration/record-store';
 import { GitHubError, type CreateReviewCommentInput, type GitHubAdapter } from '../../collaboration/github-adapter';
 import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { ResolvedVisualSpecConfig } from '../../config';
@@ -71,17 +71,15 @@ const LINE_NOT_IN_DIFF = (() => {
   return new GitHubError('createReviewComment', raw.message, Number(raw.status), raw.errors[0]?.code);
 })();
 
-const doc: CollaborationDocument = {
+const doc: CollaborationRecord = {
   documentId: 'doc-1',
   documentPath: 'docs/spec.md',
   title: 'Spec',
-  frontmatter: {},
-  nodes: [],
-  doc: { root: {} },
-  github: { owner: 'acme', repo: 'specs', branch: 'vs/doc-1', pullNumber: 7 },
+  markdown: '# Onboarding guide\n\nhello\n',
+  github: { owner: 'acme', repo: 'specs', branch: 'vs/doc-1', pullNumber: 7, resolved: false },
 };
 
-function documents(): DocumentStore {
+function documents(): CollaborationStore {
   return {
     async read(id) {
       return id === 'doc-1' ? doc : null;
@@ -89,9 +87,6 @@ function documents(): DocumentStore {
     async write() {},
     async list() {
       return ['doc-1'];
-    },
-    async resolveNode() {
-      return { found: false };
     },
   };
 }

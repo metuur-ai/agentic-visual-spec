@@ -56,7 +56,7 @@
  */
 import type { ResolvedCollaborationConfig } from '../config';
 import type { AuthorizationVerdict, CollabAuthorizer, CollabOperation } from '../vite/routes/collab';
-import type { DocumentStore } from './document-store';
+import type { CollaborationStore } from './record-store';
 import { type GhExecutor, defaultExecGh, scrubCredentials } from './github-executor';
 
 /** LLD §9 — the only two roles. There is no hierarchy and no third role. */
@@ -96,10 +96,10 @@ export type CollabAuthorizerOptions = {
   /** Injectable so tests never exec `gh` (R-4.8 / R-12.3). Defaults to the real CLI. */
   exec?: GhExecutor;
   /**
-   * The host's document-store thunk, so a runtime re-root is honoured. Used only to
+   * The host's collaboration-store thunk, so a runtime re-root is honoured. Used only to
    * find the Pull Request an author-only operation applies to.
    */
-  documents: () => DocumentStore;
+  documents: () => CollaborationStore;
   /** How long a repo-permission answer may be reused. Default 60s. */
   permissionTtlMs?: number;
   /** Injectable clock, so the TTL is testable without a timer. */

@@ -5,9 +5,9 @@
  * Node-reachable entrypoint. Nothing guarded this one, and the cost was real — from
  * `3fd0095`, the commit that first mounted the collaboration UI in `App.tsx`, until this
  * file was written, **`npm run build` failed outright**. Mounting the UI made
- * `ui/collab-app.tsx` → `failure-states.ts` → `cache-lifecycle.ts` and
- * `ui/collab-editor.tsx` → `node-identity.ts` → `document-store.ts` reachable, dragging
- * `node:fs/promises` and `node:path` into the browser graph, and Vite failed on
+ * `ui/collab-app.tsx` → `failure-states.ts` → `cache-lifecycle.ts` reachable, and the
+ * collaboration editor reachable the store that holds documents on disk, dragging
+ * `node:fs/promises` and `node:path` into the browser graph; Vite failed on
  * `"rm" is not exported by "__vite-browser-external"`.
  *
  * The whole test suite stayed green throughout, because vitest runs in Node and resolves
@@ -18,7 +18,7 @@
  * and `import type` alike. Type-only edges are erased at compile time and reach no
  * runtime code, so following them here would report modules the bundle never contains —
  * `ui/collab-client.ts` type-imports `job-hub`, and half of `ui/` type-imports
- * `document-protocol`. A guard that cries wolf gets deleted, so this one traverses value
+ * `document-record`. A guard that cries wolf gets deleted, so this one traverses value
  * imports only.
  */
 import { existsSync, readFileSync, statSync } from 'node:fs';
@@ -94,9 +94,10 @@ describe('the browser bundle reaches no node builtin', () => {
    * green suite for so long.
    */
   it('reports offences rather than always passing', () => {
-    // `document-store.ts` is Node-only by design and is *not* reachable by value from the
-    // app. Pointed at it directly, the walker must find the builtins it really imports.
-    const chains = nodeBuiltinChains('core/collaboration/document-store.ts');
+    // `record-store.ts` is Node-only by design and is *not* reachable by value from the
+    // app — `document-record.ts` next door is the half that is. Pointed at the Node-only
+    // one directly, the walker must find the builtins it really imports.
+    const chains = nodeBuiltinChains('core/collaboration/record-store.ts');
     expect(chains.join('\n')).toMatch(/node:fs\/promises/);
   });
 

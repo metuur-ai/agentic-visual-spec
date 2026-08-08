@@ -9,10 +9,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import { resolveConfig } from '../config';
-import type { CollaborationDocument } from './document-protocol';
-import { serializeCollaborationDocument } from './document-protocol';
-import type { DocumentStore } from './document-store';
-import { resolveNodeIn } from './document-store';
+import type { CollaborationRecord } from './document-record';
+import type { CollaborationStore } from './record-store';
 import { createGitHubAdapter } from './github-adapter';
 import type { GhExecutor, GhResult } from './github-executor';
 import { type JobContext, type LifecycleState } from './job-hub';
@@ -48,20 +46,18 @@ function recorder(responses: Array<Partial<GhResult>>) {
   return { exec, calls, endpoints: () => calls.map((c) => endpointOf(c.args)), methods: () => calls.map((c) => methodOf(c.args)) };
 }
 
-function makeDoc(overrides: Partial<CollaborationDocument> = {}): CollaborationDocument {
+function makeDoc(overrides: Partial<CollaborationRecord> = {}): CollaborationRecord {
   return {
     documentId: 'doc-1',
-    documentPath: 'documents/doc-1.json',
+    documentPath: 'documents/doc-1.md',
     title: 'Onboarding guide',
-    frontmatter: {},
-    nodes: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'hello' }],
-    doc: { root: { children: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'hello' }] } },
+    markdown: '# Onboarding guide\n\nhello\n',
     ...overrides,
   };
 }
 
 /** A `GET /pulls/:n` response whose body is what 8.2 actually writes (R-11.1). */
-function pullResponse(doc: CollaborationDocument, overrides: { body?: string; number?: number } = {}): string {
+function pullResponse(doc: CollaborationRecord, overrides: { body?: string; number?: number } = {}): string {
   return JSON.stringify({
     number: overrides.number ?? 42,
     state: 'open',
@@ -80,11 +76,11 @@ function pullResponse(doc: CollaborationDocument, overrides: { body?: string; nu
   });
 }
 
-/** A `GET /contents/:path` response carrying a real serialized collaboration document. */
-function contentsResponse(doc: CollaborationDocument): string {
-  const content = serializeCollaborationDocument(doc);
+/** A `GET /contents/:path` response carrying the document's Markdown (R-0.1). */
+function contentsResponse(doc: CollaborationRecord): string {
+  const content = doc.markdown;
   return JSON.stringify({
-    name: `${doc.documentId}.json`,
+    name: `${doc.documentId}.md`,
     path: doc.documentPath,
     sha: 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678',
     type: 'file',
@@ -94,10 +90,10 @@ function contentsResponse(doc: CollaborationDocument): string {
 }
 
 /** An empty store — the reviewer has never seen this document (R-11.2). */
-function memoryStore(seed?: CollaborationDocument) {
-  const docs = new Map<string, CollaborationDocument>();
+function memoryStore(seed?: CollaborationRecord) {
+  const docs = new Map<string, CollaborationRecord>();
   if (seed) docs.set(seed.documentId, seed);
-  const store: DocumentStore = {
+  const store: CollaborationStore = {
     async read(id) {
       return docs.get(id) ?? null;
     },
@@ -106,10 +102,6 @@ function memoryStore(seed?: CollaborationDocument) {
     },
     async list() {
       return [...docs.keys()].sort();
-    },
-    async resolveNode(id, nodeId) {
-      const doc = docs.get(id);
-      return doc ? resolveNodeIn(doc, nodeId) : { found: false };
     },
   };
   return { store, docs };
@@ -134,14 +126,14 @@ function context(): JobContext & { logs: string[]; states: LifecycleState[] } {
 type RunResult = {
   err: unknown;
   ctx: ReturnType<typeof context>;
-  docs: Map<string, CollaborationDocument>;
+  docs: Map<string, CollaborationRecord>;
   endpoints: () => string[];
   methods: () => string[];
 };
 
 async function run(
   responses: Array<Partial<GhResult>>,
-  options: { seed?: CollaborationDocument; documentId?: string; pullNumber?: number; discardLocal?: boolean } = {},
+  options: { seed?: CollaborationRecord; documentId?: string; pullNumber?: number; discardLocal?: boolean } = {},
 ): Promise<RunResult> {
   const { exec, endpoints, methods } = recorder(responses);
   const { store, docs } = memoryStore(options.seed);
@@ -205,7 +197,7 @@ describe('R-11.1 — the PR body carries repo, branch and document', () => {
       repo: 'docs',
       branch: BRANCH,
       documentId: 'doc-1',
-      documentPath: 'documents/doc-1.json',
+      documentPath: 'documents/doc-1.md',
     });
   });
 
@@ -274,19 +266,19 @@ describe('R-11.2 — opening by pull request reference', () => {
     expect(r.err).toBeUndefined();
     expect(r.endpoints()).toEqual([
       '/repos/acme/docs/pulls/42',
-      `/repos/acme/docs/contents/documents/doc-1.json?ref=${BRANCH}`,
+      `/repos/acme/docs/contents/documents/doc-1.md?ref=${BRANCH}`,
     ]);
     // The document the routes serve from `GET /__vs/collab/:id` is this one.
     const stored = r.docs.get('doc-1');
     expect(stored).toMatchObject({ documentId: 'doc-1', title: 'Onboarding guide' });
-    expect(stored?.nodes).toEqual(doc.nodes);
-    expect(stored?.doc).toEqual(doc.doc);
+    // R-0.1 — what landed locally is the branch's bytes, verbatim.
+    expect(stored?.markdown).toBe(doc.markdown);
   });
 
   it('binds the fetched document to the pull request so comments and sync work', async () => {
     const doc = makeDoc();
     const r = await run([{ stdout: pullResponse(doc) }, { stdout: contentsResponse(doc) }]);
-    const bound = r.docs.get('doc-1') as CollaborationDocument;
+    const bound = r.docs.get('doc-1') as CollaborationRecord;
     expect(bound.github).toEqual({
       owner: 'acme',
       repo: 'docs',
@@ -312,14 +304,14 @@ describe('R-11.2 — opening by pull request reference', () => {
     const doc = makeDoc();
     const sealed = { ...doc, github: { owner: 'acme', repo: 'docs', branch: BRANCH, pullNumber: 42, resolved: false, contentSha: documentContentSha(doc) } };
     // What an agent leaves behind: the same document with a block it added.
-    const edited = { ...sealed, nodes: [...(doc.nodes ?? []), { id: 'n-agent', type: 'paragraph', version: 1, content: 'applied by the agent' }] };
+    const edited = { ...sealed, markdown: `${doc.markdown}\napplied by the agent\n` };
 
     const r = await run([{ stdout: pullResponse(doc) }, { stdout: contentsResponse(doc) }], { seed: edited });
 
     expect(reasonOf(r.err)).toBe('local_diverged');
     expect(String((r.err as Error).message)).toContain('not on');
-    // And the local copy is untouched — the agent's block is still there.
-    expect((r.docs.get('doc-1') as CollaborationDocument).nodes).toHaveLength(2);
+    // And the local copy is untouched — the agent's paragraph is still there.
+    expect((r.docs.get('doc-1') as CollaborationRecord).markdown).toContain('applied by the agent');
   });
 
   it('opens normally when the local copy still matches its seal — the stale-copy case', async () => {
@@ -335,7 +327,7 @@ describe('R-11.2 — opening by pull request reference', () => {
   it('discards the local copy when the caller explicitly says so', async () => {
     const doc = makeDoc();
     const sealed = { ...doc, github: { owner: 'acme', repo: 'docs', branch: BRANCH, pullNumber: 42, resolved: false, contentSha: documentContentSha(doc) } };
-    const edited = { ...sealed, nodes: [...(doc.nodes ?? []), { id: 'n-agent', type: 'paragraph', version: 1, content: 'applied by the agent' }] };
+    const edited = { ...sealed, markdown: `${doc.markdown}\napplied by the agent\n` };
 
     const r = await run([{ stdout: pullResponse(doc) }, { stdout: contentsResponse(doc) }], { seed: edited, discardLocal: true });
 
@@ -345,21 +337,22 @@ describe('R-11.2 — opening by pull request reference', () => {
   it('refreshes a document that is already here from the branch (same PR)', async () => {
     const stale = makeDoc({
       title: 'Stale local copy',
-      nodes: [{ id: 'n-7', type: 'paragraph', version: 1, content: 'old' }],
+      markdown: '# Stale local copy\n\nold\n',
       github: { owner: 'acme', repo: 'docs', branch: BRANCH, pullNumber: 42, resolved: false },
-    } as Partial<CollaborationDocument>);
+    });
     const fresh = makeDoc({ title: 'Onboarding guide' });
     const r = await run([{ stdout: pullResponse(fresh) }, { stdout: contentsResponse(fresh) }], { seed: stale });
 
     expect(r.err).toBeUndefined();
+    // The title comes back out of the branch's own bytes — there is nowhere else for it.
     expect(r.docs.get('doc-1')?.title).toBe('Onboarding guide');
-    expect(r.docs.get('doc-1')?.nodes?.[0]?.content).toBe('hello');
+    expect(r.docs.get('doc-1')?.markdown).toBe(fresh.markdown);
   });
 
   it('refuses to re-point a document that is attached to a different pull request', async () => {
     const attached = makeDoc({
       github: { owner: 'acme', repo: 'docs', branch: BRANCH, pullNumber: 7, resolved: false },
-    } as Partial<CollaborationDocument>);
+    });
     const r = await run([{ stdout: pullResponse(makeDoc()) }], { seed: attached });
 
     expect(reasonOf(r.err)).toBe('already_attached');
@@ -508,7 +501,7 @@ describe('R-11.4 — specific causes, never a generic failure', () => {
     const r = await run([{ stdout: pullResponse(makeDoc()) }, { stdout: JSON.stringify({ message: 'Not Found', status: '404' }), stderr: 'gh: Not Found (HTTP 404)', exitCode: 1 }]);
     expect(reasonOf(r.err)).toBe('document_missing');
     expect((r.err as Error).message).toBe(
-      `acme/docs#42 references documents/doc-1.json on ${BRANCH}, and there is no such file on that branch.`,
+      `acme/docs#42 references documents/doc-1.md on ${BRANCH}, and there is no such file on that branch.`,
     );
   });
 

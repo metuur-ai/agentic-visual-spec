@@ -25,20 +25,14 @@
  * rewrites either into a generic string.
  *
  * IT IMPORTS ONLY TYPES FROM `core/`. `import type` is erased at build time, so no
- * `node:fs` reaches the browser bundle through `job-hub.ts` → `document-store.ts`; the
- * shapes are still the server's, declared once (R-2.13's walker sees these imports, and
- * none of them reach `markdownToInjectable` / `canonicalizeMarkdown` / `markdownToJSON`).
+ * `node:fs` reaches the browser bundle through `job-hub.ts`; the shapes are still the
+ * server's, declared once.
  */
 import type { JobEvent, JobKind, JobSnapshot, JobSync } from '../core/collaboration/job-hub';
 import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import type { CommentPatch } from '../core/vite/routes/comments';
-import type {
-  CollaborationDocument,
-  DocumentFrontmatter,
-  GitHubBinding,
-  JsonDocument,
-} from '../core/collaboration/document-protocol';
+import type { CollaborationRecord, GitHubBinding } from '../core/collaboration/document-record';
 
 /** Root of the route family. Not configurable — the server mounts it at one path. */
 const BASE = '/__vs/collab';
@@ -78,10 +72,9 @@ export type JobAccepted = {
 /**
  * `GET /__vs/collab/:id` — the R-8.4 recovery snapshot plus the document's identity.
  *
- * The document here is a *summary*, not a `CollaborationDocument`: the route projects
- * four fields and drops `doc` / `nodes` / `frontmatter`, because this body is also the
- * SSE `sync` frame. Rendering surfaces (`CollabDocumentView`, `collabCommentPanelSource`)
- * want the whole thing and get it from `document()` / `comments()` below.
+ * The document here is a *summary*, not a `CollaborationRecord`: the route projects four
+ * fields and drops the Markdown, because this body is also the SSE `sync` frame. The
+ * rendering surfaces want the bytes and get them from `document()` below.
  */
 export type CollabDocumentSummary = {
   documentId: string;
@@ -127,13 +120,6 @@ export type AddCommentInput = Idempotent & {
   endLine?: number;
   selectedText?: string;
   workflow?: string;
-  /**
-   * LEGACY, and ignored by the server. The document view still identifies a block by
-   * `nodeId` and has not yet been migrated to send a line range; accepting the field
-   * keeps it compiling and its comments posting (document-level) until it is. Delete it —
-   * and this comment — once the view sends `startLine`.
-   */
-  nodeId?: string;
 };
 
 /**
@@ -165,22 +151,18 @@ export type StartDocumentInput = Idempotent & {
   documentId: string;
   documentPath: string;
   title?: string;
-  frontmatter?: DocumentFrontmatter;
-  doc?: JsonDocument;
+  /** R-0.1 — the document itself. Committed to the branch verbatim by the create job. */
+  markdown?: string;
 };
 
 export type OpenDocumentInput = Idempotent & { documentId: string; pullNumber: number; discardLocal?: boolean };
 
 /**
  * R-8.9 — `markdown` is the whole payload, and the route requires it *before* it checks
- * authorization. Markdown is the document (LLD §2), so publish commits one artifact and
+ * authorization. Markdown is the document (R-0.1), so publish commits one artifact and
  * there is no structured half to send beside it.
- *
- * `json` is optional and **ignored by the server**. It survives only because
- * `ui/publish-payload.ts` and `ui/collab-app.tsx` still produce a JSON+Markdown pair; it
- * goes when that generator does.
  */
-export type PublishInput = Idempotent & { json?: JsonDocument; markdown: string };
+export type PublishInput = Idempotent & { markdown: string };
 
 export interface CollabClient {
   /** `GET /__vs/collab` — R-7.8 availability + the login comments will be attributed to. */
@@ -192,10 +174,11 @@ export interface CollabClient {
   /** `GET /__vs/collab/:id` — R-8.4, what a late subscriber recovers from. */
   status(documentId: string): Promise<CollabResult<CollabDocumentStatus>>;
   /**
-   * `GET /__vs/collab/:id/document` — R-7.3 / R-7.4, the whole `CollaborationDocument`.
-   * Separate from `status()` because that body doubles as the SSE `sync` frame.
+   * `GET /__vs/collab/:id/document` — R-7.3 / R-7.9, the record carrying the Markdown as
+   * it stands on the Pull Request branch. Separate from `status()` because that body
+   * doubles as the SSE `sync` frame.
    */
-  document(documentId: string): Promise<CollabResult<CollaborationDocument>>;
+  document(documentId: string): Promise<CollabResult<CollaborationRecord>>;
   /**
    * `GET /__vs/collab/:id/comments` — R-5.7 / R-6.5, the conversation, unfiltered.
    *
@@ -268,7 +251,7 @@ export function createCollabClient(fetchImpl?: typeof fetch): CollabClient {
     start: (input) => send<JobAccepted>('/start', 'POST', input),
     open: (input) => send<JobAccepted>('/open', 'POST', input),
     status: (documentId) => call<CollabDocumentStatus>(`/${documentId}`),
-    document: (documentId) => call<CollaborationDocument>(`/${documentId}/document`),
+    document: (documentId) => call<CollaborationRecord>(`/${documentId}/document`),
     comments: (documentId) => call<ReviewThreadRecord[]>(`/${documentId}/comments`),
     sync: (documentId, input) => send<JobAccepted>(`/${documentId}/sync`, 'POST', input ?? {}),
     publish: (documentId, input) => send<JobAccepted>(`/${documentId}/publish`, 'POST', input),

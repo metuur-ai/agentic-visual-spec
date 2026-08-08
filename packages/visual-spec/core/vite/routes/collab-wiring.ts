@@ -15,7 +15,7 @@
  * because that path never needed any of them.
  *
  * `open` (task 11.1, R-11.2) is wired below from `core/collaboration/open.ts`, in the
- * same shape as `create`: it fetches the canonical JSON off the PR branch into the local
+ * same shape as `create`: it fetches the Markdown off the PR branch into the local
  * store, then starts the poller, because a reviewer's document is PR-open from the moment
  * it is opened and their comments arrive over the same sync path an author's do.
  *
@@ -29,7 +29,7 @@
  * `@lyfie/luthor`, no react (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
  */
 import { createCollabAuthorizer } from '../../collaboration/authorization';
-import type { DocumentStore } from '../../collaboration/document-store';
+import type { CollaborationStore } from '../../collaboration/record-store';
 import { createRecoveryBodies, withOrphanCleanup, withPublishFailureStates } from '../../collaboration/failure-states';
 import { createGitHubAdapter } from '../../collaboration/github-adapter';
 import { type GhExecutor, defaultExecGh } from '../../collaboration/github-executor';
@@ -48,8 +48,8 @@ import type { CollabAuthorizer, CollabJobBodies } from './collab';
 export type CollabWiringOptions = {
   /** Read once, at construction: the adapter is per-repo, not per-request. */
   config: () => ResolvedVisualSpecConfig;
-  /** The host's own document-store thunk, so a runtime re-root is honoured. */
-  documents: () => DocumentStore;
+  /** The host's own collaboration-store thunk, so a runtime re-root is honoured. */
+  documents: () => CollaborationStore;
   /** The host's registry. The poller starts jobs on the same hubs the routes do. */
   jobs: JobHubRegistry;
   /** Task 5.3 plugs the comment cache in here — one line, in both hosts. */
@@ -108,11 +108,10 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
   // The poller re-reads `documents()` per call rather than closing over one store, so a
   // runtime "change directory" re-roots the next tick too — the same discipline the
   // hosts already use for the route-facing store.
-  const store: DocumentStore = {
+  const store: CollaborationStore = {
     read: (id) => options.documents().read(id),
     write: (doc) => options.documents().write(doc),
     list: () => options.documents().list(),
-    resolveNode: (id, nodeId) => options.documents().resolveNode(id, nodeId),
   };
   const lifecycle = createLifecycle({
     adapter,
