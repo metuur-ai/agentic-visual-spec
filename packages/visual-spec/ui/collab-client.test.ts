@@ -127,16 +127,51 @@ describe('every wired route, on its success path', () => {
     });
   });
 
-  it('POST /:id/comments anchors on nodeId (R-7.5)', async () => {
-    const saved = { ok: true, id: 'c-a1b2c3d4', comment: { id: 'c-a1b2c3d4' } };
+  it('POST /:id/comments anchors on path + line (R-0.3 / R-7.5)', async () => {
+    const saved = { ok: true, id: 'c-000dbba1', comment: { id: 'c-000dbba1' } };
     const { impl, calls } = stubFetch({ json: saved });
-    const result = await createCollabClient(impl).addComment('doc-1', { comment: 'tighten this', nodeId: 'n-7' });
+    const result = await createCollabClient(impl).addComment('doc-1', {
+      comment: 'tighten this',
+      path: 'docs/spec.md',
+      startLine: 12,
+      endLine: 15,
+      selectedText: 'The reviewer reads this block.',
+    });
     expect(calls[0]).toEqual({
       url: '/__vs/collab/doc-1/comments',
       method: 'POST',
-      body: { comment: 'tighten this', nodeId: 'n-7' },
+      body: {
+        comment: 'tighten this',
+        path: 'docs/spec.md',
+        startLine: 12,
+        endLine: 15,
+        selectedText: 'The reviewer reads this block.',
+      },
     });
-    expect(result.ok && result.value.id).toBe('c-a1b2c3d4');
+    expect(result.ok && result.value.id).toBe('c-000dbba1');
+  });
+
+  /*
+   * R-7.13 — the server degrades to a file-level comment when the line is not in the
+   * diff, and says so. The disclosure has to reach the caller intact: a client that
+   * dropped it would show a comment anchored to a line it is not actually on.
+   */
+  it('passes the degraded disclosure through untouched (R-7.13)', async () => {
+    const saved = {
+      ok: true,
+      id: 'c-000dbba1',
+      comment: { id: 'c-000dbba1' },
+      degraded: { to: 'file', reason: 'Validation Failed' },
+    };
+    const { impl } = stubFetch({ json: saved });
+    const result = await createCollabClient(impl).addComment('doc-1', { comment: 'x', startLine: 12 });
+    expect(result.ok && result.value.degraded).toEqual({ to: 'file', reason: 'Validation Failed' });
+  });
+
+  it('carries the idempotency key so a retry after a timeout cannot duplicate (R-5.11)', async () => {
+    const { impl, calls } = stubFetch({ json: { ok: true, id: 'c-000dbba1', comment: {} } });
+    await createCollabClient(impl).addComment('doc-1', { comment: 'x', startLine: 12, idempotencyKey: 'k-1' });
+    expect(calls[0]?.body).toEqual({ comment: 'x', startLine: 12, idempotencyKey: 'k-1' });
   });
 
   it('POST /:id/comments/:commentId/reply posts to the reply path', async () => {

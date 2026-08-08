@@ -30,6 +30,7 @@
  * none of them reach `markdownToInjectable` / `canonicalizeMarkdown` / `markdownToJSON`).
  */
 import type { JobEvent, JobKind, JobSnapshot, JobSync } from '../core/collaboration/job-hub';
+import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import type { CommentPatch } from '../core/vite/routes/comments';
 import type {
@@ -91,9 +92,49 @@ export type CollabDocumentSummary = {
 
 export type CollabDocumentStatus = JobSnapshot & { document: CollabDocumentSummary | null };
 
-/** What the comment routes answer. `PATCH` answers without an `id`. */
-export type CommentSaved = { ok: true; id: string; comment: CommentRecord };
+/**
+ * What the comment routes answer. `PATCH` answers without an `id`.
+ *
+ * `degraded` is R-7.13's disclosure: the line the user selected is not part of the Pull
+ * Request's diff, so the server retried once as a file-level comment. The comment exists
+ * and nothing the user typed was lost — but it now hangs off the file rather than the
+ * line, and the panel has to say so instead of pretending the anchor is what was asked
+ * for. `reason` is GitHub's own refusal text.
+ */
+export type CommentSaved = {
+  ok: true;
+  id: string;
+  comment: ReviewThreadRecord;
+  degraded?: { to: 'file'; reason: string };
+};
 export type CommentUpdated = { ok: true; comment: CommentRecord };
+
+/**
+ * What `POST /:id/comments` takes (R-0.3 — a comment is anchored by path and line).
+ *
+ * `path` may be omitted for the document under review; the server fills in the
+ * document's own path. `startLine` may be omitted for a document-level comment, which is
+ * posted against the file by intent rather than by degradation.
+ *
+ * `selectedText` is what R-7.12 quotes back into a file-level body, and it can only come
+ * from here: the browser holds the selection, and the server re-reading the branch to
+ * guess at it would be a second, disagreeing answer to what the user picked.
+ */
+export type AddCommentInput = Idempotent & {
+  comment: string;
+  path?: string;
+  startLine?: number;
+  endLine?: number;
+  selectedText?: string;
+  workflow?: string;
+  /**
+   * LEGACY, and ignored by the server. The document view still identifies a block by
+   * `nodeId` and has not yet been migrated to send a line range; accepting the field
+   * keeps it compiling and its comments posting (document-level) until it is. Delete it —
+   * and this comment — once the view sends `startLine`.
+   */
+  nodeId?: string;
+};
 
 /**
  * Expected failures, kept apart from thrown ones. `status` is the server's, so a caller
@@ -147,15 +188,28 @@ export interface CollabClient {
    * Separate from `status()` because that body doubles as the SSE `sync` frame.
    */
   document(documentId: string): Promise<CollabResult<CollaborationDocument>>;
-  /** `GET /__vs/collab/:id/comments` — R-5.7 / R-6.5, the conversation, unfiltered. */
-  comments(documentId: string): Promise<CollabResult<CommentRecord[]>>;
+  /**
+   * `GET /__vs/collab/:id/comments` — R-5.7 / R-6.5, the conversation, unfiltered.
+   *
+   * The Pull Request's review threads, projected onto `CommentRecord` (R-5.16) with
+   * GitHub's own resolution state joined on (R-5.12). A thread whose `github.isResolved`
+   * is absent is one whose resolution could not be read — not one that is unresolved
+   * (R-5.15). Replies ride on their thread's record; none is a record of its own (R-5.20).
+   */
+  comments(documentId: string): Promise<CollabResult<ReviewThreadRecord[]>>;
   /** `POST /__vs/collab/:id/sync` — R-8.6 / R-8.7, pull the PR's comments. */
   sync(documentId: string, input?: Idempotent): Promise<CollabResult<JobAccepted>>;
   /** `POST /__vs/collab/:id/publish` — R-8.9 … R-8.14. */
   publish(documentId: string, input: PublishInput): Promise<CollabResult<JobAccepted>>;
-  /** `POST /__vs/collab/:id/comments` — R-7.5, anchored on `nodeId`. */
-  addComment(documentId: string, input: { comment: string; nodeId?: string; workflow?: string }): Promise<CollabResult<CommentSaved>>;
-  /** `POST /__vs/collab/:id/comments/:commentId/reply`. */
+  /**
+   * `POST /__vs/collab/:id/comments` — R-5.4 / R-7.5, a PR review comment on the
+   * document's path at the selected line range. May answer `degraded` (R-7.13).
+   */
+  addComment(documentId: string, input: AddCommentInput): Promise<CollabResult<CommentSaved>>;
+  /**
+   * `POST /__vs/collab/:id/comments/:commentId/reply` — R-7.15. The reply is native and
+   * inherits the thread's anchor; `commentId` is the thread root's record id.
+   */
   replyToComment(documentId: string, commentId: string, input: { comment: string }): Promise<CollabResult<CommentSaved>>;
   /** `PATCH /__vs/collab/:id/comments/:commentId`. */
   patchComment(documentId: string, commentId: string, patch: CommentPatch): Promise<CollabResult<CommentUpdated>>;
@@ -207,7 +261,7 @@ export function createCollabClient(fetchImpl?: typeof fetch): CollabClient {
     open: (input) => send<JobAccepted>('/open', 'POST', input),
     status: (documentId) => call<CollabDocumentStatus>(`/${documentId}`),
     document: (documentId) => call<CollaborationDocument>(`/${documentId}/document`),
-    comments: (documentId) => call<CommentRecord[]>(`/${documentId}/comments`),
+    comments: (documentId) => call<ReviewThreadRecord[]>(`/${documentId}/comments`),
     sync: (documentId, input) => send<JobAccepted>(`/${documentId}/sync`, 'POST', input ?? {}),
     publish: (documentId, input) => send<JobAccepted>(`/${documentId}/publish`, 'POST', input),
     addComment: (documentId, input) => send<CommentSaved>(`/${documentId}/comments`, 'POST', input),

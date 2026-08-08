@@ -22,8 +22,16 @@ import { describe, expect, it, vi } from 'vitest';
 import type { CollaborationDocument } from '../../collaboration/document-protocol';
 import type { CollaborationPreflight } from '../../collaboration/credentials';
 import type { DocumentStore } from '../../collaboration/document-store';
+import { GitHubError, type CreateReviewCommentInput, type GitHubAdapter } from '../../collaboration/github-adapter';
 import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { JobEvent, JobSync, SseSink } from '../../collaboration/job-hub';
+import {
+  reviewCommentIdFor,
+  reviewRecordIdFor,
+  type ReviewComment,
+  type ReviewThreadRecord,
+  type ThreadResolution,
+} from '../../collaboration/review-comments';
 import type { ResolvedVisualSpecConfig } from '../../config';
 import type { CommentDoc, CommentRecord } from '../../editing/comment-doc';
 import { type CollabAuthorizer, type CollabDeps, type CollabJobBodies, type CollabRouteResult, createCollabRoutes } from './collab';
@@ -122,6 +130,108 @@ function memoryComments(seed: CommentRecord[] = []) {
     return next;
   };
   return { store: Object.assign(store, { setResolved }), all: () => comments };
+}
+
+/* ------------------------------------------------------------------ *
+ * The review-comment double (R-4.8 / R-12.3 — nothing here execs `gh`)
+ * ------------------------------------------------------------------ */
+
+/** The head sha `getPullRequest` reports unless a test moves it. */
+const HEAD_SHA = 'a'.repeat(40);
+
+/** One review comment as GitHub returns it, with the projection's fields filled in. */
+function reviewComment(over: Partial<ReviewComment> = {}): ReviewComment {
+  return {
+    id: 900001,
+    inReplyToId: null,
+    path: 'docs/spec.md',
+    line: 12,
+    startLine: null,
+    originalLine: 12,
+    side: 'RIGHT',
+    subjectType: 'line',
+    commitId: HEAD_SHA,
+    originalCommitId: HEAD_SHA,
+    diffHunk: '@@ -10,3 +10,3 @@',
+    body: 'tighten this',
+    user: 'octocat',
+    createdAt: 'T0',
+    updatedAt: 'T0',
+    htmlUrl: 'https://github.com/acme/specs/pull/7#discussion_r900001',
+    ...over,
+  };
+}
+
+/**
+ * A `GitHubAdapter` standing in for the four methods the review-comment routes call, and
+ * recording what they were called with.
+ *
+ * `createFails` / `replyFails` are consumed one per attempt, which is what makes the
+ * R-7.13 retry observable: a single queued 422 fails the first create and lets the second
+ * through, so a route that retried twice, or not at all, fails here.
+ */
+function reviewAdapter(
+  options: {
+    list?: ReviewComment[];
+    resolution?: ThreadResolution[] | Error;
+    createFails?: (Error | null)[];
+    replyFails?: (Error | null)[];
+  } = {},
+) {
+  const creates: CreateReviewCommentInput[] = [];
+  const replies: { commentId: number; body: string }[] = [];
+  const pulls: number[] = [];
+  const createFails = [...(options.createFails ?? [])];
+  const replyFails = [...(options.replyFails ?? [])];
+  let headSha = HEAD_SHA;
+  let nextId = 900100;
+
+  const adapter = {
+    async getPullRequest(_repo: unknown, pullNumber: number) {
+      pulls.push(pullNumber);
+      return { number: pullNumber, headSha, state: 'open' };
+    },
+    async createReviewComment(_repo: unknown, _pullNumber: number, input: CreateReviewCommentInput) {
+      creates.push(input);
+      const fail = createFails.shift();
+      if (fail) throw fail;
+      nextId += 1;
+      return reviewComment({
+        id: nextId,
+        path: input.path,
+        body: input.body,
+        commitId: input.commitId,
+        ...(input.line === undefined
+          ? { subjectType: 'file' as const, line: null }
+          : { line: input.line, startLine: input.startLine ?? null }),
+      });
+    },
+    async replyToReviewComment(_repo: unknown, _pullNumber: number, commentId: number, body: string) {
+      replies.push({ commentId, body });
+      const fail = replyFails.shift();
+      if (fail) throw fail;
+      nextId += 1;
+      return reviewComment({ id: nextId, inReplyToId: commentId, body });
+    },
+    async listReviewComments() {
+      return options.list ?? [];
+    },
+    async listThreadResolution() {
+      if (options.resolution instanceof Error) throw options.resolution;
+      return options.resolution ?? [];
+    },
+  } as unknown as GitHubAdapter;
+
+  return {
+    adapter,
+    creates,
+    replies,
+    pulls,
+    lastId: () => nextId,
+    setHeadSha: (sha: string) => {
+      headSha = sha;
+    },
+  };
 }
 
 /** An `SseSink` that records what the hub wrote. */
@@ -573,97 +683,152 @@ describe('R-8.9 / R-12.7 — publish payload validation', () => {
 });
 
 /* ================================================================== *
- * R-7.5 — collaborative comments anchor on nodeId
+ * R-5.4 / R-7.5 — collaborative comments are PR REVIEW comments,
+ * anchored on path + line
  * ================================================================== */
 describe('R-7.1 / R-7.5 — comment routes', () => {
-  const withComments = (seed: CommentRecord[] = []) => {
-    const mem = memoryComments(seed);
-    return { mem, r: router({ commentStore: () => mem.store }) };
+  const withReview = (options: Parameters<typeof reviewAdapter>[0] = {}) => {
+    const fake = reviewAdapter(options);
+    return { fake, r: router({ adapter: () => fake.adapter }) };
   };
 
   /*
-   * The panel's "Apply via" control picks which skill handles a comment. Its value made it
-   * into the request body and stopped there: the route never read it and `commentRecord`
-   * stamped the default, so the control was decorative and every collaborative comment was
-   * born routed to `visual-spec`. Pinned on the trailer, because that is the only part
-   * that survives a round trip through GitHub.
+   * R-4.13 is the reason `getPullRequest` is on the create path at all. A sha held from
+   * open is stale the moment anyone pushes, and a comment posted against a stale sha is
+   * born outdated — GitHub answers `line: null` immediately. Pinned on the second create
+   * seeing the *moved* head, because that is the case a cached sha would get wrong while
+   * the first create still looked correct.
    */
-  it('carries the routing tag through to the trailer', async () => {
-    const { mem, r } = withComments();
-    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'hand this off', nodeId: 'n-7', workflow: 'research' });
+  it('re-reads the head sha at creation time and sends it as commit_id (R-4.13)', async () => {
+    const { fake, r } = withReview();
+    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'tighten this', startLine: 12 });
     expect(res.status).toBe(200);
-    expect((mem.all()[0]! as CommentRecord & { collab?: Record<string, string> }).collab).toMatchObject({
-      nodeId: 'n-7',
-      workflow: 'research',
-    });
+    expect(fake.creates[0]).toMatchObject({ path: 'docs/spec.md', body: 'tighten this', line: 12, startLine: 12, commitId: HEAD_SHA });
+
+    fake.setHeadSha('b'.repeat(40));
+    await call(r, 'POST', '/doc-1/comments', { comment: 'and this', startLine: 20 });
+    expect(fake.creates[1]?.commitId).toBe('b'.repeat(40));
+    // One read per create, never one read reused for both.
+    expect(fake.pulls).toEqual([7, 7]);
+  });
+
+  it('sends the selected range, and a single line when the selection is one line', async () => {
+    const { fake, r } = withReview();
+    await call(r, 'POST', '/doc-1/comments', { comment: 'range', startLine: 12, endLine: 15 });
+    expect(fake.creates[0]).toMatchObject({ line: 15, startLine: 12, side: 'RIGHT' });
+    await call(r, 'POST', '/doc-1/comments', { comment: 'one line', startLine: 12 });
+    expect(fake.creates[1]).toMatchObject({ line: 12, startLine: 12 });
+  });
+
+  it('answers the projected thread, keyed by the c-<8hex> id PATCH parses', async () => {
+    const { fake, r } = withReview();
+    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'tighten this', startLine: 12 });
+    const body = res.json as { ok: boolean; id: string; comment: ReviewThreadRecord };
+    expect(body.ok).toBe(true);
+    // The bijection: the record id decodes back to the REST integer GitHub returned.
+    expect(body.id).toBe(reviewRecordIdFor(fake.lastId()));
+    expect(reviewCommentIdFor(body.id)).toBe(fake.lastId());
+    expect(body.comment.github.reviewCommentId).toBe(fake.lastId());
+    // R-5.16 — projected onto the unchanged `CommentTarget`.
+    expect(body.comment.target).toEqual({ path: 'docs/spec.md', kind: 'range', startLine: 12 });
+    expect(body.comment.comment).toBe('tighten this');
+    expect(body.comment.status).toBe('open');
+  });
+
+  /*
+   * The routing tag the panel's "Apply via" control sets. R-5.4 forbids writing a
+   * machine-readable reference into the body, so GitHub has nowhere to keep it: it rides
+   * on the response and nowhere else. Asserted on both sides — present in the answer,
+   * absent from what was posted — because carrying it in the body is the tempting wrong
+   * fix, and it is the one this requirement rules out.
+   */
+  it('carries the routing tag on the answer, and never into the comment body', async () => {
+    const { fake, r } = withReview();
+    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'hand this off', startLine: 12, workflow: 'research' });
+    expect((res.json as { comment: ReviewThreadRecord }).comment.workflow).toBe('research');
+    expect(fake.creates[0]?.body).toBe('hand this off');
   });
 
   it('omits the tag when the caller sent none, rather than inventing one', async () => {
-    const { mem, r } = withComments();
-    await call(r, 'POST', '/doc-1/comments', { comment: 'no tag', nodeId: 'n-7' });
-    expect((mem.all()[0]! as CommentRecord & { collab?: Record<string, string> }).collab?.workflow).toBeUndefined();
+    const { r } = withReview();
+    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'no tag', startLine: 12 });
+    expect((res.json as { comment: ReviewThreadRecord }).comment.workflow).toBe('visual-spec');
   });
 
-  it('persists a comment against nodeId as its primary identity', async () => {
-    const { mem, r } = withComments();
-    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'tighten this', nodeId: 'n-7' });
+  /*
+   * A comment with no line is file-level BY INTENT — the document-level note R-5.7 keeps
+   * visible — so it carries no `degraded` disclosure and no restated line reference. That
+   * distinction is the whole content of R-7.12 versus R-7.13.
+   */
+  it('accepts a document-level comment with no line, posting it file-level without a disclosure', async () => {
+    const { fake, r } = withReview();
+    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'overall: good' });
     expect(res.status).toBe(200);
-    expect(res.json).toMatchObject({ ok: true, id: 'c-00000001' });
-    const saved = mem.all()[0]! as CommentRecord & { collab?: { nodeId?: string } };
-    expect(saved.collab?.nodeId).toBe('n-7');
-    expect(saved.comment).toBe('tighten this');
-    // R-1.7 — `CommentTarget` is unchanged, so the record stays a valid CommentRecord.
-    expect(saved.target).toEqual({ path: 'docs/spec.md', kind: 'file' });
+    expect(fake.creates[0]).toEqual({ path: 'docs/spec.md', body: 'overall: good', commitId: HEAD_SHA });
+    expect((res.json as { degraded?: unknown }).degraded).toBeUndefined();
+    expect((res.json as { comment: ReviewThreadRecord }).comment.target).toEqual({ path: 'docs/spec.md', kind: 'file' });
   });
 
-  it('accepts a document-level comment with no nodeId', async () => {
-    const { mem, r } = withComments();
-    expect((await call(r, 'POST', '/doc-1/comments', { comment: 'overall: good' })).status).toBe(200);
-    expect((mem.all()[0] as { collab?: unknown }).collab).toBeUndefined();
+  it('comments on the document’s own path unless the caller names another', async () => {
+    const { fake, r } = withReview();
+    await call(r, 'POST', '/doc-1/comments', { comment: 'x', startLine: 3 });
+    expect(fake.creates[0]?.path).toBe('docs/spec.md');
+    await call(r, 'POST', '/doc-1/comments', { comment: 'x', startLine: 3, path: 'docs/other.md' });
+    expect(fake.creates[1]?.path).toBe('docs/other.md');
   });
 
-  it('rejects an empty comment with 400', async () => {
-    const { r } = withComments();
+  it('rejects an empty comment and a line that is not a line with 400', async () => {
+    const { r } = withReview();
     expect((await call(r, 'POST', '/doc-1/comments', {})).status).toBe(400);
     expect((await call(r, 'POST', '/doc-1/comments', { comment: '   ' })).status).toBe(400);
+    expect((await call(r, 'POST', '/doc-1/comments', { comment: 'x', startLine: 0 })).status).toBe(400);
+    expect((await call(r, 'POST', '/doc-1/comments', { comment: 'x', startLine: 1.5 })).status).toBe(400);
+    expect((await call(r, 'POST', '/doc-1/comments', { comment: 'x', startLine: 9, endLine: 4 })).status).toBe(400);
   });
 
   it('404s on an unknown document', async () => {
-    const { r } = withComments();
-    const res = await call(r, 'POST', '/doc-nope/comments', { comment: 'x' });
-    expect(res.status).toBe(404);
+    const { r } = withReview();
+    expect((await call(r, 'POST', '/doc-nope/comments', { comment: 'x' })).status).toBe(404);
   });
 
   it('409s when the document has no pull request yet', async () => {
-    // No injected comment store: the default path derives one from the document's own
-    // GitHub binding, and a document without one cannot host a conversation.
+    // The review context is derived from the document's own binding; without one there is
+    // no pull request to host a conversation.
     const r = router({ documents: () => memoryDocuments([document({ github: undefined })]) });
-    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'x' });
-    expect(res.status).toBe(409);
+    expect((await call(r, 'POST', '/doc-1/comments', { comment: 'x' })).status).toBe(409);
   });
 
-  it('replies inherit the parent thread’s nodeId and record replyTo', async () => {
-    const parent = {
-      id: 'c-00000001',
-      workflow: 'visual-spec',
-      target: { path: 'docs/spec.md', kind: 'file' },
-      comment: 'tighten this',
-      status: 'open',
-      ts: 'T0',
-      collab: { nodeId: 'n-7' },
-    } as unknown as CommentRecord;
-    const { mem, r } = withComments([parent]);
-    const res = await call(r, 'POST', '/doc-1/comments/c-00000001/reply', { comment: 'done' });
+  it('reports a refused create with GitHub’s own cause, and keeps the user’s text out of it (R-7.14)', async () => {
+    const { r } = withReview({ createFails: [new GitHubError('createReviewComment', 'Not Found', 404)] });
+    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'tighten this', startLine: 12 });
+    expect(res).toEqual({ status: 404, json: { error: 'Not Found' } });
+  });
+
+  /* ---------------------------------------------------------------- *
+   * R-7.15 — replies are native
+   * ---------------------------------------------------------------- */
+
+  it('replies through the replies endpoint, keyed on the thread root’s integer id', async () => {
+    const { fake, r } = withReview();
+    const res = await call(r, 'POST', '/doc-1/comments/c-000dbba1/reply', { comment: 'done' });
     expect(res.status).toBe(200);
-    const saved = mem.all()[1]! as CommentRecord & { collab?: { nodeId?: string; replyTo?: string } };
-    expect(saved.collab).toEqual({ replyTo: 'c-00000001', nodeId: 'n-7' });
+    // `c-000dbba1` is 900001 in hex — the same integer `in_reply_to_id` and the reply
+    // endpoint are keyed on (R-5.19).
+    expect(fake.replies).toEqual([{ commentId: 900001, body: 'done' }]);
+    // Nothing computed an anchor: the reply inherits the thread's (R-7.15).
+    expect(fake.creates).toEqual([]);
+    expect((res.json as { comment: ReviewThreadRecord }).comment.comment).toBe('done');
   });
 
-  it('404s a reply to an unknown comment and 400s a malformed commentId', async () => {
-    const { r } = withComments();
-    expect((await call(r, 'POST', '/doc-1/comments/c-deadbeef/reply', { comment: 'x' })).status).toBe(404);
+  it('404s a reply to a root GitHub does not know, and 400s a malformed commentId', async () => {
+    const { r } = withReview({ replyFails: [new GitHubError('replyToReviewComment', 'Not Found', 404)] });
+    expect((await call(r, 'POST', '/doc-1/comments/c-000dbba1/reply', { comment: 'x' })).status).toBe(404);
     expect((await call(r, 'POST', '/doc-1/comments/nope/reply', { comment: 'x' })).status).toBe(400);
   });
+
+  /* ---------------------------------------------------------------- *
+   * PATCH keeps its store — the record-id bijection is the seam
+   * ---------------------------------------------------------------- */
 
   it('PATCH updates a comment and 404s an unknown one', async () => {
     const parent = {
@@ -674,7 +839,8 @@ describe('R-7.1 / R-7.5 — comment routes', () => {
       status: 'open',
       ts: 'T0',
     } as unknown as CommentRecord;
-    const { mem, r } = withComments([parent]);
+    const mem = memoryComments([parent]);
+    const r = router({ commentStore: () => mem.store });
     const res = await call(r, 'PATCH', '/doc-1/comments/c-00000001', { comment: 'new', status: 'applied' });
     expect(res.status).toBe(200);
     expect(mem.all()[0]!.comment).toBe('new');
@@ -685,9 +851,11 @@ describe('R-7.1 / R-7.5 — comment routes', () => {
   /*
    * The panel's Resolve button sends exactly this — a status and no text. It used to be
    * served by `updateComment`, which documents that it cannot express status and returns
-   * the record untouched, so the route answered 200 and nothing resolved. Since unresolved
-   * comments gate publishing (R-8.15), one comment locked the author out for good. Pinned
-   * on the store call, not just the response, because a 200 was exactly the wrong signal.
+   * the record untouched, so the route answered 200 and nothing resolved.
+   *
+   * R-5.13 draws the line this test sits on: `status` is the LOCAL apply-agent flag
+   * (R-5.21), and nothing on this path writes resolution to GitHub. The review-comment
+   * routes have no resolve call at all — resolving happens on github.com.
    */
   it('routes a status-only PATCH through setResolved — the resolve the panel actually sends', async () => {
     const parent = {
@@ -698,7 +866,8 @@ describe('R-7.1 / R-7.5 — comment routes', () => {
       status: 'open',
       ts: 'T0',
     } as unknown as CommentRecord;
-    const { mem, r } = withComments([parent]);
+    const mem = memoryComments([parent]);
+    const r = router({ commentStore: () => mem.store });
     const setResolved = vi.spyOn(mem.store as { setResolved: (id: string, r: boolean) => unknown }, 'setResolved');
 
     const res = await call(r, 'PATCH', '/doc-1/comments/c-00000001', { status: 'applied' });
@@ -712,6 +881,16 @@ describe('R-7.1 / R-7.5 — comment routes', () => {
     await call(r, 'PATCH', '/doc-1/comments/c-00000001', { status: 'open' });
     expect(setResolved).toHaveBeenLastCalledWith('c-00000001', false);
     expect(mem.all()[0]!.status).toBe('open');
+  });
+
+  /*
+   * R-5.13 as a source fact, not just a behavioural one. There is no GitHub operation for
+   * resolving a review thread on the REST surface and none in the adapter, so the guard
+   * that matters is that nothing here ever reaches for one.
+   */
+  it('never writes resolution state to GitHub (R-5.13)', () => {
+    const source = src('core/vite/routes/collab.ts');
+    expect(source).not.toMatch(/resolveReviewThread|unresolveReviewThread|isResolved\s*:/);
   });
 });
 
@@ -766,49 +945,76 @@ describe('GET /:id/document — the whole CollaborationDocument (R-7.3 / R-7.4)'
   });
 });
 
-describe('GET /:id/comments — the conversation (R-5.7 / R-6.5)', () => {
-  const withComments = (seed: CommentRecord[] = []) => {
-    const mem = memoryComments(seed);
-    return { mem, r: router({ commentStore: () => mem.store }) };
-  };
+describe('GET /:id/comments — the conversation (R-5.7 / R-5.12 / R-5.20)', () => {
+  const ROOT = reviewComment({ id: 900001, body: 'tighten this', line: 12 });
+  const REPLY = reviewComment({ id: 900002, inReplyToId: 900001, body: 'done', createdAt: 'T1' });
+  const ORPHAN = reviewComment({ id: 900003, inReplyToId: 800000, body: 'its root was deleted', createdAt: 'T2' });
+  const FILE_LEVEL = reviewComment({ id: 900004, subjectType: 'file', line: null, body: 'overall: good', createdAt: 'T3' });
 
-  it('round-trips what POST wrote: the records come back whole, in order', async () => {
-    const { r } = withComments();
-    await call(r, 'POST', '/doc-1/comments', { comment: 'tighten this', nodeId: 'n-7' });
-    await call(r, 'POST', '/doc-1/comments', { comment: 'overall: good' });
-    await call(r, 'POST', '/doc-1/comments/c-00000001/reply', { comment: 'done' });
+  const listing = (options: Parameters<typeof reviewAdapter>[0]) => router({ adapter: () => reviewAdapter(options).adapter });
 
+  it('groups the whole list into threads and folds replies onto their root (R-5.17 / R-5.20)', async () => {
+    const r = listing({ list: [ROOT, REPLY, ORPHAN, FILE_LEVEL] });
     const res = await call(r, 'GET', '/doc-1/comments');
     expect(res.status).toBe(200);
-    const listed = res.json as (CommentRecord & { collab?: Record<string, string> })[];
-    expect(listed.map((c) => c.id)).toEqual(['c-00000001', 'c-00000002', 'c-00000003']);
-    expect(listed.map((c) => c.comment)).toEqual(['tighten this', 'overall: good', 'done']);
-    // R-7.5 — the anchor survives the read, which is the whole point for the panel.
-    expect(listed[0]!.collab).toEqual({ nodeId: 'n-7' });
-    // R-5.7 — the node-less comment is present, not discarded.
-    expect(listed[1]!.collab).toBeUndefined();
-    expect(listed[2]!.collab).toEqual({ replyTo: 'c-00000001', nodeId: 'n-7' });
-    expect(listed[0]!.target).toEqual({ path: 'docs/spec.md', kind: 'file' });
+    const threads = res.json as ReviewThreadRecord[];
+    // Three threads, not four: the reply is not a record of its own (R-5.20).
+    expect(threads.map((t) => t.id)).toEqual([
+      reviewRecordIdFor(900001),
+      reviewRecordIdFor(900003),
+      reviewRecordIdFor(900004),
+    ]);
+    expect(threads[0]!.replies.map((rep) => rep.body)).toEqual(['done']);
+    // R-5.18 — the reply whose root is gone is promoted, never dropped.
+    expect(threads[1]!.comment).toBe('its root was deleted');
+    // R-5.7 / R-6.12 — the file-level thread is present and anchored to the document.
+    expect(threads[2]!.target).toEqual({ path: 'docs/spec.md', kind: 'file' });
+    expect(threads[2]!.github.isOutdated).toBe(false);
   });
 
-  it('reflects a PATCH, so the panel and the store never disagree', async () => {
-    const { r } = withComments();
-    await call(r, 'POST', '/doc-1/comments', { comment: 'tighten this' });
-    await call(r, 'PATCH', '/doc-1/comments/c-00000001', { status: 'applied', result: 'fixed' });
-    const listed = (await call(r, 'GET', '/doc-1/comments')).json as CommentRecord[];
-    expect(listed).toHaveLength(1);
-    expect(listed[0]!.status).toBe('applied');
+  it('joins GitHub’s resolution state onto the thread by its root’s integer id (R-4.15 / R-5.12)', async () => {
+    const r = listing({
+      list: [ROOT, REPLY, FILE_LEVEL],
+      resolution: [
+        { rootCommentId: 900001, isResolved: true, isOutdated: false },
+        { rootCommentId: 900004, isResolved: false, isOutdated: false },
+      ],
+    });
+    const threads = (await call(r, 'GET', '/doc-1/comments')).json as ReviewThreadRecord[];
+    expect(threads[0]!.github.isResolved).toBe(true);
+    expect(threads[1]!.github.isResolved).toBe(false);
+  });
+
+  /*
+   * R-4.12 / R-5.15 — resolution is a GraphQL read next to a REST one and fails on its
+   * own. When it does the conversation is still served, and every thread says "unknown"
+   * rather than "unresolved": those two answers drive different UI and a different Ready
+   * gate (R-8.25), and flattening them is a silent wrong answer.
+   */
+  it('serves the conversation when the resolution read fails, reporting unknown rather than unresolved', async () => {
+    const r = listing({ list: [ROOT, REPLY], resolution: new GitHubError('listThreadResolution', 'graphql exploded') });
+    const res = await call(r, 'GET', '/doc-1/comments');
+    expect(res.status).toBe(200);
+    const threads = res.json as ReviewThreadRecord[];
+    expect(threads).toHaveLength(1);
+    expect(threads[0]!.github.isResolved).toBeUndefined();
+    expect('isResolved' in threads[0]!.github).toBe(false);
+  });
+
+  it('marks a thread that lost its line outdated, and carries no line for it (R-6.5)', async () => {
+    const outdated = reviewComment({ id: 900005, line: null, originalLine: 12, originalCommitId: 'a'.repeat(40) });
+    const threads = (await call(listing({ list: [outdated] }), 'GET', '/doc-1/comments')).json as ReviewThreadRecord[];
+    expect(threads[0]!.github.isOutdated).toBe(true);
+    // `original_line` is a line in a different commit and is never used as a position.
+    expect(threads[0]!.target).toEqual({ path: 'docs/spec.md', kind: 'file' });
   });
 
   it('answers an empty list, not a 404, when nothing has been said yet', async () => {
-    const { r } = withComments();
-    const res = await call(r, 'GET', '/doc-1/comments');
-    expect(res).toEqual({ status: 200, json: [] });
+    expect(await call(listing({}), 'GET', '/doc-1/comments')).toEqual({ status: 200, json: [] });
   });
 
   it('404s an unknown document', async () => {
-    const { r } = withComments();
-    expect((await call(r, 'GET', '/doc-nope/comments')).status).toBe(404);
+    expect((await call(listing({}), 'GET', '/doc-nope/comments')).status).toBe(404);
   });
 
   it('409s when the document has no pull request yet, like the POST route', async () => {
@@ -828,19 +1034,18 @@ describe('GET /:id/comments — the conversation (R-5.7 / R-6.5)', () => {
       seen.push(op);
       return { ok: false, status: 401, error: 'who are you' };
     };
-    const { mem } = withComments();
-    const r = router({ commentStore: () => mem.store, authorize: deny });
-    const res = await call(r, 'GET', '/doc-1/comments');
+    const fake = reviewAdapter({ list: [ROOT] });
+    const res = await call(router({ adapter: () => fake.adapter, authorize: deny }), 'GET', '/doc-1/comments');
     expect(seen).toEqual(['read']);
     expect(res).toEqual({ status: 401, json: { error: 'who are you' } });
   });
 
-  it('gates before it reads — a denied request never touches the store', async () => {
-    const mem = memoryComments();
-    const commentStore = vi.fn(async () => mem.store);
-    const r = router({ commentStore, authorize: () => ({ ok: false, status: 403, error: 'nope' }) });
+  it('gates before it reads — a denied request never reaches GitHub', async () => {
+    const fake = reviewAdapter({ list: [ROOT] });
+    const adapter = vi.fn(() => fake.adapter);
+    const r = router({ adapter, authorize: () => ({ ok: false, status: 403, error: 'nope' }) });
     await call(r, 'GET', '/doc-1/comments');
-    expect(commentStore).not.toHaveBeenCalled();
+    expect(adapter).not.toHaveBeenCalled();
   });
 });
 

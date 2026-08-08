@@ -30,17 +30,23 @@
  * `@lyfie/luthor`, no react (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
  */
 import type { ResolvedCollaborationConfig, ResolvedVisualSpecConfig } from '../../config';
-import { COLLAB_TARGET_TEXT_KEY, captureTargetText, collabNodeVersion } from '../../collaboration/anchor-resolution';
 import { type CollaborationPreflight, credentialFingerprint, preflightCollaboration } from '../../collaboration/credentials';
 import { githubCommentStore } from '../../collaboration/comment-projection';
-import { createGitHubAdapter } from '../../collaboration/github-adapter';
+import { createGitHubAdapter, GitHubError, type GitHubAdapter, type RepoRef } from '../../collaboration/github-adapter';
 import type { GitHubBinding } from '../../collaboration/document-protocol';
 import type { CollaborationDocument, DocumentFrontmatter, JsonDocument } from '../../collaboration/document-protocol';
 import { newCollaborationDocument } from '../../collaboration/document-protocol';
 import { DOCUMENT_ID_RE, type DocumentStore } from '../../collaboration/document-store';
 import type { JobBody, JobHubRegistry, SseSink } from '../../collaboration/job-hub';
-import { DEFAULT_WORKFLOW, type CommentRecord, type CommentStatus } from '../../editing/comment-doc';
-import { randomHex8 } from '../../editing/id';
+import {
+  groupIntoThreads,
+  projectReviewThread,
+  reviewCommentIdFor,
+  type ReviewComment,
+  type ReviewThreadRecord,
+  type ThreadResolution,
+} from '../../collaboration/review-comments';
+import type { CommentRecord, CommentStatus } from '../../editing/comment-doc';
 import type { CommentDocStore, CommentPatch } from './comments';
 
 /**
@@ -248,6 +254,17 @@ export type CollabDeps = {
   }) => Promise<CommentDocStore | null> | CommentDocStore | null;
   /** Tasks 8.2 / 8.3. Partial: anything missing uses the failing stub. */
   bodies?: Partial<CollabJobBodies>;
+  /**
+   * The GitHub adapter the three **review-comment** routes drive (R-7.7 — every GitHub
+   * touch is server-side). Built per request from the document's own binding by default,
+   * so a re-synced document that moved Pull Requests is picked up without a restart.
+   * Injectable so a test never execs `gh`.
+   */
+  adapter?: (ctx: {
+    documentId: string;
+    document: CollaborationDocument;
+    repo: ResolvedCollaborationConfig;
+  }) => GitHubAdapter;
   /** Injectable so tests never exec `gh`. Memoized by the router, successes only. */
   preflight?: (repo: ResolvedCollaborationConfig) => Promise<CollaborationPreflight>;
   /** How long a successful preflight may be reused. Mirrors `createCollabAuthorizer`. */
@@ -347,6 +364,145 @@ function defaultCommentStore(documentId: string, document: CollaborationDocument
 }
 
 /* ------------------------------------------------------------------ *
+ * Review comments — the conversation itself (R-4.13, R-5.11, R-7.12, R-7.13)
+ * ------------------------------------------------------------------ */
+
+/**
+ * What a create/reply/list needs: the adapter, the repo it addresses, and the pull
+ * number carrying the conversation. All three come off the document's own binding, so
+ * nothing here is cached across documents.
+ */
+type ReviewContext = { adapter: GitHubAdapter; repoRef: RepoRef; pullNumber: number };
+
+/** Positive integer or `undefined`. A line of 0 or 1.5 is a malformed request, not a line. */
+function optionalLine(body: Record<string, unknown>, key: string): number | undefined {
+  const value = body[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) throw new Error(`invalid ${key}`);
+  return value;
+}
+
+/**
+ * R-7.12 — the body of a comment posted against the FILE rather than a line.
+ *
+ * The line is the whole reference, and a file-level comment throws it away: on
+ * github.com the thread hangs off the filename with nothing saying which paragraph the
+ * reviewer meant. So the reference is restated in the text, where it survives for a
+ * reader who has this tool installed and for one who does not.
+ *
+ * The user's own words are appended **unchanged and last** (R-7.13 — nothing the user
+ * typed is discarded or reworded). With no line to name there is nothing to restate, so
+ * a genuinely document-level comment passes through untouched rather than growing a
+ * preamble about itself.
+ */
+function fileLevelBody(
+  comment: string,
+  ref: { path: string; startLine?: number; endLine?: number; selectedText?: string },
+): string {
+  const { path, startLine, endLine, selectedText } = ref;
+  if (startLine === undefined) return comment;
+  const lines = endLine !== undefined && endLine !== startLine ? `lines ${startLine}–${endLine}` : `line ${startLine}`;
+  const header = `> **${path} ${lines}** — posted against the file because this line is not part of the pull request's diff.`;
+  if (!selectedText) return `${header}\n\n${comment}`;
+  const quoted = selectedText
+    .split('\n')
+    .map((l) => `> ${l}`)
+    .join('\n');
+  return `${header}\n>\n${quoted}\n\n${comment}`;
+}
+
+/**
+ * Create one review comment, applying the R-7.13 degrade-once policy.
+ *
+ * TWO RULES LIVE HERE AND NOWHERE ELSE.
+ *
+ * R-4.13 — `commit_id` is the Pull Request's CURRENT head, re-read from `getPullRequest`
+ * on every create. A sha cached at open time is stale as soon as anyone pushes, and a
+ * comment posted against a stale sha is born outdated: GitHub reports `line: null`
+ * immediately and the reviewer's words arrive already detached from the text.
+ *
+ * R-7.13 — a line outside the Pull Request's diff is refused with `422`
+ * (`errors[0].field: pull_request_review_thread.line`, recorded in
+ * `collaboration/fixtures/error-line-not-in-diff.json`). The retry is **here**, not in
+ * the adapter: the adapter deliberately surfaces the 422 so this policy — degrade once,
+ * then say so — stays visible at the layer that answers the user. It runs exactly once;
+ * a second 422 is a real failure and is reported as one.
+ *
+ * The 422 is discriminated on status alone, because `GitHubError` carries `status` and
+ * `errors[0].code` but not `field`. With a valid head sha, an existing path and a
+ * non-empty body already established, the unresolvable line is the remaining way for a
+ * line create to be refused — and degrading on some other 422 costs a file-level comment
+ * rather than a lost one.
+ */
+async function createReviewCommentWithPolicy(
+  ctx: ReviewContext,
+  input: { path: string; comment: string; startLine?: number; endLine?: number; selectedText?: string },
+): Promise<{ created: ReviewComment; degraded?: { to: 'file'; reason: string } }> {
+  const { adapter, repoRef, pullNumber } = ctx;
+  const { path, comment, startLine, endLine, selectedText } = input;
+
+  // R-4.13 — re-read at creation time. Never a sha held from open.
+  const pull = await adapter.getPullRequest(repoRef, pullNumber);
+  const commitId = pull.headSha;
+
+  // No line to anchor to: a document-level comment is file-level by intent, not by
+  // degradation, so it carries no "we had to" disclosure.
+  if (startLine === undefined) {
+    return { created: await adapter.createReviewComment(repoRef, pullNumber, { path, body: comment, commitId }) };
+  }
+
+  const line = endLine ?? startLine;
+  try {
+    const created = await adapter.createReviewComment(repoRef, pullNumber, {
+      path,
+      body: comment,
+      commitId,
+      line,
+      startLine,
+      side: 'RIGHT',
+    });
+    return { created };
+  } catch (err) {
+    if (!(err instanceof GitHubError) || err.status !== 422) throw err;
+    // The one retry. `line` is omitted, which is how the adapter is told to send
+    // `subject_type: file` (R-4.14).
+    const created = await adapter.createReviewComment(repoRef, pullNumber, {
+      path,
+      body: fileLevelBody(comment, {
+        path,
+        startLine,
+        ...(endLine !== undefined ? { endLine } : {}),
+        ...(selectedText ? { selectedText } : {}),
+      }),
+      commitId,
+    });
+    return { created, degraded: { to: 'file', reason: err.message } };
+  }
+}
+
+/**
+ * Project one just-created comment into the record the client renders.
+ *
+ * A create answers with a single comment, so its thread is that comment with no
+ * replies — what `groupIntoThreads` would return for a one-element list. Resolution is
+ * deliberately absent: a brand-new thread is unresolved, but "unresolved" is GitHub's
+ * answer to give (R-5.12 / R-5.15), and `undefined` here reads as "not yet known" rather
+ * than as a guess this layer made.
+ */
+function projectCreated(created: ReviewComment, workflow?: string): ReviewThreadRecord {
+  const record = projectReviewThread({ root: created, replies: [] });
+  // R-5.4 — the routing tag cannot be written into the body, so it lives only on this
+  // response. A later read from GitHub projects the default; the tag does not round-trip.
+  return workflow ? { ...record, workflow } : record;
+}
+
+/** Map an adapter failure onto a response. A 4xx is the caller's; anything else is ours. */
+function githubFailure(err: GitHubError): CollabRouteResult {
+  const status = err.status !== undefined && err.status >= 400 && err.status < 500 ? err.status : 502;
+  return { status, json: { error: err.message } };
+}
+
+/* ------------------------------------------------------------------ *
  * The router
  * ------------------------------------------------------------------ */
 
@@ -355,7 +511,6 @@ const DEFAULT_PREFLIGHT_TTL_MS = 60_000;
 export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   const bodies: CollabJobBodies = { ...STUB_BODIES, ...deps.bodies };
   const authorize = deps.authorize;
-  const now = deps.now ?? (() => new Date().toISOString());
   const runPreflight = deps.preflight ?? ((repo: ResolvedCollaborationConfig) => preflightCollaboration({ repo }));
   const preflightTtl = deps.preflightTtlMs ?? DEFAULT_PREFLIGHT_TTL_MS;
   const clock = deps.clock ?? (() => Date.now());
@@ -450,6 +605,70 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
       return { ok: false, result: { status: 501, json: { error: 'comment store does not support collaborative comments' } } };
     }
     return { ok: true, store: store as CollabCommentStore };
+  }
+
+  /**
+   * Resolve the review-comment context for a document, or the response to send instead.
+   * The same 409 the comment-store path answers, for the same reason: a document with no
+   * Pull Request has nowhere to host a conversation.
+   */
+  function reviewFor(
+    documentId: string,
+    document: CollaborationDocument,
+    repo: ResolvedCollaborationConfig,
+  ): { ok: true; ctx: ReviewContext } | { ok: false; result: CollabRouteResult } {
+    const binding = bindingOf(document);
+    if (!binding) {
+      return {
+        ok: false,
+        result: { status: 409, json: { error: `document ${documentId} has no pull request yet — run start or open first` } },
+      };
+    }
+    const adapter = deps.adapter ? deps.adapter({ documentId, document, repo }) : createGitHubAdapter();
+    return {
+      ok: true,
+      ctx: { adapter, repoRef: { owner: binding.owner, repo: binding.repo }, pullNumber: binding.pullNumber as number },
+    };
+  }
+
+  /*
+   * R-5.11 — comment-creation idempotency.
+   *
+   * The trailer-carried key the issue-comment store used is gone with the trailer: R-5.4
+   * forbids writing a machine-readable reference into a review comment's body, so there
+   * is nothing on GitHub to read a key back off, and `POST /pulls/:n/comments` offers no
+   * `Idempotency-Key` header either. The deduplication therefore lives here.
+   *
+   * It is the in-flight **promise** that is keyed, not the finished result, and that is
+   * what makes it cover the case the requirement names: a client that gave up on a slow
+   * create and retried joins the request already running instead of starting a second
+   * one. The entry outlives the response, so a retry sent after the answer was lost still
+   * resolves to the first comment. A failure is dropped, so retrying something that
+   * failed genuinely retries.
+   *
+   * Scope is this process. A create in flight across a server restart can still
+   * duplicate — narrowed, not closed, exactly as the issue-comment store's
+   * read-before-write was, and detectable afterwards on GitHub.
+   */
+  const pendingCreates = new Map<string, Promise<CollabRouteResult>>();
+
+  function onceByKey(key: string | undefined, run: () => Promise<CollabRouteResult>): Promise<CollabRouteResult> {
+    if (!key) return run();
+    const inFlight = pendingCreates.get(key);
+    if (inFlight) return inFlight;
+    const promise = run().then(
+      (result) => {
+        // Only a success is worth remembering; a failed create must stay retryable.
+        if (result.status < 200 || result.status >= 300) pendingCreates.delete(key);
+        return result;
+      },
+      (err: unknown) => {
+        pendingCreates.delete(key);
+        throw err;
+      },
+    );
+    pendingCreates.set(key, promise);
+    return promise;
   }
 
   async function handle(req: CollabRequest): Promise<CollabRouteResult> {
@@ -612,9 +831,38 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         if (!gated.ok) return gated.result;
         const loaded = await load(documentId);
         if (!loaded.ok) return loaded.result;
-        const store = await commentsFor(documentId, loaded.document, gated.repo);
-        if (!store.ok) return store.result;
-        return { status: 200, json: (await store.store.read()).comments };
+        const review = reviewFor(documentId, loaded.document, gated.repo);
+        if (!review.ok) return review.result;
+        const { adapter, repoRef, pullNumber } = review.ctx;
+
+        // R-5.17 — the adapter accumulates every page before returning, and threads are
+        // grouped over that whole list. Grouping a page at a time would turn a reply whose
+        // root sits on the previous page into an orphan thread.
+        const comments = await adapter.listReviewComments(repoRef, pullNumber);
+        const threads = groupIntoThreads(comments);
+
+        /*
+         * R-4.12 / R-5.15 — resolution is a GraphQL read alongside a REST one, and it can
+         * fail on its own. When it does the conversation is still served; every thread
+         * simply carries no `isResolved`, which the projection renders as "unknown". The
+         * one answer forbidden here is `false`: "nobody resolved it" and "we could not ask"
+         * drive different UI and a different Ready gate (R-8.25).
+         */
+        let resolutions: Map<number, ThreadResolution> | null = null;
+        try {
+          const read = await adapter.listThreadResolution(repoRef, pullNumber);
+          resolutions = new Map(read.map((r) => [r.rootCommentId, r]));
+        } catch {
+          resolutions = null;
+        }
+
+        // R-4.15 — joined on the thread root's REST integer id, which is GraphQL's
+        // `databaseId` and the same integer the `c-<8hex>` record id encodes.
+        const projected = threads.map((thread) => {
+          const resolution = resolutions?.get(thread.root.id);
+          return projectReviewThread(thread, { ...(resolution ? { resolution } : {}) });
+        });
+        return { status: 200, json: projected };
       }
 
       /* GET /__vs/collab/:id/events — R-8.2 SSE. `subscribe` writes the head itself. */
@@ -699,69 +947,104 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         });
       }
 
-      /* POST /__vs/collab/:id/comments — R-7.5, anchored on nodeId. */
+      /*
+       * POST /__vs/collab/:id/comments — R-5.4 / R-7.5, a PR **review** comment anchored
+       * on `path` + line.
+       *
+       * `path` defaults to the document's own path: the review surface renders one
+       * document (R-7.9), and a client that names no other file means that one. A request
+       * with no `startLine` is a document-level comment and is posted file-level by intent.
+       */
       if (method === 'POST' && tail === '/comments') {
         const text = requireString(body, 'comment');
-        const nodeId = typeof body.nodeId === 'string' && body.nodeId ? body.nodeId : undefined;
+        const startLine = optionalLine(body, 'startLine');
+        const endLine = optionalLine(body, 'endLine');
+        if (startLine !== undefined && endLine !== undefined && endLine < startLine) return bad('endLine precedes startLine');
         /*
          * The routing tag the panel's "Apply via" control sets: which skill handles this
          * comment. It says nothing about whether the comment is worth acting on — both of
-         * its values mean "actionable", they differ on by whom. It reached the browser's
-         * request body and went no further, so every collaborative comment was born with
-         * the default and the control was decorative.
+         * its values mean "actionable", they differ on by whom. It survives on the response
+         * only: R-5.4 forbids writing a machine-readable reference into the body, so GitHub
+         * has nowhere to keep it.
          */
         const workflow = typeof body.workflow === 'string' && body.workflow.trim() ? body.workflow.trim() : undefined;
+        // R-7.12's raw material. The browser holds the selected text; the server does not
+        // re-read the branch for it, which would be a second answer to what was selected.
+        const selectedText = typeof body.selectedText === 'string' && body.selectedText ? body.selectedText : undefined;
         const gated = await gate('comment', documentId);
         if (!gated.ok) return gated.result;
         const loaded = await load(documentId);
         if (!loaded.ok) return loaded.result;
-        const store = await commentsFor(documentId, loaded.document, gated.repo);
-        if (!store.ok) return store.result;
-        const saved = await store.store.addComment(
-          commentRecord(loaded.document.documentPath, text, now(), {
-            ...(nodeId ? anchorFields(loaded.document, nodeId) : {}),
-            ...(workflow ? { workflow } : {}),
-          }),
-        );
-        return { status: 200, json: { ok: true, id: saved.id, comment: saved } };
+        const review = reviewFor(documentId, loaded.document, gated.repo);
+        if (!review.ok) return review.result;
+        const path = typeof body.path === 'string' && body.path.trim() ? body.path.trim() : loaded.document.documentPath;
+
+        // R-5.11 — the whole create runs under the key, so a retry joins the first attempt
+        // rather than posting a second comment.
+        const key = optionalKey(body);
+        return onceByKey(key ? `${documentId}:${key}` : undefined, async () => {
+          try {
+            const { created, degraded } = await createReviewCommentWithPolicy(review.ctx, {
+              path,
+              comment: text,
+              ...(startLine !== undefined ? { startLine } : {}),
+              ...(endLine !== undefined ? { endLine } : {}),
+              ...(selectedText ? { selectedText } : {}),
+            });
+            const record = projectCreated(created, workflow);
+            return {
+              status: 200,
+              json: {
+                ok: true,
+                id: record.id,
+                comment: record,
+                // R-7.13 — the caller is told it degraded and why, in GitHub's own words.
+                ...(degraded ? { degraded } : {}),
+              },
+            };
+          } catch (err) {
+            // R-7.14 — the cause is reported; the text the user typed is theirs and is
+            // never consumed by a failed create, so the panel can re-submit it unchanged.
+            if (err instanceof GitHubError) return githubFailure(err);
+            throw err;
+          }
+        });
       }
 
-      /* POST /__vs/collab/:id/comments/:commentId/reply */
+      /*
+       * POST /__vs/collab/:id/comments/:commentId/reply — R-7.15.
+       *
+       * Replies are NATIVE now: GitHub's replies endpoint attaches the reply to the
+       * thread and the reply inherits the thread's anchor, so nothing here computes a
+       * position or writes a `replyTo` marker into a body (R-5.4). `commentId` decodes
+       * through the same `c-<8hex>` bijection `PATCH` uses; the integer it carries is the
+       * thread root's, which is what the endpoint keys on (R-5.19).
+       *
+       * An unknown root is GitHub's 404, not a local list lookup — the list is not read
+       * here, so a reply costs one request rather than a page walk plus one.
+       */
       const reply = /^\/comments\/([^/]+)\/reply$/.exec(tail);
       if (reply && method === 'POST') {
         const commentId = reply[1]!;
         if (!COMMENT_ID_RE.test(commentId)) return bad(`invalid commentId: ${commentId}`);
+        const rootId = reviewCommentIdFor(commentId);
+        if (rootId === null) return bad(`invalid commentId: ${commentId}`);
         const text = requireString(body, 'comment');
         const gated = await gate('reply', documentId);
         if (!gated.ok) return gated.result;
         const loaded = await load(documentId);
         if (!loaded.ok) return loaded.result;
-        const store = await commentsFor(documentId, loaded.document, gated.repo);
-        if (!store.ok) return store.result;
-        const parent = (await store.store.read()).comments.find((c) => c.id === commentId);
-        if (!parent) return { status: 404, json: { error: `unknown comment: ${commentId}` } };
-        /*
-         * The `replyTo` marker rides on the record's `collab` trailer fields. Persisting
-         * it into the GitHub body is the projection layer's job (task 5.2); this layer
-         * only states the intent.
-         *
-         * It states it as the parent's GITHUB issue-comment id, not our local `c-…` id.
-         * That is what the trailer's `replyTo` means everywhere else — the resolution
-         * replies write it that way and `markerOf` parses it as a number — and it is the
-         * only id that survives a reader who has never seen this machine's store. Passing
-         * the local id produced a trailer nothing could resolve, so the parent link was
-         * lost the moment it reached GitHub and no reply could ever be threaded again.
-         */
-        const parentTrailer = (parent as { collab?: { nodeId?: string }; github?: { issueCommentId?: number } }).collab;
-        const parentIssueCommentId = (parent as { github?: { issueCommentId?: number } }).github?.issueCommentId;
-        const nodeId = parentTrailer?.nodeId;
-        const saved = await store.store.addComment(
-          commentRecord(loaded.document.documentPath, text, now(), {
-            replyTo: String(parentIssueCommentId ?? commentId),
-            ...(nodeId ? { nodeId } : {}),
-          }),
-        );
-        return { status: 200, json: { ok: true, id: saved.id, comment: saved } };
+        const review = reviewFor(documentId, loaded.document, gated.repo);
+        if (!review.ok) return review.result;
+        const { adapter, repoRef, pullNumber } = review.ctx;
+        try {
+          const created = await adapter.replyToReviewComment(repoRef, pullNumber, rootId, text);
+          const record = projectCreated(created);
+          return { status: 200, json: { ok: true, id: record.id, comment: record } };
+        } catch (err) {
+          if (err instanceof GitHubError) return githubFailure(err);
+          throw err;
+        }
       }
 
       /* PATCH /__vs/collab/:id/comments/:commentId */
@@ -828,56 +1111,4 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
       deps.jobs.disposeAll();
     },
   };
-}
-
-/**
- * R-6.5 / R-7.5 — the anchor a new collaborative comment is born with.
- *
- * `nodeId` is the primary identity. The other two are captured **here, at creation
- * time, and nowhere else**, because after the fact they are unrecoverable:
- *
- *   `text`        the block's text as it reads now (`captureTargetText`). Once the node
- *                 is deleted the `nodes` projection entry goes with it, and the trailer
- *                 is the only part of the comment that survives a GitHub round-trip —
- *                 so an orphan with no captured text can never say what it was about.
- *   `nodeVersion` the version the comment was authored against. Without it R-6.3 has
- *                 nothing to compare and every comment resolves `exact` forever.
- *
- * Both are omitted rather than faked when the document cannot supply them — a fabricated
- * version would flag comments outdated for edits nobody made.
- */
-function anchorFields(document: CollaborationDocument, nodeId: string): Record<string, string> {
-  const targetText = captureTargetText(document, nodeId);
-  const version = collabNodeVersion(document, nodeId);
-  return {
-    nodeId,
-    ...(targetText ? { [COLLAB_TARGET_TEXT_KEY]: targetText } : {}),
-    ...(version !== null ? { nodeVersion: String(version) } : {}),
-  };
-}
-
-/**
- * One collaborative comment, in the shape every `CommentDocStore` already accepts.
- * `target` still carries the document path so the record stays a valid `CommentRecord`
- * (R-1.7 — `CommentTarget` is unchanged); `collab.nodeId` is the primary identity
- * (R-7.5) and is what `githubCommentStore` writes into the trailer.
- *
- * The generated `id` is a placeholder: a GitHub-backed store replaces it with
- * `recordIdFor(issueCommentId)` in the record it returns.
- */
-function commentRecord(
-  documentPath: string,
-  text: string,
-  ts: string,
-  collab: Record<string, string>,
-): CommentRecord {
-  return {
-    id: `c-${randomHex8()}`,
-    workflow: DEFAULT_WORKFLOW,
-    target: { path: documentPath, kind: 'file' },
-    comment: text,
-    status: 'open',
-    ts,
-    ...(Object.keys(collab).length > 0 ? { collab } : {}),
-  } as CommentRecord;
 }

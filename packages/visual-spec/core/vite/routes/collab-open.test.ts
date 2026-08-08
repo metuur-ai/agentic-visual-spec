@@ -87,6 +87,25 @@ const CONTENTS = JSON.stringify({
 
 const FORBIDDEN = JSON.stringify({ message: 'Resource not accessible by personal access token', status: '403' });
 
+/** What `POST /pulls/42/comments` answers the reviewer with. */
+const REVIEW_COMMENT_CREATED = JSON.stringify({
+  id: 3740897151,
+  in_reply_to_id: null,
+  path: REMOTE_DOC.documentPath,
+  line: 3,
+  original_line: 3,
+  side: 'RIGHT',
+  subject_type: 'line',
+  commit_id: '9f8e7d6c5b4a39281706f5e4d3c2b1a098765432',
+  original_commit_id: '9f8e7d6c5b4a39281706f5e4d3c2b1a098765432',
+  diff_hunk: '@@ -1,3 +1,3 @@',
+  body: 'Tighten this paragraph.',
+  user: { login: 'reviewer-rita' },
+  created_at: '2026-08-07T11:00:00Z',
+  updated_at: '2026-08-07T11:00:00Z',
+  html_url: 'https://github.com/acme/docs/pull/42#discussion_r3740897151',
+});
+
 /**
  * A **read-only credential**, simulated the way GitHub actually behaves: every read
  * succeeds, and every endpoint that requires push permission answers 403. Posting an
@@ -107,6 +126,11 @@ function readOnlyGh() {
     if (method === 'GET' && endpoint.startsWith('/repos/acme/docs/contents/documents/doc-1.json')) return ok(CONTENTS);
     if (method === 'GET' && endpoint.startsWith('/repos/acme/docs/issues/42/comments')) return ok('[]');
     if (method === 'POST' && endpoint === '/repos/acme/docs/issues/42/comments') return ok(fixture('issue-comment-create.json'));
+    // The conversation is PR **review** comments now. Creating one is a read-access
+    // operation on GitHub, exactly as creating an issue comment is — which is the R-11.3
+    // claim this suite exists to hold.
+    if (method === 'GET' && endpoint.startsWith('/repos/acme/docs/pulls/42/comments')) return ok('[]');
+    if (method === 'POST' && endpoint === '/repos/acme/docs/pulls/42/comments') return ok(REVIEW_COMMENT_CREATED);
 
     // Anything left needs push access. A read-only credential is refused here, and the
     // assertions below require that this branch is never taken.
@@ -168,6 +192,9 @@ function reviewerHost() {
     // Same store the default builds, with the injected executor so no real `gh` runs.
     commentStore: ({ documentId, document }) =>
       githubCommentStore({ adapter, repo: { owner: REPO.owner, repo: REPO.repo }, pullNumber: 42, documentId, documentPath: document.documentPath }),
+    // Likewise for the review-comment routes: the real adapter over the reviewer's own
+    // executor, so the endpoints below are the ones production would reach.
+    adapter: () => adapter,
   });
   const call = (method: string, pathname: string, body: Record<string, unknown> = {}, sse?: SseSink): Promise<CollabRouteResult> =>
     router.handle({ method, pathname, query: {}, body, ...(sse ? { sse } : {}) });
@@ -218,8 +245,8 @@ describe('SC-4 (simulated) — a read-only reviewer completes open → read → 
       github: { branch: BRANCH, pullNumber: 42 },
     });
 
-    /* comment — R-11.3, posted as a PR issue comment */
-    const commented = (await h.call('POST', '/doc-1/comments', { comment: 'Tighten this paragraph.', nodeId: 'n-7' })) as {
+    /* comment — R-11.3, posted as a PR review comment on the document's path and line */
+    const commented = (await h.call('POST', '/doc-1/comments', { comment: 'Tighten this paragraph.', startLine: 3 })) as {
       status: number;
       json: { ok: boolean; id: string };
     };
@@ -229,7 +256,7 @@ describe('SC-4 (simulated) — a read-only reviewer completes open → read → 
     /* R-11.3 — nothing on that path needed push access. */
     expect(h.gh.refused).toEqual([]);
     const mutating = h.gh.calls.filter((c) => c.method !== 'GET');
-    expect(mutating).toEqual([{ method: 'POST', endpoint: '/repos/acme/docs/issues/42/comments' }]);
+    expect(mutating).toEqual([{ method: 'POST', endpoint: '/repos/acme/docs/pulls/42/comments' }]);
     // Named explicitly, because these are the four a read-only credential must never see.
     expect(h.gh.calls.some((c) => c.endpoint.endsWith('/git/refs'))).toBe(false);
     expect(h.gh.calls.some((c) => c.method === 'PUT' && c.endpoint.includes('/contents/'))).toBe(false);

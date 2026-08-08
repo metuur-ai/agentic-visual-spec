@@ -162,16 +162,56 @@ function memoryComments(): CommentDocStore {
   } as CommentDocStore;
 }
 
+/**
+ * The review-comment surface, stubbed to the four methods those routes call.
+ *
+ * This file is about *who may do what*, not about what GitHub answers, so the double
+ * succeeds at everything. It exists because the comment and reply rows below now reach
+ * GitHub through the adapter rather than through a `CommentDocStore`, and a router with
+ * no adapter injected would shell out to a real `gh`.
+ */
+function reviewAdapter() {
+  const created = {
+    id: 900101,
+    in_reply_to_id: null,
+    path: 'docs/spec.md',
+    line: 12,
+    original_line: 12,
+    side: 'RIGHT',
+    subject_type: 'line',
+    commit_id: 'a'.repeat(40),
+    original_commit_id: 'a'.repeat(40),
+    diff_hunk: '',
+    body: 'a note',
+    user: { login: 'reviewer-rita' },
+    created_at: '2026-08-07T11:00:00Z',
+    updated_at: '2026-08-07T11:00:00Z',
+    html_url: 'https://github.com/acme/specs/pull/7#discussion_r900101',
+  };
+  return createGitHubAdapter(async (args) => {
+    const endpoint = args[args.length - 1] as string;
+    if (endpoint.includes('--input') || args.includes('--input')) {
+      return { stdout: JSON.stringify(created), stderr: '', exitCode: 0 };
+    }
+    if (endpoint === PULL_ENDPOINT) {
+      return { stdout: JSON.stringify({ number: 7, head: { sha: 'a'.repeat(40), ref: 'vs/doc-1' }, state: 'open' }), stderr: '', exitCode: 0 };
+    }
+    return { stdout: '[]', stderr: '', exitCode: 0 };
+  });
+}
+
 /** A router with the REAL authorizer wired in, exactly as both hosts wire it. */
 function router(exec: GhExecutor, overrides: Partial<CollabDeps> = {}) {
   const documents = memoryDocuments([document()]);
   const comments = memoryComments();
+  const review = reviewAdapter();
   const r = createCollabRoutes({
     jobs: createJobHubRegistry(),
     config: () => ENABLED,
     documents: () => documents,
     preflight: async () => PREFLIGHT,
     commentStore: () => comments,
+    adapter: () => review,
     bodies: {
       create: () => async () => {},
       open: () => async () => {},
@@ -517,8 +557,11 @@ describe('caching — a stale author verdict is bounded, a stale reviewer verdic
 describe('R-9.6 — comments are attributed to the acting account, never in the body', () => {
   it('the created comment body carries no participant identity, and the request has no author field', async () => {
     const inputs: string[] = [];
-    const exec: GhExecutor = async (_args, input) => {
+    const exec: GhExecutor = async (args, input) => {
       if (input !== undefined) inputs.push(input);
+      if (args[args.length - 1] === PULL_ENDPOINT) {
+        return { stdout: JSON.stringify({ number: 7, head: { sha: 'a'.repeat(40) } }), stderr: '', exitCode: 0 };
+      }
       return { stdout: fixture('issue-comment-create.json'), stderr: '', exitCode: 0 };
     };
     const documents = memoryDocuments([document()]);
@@ -527,29 +570,24 @@ describe('R-9.6 — comments are attributed to the acting account, never in the 
       config: () => ENABLED,
       documents: () => documents,
       preflight: async () => PREFLIGHT,
-      commentStore: ({ documentId, document: doc }) =>
-        githubCommentStore({
-          adapter: createGitHubAdapter(exec),
-          repo: { owner: 'acme', repo: 'specs' },
-          pullNumber: 7,
-          documentId,
-          documentPath: doc.documentPath,
-        }),
+      adapter: () => createGitHubAdapter(exec),
       authorize: createCollabAuthorizer({ exec: asReviewer().exec, documents: () => documents }),
     });
 
-    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'Tighten this paragraph.', nodeId: 'n-7' });
+    const res = await call(r, 'POST', '/doc-1/comments', { comment: 'Tighten this paragraph.', startLine: 12 });
     expect(res.status).toBe(200);
 
     // GitHub's own API has no author field on a comment create — attribution is the
-    // credential's, natively. Assert the request never tries to supply one anyway.
+    // credential's, natively. Assert the request never tries to supply one anyway: what
+    // is sent is the anchor and the text, nothing that names a participant.
     const sent = JSON.parse(inputs[0] ?? '{}') as Record<string, unknown>;
-    expect(Object.keys(sent)).toEqual(['body']);
+    expect(Object.keys(sent).sort()).toEqual(['body', 'commit_id', 'line', 'path', 'side']);
     const body = sent.body as string;
     expect(body).not.toContain('octocat');
     expect(body).not.toMatch(/\b(login|author|user|actor)=/);
-    // The trailer that IS present carries document coordinates only.
-    expect(body).toContain('<!-- visual-spec: documentId=doc-1 nodeId=n-7 -->');
+    // R-5.4 — and no machine-readable reference of any kind: the body is what was typed.
+    expect(body).toBe('Tighten this paragraph.');
+    expect(body).not.toContain('<!-- visual-spec:');
   });
 
   it('the attributed user is read back from GitHub, not asserted by this package', async () => {

@@ -37,6 +37,24 @@
  * module never does. It reports the thread as outdated and carries the captured
  * snippet; a second stage that actually holds the document text may re-anchor it, and
  * only on an exact unique match.
+ *
+ * ---------------------------------------------------------------------------
+ * THE TWO STAGES, AND WHY BOTH LIVE HERE (R-6.3 / R-6.4 / R-6.7)
+ * ---------------------------------------------------------------------------
+ * Stage one is *capture*: read the text at `original_line` from the blob at
+ * `original_commit_id`. Reading the original line out of the original commit is not
+ * the R-6.5 violation — that rule forbids treating `original_line` as a position in
+ * the *current* file, and this reads it as a position in the file it actually belongs
+ * to. Capture needs the network, so it lives in `review-anchoring.ts`, which the
+ * browser never imports; only the clamp and the line lookup are here.
+ *
+ * Stage two is *re-anchoring*: `projectReviewThreadInDocument` searches the current
+ * document for that snippet and upgrades the target to a range on an exact unique hit,
+ * leaving `github.isOutdated` set either way. An outdated comment that found its text
+ * again is still outdated — the reviewer wrote it against a different commit, and the
+ * UI owes the reader that (R-6.10). Neither stage may drop a comment (R-6.9): no
+ * snippet, no match, or an ambiguous match all land on a file-level target that is
+ * still rendered.
  */
 import type { CommentRecord, CommentTarget } from '../editing/comment-doc';
 import { DEFAULT_WORKFLOW } from '../editing/comment-doc';
@@ -309,14 +327,121 @@ export function projectReviewThread(
  * reader one extra glance.
  */
 export function reanchorBySnippet(documentText: string, snippet: string): number | null {
-  const needle = snippet.trim();
+  const needle = clampSnippet(snippet);
   if (!needle) return null;
   const lines = documentText.split('\n');
   let found: number | null = null;
   for (let i = 0; i < lines.length; i += 1) {
-    if (lines[i]?.trim() !== needle) continue;
+    // Compare like against like: the snippet was clamped when it was captured, so a
+    // line longer than the budget must be clamped too or it could never match itself.
+    // Both effects of the clamp fail safe — collapsing whitespace or truncating can
+    // only make two lines look equal, and equal means ambiguous, which means no anchor.
+    if (clampSnippet(lines[i] ?? '') !== needle) continue;
     if (found !== null) return null; // more than one match — ambiguous, so no anchor
     found = i + 1;
   }
   return found;
+}
+
+/**
+ * R-6.7 — character budget for a captured snippet.
+ *
+ * Deliberately the same 160 as `anchor-resolution.ts`'s `TARGET_TEXT_MAX`, which is
+ * itself local mode's `snippet` budget: one product, one idea of how much text a
+ * comment carries. It is copied rather than imported because `anchor-resolution.ts`
+ * serves the retired JSON document format and is slated for deletion; an import would
+ * turn a scheduled removal into a breakage.
+ */
+export const SNIPPET_MAX = 160;
+
+/** Flatten whitespace and clamp to the snippet budget. */
+export function clampSnippet(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > SNIPPET_MAX ? flat.slice(0, SNIPPET_MAX) : flat;
+}
+
+/**
+ * The clamped text at a 1-indexed line of `fileText`, or `''` when there is none.
+ *
+ * `''` is the honest answer for a line past the end of the blob — which happens, since
+ * the blob being read is an old commit's and nothing guarantees it is still that long.
+ * An empty snippet re-anchors to nothing, so the comment stays document-level.
+ */
+export function snippetAtLine(fileText: string, line: number): string {
+  if (!Number.isInteger(line) || line < 1) return '';
+  return clampSnippet(fileText.split('\n')[line - 1] ?? '');
+}
+
+/**
+ * The nearest Markdown heading at or above `line`, or `null` when there is none.
+ *
+ * Captured because `resolveMarkdownAnchors` falls back to matching heading *text* when
+ * `data-vs-loc` finds no block at the line — the document may have been re-rendered
+ * since. The value is the heading's text without its `#`s, because that fallback
+ * compares against `textContent`.
+ *
+ * Fenced code is skipped: a `# comment` inside a shell block is not a heading, and
+ * anchoring by it would name a section that does not exist. This is a *display hint*,
+ * never a position — heading proximity may not re-anchor anything (R-6.8).
+ */
+export function headingAbove(documentText: string, line: number): string | null {
+  const lines = documentText.split('\n');
+  const limit = Math.min(Math.max(line, 1), lines.length);
+  let fence: string | null = null;
+  let heading: string | null = null;
+  for (let i = 0; i < limit; i += 1) {
+    const raw = lines[i] ?? '';
+    const mark = /^ {0,3}(```+|~~~+)/.exec(raw)?.[1] ?? null;
+    if (fence !== null) {
+      // A closing fence is the same character, at least as long as the opening one.
+      if (mark !== null && mark[0] === fence[0] && mark.length >= fence.length) fence = null;
+      continue;
+    }
+    if (mark !== null) {
+      fence = mark;
+      continue;
+    }
+    const atx = /^ {0,3}(#{1,6})\s+(.*)$/.exec(raw);
+    if (atx) heading = atx[2]?.replace(/\s+#+\s*$/, '').trim() || null;
+  }
+  return heading;
+}
+
+/**
+ * Stage two: project a thread **against the document text** (R-6.2 … R-6.4, R-6.9).
+ *
+ * Three outcomes, and no fourth:
+ *   - a current line          → `kind: 'range'` where GitHub says, plus a heading;
+ *   - outdated, snippet found exactly once → `kind: 'range'` at the match, heading
+ *     captured, and `github.isOutdated` **still true** (R-6.3, R-6.10);
+ *   - outdated with no match, an ambiguous match, or no snippet at all → `kind: 'file'`
+ *     carrying whatever snippet was captured, so the reader sees the comment and the
+ *     text it was written about even though nothing can place it (R-6.4).
+ *
+ * File-level threads pass through untouched: they are anchored to the document by
+ * construction and were never outdated (R-6.12).
+ */
+export function projectReviewThreadInDocument(
+  thread: ReviewThread,
+  documentText: string,
+  options: { snippet?: string; resolution?: ThreadResolution } = {},
+): ReviewThreadRecord {
+  const record = projectReviewThread(thread, {
+    ...(options.snippet ? { snippet: options.snippet } : {}),
+    ...(options.resolution ? { resolution: options.resolution } : {}),
+  });
+
+  if (isThreadOutdated(thread) && options.snippet) {
+    const line = reanchorBySnippet(documentText, options.snippet);
+    if (line !== null) {
+      // A single line, not a range: the extent the reviewer selected lived in a commit
+      // that is gone, and inventing an end line would be inventing a claim.
+      record.target = { path: thread.root.path, kind: 'range', startLine: line, snippet: options.snippet };
+    }
+  }
+
+  if (record.target.kind === 'range' && typeof record.target.startLine === 'number') {
+    record.target.heading = headingAbove(documentText, record.target.startLine);
+  }
+  return record;
 }

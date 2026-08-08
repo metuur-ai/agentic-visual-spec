@@ -16,10 +16,14 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   type ReviewComment,
+  SNIPPET_MAX,
   groupIntoThreads,
+  headingAbove,
   isThreadOutdated,
   projectReviewThread,
+  projectReviewThreadInDocument,
   reanchorBySnippet,
+  snippetAtLine,
   reviewCommentIdFor,
   reviewRecordIdFor,
   targetForThread,
@@ -243,5 +247,116 @@ describe('reanchorBySnippet', () => {
 
   it('returns null for an empty snippet instead of matching a blank line', () => {
     expect(reanchorBySnippet(doc, '   ')).toBeNull();
+  });
+
+  it('matches a line longer than the snippet budget against its clamped capture', () => {
+    const long = `${'a'.repeat(200)} cola`;
+    // Captured text is clamped, so the comparison must clamp the line too or a long
+    // paragraph could never re-anchor to itself.
+    expect(reanchorBySnippet(`# T\n\n${long}\n`, snippetAtLine(long, 1))).toBe(3);
+  });
+
+  it('stays ambiguous when two long lines share their clamped prefix', () => {
+    const a = `${'a'.repeat(200)} uno`;
+    const b = `${'a'.repeat(200)} dos`;
+    // Truncation can only ever create ambiguity, and ambiguity means no anchor.
+    expect(reanchorBySnippet(`${a}\n${b}\n`, snippetAtLine(a, 1))).toBeNull();
+  });
+});
+
+describe('snippetAtLine', () => {
+  const file = ['# Titulo', '', 'Texto   con   espacios', ''].join('\n');
+
+  it('reads the 1-indexed line and flattens its whitespace', () => {
+    expect(snippetAtLine(file, 3)).toBe('Texto con espacios');
+  });
+
+  it('clamps to SNIPPET_MAX, the same budget local mode gives a snippet', () => {
+    expect(SNIPPET_MAX).toBe(160);
+    expect(snippetAtLine('x'.repeat(500), 1)).toHaveLength(SNIPPET_MAX);
+  });
+
+  it('returns empty for a line past the end, or a nonsense line number', () => {
+    // An old blob is not guaranteed to still be as long as original_line.
+    expect(snippetAtLine(file, 99)).toBe('');
+    expect(snippetAtLine(file, 0)).toBe('');
+    expect(snippetAtLine(file, -1)).toBe('');
+  });
+});
+
+describe('headingAbove', () => {
+  const doc = [
+    '# Uno', // 1
+    '', // 2
+    'cuerpo', // 3
+    '', // 4
+    '## Dos ##', // 5
+    '', // 6
+    '```sh', // 7
+    '# no es un titulo', // 8
+    '```', // 9
+    'final', // 10
+  ].join('\n');
+
+  it('finds the nearest heading at or above the line, without its hashes', () => {
+    expect(headingAbove(doc, 3)).toBe('Uno');
+    expect(headingAbove(doc, 6)).toBe('Dos');
+    expect(headingAbove(doc, 1)).toBe('Uno');
+  });
+
+  it('ignores a hash inside a fenced code block', () => {
+    expect(headingAbove(doc, 10)).toBe('Dos');
+  });
+
+  it('returns null when nothing above the line is a heading', () => {
+    expect(headingAbove('solo texto\notra linea', 2)).toBeNull();
+  });
+});
+
+describe('projectReviewThreadInDocument', () => {
+  it('anchors a current line and captures its heading (R-6.2)', () => {
+    const doc = ['# Intro', '', 'uno', 'dos', 'tres'].join('\n');
+    const [thread] = groupIntoThreads([comment({ id: 1, line: 4, startLine: 3 })]);
+    const record = projectReviewThreadInDocument(thread!, doc);
+    expect(record.target).toEqual({ path: 'doc.md', kind: 'range', startLine: 3, endLine: 4, heading: 'Intro' });
+    expect(record.github.isOutdated).toBe(false);
+  });
+
+  it('re-anchors an outdated thread on a unique match and keeps the flag (R-6.3)', () => {
+    const doc = ['# Seccion', '', 'texto original', ''].join('\n');
+    const [thread] = groupIntoThreads([comment({ id: 1, line: null })]);
+    const record = projectReviewThreadInDocument(thread!, doc, { snippet: 'texto original' });
+    expect(record.target).toEqual({
+      path: 'doc.md',
+      kind: 'range',
+      startLine: 3,
+      snippet: 'texto original',
+      heading: 'Seccion',
+    });
+    expect(record.github.isOutdated).toBe(true);
+  });
+
+  it('stays file-level with its snippet when the match is ambiguous or absent (R-6.4)', () => {
+    const [thread] = groupIntoThreads([comment({ id: 1, line: null })]);
+    for (const doc of ['dos veces\notra\ndos veces', 'nada parecido']) {
+      const record = projectReviewThreadInDocument(thread!, doc, { snippet: 'dos veces' });
+      expect(record.target).toEqual({ path: 'doc.md', kind: 'file', snippet: 'dos veces' });
+      expect(record.github.isOutdated).toBe(true);
+    }
+  });
+
+  it('stays file-level when no snippet was captured at all', () => {
+    const [thread] = groupIntoThreads([comment({ id: 1, line: null })]);
+    const record = projectReviewThreadInDocument(thread!, 'cualquier cosa');
+    expect(record.target).toEqual({ path: 'doc.md', kind: 'file' });
+  });
+
+  it('never re-anchors by heading proximity (R-6.8)', () => {
+    // Same heading, snippet nowhere: a heading match must not become a position.
+    const doc = ['# Seccion', '', 'otro texto'].join('\n');
+    const [thread] = groupIntoThreads([comment({ id: 1, line: null })]);
+    const record = projectReviewThreadInDocument(thread!, doc, { snippet: 'texto original' });
+    expect(record.target.kind).toBe('file');
+    expect(record.target.heading).toBeUndefined();
   });
 });
