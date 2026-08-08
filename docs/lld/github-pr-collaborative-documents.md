@@ -460,9 +460,11 @@ reply markers, a dual-artifact publish, and a `.gitattributes` rule whose only j
 to stop reviewers seeing a wall of JSON diff. All of that existed to buy one property —
 a comment that never goes outdated — which every GitHub user already lives without.
 
-*Rejected:* the `.mdj` variants, both of them. A JSON envelope under a new extension is
-the same format with a different name; a local review-session sidecar has nothing left
-to hold once the conversation lives in the PR.
+*Rejected:* giving the JSON envelope a dedicated extension so the viewer could render
+it as prose. That is the same format under a different name — it keeps every cost
+above and buys only a nicer-looking file tree. Also rejected: a local sidecar holding
+the review session beside the `.md`, which has nothing left to hold once the
+conversation lives in the pull request.
 
 ### Comments as PR review comments, not issue comments
 
