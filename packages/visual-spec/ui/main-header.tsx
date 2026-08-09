@@ -1,8 +1,12 @@
 import { type CommentRecord, buildApplyPrompt, useComments, useInspector, useSpecsRoot } from '../core/app';
-import { memo, useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { HelpButton } from './help-page';
 import { CommentHistoryList } from './comment-history-list';
 import { toPath } from './md-path';
+// `document-record.ts` imports nothing (see its header), so the id pattern crosses into
+// the browser as a value without dragging `node:*` behind it.
+import { DOCUMENT_ID_RE } from '../core/collaboration/document-record';
+import { type CollabAvailabilitySnapshot, createCollabClient } from './collab-client';
 import type { PullRequestSummary } from './collab-client';
 import { type CollabPulls, type ConfiguredRepo, useCollabPulls } from './use-collab-pulls';
 import { type BranchListing, useGitBranches } from './use-git-branches';
@@ -1221,6 +1225,197 @@ function InspectorToggle() {
   );
 }
 
+/**
+ * The document id derived from the open file's name, sanitized into `DOCUMENT_ID_RE`.
+ *
+ * The id names the branch (`visual-spec/<id>`) and the record, so it cannot be the raw
+ * file name: spaces, dots and accents are all legal in a file name and none of them is
+ * legal here. A run of anything the id may not contain collapses to a single `-`, and
+ * the leading characters are trimmed until an alphanumeric because the pattern anchors
+ * on one.
+ *
+ * The result may be empty (`___.md`, `---.md`), and that is deliberate: the caller asks
+ * for one rather than inventing a name the author never chose.
+ */
+export function documentIdFromPath(path: string): string {
+  const base = (path.split(/[\\/]/).pop() ?? '').replace(/\.[^.]+$/, '');
+  return base
+    .toLowerCase()
+    .replace(/[^a-z0-9\-_]+/g, '-')
+    .replace(/^[^a-z0-9]+/, '')
+    .replace(/-+$/, '');
+}
+
+type PrStatus = { kind: 'idle' } | { kind: 'busy' } | { kind: 'error'; message: string } | { kind: 'ok'; message: string };
+
+/** The bytes on disk for the open file — what the create job commits to the branch. */
+async function readMarkdown(path: string): Promise<string> {
+  const res = await fetch(`/__vs/tree/file?path=${encodeURIComponent(path)}`);
+  if (!res.ok) throw new Error(`Could not read ${path} (HTTP ${res.status}).`);
+  const body = (await res.json()) as { content?: unknown };
+  if (typeof body.content !== 'string') throw new Error(`${path} has no text content to commit.`);
+  return body.content;
+}
+
+/**
+ * R-8.5 from the file that is already open — "put *this* under review".
+ *
+ * `CollabOpenPanel`'s own author entry creates a NEW, EMPTY document at
+ * `documents/<id>.md`. That is the wrong shape for the only thing an author ever
+ * actually wants to do first: they have written a file, it is on screen, and they want a
+ * pull request for it. So this posts the same `POST /__vs/collab/start` with the two
+ * fields that route has always accepted and nothing sent until now — the *open file's*
+ * `documentPath` and its `markdown`.
+ *
+ * THE FILE KEEPS THE PATH IT ALREADY HAS. `documentPath` is `test/javier/for-comment.md`,
+ * not `documents/for-comment.md`. It breaks the convention that every document lives
+ * under `documents/`, on purpose: copying the bytes to a second path would leave the same
+ * document in two places on the branch, and the author would sooner or later edit the one
+ * the pull request is not about. One file, one path, wherever the author put it.
+ *
+ * IT DOES NOT OFFER WHAT THE SERVER WILL REFUSE. `create` is author-only, and
+ * `GET /__vs/collab` already says whether this credential can write. On a definite `false`
+ * the form is replaced by the server's own reason (R-12.5) rather than by a button that
+ * exists to fail. An *absent* `canPublish` means the server could not determine write
+ * access; the form is shown, because the route refuses server-side regardless (R-9.11).
+ */
+function StartPullRequestButton({ file, onStarted }: { file: string; onStarted?: (documentId: string) => void }) {
+  const client = useMemo(() => createCollabClient(), []);
+  const [availability, setAvailability] = useState<CollabAvailabilitySnapshot | null>(null);
+  const [open, setOpen] = useState(false);
+  const [id, setId] = useState(() => documentIdFromPath(file));
+  const [title, setTitle] = useState('');
+  const [prStatus, setPrStatus] = useState<PrStatus>({ kind: 'idle' });
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let live = true;
+    void client.availability().then((res) => {
+      // A failed probe is not a verdict: leave `availability` null and render nothing,
+      // rather than claim collaboration is off.
+      if (live && res.ok) setAvailability(res.value);
+    });
+    return () => {
+      live = false;
+    };
+  }, [client]);
+
+  // A different file is a different document. The id follows it, and last file's error
+  // must not sit over this one's form.
+  useEffect(() => {
+    setId(documentIdFromPath(file));
+    setTitle('');
+    setPrStatus({ kind: 'idle' });
+    setOpen(false);
+  }, [file]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+
+  if (!availability?.available) return null;
+  const blocked = availability.canPublish === false;
+
+  async function start() {
+    const documentId = id.trim();
+    if (!documentId) {
+      setPrStatus({ kind: 'error', message: 'Enter a document id — it names the branch and the record, e.g. for-comment.' });
+      return;
+    }
+    if (!DOCUMENT_ID_RE.test(documentId)) {
+      // The route's own refusal, said before the round trip rather than after it.
+      setPrStatus({ kind: 'error', message: `invalid documentId: ${documentId} — letters, digits, "-" and "_" only, starting with a letter or digit.` });
+      return;
+    }
+    setPrStatus({ kind: 'busy' });
+    let markdown: string;
+    try {
+      markdown = await readMarkdown(file);
+    } catch (err) {
+      setPrStatus({ kind: 'error', message: (err as Error).message });
+      return;
+    }
+    const trimmedTitle = title.trim();
+    const res = await client.start({
+      documentId,
+      documentPath: file,
+      markdown,
+      ...(trimmedTitle ? { title: trimmedTitle } : {}),
+    });
+    if (!res.ok) {
+      // The server's own words, as `CollabOpenPanel` does — a 403 here names write access.
+      setPrStatus({ kind: 'error', message: res.message });
+      return;
+    }
+    setPrStatus({ kind: 'ok', message: `Creating ${documentId} — opening a pull request…` });
+    onStarted?.(documentId);
+  }
+
+  return (
+    <div ref={rootRef} style={{ position: 'relative' }}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={blocked ? 'This session cannot create a pull request' : `Open a pull request for ${file}`}
+        style={blocked ? { ...secondary, color: '#94a3b8' } : secondary}
+      >
+        Start pull request
+      </button>
+      {open && (
+        <div style={historyPop} data-vs-start-pr>
+          <div style={applyPopHead}>
+            <span style={{ fontWeight: 700 }}>Start pull request</span>
+            <button type="button" onClick={() => setOpen(false)} style={closeBtn} title="Close" aria-label="Close">
+              ✕
+            </button>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 12 }}>
+            {blocked ? (
+              <p data-vs-start-pr-blocked style={prNote}>
+                {availability.publishBlocked?.message ??
+                  `Your credential has no write access to ${availability.repo.owner}/${availability.repo.repo}, so this session cannot open a pull request.`}
+              </p>
+            ) : (
+              <>
+                <p style={prNote}>
+                  Commits <code>{file}</code> to <code>visual-spec/&lt;id&gt;</code> at that same path and opens a pull
+                  request against {availability.repo.owner}/{availability.repo.repo}.
+                </p>
+                <label style={prRow}>
+                  <span style={prLabel}>Document id</span>
+                  <input value={id} onChange={(e) => setId(e.target.value)} placeholder="for-comment" style={prInput} />
+                </label>
+                <label style={prRow}>
+                  <span style={prLabel}>Title</span>
+                  <input
+                    value={title}
+                    onChange={(e) => setTitle(e.target.value)}
+                    placeholder="Optional — defaults to the document id"
+                    style={prInput}
+                  />
+                </label>
+                <button type="button" onClick={() => void start()} disabled={prStatus.kind === 'busy'} style={rerunBtn}>
+                  {prStatus.kind === 'busy' ? 'Creating…' : 'Create pull request'}
+                </button>
+              </>
+            )}
+            {(prStatus.kind === 'error' || prStatus.kind === 'ok') && (
+              <p data-vs-start-pr-status style={prStatus.kind === 'error' ? prError : prOk}>
+                {prStatus.message}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export type ViewMode = 'view' | 'edit';
 
 /** Segmented View / Edit switch — shown only for markdown files. */
@@ -1298,6 +1493,12 @@ export function MainHeader({
         <HistoryButton file={file} comments={comments} />
         {isMarkdown && onModeChange && <ModeToggle mode={mode} onModeChange={onModeChange} />}
         {withInspector && mode === 'view' && <InspectorToggle />}
+        {/*
+          R-8.5 — the open file's own way onto a pull request. Markdown only: the create
+          job commits the bytes as the document (R-0.1), and `actions.onResumeCollab` is
+          the same landing `CollabOpenPanel`'s `onOpened` reaches — the document pane.
+        */}
+        {isMarkdown && file && <StartPullRequestButton file={file} {...(actions?.onResumeCollab ? { onStarted: actions.onResumeCollab } : {})} />}
 
         {copied && <span style={toast}>✓ Copied</span>}
         <div ref={cartRef} style={{ position: 'relative' }}>
@@ -1519,6 +1720,12 @@ const applyPopHead: React.CSSProperties = { display: 'flex', alignItems: 'center
 const rerunBtn: React.CSSProperties = { padding: '3px 9px', border: '1px solid #d1d5db', borderRadius: 6, background: 'white', color: '#475569', cursor: 'pointer', font: '12px system-ui', fontWeight: 600, flexShrink: 0 };
 const cancelBtn: React.CSSProperties = { padding: '3px 10px', border: '1px solid #fecaca', borderRadius: 6, background: '#fef2f2', color: '#dc2626', cursor: 'pointer', font: '12px system-ui', fontWeight: 700, flexShrink: 0 };
 const closeBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 22, height: 22, padding: 0, border: '1px solid #e5e7eb', borderRadius: 6, background: 'white', color: '#64748b', cursor: 'pointer', font: '12px system-ui', fontWeight: 700, flexShrink: 0 };
+const prNote: React.CSSProperties = { margin: 0, fontSize: 12, color: '#64748b', lineHeight: 1.5, overflowWrap: 'anywhere' };
+const prRow: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 6 };
+const prLabel: React.CSSProperties = { fontSize: 11, color: '#64748b', width: 84, flexShrink: 0 };
+const prInput: React.CSSProperties = { font: '12px ui-monospace, monospace', padding: '3px 6px', border: '1px solid #d1d5db', borderRadius: 4, flex: 1, minWidth: 0 };
+const prOk: React.CSSProperties = { margin: 0, fontSize: 12, color: '#0f766e' };
+const prError: React.CSSProperties = { margin: 0, fontSize: 12, color: '#b91c1c', overflowWrap: 'anywhere' };
 const modelNote: React.CSSProperties = { padding: '7px 12px', borderTop: '1px solid #f1f5f9', color: '#94a3b8', fontSize: 11, fontStyle: 'italic', background: '#fbfaff' };
 const scopeRow: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, width: '100%', textAlign: 'left', padding: '10px 11px', margin: '2px 0', border: '1px solid #ece6fb', borderRadius: 9, background: '#fbfaff', color: '#1e293b', cursor: 'pointer', font: '13px system-ui' };
 const scopeTitle: React.CSSProperties = { fontWeight: 600, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };

@@ -350,6 +350,47 @@ describe('R-13.13 — a Markdown file under review can be commented on', () => {
   });
 });
 
+/*
+ * Reported as "I can't add any comment" on a surface where commenting worked. Every
+ * Markdown file opens rendered, a rendered surface has no lines, and the only way in was
+ * a small pill in the breadcrumb. `I` starts commenting everywhere else in this app and
+ * did nothing here. A mechanism nobody can find is not a working mechanism.
+ */
+describe('the way into commenting is discoverable on a rendered document', () => {
+  it('says how to comment, where the reader is looking', async () => {
+    const server = fakeDraftServer();
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'spec.md' }));
+    await waitFor(() => expect(document.querySelector('[data-vs-comment-hint]')).toBeTruthy());
+  });
+
+  it('arms line selection on `I`, the key that starts commenting everywhere else', async () => {
+    const server = fakeDraftServer();
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'spec.md' }));
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Refunds' })).toBeTruthy());
+    expect(document.querySelector('[data-line="1"]')).toBeNull();
+
+    fireEvent.keyDown(window, { key: 'i' });
+    await waitFor(() => expect(document.querySelector('[data-line="1"]')).toBeTruthy());
+    // ...and the hint is gone, because the thing it pointed at has happened.
+    expect(document.querySelector('[data-vs-comment-hint]')).toBeNull();
+  });
+
+  it('does not steal `i` from someone typing a comment', async () => {
+    const server = fakeDraftServer();
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+
+    await openAndSelectLine1();
+    const box = await screen.findByLabelText('Review comment');
+    fireEvent.change(box, { target: { value: 'i' } });
+    fireEvent.keyDown(box, { key: 'i' });
+    expect((box as HTMLTextAreaElement).value).toBe('i');
+  });
+});
+
 describe('R-13.13 — a comment is held locally, and never sent by typing it', () => {
   it('anchors it to the selected line, at the checked-out head, and lists it as a draft', async () => {
     const server = fakeDraftServer();

@@ -373,6 +373,28 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
   const [asSource, setAsSource] = useState(false);
   const rendered = entry.kind === 'markdown' && !asSource;
 
+  /*
+   * `I` starts commenting everywhere else in this app, so it has to start commenting
+   * here. Without it the only way in was a small pill in the breadcrumb, and a reviewer
+   * looking at a rendered document with no lines in it had no reason to suspect one
+   * existed — the mechanism worked and was undiscoverable, which is the same thing as
+   * broken. Reported as "I can't add any comment" on a surface where commenting worked.
+   */
+  useEffect(() => {
+    if (!rendered) return undefined;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'i' && event.key !== 'I') return;
+      // Never steal the key from someone typing a comment.
+      const el = event.target as HTMLElement | null;
+      const tag = el?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || el?.isContentEditable) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      setAsSource(true);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [rendered]);
+
   return (
     <main style={pane}>
       <div style={{ maxWidth: 1100, margin: '0 auto', padding: '20px 36px 120px' }}>
@@ -408,6 +430,11 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
           <div style={placeholder}>No preview for this file.</div>
         ) : rendered ? (
           <div style={mdWrap}>
+            {/* The affordance stated where the reader is looking. The pill in the crumb
+                reads as metadata, not as the way in. */}
+            <div style={commentHint} data-vs-comment-hint>
+              Press <kbd style={kbd}>I</kbd> — or <b>Source</b> above — to comment on a line.
+            </div>
             <MarkdownSurface source={content} />
           </div>
         ) : (
@@ -602,6 +629,8 @@ const emptyLine: React.CSSProperties = { padding: '4px 12px', font: '12px system
 const errorLine: React.CSSProperties = { padding: '4px 12px', font: '12px system-ui', color: '#b91c1c' };
 const pane: React.CSSProperties = { flex: 1, minWidth: 0, overflow: 'auto', background: '#f8fafc' };
 const crumb: React.CSSProperties = { font: '12px ui-monospace, monospace', color: '#64748b', marginBottom: 12 };
+const commentHint: React.CSSProperties = { margin: '-4px 0 14px', padding: '7px 11px', borderRadius: 8, background: '#f5f3ff', border: '1px solid #ddd6fe', color: '#5b21b6', font: '12px system-ui' };
+const kbd: React.CSSProperties = { padding: '1px 6px', borderRadius: 4, border: '1px solid #c4b5fd', background: 'white', font: '11px ui-monospace, monospace' };
 const viewToggle: React.CSSProperties = { marginLeft: 10, padding: '2px 8px', border: '1px solid #cbd5e1', borderRadius: 999, background: 'white', color: '#475569', font: '600 11px system-ui', cursor: 'pointer' };
 const mdWrap: React.CSSProperties = { background: 'white', border: '1px solid #e2e8f0', borderRadius: 8, padding: '16px 24px' };
 const placeholder: React.CSSProperties = { padding: '48px 24px', textAlign: 'center', color: '#64748b', background: 'white', border: '1px dashed #cbd5e1', borderRadius: 12 };
