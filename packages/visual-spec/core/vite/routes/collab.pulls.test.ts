@@ -33,8 +33,8 @@ const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const src = (rel: string) => readFileSync(resolve(pkgRoot, rel), 'utf8');
 
 const REPO = { owner: 'acme', repo: 'specs', baseBranch: 'main' } as const;
-const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO } };
-const DISABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: null };
+const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO }, git: { allowCheckout: false } };
+const DISABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: null, git: { allowCheckout: false } };
 
 const OK_PREFLIGHT: CollaborationPreflight = {
   available: true,
@@ -80,7 +80,9 @@ function repoAdapter(
         number: pullNumber,
         headSha: 'a'.repeat(40),
         baseBranch: 'main',
-        headBranch: 'contributor:patch-1',
+        // GitHub's `head.ref` is the BARE branch name even for a fork — the
+        // owner-qualified form is `head.label`, which no mapper here reads.
+        headBranch: 'patch-1',
         state: 'open',
         htmlUrl: 'https://github.com/acme/specs/pull/7',
         body: '',
@@ -233,6 +235,21 @@ describe('GET /__vs/collab/pulls', () => {
     expect(res.status).toBe(400);
     expect(res.json).toMatchObject({ error: expect.stringContaining('invalid state: merged') });
     expect(gh.states).toEqual([]);
+  });
+
+  /*
+   * R-7.4 / R-7.5 — the document identifier is already resolved by the time the
+   * route sees a pull request, and the description it was resolved from is not
+   * carried alongside it. The client has no body to parse, which is what makes
+   * R-7.5 structural rather than a rule somebody has to remember.
+   */
+  it('answers with the server-resolved documentId and no pull request description', async () => {
+    const gh = repoAdapter({ pulls: [summary({ documentId: 'doc-1' }), summary({ number: 8 })] });
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls');
+    expect(res.status).toBe(200);
+    const { pulls } = res.json as { pulls: Record<string, unknown>[] };
+    expect(pulls.map((p) => p.documentId)).toEqual(['doc-1', undefined]);
+    for (const pull of pulls) expect(Object.keys(pull)).not.toContain('body');
   });
 
   it('surfaces a GitHub failure with GitHub’s own status', async () => {
@@ -404,7 +421,7 @@ describe('GET /__vs/collab/pulls/:n/files', () => {
     expect(res.json).toMatchObject({
       pullNumber: 7,
       baseBranch: 'main',
-      headBranch: 'contributor:patch-1',
+      headBranch: 'patch-1',
       mergeBaseSha: 'b'.repeat(40),
       files: ['docs/spec.md', 'README.md'],
     });

@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { GitHubError, createGitHubAdapter } from './github-adapter';
+import { buildPullRequestBody } from './lifecycle';
 import type { GhExecutor, GhResult } from './github-executor';
 import { scrubCredentials } from './github-executor';
 
@@ -297,6 +298,80 @@ describe('scrubCredentials', () => {
 
   it('leaves ordinary diagnostics alone', () => {
     expect(scrubCredentials('Reference already exists')).toBe('Reference already exists');
+  });
+});
+
+/*
+ * `listPullRequests` — the projection the header's count and list read.
+ *
+ * Asserted against `fixtures/pulls-list.json`, which is a captured list-endpoint
+ * payload rather than a hand-written one: the fields that matter here (`head.ref`
+ * beside `head.label`, a `null` body) are exactly the ones a hand-written double
+ * gets wrong, and one did.
+ */
+describe('createGitHubAdapter — listPullRequests (R-7.4 / R-7.5)', () => {
+  const list = () => createGitHubAdapter(recorder([{ stdout: fixture('pulls-list.json') }]).exec).listPullRequests(repo);
+
+  /*
+   * The fork case. GitHub owner-qualifies `head.label` (`contributor:patch-1`) and
+   * leaves `head.ref` bare (`patch-1`); the adapter maps `ref`. A double that mocked
+   * `headBranch: 'contributor:patch-1'` was teaching the opposite.
+   */
+  it('maps the bare head ref of a fork pull request, never the owner-qualified label', async () => {
+    const raw = JSON.parse(fixture('pulls-list.json')) as { head: { ref: string; label: string } }[];
+    expect(raw[0]?.head.label).toBe('contributor:patch-1');
+
+    const pulls = await list();
+    expect(pulls[0]?.headBranch).toBe('patch-1');
+    expect(pulls.map((p) => p.headBranch)).not.toContain('contributor:patch-1');
+  });
+
+  it('resolves documentId from the body trailer, on the server', async () => {
+    const pulls = await list();
+    expect(pulls.find((p) => p.number === 11)?.documentId).toBe('doc-1');
+  });
+
+  it('reads back what buildPullRequestBody writes — one format, one parser', async () => {
+    const body = buildPullRequestBody({
+      repo: { owner: 'acme', repo: 'docs' },
+      branch: 'visual-spec/doc-9',
+      documentId: 'doc-9',
+      documentPath: 'docs/doc-9.md',
+      title: 'Spec: doc-9',
+    });
+    const payload = JSON.stringify([{ number: 9, body, head: { ref: 'visual-spec/doc-9' }, base: { ref: 'main' } }]);
+    const { exec } = recorder([{ stdout: payload }]);
+    const pulls = await createGitHubAdapter(exec).listPullRequests(repo);
+    expect(pulls[0]?.documentId).toBe('doc-9');
+  });
+
+  it('leaves documentId undefined for a pull request that carries no trailer', async () => {
+    const pulls = await list();
+    // Number 12 has a `null` body; number 9 has prose and no trailer.
+    expect(pulls.find((p) => p.number === 12)?.documentId).toBeUndefined();
+    expect(pulls.find((p) => p.number === 9)?.documentId).toBeUndefined();
+  });
+
+  it('answers undefined rather than throwing on a malformed trailer', async () => {
+    // `documentId=%zz` is not decodable — `decodeURIComponent` throws on it, and a
+    // throw here would take the whole list down over one hand-edited pull request.
+    const pulls = await list();
+    expect(pulls.find((p) => p.number === 10)?.documentId).toBeUndefined();
+    expect(pulls).toHaveLength(4);
+  });
+
+  /*
+   * R-7.5 is structural, not a convention: the client cannot parse a body it was
+   * never given. So the assertion is that no body reaches the projection at all,
+   * not merely that nothing currently reads one.
+   */
+  it('carries no pull request body text whatsoever', async () => {
+    const pulls = await list();
+    for (const pull of pulls) expect(Object.keys(pull)).not.toContain('body');
+    const serialized = JSON.stringify(pulls);
+    for (const fragment of ['visual-spec collab open', 'Bumps eslint', 'Half-written by hand', '<!--']) {
+      expect(serialized).not.toContain(fragment);
+    }
   });
 });
 

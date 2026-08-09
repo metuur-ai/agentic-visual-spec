@@ -21,6 +21,7 @@
  * Comments are PR **issue** comments (`/issues/:number/comments`) — never review
  * comments, which require a diff hunk a JSON payload cannot provide.
  */
+import { parseCommentBody } from './comment-projection';
 import { type GhExecutor, defaultExecGh, scrubCredentials } from './github-executor';
 import { type ReviewComment, type ThreadResolution, toReviewComment } from './review-comments';
 
@@ -91,6 +92,13 @@ export type PullRequestListState = 'open' | 'closed' | 'all';
 /**
  * One row of a Pull Request list. Deliberately not `PullRequestDetail`: see
  * `listPullRequests`. `author` is the login, or `''` when GitHub reports a deleted user.
+ *
+ * `documentId` is present exactly when the pull request carries a visual-spec trailer,
+ * i.e. when it is a collaboration document (R-7.4). It is resolved **here**, on the
+ * server, and the body it was resolved from is not carried alongside it — see
+ * `toPullRequestSummary`. Note the asymmetry with `PullRequestDetail`, which does carry
+ * `body`: that one is read one PR at a time by a caller that needs the whole reference
+ * (branch and path as well as the id), and it never reaches a browser.
  */
 export type PullRequestSummary = {
   number: number;
@@ -103,6 +111,8 @@ export type PullRequestSummary = {
   htmlUrl: string;
   author: string;
   updatedAt: string;
+  /** R-7.4 — the collaboration document on this PR, absent when there is none. */
+  documentId?: string;
 };
 
 /**
@@ -214,6 +224,10 @@ export interface GitHubAdapter {
    * (GitHub only computes it per-PR), so promising the detail shape here would mean
    * promising a field that is always `null`. Carries `title` and `author`, which the
    * detail shape lacks and a list has to render.
+   *
+   * The list endpoint *does* return each pull request's body. It is reduced here to
+   * `documentId` (R-7.4) and then dropped, so no caller of this method — least of all a
+   * browser — ever holds a body to parse (R-7.5).
    */
   listPullRequests(repo: RepoRef, state?: PullRequestListState): Promise<PullRequestSummary[]>;
   /**
@@ -382,10 +396,41 @@ function toPullRequestDetail(raw: Json): PullRequestDetail {
   };
 }
 
+/**
+ * R-7.4 — the collaboration document a pull request carries, or `undefined`.
+ *
+ * `parseCommentBody` is the 5.1 parser that `buildPullRequestBody` writes against, and
+ * this is the only implementation of the read (R-11.1). Nothing about the body escapes:
+ * only the id comes back, so no second parser is ever *possible* downstream.
+ *
+ * It can throw, on exactly one input: `decodeURIComponent` rejects an undecodable
+ * percent-escape, which a hand-edited trailer on github.com can easily produce. One such
+ * pull request must not take down the whole list, so a malformed trailer is answered the
+ * same way as no trailer — this pull request is not a collaboration document.
+ */
+function documentIdOf(body: unknown): string | undefined {
+  try {
+    return parseCommentBody(str(body)).trailer?.documentId || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The list projection. `head.ref` is the **bare** branch name even for a pull request
+ * from a fork — GitHub puts the owner-qualified form in `head.label`, which nothing here
+ * reads, because a fork's head branch does not exist on this repository and naming it as
+ * though it did is how a comparison 404s.
+ *
+ * `body` is deliberately absent from the result: it is reduced to `documentId` and
+ * dropped. R-7.5 says the client does not parse the body, and shipping it would leave
+ * that a convention rather than a structural fact.
+ */
 function toPullRequestSummary(raw: Json): PullRequestSummary {
   const head = raw.head as Json | undefined;
   const base = raw.base as Json | undefined;
   const user = raw.user as Json | undefined;
+  const documentId = documentIdOf(raw.body);
   return {
     number: num(raw.number),
     title: str(raw.title),
@@ -397,6 +442,7 @@ function toPullRequestSummary(raw: Json): PullRequestSummary {
     htmlUrl: str(raw.html_url),
     author: str(user?.login),
     updatedAt: str(raw.updated_at),
+    ...(documentId ? { documentId } : {}),
   };
 }
 
