@@ -1032,6 +1032,39 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
        * branch that does not exist on this repository, and comparing against its name
        * would 404 for exactly the contributors a reviewer most needs to read.
        */
+      /*
+       * GET /__vs/collab/pulls/:n/description — what the pull request SAYS it is (R-13.1).
+       *
+       * The listing deliberately does not carry bodies: it is every open pull request, and
+       * a body is unbounded prose that most rows will never have read. So the description
+       * is its own read, made once, for the row a reviewer actually opened.
+       *
+       * IT SERVES THE BODY AND NOT THE DETAIL. `getPullRequest` answers merge state, head
+       * sha, both branches — all of which the listing already gave the browser, and two of
+       * which (`mergeable`, `mergeableState`) it has no way to keep current. Handing the
+       * whole record over would put a second, staler copy of those facts on the same screen
+       * as the first. The body is the one field the browser does not already have.
+       *
+       * A `read` gate, like the listing: reading a description writes nothing.
+       */
+      const pullDescription = /^\/pulls\/([^/]+)\/description$/.exec(pathname);
+      if (pullDescription && method === 'GET') {
+        const pullNumber = parsePullNumber(pullDescription[1]!);
+        if (pullNumber === null) return bad(`invalid pullNumber: ${pullDescription[1]!}`);
+        const gated = await gate('read', null);
+        if (!gated.ok) return gated.result;
+        try {
+          const pull = await repoAdapter().getPullRequest(repoRefOf(gated.repo), pullNumber);
+          // An empty body is a real answer — the pull request has no description — and the
+          // UI says so in its own words. `null` would make "none" indistinguishable from
+          // "not read yet".
+          return { status: 200, json: { pullNumber, body: pull.body ?? '' } };
+        } catch (err) {
+          if (err instanceof GitHubError) return githubFailure(err);
+          throw err;
+        }
+      }
+
       const pullFiles = /^\/pulls\/([^/]+)\/files$/.exec(pathname);
       if (pullFiles && method === 'GET') {
         const pullNumber = parsePullNumber(pullFiles[1]!);

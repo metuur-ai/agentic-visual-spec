@@ -28,6 +28,7 @@ import { toPath } from './md-path';
 import { WorkflowSelect, loadWorkflow } from './workflow-select';
 import { CommentHistoryList, locate } from './comment-history-list';
 import { useActiveComment } from './active-comment';
+import { BusyLabel } from './spinner';
 
 /** Nearest heading at or above the clicked element — the robust markdown anchor. */
 function nearestHeading(anchor: HTMLElement, root: HTMLElement): string | null {
@@ -91,6 +92,8 @@ export type CommentPanelSource = {
   orphans: { comment: CommentRecord; targetText: string }[];
   /** Whether "select everything under this heading" applies (local markdown only). */
   supportsSections?: boolean;
+  /** Whether the comment is destined for a local apply run. `false` hides "Apply via". */
+  supportsWorkflows?: boolean;
   /**
    * R-9.8 — post a threaded reply. Collaboration only: a GitHub issue comment can
    * carry replies, a local sidecar comment cannot, so local mode leaves this unset
@@ -109,6 +112,29 @@ export type CommentPanelSource = {
    * file on this machine and has never heard of a pull request.
    */
   origin?: (c: CommentRecord) => CommentOrigin;
+  /**
+   * Extra controls in a row's action bar, decided per comment by the source.
+   *
+   * The panel deliberately knows nothing about what they do. It grew this because a pull
+   * request review's comments have a life the sidecar's do not — a draft is held on this
+   * machine and then *sent* — and the alternative was a second comment panel that differed
+   * from this one in one button. `locate`, `reply`, `link` and `remove` stay first-class
+   * because every source either has them or provably cannot; sending is the one act that
+   * belongs to exactly one source.
+   */
+  actions?: (c: CommentRecord) => CommentAction[];
+  /** The same act over every comment it applies to — "Send all 3". Absent means none. */
+  bulkAction?: CommentAction | null;
+  /** A per-comment warning or receipt, rendered above the action bar. */
+  notice?: (c: CommentRecord) => React.ReactNode | null;
+};
+
+/** One source-owned control. `danger` dresses it as destructive; `primary` as the act. */
+export type CommentAction = {
+  label: string;
+  title?: string;
+  tone?: 'primary' | 'danger' | 'plain';
+  run: () => Promise<void> | void;
 };
 
 /**
@@ -245,6 +271,7 @@ function Panel({ width, source }: { width: number; source: CommentPanelSource })
   const path = source.path;
   const [text, setText] = useState('');
   const [workflow, setWorkflow] = useState(loadWorkflow);
+  const [creating, setCreating] = useState(false);
   const [tab, setTab] = useState<PanelTab>('open');
 
   // When a single heading is selected, offer to grab everything under it.
@@ -278,10 +305,20 @@ function Panel({ width, source }: { width: number; source: CommentPanelSource })
   const described = selected ? source.describe(selection) : null;
   const uncommentable = described && 'uncommentable' in described ? described.uncommentable : null;
 
+  /*
+   * `create` is a round trip — a sidecar write, or a POST that mints a review draft — and
+   * the button gave no sign of it. On a slow one the reviewer pressed again and got two
+   * comments, so the guard is as much about that as about the missing signal.
+   */
   const submit = async () => {
-    if (!selected || uncommentable || !text.trim()) return;
-    await source.create(selection, text.trim(), workflow);
-    setText('');
+    if (!selected || uncommentable || !text.trim() || creating) return;
+    setCreating(true);
+    try {
+      await source.create(selection, text.trim(), workflow);
+      setText('');
+    } finally {
+      setCreating(false);
+    }
   };
 
   return (
@@ -309,7 +346,13 @@ function Panel({ width, source }: { width: number; source: CommentPanelSource })
                       ⤢ Select all content under this heading
                     </button>
                   )}
-                  <WorkflowSelect value={workflow} onChange={setWorkflow} />
+                  {/*
+                    * "Apply via <workflow>" names the agent that will act on the comment
+                    * locally. A pull request review comment is not applied by anything
+                    * here — it is sent to GitHub — so offering the choice would promise a
+                    * run that never happens.
+                    */}
+                  {source.supportsWorkflows !== false && <WorkflowSelect value={workflow} onChange={setWorkflow} />}
                   <textarea
                     value={text}
                     onChange={(e) => setText(e.target.value)}
@@ -318,7 +361,9 @@ function Panel({ width, source }: { width: number; source: CommentPanelSource })
                     style={textarea}
                   />
                   <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>
-                    <button type="button" onClick={submit} style={btnPrimary}>Add comment</button>
+                    <button type="button" onClick={submit} disabled={creating} style={btnPrimary}>
+                      <BusyLabel busy={creating}>{creating ? 'Adding…' : 'Add comment'}</BusyLabel>
+                    </button>
                   </div>
                 </>
               )}
@@ -453,6 +498,22 @@ function CommentList({ source }: { source: CommentPanelSource }) {
   const link = source.link ?? (() => undefined);
   const origin = source.origin ?? (() => LOCAL_ONLY);
   const [confirmId, setConfirmId] = useState<string | null>(null);
+  /*
+   * Which source-owned action is in flight, keyed `<comment id>:<label>` — and `bulk` for
+   * the group one. The panel runs these, so the panel is the only place that can know they
+   * are running; the source hands over a `run()` and hears nothing back.
+   */
+  const [runningAction, setRunningAction] = useState<string | null>(null);
+  const runAction = async (key: string, run: () => Promise<void> | void) => {
+    if (runningAction) return;
+    setRunningAction(key);
+    try {
+      await run();
+    } finally {
+      setRunningAction(null);
+    }
+  };
+  const [removingId, setRemovingId] = useState<string | null>(null);
   const [replyId, setReplyId] = useState<string | null>(null);
   const [replyText, setReplyText] = useState('');
   const [replyBusy, setReplyBusy] = useState(false);
@@ -494,7 +555,25 @@ function CommentList({ source }: { source: CommentPanelSource }) {
   if (!mine.length) return null;
   return (
     <div style={{ padding: 12, borderTop: '1px solid #e5e7eb' }}>
-      <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 8 }}>{mine.length} open on this file</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 12, opacity: 0.6 }}>{mine.length} open on this file</span>
+        <span style={{ flex: 1 }} />
+        {/* "Send all 3" — the one act that applies to the group rather than to a row. */}
+        {source.bulkAction && (
+          <button
+            type="button"
+            data-vs-comment-bulk
+            onClick={() => void runAction('bulk', source.bulkAction!.run)}
+            disabled={runningAction !== null}
+            title={source.bulkAction.title ?? ''}
+            style={actionStyle(source.bulkAction.tone)}
+          >
+            <BusyLabel busy={runningAction === 'bulk'}>
+              {runningAction === 'bulk' ? 'Sending…' : source.bulkAction.label}
+            </BusyLabel>
+          </button>
+        )}
+      </div>
       <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 8 }}>
         {mine.map((c) => (
           <li
@@ -520,7 +599,24 @@ function CommentList({ source }: { source: CommentPanelSource }) {
               {source.label(c)}
             </div>
             <div style={{ margin: '2px 0' }}>{c.comment}</div>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4 }}>
+            {/* A warning the source needs the reader to see before they act on the row. */}
+            {source.notice?.(c)}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4, flexWrap: 'wrap' }}>
+              {source.actions?.(c).map((a) => {
+                const key = `${c.id}:${a.label}`;
+                return (
+                  <button
+                    key={a.label}
+                    type="button"
+                    onClick={() => void runAction(key, a.run)}
+                    disabled={runningAction !== null}
+                    title={a.title ?? ''}
+                    style={actionStyle(a.tone)}
+                  >
+                    <BusyLabel busy={runningAction === key}>{a.label}</BusyLabel>
+                  </button>
+                );
+              })}
               <button
                 type="button"
                 onClick={() => source.locate(c)}
@@ -563,10 +659,15 @@ function CommentList({ source }: { source: CommentPanelSource }) {
                     <span style={{ fontSize: 12, color: '#475569' }}>Delete?</span>
                     <button
                       type="button"
-                      onClick={() => { void source.remove!(c.id); setConfirmId(null); }}
+                      disabled={removingId !== null}
+                      onClick={() => {
+                        setRemovingId(c.id);
+                        setConfirmId(null);
+                        void source.remove!(c.id).finally(() => setRemovingId(null));
+                      }}
                       style={confirmYes}
                     >
-                      Yes
+                      <BusyLabel busy={removingId === c.id}>Yes</BusyLabel>
                     </button>
                     <button type="button" onClick={() => setConfirmId(null)} style={confirmNo}>No</button>
                   </span>
@@ -605,7 +706,7 @@ function CommentList({ source }: { source: CommentPanelSource }) {
                     }}
                     style={confirmYes}
                   >
-                    {replyBusy ? 'Posting…' : 'Post reply'}
+                    <BusyLabel busy={replyBusy}>{replyBusy ? 'Posting…' : 'Post reply'}</BusyLabel>
                   </button>
                 </div>
               </div>
@@ -663,7 +764,19 @@ const textarea: React.CSSProperties = { width: '100%', height: 70, padding: '6px
 const btnPrimary: React.CSSProperties = { padding: '5px 12px', border: '1px solid #2563eb', borderRadius: 4, background: '#2563eb', color: 'white', cursor: 'pointer', font: 'inherit' };
 const card: React.CSSProperties = { border: '1px solid #f1f5f9', borderRadius: 8, padding: 8, overflowWrap: 'anywhere' };
 /** R-13.18's two chips. Different words and different colours — never one chip and a gap. */
-const originChip: React.CSSProperties = { font: '600 10px system-ui', padding: '1px 7px', borderRadius: 99, whiteSpace: 'nowrap', letterSpacing: 0.2 };
+/*
+ * Sending and discarding must not look like the same kind of act, so the tone is part of
+ * the action rather than something every source restyles for itself.
+ */
+const actionBase: React.CSSProperties = { padding: '3px 10px', borderRadius: 6, cursor: 'pointer', font: '600 12px system-ui', flexShrink: 0 };
+const actionPrimary: React.CSSProperties = { ...actionBase, border: '1px solid #2563eb', background: '#2563eb', color: 'white' };
+const actionDanger: React.CSSProperties = { ...actionBase, border: '1px solid #fecaca', background: 'white', color: '#b91c1c' };
+const actionPlain: React.CSSProperties = { ...actionBase, border: '1px solid #d1d5db', background: 'white', color: '#334155' };
+function actionStyle(tone: CommentAction['tone']): React.CSSProperties {
+  return tone === 'primary' ? actionPrimary : tone === 'danger' ? actionDanger : actionPlain;
+}
+
+const originChip: React.CSSProperties ={ font: '600 10px system-ui', padding: '1px 7px', borderRadius: 99, whiteSpace: 'nowrap', letterSpacing: 0.2 };
 const originLocal: React.CSSProperties = { ...originChip, border: '1px solid #fcd34d', background: '#fef3c7', color: '#92400e' };
 const originGithub: React.CSSProperties = { ...originChip, border: '1px solid #bbf7d0', background: '#f0fdf4', color: '#166534' };
 const cardActive: React.CSSProperties = { border: '1px solid #f59e0b', background: '#fffbeb', boxShadow: '0 0 0 2px rgba(245,158,11,0.25)' };

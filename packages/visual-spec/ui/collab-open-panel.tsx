@@ -45,6 +45,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import { type CollabAvailabilitySnapshot, createCollabClient } from './collab-client';
+import { BusyLabel } from './spinner';
 
 export type { CollabAvailabilitySnapshot };
 
@@ -209,7 +210,7 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
             disabled={status.kind === 'busy' || availability?.available === false}
             style={button}
           >
-            {status.kind === 'busy' ? 'Opening…' : 'Open'}
+            <BusyLabel busy={status.kind === 'busy'}>{status.kind === 'busy' ? 'Opening…' : 'Open'}</BusyLabel>
           </button>
         </div>
       )}

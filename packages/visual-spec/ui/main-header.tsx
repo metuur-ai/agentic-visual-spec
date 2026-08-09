@@ -1,6 +1,7 @@
 import { type CommentRecord, buildApplyPrompt, useComments, useInspector, useSpecsRoot } from '../core/app';
 import { Fragment, type ReactNode, memo, useCallback, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from 'react';
 import { HelpButton } from './help-page';
+import { BusyLabel, Spinner } from './spinner';
 import { CommentHistoryList } from './comment-history-list';
 import { isCommentPanelListening, revealInCommentPanel, subscribeCommentPanel } from './comment-panel';
 import { toPath } from './md-path';
@@ -730,7 +731,10 @@ function BranchMenu({
               style={scopeRow}
             >
               <span style={scopeTitle}>{name}</span>
-              <span style={branchMeta}>{changing === name ? 'changing…' : 'on origin'}</span>
+              <span style={{ ...branchMeta, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                {changing === name && <Spinner size={10} />}
+                {changing === name ? 'changing…' : 'on origin'}
+              </span>
             </button>
           ))}
         </div>
@@ -932,7 +936,7 @@ function ChangeDirButton() {
       title="Open a different directory (uses your system folder picker)"
       style={changeBtn}
     >
-      <FolderIcon size={11} /> {picking ? 'Opening…' : 'Change…'}
+      {picking ? <Spinner size={11} /> : <FolderIcon size={11} />} {picking ? 'Opening…' : 'Change…'}
     </button>
   );
 }
@@ -1760,7 +1764,7 @@ function StartPullRequestButton({
                   />
                 </label>
                 <button type="button" onClick={() => void start()} disabled={prStatus.kind === 'busy'} style={rerunBtn}>
-                  {prStatus.kind === 'busy' ? 'Creating…' : 'Create pull request'}
+                  <BusyLabel busy={prStatus.kind === 'busy'}>{prStatus.kind === 'busy' ? 'Creating…' : 'Create pull request'}</BusyLabel>
                 </button>
               </>
             )}

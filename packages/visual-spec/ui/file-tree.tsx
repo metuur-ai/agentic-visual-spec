@@ -5,6 +5,7 @@
  */
 import { useMemo, useRef, useState } from 'react';
 import type { FileKind, TreeEntry } from './use-tree';
+import { BusyLabel } from './spinner';
 
 type TreeNode = {
   name: string;
@@ -87,6 +88,7 @@ export function FileTree({
   onCreated,
   onRenamed,
   readOnly = false,
+  defaultOpen = false,
 }: {
   entries: TreeEntry[];
   current: string;
@@ -104,6 +106,13 @@ export function FileTree({
    * tree the row came from, so offering them here would be offering the wrong write.
    */
   readOnly?: boolean;
+  /**
+   * Start with every folder open. The filter already force-opens the tree, on the same
+   * reasoning — a reader who has narrowed the set wants to see it, not click down to
+   * it — and a small, deliberately-chosen set of paths is that situation arrived at from
+   * the other direction. A caller that omits this gets the collapsed tree.
+   */
+  defaultOpen?: boolean;
 }) {
   const q = filter.trim().toLowerCase();
   const matching = useMemo(() => (q ? entries.filter((e) => e.path.toLowerCase().includes(q)) : entries), [entries, q]);
@@ -192,7 +201,7 @@ export function FileTree({
       )}
       <ul style={listReset}>
         {tree.children.map((node) => (
-          <TreeItem key={node.path} node={node} depth={0} current={current} onPick={onPick} expanded={expanded} toggle={toggle} forceOpen={q.length > 0} commentCounts={commentCounts} write={write} readOnly={readOnly} />
+          <TreeItem key={node.path} node={node} depth={0} current={current} onPick={onPick} expanded={expanded} toggle={toggle} forceOpen={defaultOpen || q.length > 0} commentCounts={commentCounts} write={write} readOnly={readOnly} />
         ))}
       </ul>
     </div>
@@ -223,7 +232,7 @@ function PathInput({ write, label, submitLabel, indent }: { write: WriteState; l
           style={pathInput}
         />
         <button type="submit" disabled={write.busy} style={inlineSubmit}>
-          {submitLabel}
+          <BusyLabel busy={write.busy}>{submitLabel}</BusyLabel>
         </button>
         <button type="button" onClick={write.dismiss} aria-label="Cancel" style={inlineCancel}>
           ✕
@@ -287,7 +296,13 @@ function TreeItem({
           >
             <span style={glyph}>{KIND_GLYPH[node.kind ?? 'binary']}</span>
             <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{node.name}</span>
-            {count > 0 && <span style={countBadge}>{count}</span>}
+            {/* The number carries the meaning; the label is what stops a bare `2` from
+            being a number with no noun for anything reading it aloud. */}
+            {count > 0 && (
+              <span data-vs-file-comments={node.path} aria-label={`${count} comment${count === 1 ? '' : 's'}`} style={countBadge}>
+                {count}
+              </span>
+            )}
           </button>
           {!readOnly && (hover || active) && (
             <button
@@ -327,7 +342,13 @@ function TreeItem({
           <span style={folderGlyph}>{open ? '📂' : '📁'}</span>
           <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{node.name}</span>
         </button>
-        {count > 0 && <span style={countBadge}>{count}</span>}
+        {/* The number carries the meaning; the label is what stops a bare `2` from
+            being a number with no noun for anything reading it aloud. */}
+            {count > 0 && (
+              <span data-vs-file-comments={node.path} aria-label={`${count} comment${count === 1 ? '' : 's'}`} style={countBadge}>
+                {count}
+              </span>
+            )}
         {!open && count === 0 && hasDescendantComments && <span style={folderDot} title="Contains comments" />}
         {(hover || active) && (
           <button

@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CollaborationRecord } from '../core/collaboration/document-record';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { App } from './App';
+import { intentFromUrl } from './collab-app';
 
 /** A minimal but real collaboration document: line 3 is what the anchored comment names. */
 const DOCUMENT: CollaborationRecord = {
@@ -272,5 +273,68 @@ describe('the collaboration UI is mounted from App.tsx (task U-1)', () => {
     fireEvent.click(screen.getByText('← Files'));
     await waitFor(() => expect(screen.getByText(/Select a file or folder/)).toBeTruthy());
     expect(screen.queryAllByText('First paragraph.')).toHaveLength(0);
+  });
+});
+
+/*
+ * A reload during a review dropped the reviewer on the file tree: the checkout, the
+ * scrolled tree, the open document and any held drafts all went, and getting back meant
+ * sidebar → drawer → row again. The original note argued a checkout was "one click and no
+ * loss" to rebuild — both halves stopped being true once the drawer and review drafts
+ * existed.
+ */
+describe('a reload comes back to what was open', () => {
+  const search = () => new URLSearchParams(window.location.search);
+
+  beforeEach(() => {
+    window.history.replaceState(null, '', '/');
+  });
+
+  it('names the reviewed pull request in the URL, and reopens it on a cold load', async () => {
+    const { unmount } = render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /Collaborate on pull requests/ }));
+    const drawer = await screen.findByRole('dialog', { name: 'Collaborate on pull requests' });
+    fireEvent.click(within(drawer.querySelector('[data-vs-pull="42"]') as HTMLElement).getByRole('button', { name: /Review the code/ }));
+
+    await screen.findByText(/The Spec/);
+    await waitFor(() => expect(search().get('vspr')).toBe('42'));
+
+    // The number, not the worktree: a path and a sha are git's and can move between loads.
+    expect(search().get('vsdoc')).toBeNull();
+
+    // A cold load — a fresh tree, as a reload gives — re-mounts it rather than landing home.
+    unmount();
+    render(<App />);
+    await waitFor(() => expect(screen.queryByText(/Select a file or folder/)).toBeNull());
+    await screen.findByText(/Read-only checkout/);
+  });
+
+  /*
+   * `← Files` says the reviewer is done here. Leaving the parameter behind would drag the
+   * next reload back onto a review they just walked out of.
+   */
+  it('forgets it when the surface is left on purpose', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /Collaborate on pull requests/ }));
+    const drawer = await screen.findByRole('dialog', { name: 'Collaborate on pull requests' });
+    fireEvent.click(within(drawer.querySelector('[data-vs-pull="42"]') as HTMLElement).getByRole('button', { name: /Review the code/ }));
+
+    await waitFor(() => expect(search().get('vspr')).toBe('42'));
+    fireEvent.click(await screen.findByRole('button', { name: '← Pull requests' }));
+    await waitFor(() => expect(search().get('vspr')).toBeNull());
+  });
+
+  /* A document open on a pull request is the more specific place to be, and the only one
+   * that can be holding unpublished work. */
+  it('prefers an open document over the pull request it sits on', () => {
+    window.history.replaceState(null, '', '/?vsdoc=doc-1&vspr=42');
+    expect(intentFromUrl()).toEqual({ documentId: 'doc-1' });
+  });
+
+  it('ignores a pull number that is not one', () => {
+    window.history.replaceState(null, '', '/?vspr=not-a-number');
+    expect(intentFromUrl()).toBeNull();
+    window.history.replaceState(null, '', '/?vspr=0');
+    expect(intentFromUrl()).toBeNull();
   });
 });

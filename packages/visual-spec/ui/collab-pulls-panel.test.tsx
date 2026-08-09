@@ -11,7 +11,7 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import { fireEvent } from '@testing-library/dom';
 import { describe, expect, it, vi } from 'vitest';
-import { CollabPullsPanel, shortSha } from './collab-pulls-panel';
+import { CollabPullsPanel, groupByOwner, shortSha } from './collab-pulls-panel';
 
 const PULL = {
   number: 42,
@@ -240,5 +240,197 @@ describe('a pull request that carries a document offers to resume it (P6)', () =
 
     await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
     expect(onResume).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * On someone else's pull request you review; on your own you read what came back. The
+ * listing made the reader draw that line by eye, matching a login against an author
+ * column row by row — and the login is something the server already told us.
+ */
+describe('your own pull requests are their own section', () => {
+  const MINE = { ...PULL, number: 7, title: 'My own work', author: 'reviewer-rita' };
+  const THEIRS = { ...PULL, number: 8, title: 'Someone else’s', author: 'dev-dan' };
+
+  /** `GET /__vs/collab` — the snapshot the whole collaboration UI already gates on. */
+  const signedIn = (login: string) => ({
+    '/__vs/collab': { ok: true, status: 200, json: { available: true, login, repo: { owner: 'acme', repo: 'docs' } } },
+  });
+
+  it('puts yours first, under their own headings', async () => {
+    const { impl } = fakeFetch({
+      '/__vs/collab/pulls?state=open': { ok: true, status: 200, json: { pulls: [THEIRS, MINE] } },
+      ...signedIn('reviewer-rita'),
+    });
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+
+    await screen.findByText('Yours');
+    const groups = [...document.querySelectorAll('[data-vs-pull-group]')].map((g) => g.getAttribute('data-vs-pull-group'));
+    expect(groups).toEqual(['mine', 'others']);
+
+    const mine = document.querySelector('[data-vs-pull-group="mine"]') as HTMLElement;
+    expect(mine.textContent).toContain('My own work');
+    expect(mine.textContent).not.toContain('Someone else’s');
+    expect(screen.getByText('From others').textContent).toBe('From others');
+  });
+
+  /*
+   * GitHub logins are case-insensitive, and a wrong split is worse than none: it would
+   * file the reader's own work under someone else's heading.
+   */
+  it('matches the login regardless of case', () => {
+    const groups = groupByOwner([MINE, THEIRS], 'Reviewer-Rita');
+    expect(groups.map((g) => g.key)).toEqual(['mine', 'others']);
+    expect(groups[0]!.rows).toEqual([MINE]);
+  });
+
+  /*
+   * A heading over the only group is a label, not a division — so where every row falls
+   * on one side, or the login never arrived, the list stays exactly as it was.
+   */
+  it('stays flat when there is nothing to divide', () => {
+    expect(groupByOwner([MINE, THEIRS], null).map((g) => g.title)).toEqual([null]);
+    expect(groupByOwner([MINE], 'reviewer-rita').map((g) => g.title)).toEqual([null]);
+    expect(groupByOwner([THEIRS], 'reviewer-rita').map((g) => g.title)).toEqual([null]);
+  });
+
+  it('renders no heading when the availability snapshot cannot be read', async () => {
+    const { impl } = fakeFetch({
+      '/__vs/collab/pulls?state=open': { ok: true, status: 200, json: { pulls: [THEIRS, MINE] } },
+    });
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+
+    await screen.findByText(/My own work/);
+    expect(screen.queryByText('Yours')).toBeNull();
+    expect(document.querySelector('[data-vs-pull-group="all"]')).toBeTruthy();
+  });
+});
+
+/*
+ * Every button here runs git or GitHub, and none of them showed it: `Resume writing` and
+ * `Remove checkout` only greyed out, and the row-wide busy flag put "Checking out…" on
+ * the *mount* button when `Resume` was the one pressed. Reported as "it looks like nothing
+ * happened".
+ */
+describe('a control that is waiting on the network says so, and it is the right control', () => {
+  /**
+   * A `fetch` that never settles for one route and answers the rest normally, so the
+   * in-flight state stays on screen to be asserted.
+   */
+  function hangingOn(route: string, overrides: Parameters<typeof fakeFetch>[0] = {}): typeof fetch {
+    const rest = fakeFetch(overrides).impl as unknown as (u: string, i?: RequestInit) => Promise<Response>;
+    return (async (url: string, init?: RequestInit) =>
+      url.startsWith(route) ? new Promise<Response>(() => {}) : rest(url, init)) as unknown as typeof fetch;
+  }
+
+  it('spins the button that was pressed, not the one beside it', async () => {
+    const withDoc = { ...PULL, documentId: 'doc-1' };
+    const impl = hangingOn('/__vs/collab/open', {
+      '/__vs/collab/pulls?state=open': { ok: true, status: 200, json: { pulls: [withDoc] } },
+    });
+
+    render(<CollabPullsPanel onReview={vi.fn()} onResume={vi.fn()} fetchImpl={impl} />);
+    const resume = await screen.findByRole('button', { name: /Resume writing/ });
+
+    fireEvent.click(resume);
+
+    // The pressed control carries the ring and says what it is doing.
+    await waitFor(() => expect(screen.getByRole('button', { name: /Opening…/ })).toBeTruthy());
+    expect(screen.getByRole('button', { name: /Opening…/ }).querySelector('[data-vs-spinner]')).toBeTruthy();
+    // ...and the neighbour is not claiming the wait it is not doing.
+    expect(screen.queryByText('Checking out…')).toBeNull();
+    expect(screen.getByRole('button', { name: /Review the code/ })).toBeTruthy();
+  });
+
+  it('spins while a checkout is being mounted', async () => {
+    const impl = hangingOn('/__vs/collab/pulls/42/mount');
+
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    fireEvent.click(await screen.findByRole('button', { name: /Review the code/ }));
+
+    const btn = await screen.findByRole('button', { name: /Checking out…/ });
+    expect(btn.querySelector('[data-vs-spinner]')).toBeTruthy();
+  });
+
+  it('spins the list itself while the pull requests are still being read', async () => {
+    const impl = hangingOn('/__vs/collab/pulls?');
+
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    const line = await screen.findByText('Loading pull requests…');
+    expect(line.querySelector('[data-vs-spinner]')).toBeTruthy();
+  });
+});
+
+/*
+ * A listing of titles answers "what is open" and not "what is this" — the second question
+ * cost a trip to github.com. The body is a disclosure and not a column: it is unbounded
+ * prose, and printing every one of them would bury the listing it belongs to.
+ */
+describe('a pull request can say what it is, without leaving the list', () => {
+  const withBody = (body: string) => ({
+    '/__vs/collab/pulls/42/description': { ok: true, status: 200, json: { pullNumber: 42, body } },
+  });
+
+  it('reads the description only once it is asked for, and renders it as Markdown', async () => {
+    const { impl, calls } = fakeFetch(withBody('## Why\n\nBecause the rules changed.'));
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    await screen.findByText(/Rework the payment rules/);
+
+    // Nothing was fetched for a row nobody opened.
+    expect(calls.map((c) => c.url)).not.toContain('/__vs/collab/pulls/42/description');
+
+    fireEvent.click(screen.getByRole('button', { name: /View description/ }));
+
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Why' })).toBeTruthy());
+    expect(screen.getByText('Because the rules changed.')).toBeTruthy();
+    expect(calls.map((c) => c.url)).toContain('/__vs/collab/pulls/42/description');
+  });
+
+  it('closes again on a second press', async () => {
+    const { impl } = fakeFetch(withBody('Some prose.'));
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    await screen.findByText(/Rework the payment rules/);
+
+    fireEvent.click(screen.getByRole('button', { name: /View description/ }));
+    await screen.findByText('Some prose.');
+
+    fireEvent.click(screen.getByRole('button', { name: /Hide description/ }));
+    await waitFor(() => expect(screen.queryByText('Some prose.')).toBeNull());
+  });
+
+  /* `''` is a real answer — the author wrote no description — not a failed read. */
+  it('says so when there is no description, rather than showing an empty box', async () => {
+    const { impl } = fakeFetch(withBody(''));
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    await screen.findByText(/Rework the payment rules/);
+
+    fireEvent.click(screen.getByRole('button', { name: /View description/ }));
+    await screen.findByText('No description on this pull request.');
+  });
+
+  it('spins the control while the body is being read', async () => {
+    const impl = ((url: string) =>
+      url.endsWith('/description')
+        ? new Promise<Response>(() => {})
+        : (fakeFetch().impl as unknown as (u: string) => Promise<Response>)(url)) as unknown as typeof fetch;
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    await screen.findByText(/Rework the payment rules/);
+
+    const btn = screen.getByRole('button', { name: /View description/ });
+    fireEvent.click(btn);
+    await waitFor(() => expect(btn.querySelector('[data-vs-spinner]')).toBeTruthy());
+  });
+
+  /* R-11.4 — the server's own sentence, in the panel's one error line. */
+  it('shows the server’s words when the description cannot be read', async () => {
+    const message = 'cannot read acme/docs#42: read access denied (HTTP 403).';
+    const { impl } = fakeFetch({
+      '/__vs/collab/pulls/42/description': { ok: false, status: 403, json: { error: message } },
+    });
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    await screen.findByText(/Rework the payment rules/);
+
+    fireEvent.click(screen.getByRole('button', { name: /View description/ }));
+    await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
   });
 });

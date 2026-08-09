@@ -1,6 +1,6 @@
 import { InspectorProvider, useComments } from '../core/app';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { CollabApp, type CollabIntent } from './collab-app';
+import { CollabApp, type CollabIntent, clearCollabUrl, intentFromUrl } from './collab-app';
 import { CollabDrawer } from './collab-drawer';
 import { FileTree } from './file-tree';
 import { GenericEditor } from './generic-editor';
@@ -29,7 +29,9 @@ export function App() {
   // entry panels, while the header's pull request list already knows which document to
   // resume (R-7.7) or which pull request to check out (R-7.8) and would otherwise ask
   // the user to find it again on the screen they just came from.
-  const [collab, setCollab] = useState<CollabIntent | null>(null);
+  // Seeded from the URL, so a reload during a review or an open document comes back to
+  // it rather than to the file tree. `intentFromUrl` owns which parameter wins.
+  const [collab, setCollab] = useState<CollabIntent | null>(intentFromUrl);
   // The picker that leads to it. It is a right-side drawer over the file shell rather
   // than the first screen of the swapped-in route: "what pull requests are there?" is a
   // question asked *while* looking at the files, and answering it used to cost the whole
@@ -268,6 +270,9 @@ export function App() {
         <CollabApp
           initial={collab}
           onExit={() => {
+            // Leaving the surface takes its parameters with it, or the next reload would
+            // put the reviewer straight back on a review they just walked out of.
+            clearCollabUrl();
             setCollab(null);
             if (collab.review) setPicker(true);
           }}

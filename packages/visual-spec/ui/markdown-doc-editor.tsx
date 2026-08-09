@@ -14,6 +14,7 @@ import { combineFrontmatter, splitFrontmatter } from './frontmatter';
 import { detectFidelityRisk } from './md-fidelity';
 import { makeImageResolver, normalizeRelPath, toSurfaceId } from './md-path';
 import { SourceEditor } from './source-editor';
+import { Spinner } from './spinner';
 import { type CommentDraft, WysiwygEditor } from './wysiwyg-editor';
 
 export type EditorEngine = 'source' | 'wysiwyg';
@@ -264,7 +265,11 @@ function SaveBar({
         ))}
       </div>
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
-        <span style={{ fontSize: 12, fontWeight: 600, color }}>{status}</span>
+        {/* The word already said "Saving…"; the ring is what makes it noticed. */}
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, fontWeight: 600, color }}>
+          {saving && <Spinner size={11} />}
+          {status}
+        </span>
         <button type="button" onClick={onDone} disabled={saving} style={{ ...doneBtn, opacity: saving ? 0.5 : 1 }} title="Save and return to the rendered view (⌘/Ctrl+S saves without leaving)">
           ✓ Done
         </button>

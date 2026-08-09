@@ -19,7 +19,7 @@
  *
  * PICKING CLOSES IT. A row's `Resume writing` / `Review the code` hands the result up to
  * `App.tsx`, which dismisses the drawer and mounts the full-width surface. Nothing that
- * needs room is ever rendered in 480px.
+ * needs room is ever rendered inside it.
  */
 import { useEffect, useRef } from 'react';
 
@@ -174,7 +174,14 @@ const scrim: React.CSSProperties = {
 };
 
 const panelStyle: React.CSSProperties = {
-  width: 'min(480px, 100vw)',
+  /*
+   * Wider than the 480px it started at, because the rows now hold prose. A pull request
+   * description is Markdown a reviewer is expected to *read* — paragraphs, lists, task
+   * checklists — and at 480px, inside a card, inside a scroll box, it was a column of
+   * five-word lines. 720px puts the body near the 60–75 character measure that makes it
+   * readable, and the listing rows get their branch names back on one line as well.
+   */
+  width: 'min(720px, 100vw)',
   height: '100%',
   display: 'flex',
   flexDirection: 'column',

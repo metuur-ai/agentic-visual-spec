@@ -36,7 +36,7 @@
  */
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { defaultExecGit, type GitExecutor } from '../git-context';
+import { defaultExecGit, type GitExecutor, parseRemoteUrl } from '../git-context';
 
 /** Where PR worktrees are mounted, relative to the served directory. */
 export const WORKTREE_DIR = '.visual-spec/worktrees';
@@ -54,8 +54,15 @@ const PR_REF_PREFIX = 'refs/visual-spec/pr';
  * - `no-origin`     — nothing to fetch from.
  * - `fetch-failed`  — the PR ref could not be fetched (offline, private repo, no auth).
  * - `worktree-failed` — git refused to create the checkout.
+ * - `head-mismatch`  — the checkout landed on a commit that is not the pull request's
+ *                      head. See `mountPullRequest`.
  */
-export type WorktreeFailure = 'not-a-repo' | 'no-origin' | 'fetch-failed' | 'worktree-failed';
+export type WorktreeFailure =
+  | 'not-a-repo'
+  | 'no-origin'
+  | 'fetch-failed'
+  | 'worktree-failed'
+  | 'head-mismatch';
 
 export type MountedWorktree = {
   pullNumber: number;
@@ -67,7 +74,60 @@ export type MountedWorktree = {
 
 export type MountResult =
   | { ok: true; worktree: MountedWorktree }
-  | { ok: false; reason: WorktreeFailure };
+  /**
+   * `detail` is the part of the answer only this call knows — the two commits that
+   * disagree, for `head-mismatch`. The route turns `reason` into the sentence that
+   * says what to do; `detail` is appended so the reader can see the evidence.
+   */
+  | { ok: false; reason: WorktreeFailure; detail?: string };
+
+/** What a caller knows about the pull request that `mountPullRequest` cannot read locally. */
+export type MountOptions = {
+  /**
+   * The repository the pull request belongs to, as the *collaboration config* names it.
+   *
+   * Without this the fetch goes to the served directory's `origin`, which is right only
+   * while the two agree. They do not agree when `VS_COLLAB_REPO` points the surface at a
+   * repository the checkout is not a clone of — and then `refs/pull/<n>/head` resolves in
+   * the wrong repository, silently: the same number names a different pull request, the
+   * fetch succeeds, and the reviewer gets a checkout of somebody else's commit whose tree
+   * has none of the files the changed-files list (read from the configured repo) names.
+   * Observed as an empty "No preview for this file." on every row.
+   */
+  repo?: { owner: string; repo: string };
+  /**
+   * The head commit the pull request is at, as the API just reported it.
+   *
+   * Checked against what the checkout actually landed on. With `repo` set this can only
+   * differ when the head moved between the two reads — a force-push mid-mount — but the
+   * check is not there for the race: it is the assertion that the fetch resolved in the
+   * repository the rest of the surface is talking about. A wrong repo is silent without
+   * it and obvious with it.
+   */
+  expectedHeadSha?: string;
+};
+
+/**
+ * Where to fetch `refs/pull/<n>/head` from.
+ *
+ * `origin` whenever the configured repository is the one `origin` already points at —
+ * the ordinary case, and the one that keeps working when `origin` is an ssh remote, a
+ * local path, or anything else `parseRemoteUrl` declines. Otherwise an explicit URL for
+ * the configured repository, on the host `origin` names so an Enterprise install is not
+ * sent to github.com. Credential helpers key on the URL, so an https fetch here
+ * authenticates exactly as a fetch of that repository would anywhere else.
+ */
+export function fetchSource(originUrl: string, repo?: { owner: string; repo: string }): string {
+  if (!repo) return 'origin';
+  const parsed = parseRemoteUrl(originUrl.trim());
+  const same =
+    parsed !== null &&
+    parsed.owner.toLowerCase() === repo.owner.toLowerCase() &&
+    parsed.repo.toLowerCase() === repo.repo.toLowerCase();
+  if (same) return 'origin';
+  const host = parsed?.host ?? 'github.com';
+  return `https://${host}/${repo.owner}/${repo.repo}.git`;
+}
 
 /**
  * Refuse a pull number that is not one.
@@ -127,22 +187,31 @@ export async function ensureIgnored(baseDir: string): Promise<void> {
  * the freshly fetched head rather than removed and recreated, so a reviewer who pulls
  * again after new commits keeps the same path (any editor tab pointing into it stays
  * valid) and pays one `checkout` instead of a full re-materialisation.
+ *
+ * `options` is what the caller knows and this module cannot read off the disk: which
+ * repository the pull request is in, and what commit it is at. Both default to absent,
+ * which is the pre-existing behaviour — fetch from `origin`, believe whatever lands.
  */
 export async function mountPullRequest(
   baseDir: string,
   pullNumber: number,
   exec: GitExecutor = defaultExecGit,
+  options: MountOptions = {},
 ): Promise<MountResult> {
   const inRepo = await exec(['-C', baseDir, 'rev-parse', '--git-dir']);
   if (inRepo.exitCode !== 0) return { ok: false, reason: 'not-a-repo' };
 
+  // Read even when `options.repo` will override it: no origin means no host to build the
+  // override URL on, and — more to the point — a directory with no remote is not a
+  // checkout of anything, which is its own answer.
   const origin = await exec(['-C', baseDir, 'remote', 'get-url', 'origin']);
   if (origin.exitCode !== 0) return { ok: false, reason: 'no-origin' };
 
   const ref = prRef(pullNumber);
+  const source = fetchSource(origin.stdout, options.repo);
   // `+` forces the update: a force-pushed PR head is not a fast-forward, and refusing
   // it would pin the reviewer to a commit that no longer exists on the PR.
-  const fetched = await exec(['-C', baseDir, 'fetch', 'origin', `+refs/pull/${pullNumber}/head:${ref}`]);
+  const fetched = await exec(['-C', baseDir, 'fetch', source, `+refs/pull/${pullNumber}/head:${ref}`]);
   if (fetched.exitCode !== 0) return { ok: false, reason: 'fetch-failed' };
 
   await ensureIgnored(baseDir);
@@ -166,9 +235,27 @@ export async function mountPullRequest(
   // repository under `/tmp`; a fixture would never have shown it.
   const canonical = await exec(['-C', abs, 'rev-parse', '--show-toplevel']);
   const path = canonical.exitCode === 0 ? canonical.stdout.trim() : abs;
+  const headSha = head.stdout.trim();
+
+  /*
+   * The checkout must be the commit the pull request is at, or it is not that pull
+   * request. Reported rather than silently served: the failure this catches — the ref
+   * resolving in the wrong repository — produces a checkout that looks perfectly healthy
+   * and simply has the wrong files in it, which reads to the user as the product being
+   * broken. Two shas beats an empty pane.
+   */
+  const { expectedHeadSha } = options;
+  if (expectedHeadSha !== undefined && expectedHeadSha !== '' && headSha !== expectedHeadSha) {
+    return {
+      ok: false,
+      reason: 'head-mismatch',
+      detail: `the checkout is at ${headSha.slice(0, 7)}, the pull request is at ${expectedHeadSha.slice(0, 7)}`,
+    };
+  }
+
   return {
     ok: true,
-    worktree: { pullNumber, path, headSha: head.stdout.trim() },
+    worktree: { pullNumber, path, headSha },
   };
 }
 

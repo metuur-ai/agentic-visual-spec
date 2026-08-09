@@ -333,6 +333,13 @@ export interface CollabClient {
   /** `GET /__vs/collab/pulls/:n/files` — R-13.11, the review's entry point. */
   pullRequestFiles(pullNumber: number): Promise<CollabResult<PullRequestChangedFiles>>;
   /**
+   * `GET /__vs/collab/pulls/:n/description` — what the pull request says it is.
+   *
+   * Its own call rather than a field on the listing: bodies are unbounded prose, and most
+   * rows in a listing are never opened. `''` is a real answer (no description written).
+   */
+  pullRequestDescription(pullNumber: number): Promise<CollabResult<string>>;
+  /**
    * `GET /__vs/collab/pulls/:n/drafts` — R-13.13 / R-13.17, everything held for this
    * pull request, **published records included**. The published ones are how the UI can
    * say a comment is on the pull request rather than leaving the reviewer to infer it
@@ -448,6 +455,8 @@ export function createCollabClient(fetchImpl?: typeof fetch): CollabClient {
     mountPullRequest: (pullNumber) => send<WorktreeMounted>(`/pulls/${pullNumber}/mount`, 'POST', {}),
     unmountPullRequest: (pullNumber) => call<WorktreeRemoved>(`/pulls/${pullNumber}/mount`, { method: 'DELETE' }),
     pullRequestFiles: (pullNumber) => call<PullRequestChangedFiles>(`/pulls/${pullNumber}/files`),
+    pullRequestDescription: (pullNumber) =>
+      projected(call<{ body: string }>(`/pulls/${pullNumber}/description`), (b) => b.body),
     reviewDrafts: (pullNumber) =>
       projected(call<{ drafts: ReviewDraft[] }>(`/pulls/${pullNumber}/drafts`), (b) => b.drafts),
     holdReviewDraft: (pullNumber, input) => send<ReviewDraftSaved>(`/pulls/${pullNumber}/drafts`, 'POST', input),

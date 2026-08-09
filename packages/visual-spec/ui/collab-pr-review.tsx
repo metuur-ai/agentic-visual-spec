@@ -51,7 +51,13 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import { InspectOverlay, InspectorProvider } from '../core/app';
+import { ActiveCommentProvider } from './active-comment';
 import { CodeView, type LineSelection } from './code-view';
+import { CommentPanel } from './comment-panel';
+import { IndicatorLayer } from './indicator-layer';
+import { BusyLabel, LoadingLine, Spinner } from './spinner';
+import { reviewCommentPanelSource, reviewIndicatorTargets } from './review-comment-source';
 import {
   type MountedWorktree,
   type PullRequestSummary,
@@ -94,6 +100,39 @@ export function entriesUnder(entries: TreeEntry[], prefix: string): TreeEntry[] 
   return entries
     .filter((e) => e.path.startsWith(prefix) && e.path.length > prefix.length)
     .map((e) => ({ ...e, path: e.path.slice(prefix.length) }));
+}
+
+/**
+ * The changed paths as a tree, with the folders that hold them.
+ *
+ * WHY NOT THE FLAT LIST IT REPLACED. A pull request touching 26 files across a monorepo
+ * printed 26 copies of `packages/visual-spec/…`, each ellipsised in the middle so the part
+ * that differed — the filename — was the part that got cut. The reviewer could see which
+ * repository the change was in and not which files it was in. Nesting spends the width on
+ * the leaves instead, and the shape of the change becomes readable at a glance: four docs,
+ * then a run of `core/vite/routes`, then the UI.
+ *
+ * THE ENTRIES ARE THE CHECKOUT'S OWN where the checkout has them, so a row opens exactly
+ * the file the flat list opened and carries the `kind` the server detected. A path the
+ * checkout does not have is a file the pull request deleted (R-13.12); it still gets a row,
+ * because "this was removed" is part of the change, and clicking it reports that rather
+ * than opening nothing.
+ *
+ * `buildTree` resolves each node's parent by path and needs the parent to exist, so the
+ * directories are synthesised here rather than left to it.
+ */
+export function changedTreeEntries(paths: readonly string[], byPath: Map<string, TreeEntry>): TreeEntry[] {
+  const out = new Map<string, TreeEntry>();
+  for (const path of paths) {
+    const segments = path.split('/');
+    for (let i = 1; i < segments.length; i++) {
+      const dir = segments.slice(0, i).join('/');
+      if (!out.has(dir)) out.set(dir, { path: dir, name: segments[i - 1]!, type: 'dir' });
+    }
+    out.set(path, byPath.get(path) ?? { path, name: segments[segments.length - 1]!, type: 'file', kind: 'text' });
+  }
+  // Sorted by path so parents precede children, which is what `buildTree` relies on.
+  return [...out.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 
 /**
@@ -236,6 +275,7 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
   const checkout = useMemo(() => entriesUnder(entries, prefix), [entries, prefix]);
   const byPath = useMemo(() => new Map(checkout.map((e) => [e.path, e])), [checkout]);
   const checkoutFiles = useMemo(() => checkout.filter((e) => e.type === 'file').length, [checkout]);
+  const changedEntries = useMemo(() => changedTreeEntries(changed ?? [], byPath), [changed, byPath]);
 
   /**
    * How many review comments each file carries, for the count on its row.
@@ -323,15 +363,22 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
         <a href={pull.htmlUrl} target="_blank" rel="noreferrer" style={ghLink}>
           On GitHub ↗
         </a>
+        {/*
+          * `reload()` re-walks the checkout — thousands of files on a real repository —
+          * and the button gave no sign of it, so a reviewer waiting for a pushed commit to
+          * appear pressed it repeatedly. `useTree`'s own `loading` is the truth here; this
+          * button does not need a flag of its own.
+          */}
         <button
           type="button"
           onClick={() => {
             invalidateTree();
-            reload();
+            void reload();
           }}
+          disabled={loading}
           style={backBtn}
         >
-          Refresh files
+          <BusyLabel busy={loading}>{loading ? 'Refreshing…' : 'Refresh files'}</BusyLabel>
         </button>
       </div>
 
@@ -356,35 +403,40 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
               {changedError}
             </div>
           )}
-          <ul style={listReset}>
-            {(changed ?? []).map((path) => {
-              const comments = commentsPerFile.get(path) ?? 0;
-              return (
-                <li key={path} style={changedRowWrap}>
-                  <button
-                    type="button"
-                    onClick={() => open(path)}
-                    title={path}
-                    style={{ ...changedRow, ...(selected?.path === path ? rowActive : {}) }}
-                  >
-                    {path}
-                  </button>
-                  {comments > 0 && (
-                    // Outside the button on purpose: it is a property of the row, not part
-                    // of the control's name — a reviewer looking for `src/pay.ts` should
-                    // still find a control called `src/pay.ts`.
-                    <span data-vs-file-comments={path} style={countBadge}>
-                      {comments}
-                      <span style={srOnly}> review comments</span>
-                      <span aria-hidden="true" style={countWord}>
-                        {comments === 1 ? 'comment' : 'comments'}
-                      </span>
-                    </span>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
+          {/*
+            * The same component the checkout below uses, so the two halves of R-13.11 are
+            * browsed the same way. `commentCounts` is what puts the review-comment count on
+            * a row — the badge the flat list rendered by hand — and it is `FileTree`'s own
+            * affordance, already used by the local sidebar.
+            */}
+          {/*
+            * It takes the column's spare height rather than a fixed slice of it. A capped
+            * box scrolled a 26-file tree inside 320px while the sidebar below it sat empty;
+            * when the checkout disclosure is open the two share the space, which is the
+            * only moment either of them has to give any up.
+            */}
+          {/*
+            * WHILE `/files` IS IN FLIGHT THE COLUMN SAID NOTHING AT ALL — the heading, the
+            * sentence under it, and then blank space where the tree would be, with the
+            * checkout disclosure below it not yet rendered either. It read as a review of a
+            * pull request that changed nothing, and stayed that way for as long as GitHub
+            * took. `changed === null` is precisely "not answered yet"; the empty *array* is
+            * the different claim, and it has its own sentence further down.
+            */}
+          {changed === null && !changedError && (
+            <LoadingLine style={{ padding: '2px 12px 6px', fontSize: 12 }}>Reading what changed…</LoadingLine>
+          )}
+          <div data-vs-changed-tree style={{ flex: 1, minHeight: 0, padding: '0 6px 4px', overflow: 'auto' }}>
+            <FileTree
+              entries={changedEntries}
+              current={selected?.path ?? ''}
+              filter=""
+              onPick={(entry) => open(entry.path)}
+              commentCounts={commentsPerFile}
+              readOnly
+              defaultOpen
+            />
+          </div>
           {changed !== null && changed.length === 0 && !changedError && (
             <div style={emptyLine}>This pull request changes no files.</div>
           )}
@@ -396,15 +448,27 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
             aria-controls="vs-checkout-rest"
             style={restToggle}
           >
-            <span aria-hidden="true">{restOpen ? '▾' : '▸'}</span> Rest of the checkout · {checkoutFiles} files — read
-            for context, not under review
+            <span aria-hidden="true">{restOpen ? '▾' : '▸'}</span> Rest of the checkout ·{' '}
+            {/*
+              * The tree walk covers the whole checkout and is slow on a real repository.
+              * `0 files` while it runs is a number the walk has not produced — a claim, not
+              * a placeholder — so it waits and says it is counting.
+              */}
+            {loading ? (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, verticalAlign: 'middle' }}>
+                <Spinner size={10} /> counting files…
+              </span>
+            ) : (
+              `${checkoutFiles} files`
+            )}{' '}
+            — read for context, not under review
           </button>
           {restOpen && (
             <div id="vs-checkout-rest" style={restBody}>
               <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="filter…" style={filterInput} />
               <div style={{ flex: 1, overflow: 'auto', padding: 6 }}>
                 {loading ? (
-                  <div style={emptyLine}>Loading…</div>
+                  <LoadingLine style={{ padding: '4px 12px', fontSize: 12 }} />
                 ) : (
                   <FileTree entries={checkout} current={selected?.path ?? ''} filter={filter} onPick={setSelected} readOnly />
                 )}
@@ -427,7 +491,18 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
             onDiscard={discard}
           />
         ) : (
-          <main style={centerMsg}>Pick a changed file to start reading, or open any file in the checkout.</main>
+          <main style={centerMsg}>
+            {/*
+              * Not "pick a file" before there is a list to pick from — that sentence sends
+              * the reader to a column that is still empty, and reads as the answer having
+              * already arrived.
+              */}
+            {changed === null && !changedError ? (
+              <LoadingLine>Opening the checkout…</LoadingLine>
+            ) : (
+              'Pick a changed file to start reading, or open any file in the checkout.'
+            )}
+          </main>
         )}
       </div>
     </div>
@@ -465,15 +540,22 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
   const [selection, setSelection] = useState<LineSelection | null>(null);
   const content = file && 'content' in file ? file.content : undefined;
   /*
-   * Markdown renders rendered by default, because that is how a document under review is
-   * meant to be read. But the rendered surface has no lines, and a comment anchors to
-   * one — so on a Markdown file the composer was unreachable, which in a Markdown-centric
-   * product meant commenting did not work on exactly the files people review. The source
-   * view is the same read-only `CodeView` every other file gets; the toggle only chooses
-   * which one is on screen. Found in the browser against a real pull request.
+   * MARKDOWN IS READ RENDERED, AND COMMENTED ON RENDERED.
+   *
+   * An earlier revision solved "the rendered surface has no lines to anchor to" by
+   * sending the reviewer to the raw source: `Start commenting` swapped the document for
+   * `CodeView` and put a textarea underneath. It worked, and it was the wrong act — this
+   * product teaches one way to comment (click the block you mean, write beside it), and a
+   * reviewer who had learned it on their own files had to learn a second thing to do the
+   * same job on someone else's. The premise was also false: `MarkdownSurface` stamps every
+   * block with `data-vs-loc`, so a block selection IS a line range, which is exactly what
+   * a draft anchors to. The source view was never carrying information the rendered one
+   * lacks — it was only the view that happened to print line numbers.
+   *
+   * Code and everything else still go through `CodeView` and the line composer below,
+   * because those files have no rendered form to click on.
    */
-  const [asSource, setAsSource] = useState(false);
-  const rendered = entry.kind === 'markdown' && !asSource;
+  const rendered = entry.kind === 'markdown';
 
   const held = drafts.filter((d) => d.status !== 'published');
   const sent = drafts.filter((d) => d.status === 'published');
@@ -489,81 +571,47 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
   };
 
   /*
-   * `I` starts commenting everywhere else in this app, so it has to start commenting
-   * here. Without it the only way in was a small pill in the breadcrumb, and a reviewer
-   * looking at a rendered document with no lines in it had no reason to suspect one
-   * existed — the mechanism worked and was undiscoverable, which is the same thing as
-   * broken. Reported as "I can't add any comment" on a surface where commenting worked.
+   * The panel's half of the rendered surface: this file's drafts, and what a new one does.
+   * Built here rather than inside the source module because `onHold` / `onPublish` /
+   * `onDiscard` are this component's props — the store lives one level up, with the pull
+   * request, not with the file on screen.
    */
-  useEffect(() => {
-    if (!rendered) return undefined;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== 'i' && event.key !== 'I') return;
-      // Never steal the key from someone typing a comment.
-      const el = event.target as HTMLElement | null;
-      const tag = el?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || el?.isContentEditable) return;
-      if (event.metaKey || event.ctrlKey || event.altKey) return;
-      setAsSource(true);
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [rendered]);
+  const panelSource = useMemo(
+    () =>
+      reviewCommentPanelSource({
+        path: entry.path,
+        headSha,
+        drafts,
+        hold: onHold,
+        publish: onPublish,
+        discard: onDiscard,
+        notice: (id) => {
+          const n = notices[id];
+          if (!n) return null;
+          return <DraftNoticeBox notice={n} onPublish={onPublish} draftId={id} />;
+        },
+      }),
+    [entry.path, headSha, drafts, onHold, onPublish, onDiscard, notices],
+  );
 
-  return (
+  const body = (
     <main style={pane}>
       <div style={{ maxWidth: 1100, margin: '0 auto', padding: '20px 36px 120px' }}>
         <div style={crumb}>
           {entry.type === 'dir' ? '📂 ' : ''}
           {entry.path}
           <span style={{ opacity: 0.7 }}> · read-only</span>
-          {entry.type === 'file' && entry.kind === 'markdown' && (
-            <button
-              type="button"
-              data-vs-md-view={asSource ? 'source' : 'rendered'}
-              onClick={() => {
-                // The selection belongs to the source view's line numbers; carrying it
-                // across would leave a composer open against a surface that no longer
-                // shows the line it names.
-                setSelection(null);
-                setAsSource((v) => !v);
-              }}
-              title={asSource ? 'Show the rendered document' : 'Show the source, where lines can be commented on'}
-              style={viewToggle}
-            >
-              {asSource ? 'Rendered' : 'Source · to comment'}
-            </button>
-          )}
         </div>
         {entry.type === 'dir' ? (
           <div style={placeholder}>Folder — pick a file inside it.</div>
         ) : loading ? (
-          <p style={{ opacity: 0.6 }}>Loading…</p>
+          <LoadingLine />
         ) : entry.kind === 'image' ? (
           <img src={rawUrl(path)} alt={entry.name} style={{ maxWidth: '100%', borderRadius: 8, border: '1px solid #e2e8f0' }} />
         ) : content == null ? (
           <div style={placeholder}>No preview for this file.</div>
         ) : rendered ? (
           <div style={mdWrap}>
-            {/*
-              * The affordance stated where the reader is looking, and stated as a control.
-              *
-              * The pill in the crumb reads as metadata, not as the way in, and a keyboard
-              * shortcut printed as a sentence is something you have to already know to
-              * look for. Both still work — this is the same `setAsSource(true)` the `I`
-              * handler below performs, and the pill still toggles. What changed is that
-              * the primary way in is now a button a reviewer can see and press, with the
-              * shortcut demoted to a hint under it. Rendered only on the rendered Markdown
-              * view, because that is the view with no lines to anchor a comment to.
-              */}
-            <div style={commentHint} data-vs-comment-hint>
-              <button type="button" onClick={() => setAsSource(true)} style={startCommentBtn}>
-                Start commenting
-              </button>
-              <span style={hintLine}>
-                or press <kbd style={kbd}>I</kbd> — picks a line, then you write
-              </span>
-            </div>
             <MarkdownSurface source={content} />
           </div>
         ) : (
@@ -593,7 +641,13 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
             {error}
           </div>
         )}
-        {drafts.length > 0 && (
+        {/*
+          * The below-document list is the CODE path's only home for its drafts. On a
+          * rendered document `CommentPanel` beside it carries the same comments with the
+          * same two acts, and printing them twice on one screen would make the two copies
+          * look like two sets of comments.
+          */}
+        {!rendered && drafts.length > 0 && (
           /*
             * R-13.18, SAID ONCE PER GROUP INSTEAD OF ONCE PER CARD.
             *
@@ -650,7 +704,66 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
           </section>
         )}
       </div>
+      {/*
+        * The overlay hit-tests a click into a block selection, and the markers say which
+        * blocks already carry one. Both are the local surface's own components, reading
+        * `data-vs-loc` off the same rendered Markdown — R-6.6's one resolver, doing the
+        * same job for a third kind of comment.
+        */}
+      {rendered && <InspectOverlay />}
+      {rendered && <IndicatorLayer targets={reviewIndicatorTargets(entry.path, drafts)} />}
     </main>
+  );
+
+  if (!rendered) return body;
+
+  /*
+   * `surfaceId` namespaces the inspector's selection, and a checkout's file is not the
+   * local file of the same name — the reviewer may well have both open across a session.
+   * The pull request number is what keeps the two apart.
+   */
+  return (
+    <ActiveCommentProvider>
+      <InspectorProvider key={`${prefix}:${entry.path}`} surfaceId={`review:${prefix}:${entry.path}`} pageIndex={0}>
+        {body}
+        <CommentPanel width={340} source={panelSource} />
+      </InspectorProvider>
+    </ActiveCommentProvider>
+  );
+}
+
+/**
+ * R-13.14's warning, and its override.
+ *
+ * Extracted from `DraftCard` because the rendered surface's comment panel shows the same
+ * notice on the same draft, and a stale-head warning that appeared on one surface and not
+ * the other would let a reviewer send a comment past a check they never saw.
+ */
+function DraftNoticeBox({
+  notice,
+  draftId,
+  onPublish,
+}: {
+  notice: DraftNotice;
+  draftId: string;
+  onPublish: (id: string, force?: boolean) => Promise<void>;
+}) {
+  return (
+    <div data-vs-draft-notice={notice.kind} style={notice.kind === 'error' ? noticeError : notice.kind === 'stale' ? noticeStale : noticeNote}>
+      {notice.kind === 'stale' ? (
+        <>
+          <div>
+            Written against <code>{notice.draftHeadSha}</code>; the pull request is now at{' '}
+            <code>{notice.currentHeadSha}</code>. Sending it now would anchor it to whatever sits at that line today.
+          </div>
+          <button type="button" onClick={() => void onPublish(draftId, true)} style={{ ...primaryBtn, marginTop: 6 }}>
+            Send anyway
+          </button>
+        </>
+      ) : (
+        notice.message
+      )}
+    </div>
   );
 }
 
@@ -702,7 +815,7 @@ function DraftComposer({
           Cancel
         </button>
         <button type="button" disabled={!text.trim() || busy} onClick={submit} style={primaryBtn}>
-          {busy ? 'Saving…' : 'Save draft'}
+          <BusyLabel busy={busy}>{busy ? 'Saving…' : 'Save draft'}</BusyLabel>
         </button>
       </div>
     </div>
@@ -745,23 +858,7 @@ function DraftCard({
       </div>
       <div style={{ margin: '6px 0', font: '13px system-ui', color: '#0f172a', overflowWrap: 'anywhere' }}>{draft.comment}</div>
 
-      {notice && (
-        <div data-vs-draft-notice={notice.kind} style={notice.kind === 'error' ? noticeError : notice.kind === 'stale' ? noticeStale : noticeNote}>
-          {notice.kind === 'stale' ? (
-            <>
-              <div>
-                Written against <code>{notice.draftHeadSha}</code>; the pull request is now at{' '}
-                <code>{notice.currentHeadSha}</code>. Sending it now would anchor it to whatever sits at that line today.
-              </div>
-              <button type="button" onClick={() => void onPublish(draft.id, true)} style={{ ...primaryBtn, marginTop: 6 }}>
-                Send anyway
-              </button>
-            </>
-          ) : (
-            notice.message
-          )}
-        </div>
-      )}
+      {notice && <DraftNoticeBox notice={notice} draftId={draft.id} onPublish={onPublish} />}
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
         {published ? (
@@ -812,28 +909,15 @@ const sectionHead: React.CSSProperties = { padding: '10px 12px 6px', font: '700 
 /** P7 — the changed files lead, so their heading is the heavy one on the sidebar. */
 const leadHead: React.CSSProperties = { padding: '12px 12px 2px', font: '700 13px system-ui', color: '#0f172a' };
 const leadNote: React.CSSProperties = { padding: '0 12px 6px', font: '11px system-ui', color: '#64748b' };
-const listReset: React.CSSProperties = { listStyle: 'none', margin: 0, padding: '0 6px', maxHeight: 320, overflow: 'auto' };
-const changedRowWrap: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 6 };
 /** The count, in violet, and never the colour on its own — the numeral is the message. */
-const countBadge: React.CSSProperties = { flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 3, padding: '1px 7px', borderRadius: 99, border: '1px solid #ddd6fe', background: '#f5f3ff', color: '#5b21b6', font: '600 10px system-ui' };
-const countWord: React.CSSProperties = { fontWeight: 400 };
-const srOnly: React.CSSProperties = { position: 'absolute', width: 1, height: 1, padding: 0, margin: -1, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap', border: 0 };
 /** The whole second half of R-13.11, folded into the line that says what it is for. */
-const restToggle: React.CSSProperties = { display: 'block', width: 'calc(100% - 12px)', margin: '10px 6px 0', textAlign: 'left', padding: '8px 8px', border: '1px solid #e2e8f0', borderRadius: 6, background: '#f8fafc', color: '#64748b', font: '11px system-ui', lineHeight: 1.45, cursor: 'pointer' };
+const restToggle: React.CSSProperties = { flexShrink: 0, display: 'block', width: 'calc(100% - 12px)', margin: '10px 6px 0', textAlign: 'left', padding: '8px 8px', border: '1px solid #e2e8f0', borderRadius: 6, background: '#f8fafc', color: '#64748b', font: '11px system-ui', lineHeight: 1.45, cursor: 'pointer' };
 const restBody: React.CSSProperties = { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, paddingTop: 8 };
-const changedRow: React.CSSProperties = { display: 'block', width: '100%', textAlign: 'left', padding: '3px 6px', border: 'none', borderRadius: 4, background: 'transparent', cursor: 'pointer', font: '12px ui-monospace, monospace', color: '#475569', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
-const rowActive: React.CSSProperties = { background: '#eff6ff', color: '#1d4ed8', fontWeight: 600 };
 const filterInput: React.CSSProperties = { margin: '0 12px 6px', padding: '4px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: '12px system-ui' };
 const emptyLine: React.CSSProperties = { padding: '4px 12px', font: '12px system-ui', color: '#94a3b8' };
 const errorLine: React.CSSProperties = { padding: '4px 12px', font: '12px system-ui', color: '#b91c1c' };
 const pane: React.CSSProperties = { flex: 1, minWidth: 0, overflow: 'auto', background: '#f8fafc' };
 const crumb: React.CSSProperties = { font: '12px ui-monospace, monospace', color: '#64748b', marginBottom: 12 };
-const commentHint: React.CSSProperties = { display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 6, margin: '-4px 0 14px', padding: '10px 12px', borderRadius: 8, background: '#f5f3ff', border: '1px solid #ddd6fe', color: '#5b21b6', font: '12px system-ui' };
-/** The way in, as a control. The shortcut is the hint under it, not the mechanism. */
-const startCommentBtn: React.CSSProperties = { padding: '6px 14px', border: '1px solid #6d28d9', borderRadius: 6, background: '#7c3aed', color: 'white', font: '600 12px system-ui', cursor: 'pointer' };
-const hintLine: React.CSSProperties = { font: '11px system-ui', color: '#6d28d9' };
-const kbd: React.CSSProperties = { padding: '1px 6px', borderRadius: 4, border: '1px solid #c4b5fd', background: 'white', font: '11px ui-monospace, monospace' };
-const viewToggle: React.CSSProperties = { marginLeft: 10, padding: '2px 8px', border: '1px solid #cbd5e1', borderRadius: 999, background: 'white', color: '#475569', font: '600 11px system-ui', cursor: 'pointer' };
 const mdWrap: React.CSSProperties = { background: 'white', border: '1px solid #e2e8f0', borderRadius: 8, padding: '16px 24px' };
 const placeholder: React.CSSProperties = { padding: '48px 24px', textAlign: 'center', color: '#64748b', background: 'white', border: '1px dashed #cbd5e1', borderRadius: 12 };
 const centerMsg: React.CSSProperties = { flex: 1, display: 'grid', placeItems: 'center', opacity: 0.6, font: '13px system-ui' };

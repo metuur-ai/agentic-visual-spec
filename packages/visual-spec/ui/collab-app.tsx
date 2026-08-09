@@ -39,6 +39,7 @@ import { CollabOpenPanel } from './collab-open-panel';
 import { CollabPrReview } from './collab-pr-review';
 import { CollabPullsPanel, shortSha } from './collab-pulls-panel';
 import { ActiveCommentProvider } from './active-comment';
+import { BusyLabel, LoadingLine } from './spinner';
 import { CommentPanel, type CommentPanelSource } from './comment-panel';
 import { IndicatorLayer } from './indicator-layer';
 import { MarkdownSurface } from './markdown-surface';
@@ -66,6 +67,23 @@ type PaneMode = 'review' | 'edit';
  */
 const DOCUMENT_PARAM = 'vsdoc';
 
+/**
+ * The pull request being *read*, kept in the URL for the same reason `vsdoc` is.
+ *
+ * The original note here argued a checkout needed no such treatment: "remounting it is one
+ * click and no loss". Both halves stopped being true. The way in is now the sidebar, the
+ * drawer and a row — not one click — and a reviewer arrives at a reload holding review
+ * drafts, a scrolled file tree and an open document, all of which a bounce to the file
+ * view throws away. The checkout itself is still cheap to rebuild, which is exactly why
+ * restoring it is safe: `mount` moves the existing worktree rather than recreating it
+ * (R-13.12), so the recovery costs one idempotent call.
+ *
+ * It stores the NUMBER and not the worktree. The worktree is a path and a sha that git
+ * owns and can move between one load and the next; the number is the only part of a review
+ * that is stable, and re-mounting is what turns it back into the rest.
+ */
+const PULL_PARAM = 'vspr';
+
 function documentFromUrl(): string | null {
   if (typeof window === 'undefined') return null;
   return new URLSearchParams(window.location.search).get(DOCUMENT_PARAM);
@@ -77,6 +95,45 @@ function rememberInUrl(documentId: string | null): void {
   if (documentId) url.searchParams.set(DOCUMENT_PARAM, documentId);
   else url.searchParams.delete(DOCUMENT_PARAM);
   window.history.replaceState(null, '', url);
+}
+
+function rememberPullInUrl(pullNumber: number | null): void {
+  if (typeof window === 'undefined') return;
+  const url = new URL(window.location.href);
+  if (pullNumber !== null) url.searchParams.set(PULL_PARAM, String(pullNumber));
+  else url.searchParams.delete(PULL_PARAM);
+  window.history.replaceState(null, '', url);
+}
+
+/**
+ * Forget whatever the URL was reopening.
+ *
+ * `← Files` is a statement that the reviewer is done with this surface, and leaving the
+ * parameters behind would make the next reload drag them back to it. The document pane
+ * clears `vsdoc` through `setDocumentId(null)` on its own paths; this covers the exits
+ * that go around it, which is every one that leaves the surface entirely.
+ */
+export function clearCollabUrl(): void {
+  rememberInUrl(null);
+  rememberPullInUrl(null);
+}
+
+/**
+ * What a cold load should reopen, read off the URL — or `null` for the file view.
+ *
+ * `App.tsx` calls this for its initial state, because the decision to be on the
+ * collaboration surface at all is its own; `CollabApp` then reads `vsdoc` again for the
+ * document. The document wins over the pull request: a document open on a pull request is
+ * the more specific place to be, and is the one that can hold unpublished work.
+ */
+export function intentFromUrl(): CollabIntent | null {
+  if (typeof window === 'undefined') return null;
+  const params = new URLSearchParams(window.location.search);
+  const documentId = params.get(DOCUMENT_PARAM);
+  if (documentId) return { documentId };
+  const raw = params.get(PULL_PARAM);
+  const pull = raw && /^\d+$/.test(raw) ? Number(raw) : NaN;
+  return Number.isSafeInteger(pull) && pull > 0 ? { reviewPull: pull } : null;
 }
 
 /**
@@ -166,6 +223,13 @@ export function CollabApp({ onExit, initial }: { onExit: () => void; initial?: C
   useEffect(() => {
     if (opened) rememberInUrl(opened);
   }, [opened]);
+
+  // The same contract for the checkout: whichever pull request is on screen is the one the
+  // URL names, and leaving the review takes it back out.
+  const reviewedPull = pullReview?.pull.number ?? null;
+  useEffect(() => {
+    rememberPullInUrl(reviewedPull);
+  }, [reviewedPull]);
 
   // P5 — one row, not two. While a checkout is on screen `CollabPrReview` renders the row
   // that carries the number, the mounted commit and the read-only statement (R-9.1 …
@@ -321,7 +385,11 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
   );
 
   if (loading) {
-    return <main style={centerMsg}>Loading…</main>;
+    return (
+      <main style={centerMsg}>
+        <LoadingLine />
+      </main>
+    );
   }
   if (error) {
     // R-11.4 — the server's own words, not a generic failure.
@@ -509,7 +577,7 @@ function PublishConfirm({
             Cancel
           </button>
           <button type="button" onClick={onConfirm} disabled={busy} style={publishBtn}>
-            {busy ? 'Publishing…' : 'Publish'}
+            <BusyLabel busy={busy}>{busy ? 'Publishing…' : 'Publish'}</BusyLabel>
           </button>
         </div>
       </div>

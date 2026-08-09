@@ -428,3 +428,85 @@ describe('execution-path invariants', () => {
     }
   });
 });
+
+/*
+ * A repository renamed or transferred on GitHub answers 301 to a write, with a body whose
+ * whole message is "Moved Permanently". That reached the reviewer verbatim, on the one
+ * action that matters, saying nothing about what to do — and the surface looked healthy up
+ * to that point because `gh` follows the redirect on reads.
+ */
+describe('R-4.9 — a moved repository says so, not "Moved Permanently"', () => {
+  /*
+   * `gh`'s real output for a write against a renamed repository. Two details matter and
+   * both were got wrong the first time: the status is **307** (a method-preserving
+   * redirect, which `gh` will not follow for a POST) and the stderr carries no
+   * parentheses, so the `(HTTP nnn)` regex that reads every other failure found nothing.
+   */
+  const moved = {
+    exitCode: 1,
+    stdout: JSON.stringify({ message: 'Moved Permanently', url: 'https://api.github.com/repositories/1276508763' }),
+    stderr: 'gh: HTTP 307',
+  };
+
+  it('names the repository and what to change', async () => {
+    const { exec } = recorder([moved]);
+    const adapter = createGitHubAdapter(exec);
+
+    await expect(
+      adapter.createReviewComment({ owner: 'metuur', repo: 'agentic-visual-spec' }, 1, {
+        path: 'docs/spec.md',
+        body: 'a comment',
+        commitId: 'abc1234',
+      }),
+    ).rejects.toMatchObject({
+      status: 307,
+      ghErrorCode: 'repo_moved',
+      message: expect.stringContaining('metuur/agentic-visual-spec'),
+    });
+  });
+
+  it('explains why reading kept working, so the silence up to now is not a second mystery', async () => {
+    const { exec } = recorder([moved]);
+    const adapter = createGitHubAdapter(exec);
+
+    const err = await adapter
+      .createReviewComment({ owner: 'metuur', repo: 'agentic-visual-spec' }, 1, { path: 'a.md', body: 'x', commitId: 'c' })
+      .then(() => null, (e: Error) => e);
+
+    expect(err?.message).toMatch(/renamed or transferred/i);
+    expect(err?.message).toMatch(/origin/);
+    expect(err?.message).not.toBe('Moved Permanently');
+  });
+
+  /* The read's redirect is 301, and it says the same thing. */
+  it('answers for the read redirect too', async () => {
+    const { exec } = recorder([
+      { exitCode: 1, stdout: JSON.stringify({ message: 'Moved Permanently' }), stderr: 'gh: Moved Permanently (HTTP 301)' },
+    ]);
+    await expect(
+      createGitHubAdapter(exec).createReviewComment({ owner: 'acme', repo: 'docs' }, 1, { path: 'a.md', body: 'x', commitId: 'c' }),
+    ).rejects.toMatchObject({ status: 301, ghErrorCode: 'repo_moved' });
+  });
+
+  /* The parenthesised form is what every other failure uses; it must keep working. */
+  it('still reads the status out of the parenthesised form', async () => {
+    const { exec } = recorder([
+      { exitCode: 1, stdout: JSON.stringify({ message: 'Validation Failed' }), stderr: 'gh: Validation Failed (HTTP 422)' },
+    ]);
+    await expect(
+      createGitHubAdapter(exec).createReviewComment({ owner: 'acme', repo: 'docs' }, 1, { path: 'a.md', body: 'x', commitId: 'c' }),
+    ).rejects.toMatchObject({ status: 422, message: 'Validation Failed' });
+  });
+
+  /* Every other status keeps GitHub's own words — R-11.4's rule, unchanged. */
+  it('leaves other failures alone', async () => {
+    const { exec } = recorder([
+      { exitCode: 1, stdout: JSON.stringify({ message: 'Not Found' }), stderr: 'gh: Not Found (HTTP 404)' },
+    ]);
+    const adapter = createGitHubAdapter(exec);
+
+    await expect(
+      adapter.createReviewComment({ owner: 'acme', repo: 'docs' }, 1, { path: 'a.md', body: 'x', commitId: 'c' }),
+    ).rejects.toMatchObject({ status: 404, message: 'Not Found' });
+  });
+});

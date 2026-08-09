@@ -64,7 +64,7 @@ function summary(over: Partial<PullRequestSummary> = {}): PullRequestSummary {
 
 /** The repo-level adapter double, recording what the routes asked for. */
 function repoAdapter(
-  options: { pulls?: PullRequestSummary[]; listFails?: Error; pullFails?: Error; files?: string[] } = {},
+  options: { pulls?: PullRequestSummary[]; listFails?: Error; pullFails?: Error; files?: string[]; body?: string } = {},
 ) {
   const states: (string | undefined)[] = [];
   const compares: { base: string; head: string }[] = [];
@@ -85,7 +85,7 @@ function repoAdapter(
         headBranch: 'patch-1',
         state: 'open',
         htmlUrl: 'https://github.com/acme/specs/pull/7',
-        body: '',
+        body: options.body ?? '',
         merged: false,
         mergeable: true,
         mergeableState: 'clean',
@@ -160,7 +160,7 @@ describe('/pulls is matched before the document-scoped route', () => {
     const text = src('core/vite/routes/collab.ts');
     const scoped = text.indexOf('const scoped = /^\\/([^/]+)(\\/.*)?$/.exec(pathname)');
     expect(scoped).toBeGreaterThan(-1);
-    for (const marker of ["pathname === '/pulls'", "pathname === '/pulls/mounted'", '/^\\/pulls\\/([^/]+)\\/mount$/', '/^\\/pulls\\/([^/]+)\\/files$/']) {
+    for (const marker of ["pathname === '/pulls'", "pathname === '/pulls/mounted'", '/^\\/pulls\\/([^/]+)\\/mount$/', '/^\\/pulls\\/([^/]+)\\/files$/', '/^\\/pulls\\/([^/]+)\\/description$/']) {
       const at = text.indexOf(marker);
       expect(at, marker).toBeGreaterThan(-1);
       expect(at, marker).toBeLessThan(scoped);
@@ -191,10 +191,11 @@ describe('R-9.8 — the /pulls family gates on `read` and nothing stronger', () 
     await call(r, 'GET', '/pulls');
     await call(r, 'GET', '/pulls/mounted');
     await call(r, 'GET', '/pulls/7/files');
+    await call(r, 'GET', '/pulls/7/description');
     await r.handle({ method: 'POST', pathname: '/pulls/7/mount', query: {}, body: {} });
     await r.handle({ method: 'DELETE', pathname: '/pulls/7/mount', query: {}, body: {} });
 
-    expect(seen).toHaveLength(5);
+    expect(seen).toHaveLength(6);
     expect(new Set(seen.map((s) => s.op))).toEqual(new Set(['read']));
     expect(seen.every((s) => s.documentId === null)).toBe(true);
   });
@@ -809,5 +810,44 @@ describe('/__vs/collab/pulls/:n/drafts', () => {
       expect(at, marker).toBeGreaterThan(-1);
       expect(at, marker).toBeLessThan(scoped);
     }
+  });
+});
+
+
+/* ================================================================== *
+ * GET /pulls/:n/description
+ * ================================================================== */
+describe('GET /__vs/collab/pulls/:n/description', () => {
+  /*
+   * The listing carries no bodies on purpose — it is every open pull request, and a body
+   * is unbounded prose most rows will never have read. So this is its own call, made once,
+   * for the row a reviewer opened.
+   */
+  it('answers the body, and only the body', async () => {
+    const gh = repoAdapter({ body: '## Why\n\nBecause the rules changed.' });
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/7/description');
+
+    expect(res.status).toBe(200);
+    // Not the detail: `mergeable` and friends are facts the browser already has from the
+    // listing and cannot keep current, so a second staler copy must not travel with this.
+    expect(res.json).toEqual({ pullNumber: 7, body: '## Why\n\nBecause the rules changed.' });
+  });
+
+  /* An empty body is a real answer; `null` would make "none" look like "not read yet". */
+  it('answers an empty string when the pull request has no description', async () => {
+    const res = await call(router(), 'GET', '/pulls/7/description');
+    expect(res.json).toEqual({ pullNumber: 7, body: '' });
+  });
+
+  /* Refused at the edge with the route's own wording, the same way `/files` refuses it. */
+  it('refuses a pull number that is not one', async () => {
+    const res = await call(router(), 'GET', '/pulls/nope/description');
+    expect(res).toEqual({ status: 400, json: { error: 'invalid pullNumber: nope' } });
+  });
+
+  it('passes GitHub’s own sentence through on failure (R-11.4)', async () => {
+    const gh = repoAdapter({ pullFails: new GitHubError('getPullRequest', 'Not Found', 404) });
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/7/description');
+    expect(res).toEqual({ status: 404, json: { error: 'Not Found' } });
   });
 });

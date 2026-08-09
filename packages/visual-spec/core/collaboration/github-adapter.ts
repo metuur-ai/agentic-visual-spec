@@ -361,8 +361,54 @@ function graphqlErrorsIn(stdout: string): string | null {
   return errors.map((e) => str(e.message, 'unknown GraphQL error')).join('; ');
 }
 
+/**
+ * `owner/repo` out of a `gh api` argument list, for an error that needs to name it.
+ *
+ * The endpoint is one of the positional arguments — everything else is a flag or a flag's
+ * value — so the repo is found by shape rather than by position, which changes per call.
+ */
+function repoInArgs(args: readonly string[]): string | null {
+  for (const arg of args) {
+    // Endpoints are written with a leading slash (`/repos/…`); the GraphQL ones are not
+    // endpoints at all, so an argument that does not start this way is simply skipped.
+    const match = /^\/?repos\/([^/]+\/[^/]+)/.exec(arg);
+    if (match) return match[1]!;
+  }
+  return null;
+}
+
+/** Put `canonical` where `stale` was, in whichever argument carried the endpoint. */
+function retargetRepo(args: readonly string[], stale: string, canonical: string): string[] {
+  return args.map((arg) => (/^\/?repos\//.test(arg) ? arg.replace(`repos/${stale}`, `repos/${canonical}`) : arg));
+}
+
+/**
+ * The statuses GitHub answers for a repository that has been renamed or transferred.
+ *
+ * 301 is the read; **307** is the write — a method-preserving redirect, which `gh` will
+ * not follow for a POST, and which is therefore the one a reviewer meets in practice. 308
+ * is the permanent form of the same thing.
+ */
+const MOVED = new Set([301, 307, 308]);
+
+/**
+ * The message for a move this adapter could NOT resolve on its own.
+ *
+ * The normal path never reaches here: `call()` asks GitHub for the repository's current
+ * name and retries against it (see the note there). This is what is left when even that
+ * read fails — the credential cannot see the repository at all, or `gh` is not answering —
+ * and at that point the honest instruction is the manual one.
+ */
+function movedPermanently(repo: string | null): string {
+  const named = repo ?? 'the configured repository';
+  return (
+    `${named} has been renamed or transferred on GitHub, and its current name could not be read back. ` +
+    "Point the repository's `origin` remote at its current name (or set `collaboration` in visual-spec.config.ts), then try again."
+  );
+}
+
 /** Pull `{ status, message, errors[].code }` out of a `gh api` failure. */
-function classify(operation: string, res: { stdout: string; stderr: string }): GitHubError {
+function classify(operation: string, res: { stdout: string; stderr: string }, args: readonly string[] = []): GitHubError {
   let body: Json = {};
   try {
     const parsed = JSON.parse(res.stdout) as unknown;
@@ -370,12 +416,24 @@ function classify(operation: string, res: { stdout: string; stderr: string }): G
   } catch {
     // gh writes a plain-text diagnostic when there is no JSON body.
   }
-  const fromStderr = /\(HTTP (\d{3})\)/.exec(res.stderr);
+  /*
+   * `gh` writes the status two ways, and only one of them was being read.
+   *
+   *   gh: Not Found (HTTP 404)   ← a failure with a message from the body
+   *   gh: HTTP 307               ← a redirect, which has no message of its own
+   *
+   * The parenthesised form was the only one matched, so every redirect arrived with no
+   * status at all — and the branch below that turns a redirect into a sentence could
+   * never fire. Found in the browser: a `Send` against a renamed repository showed
+   * GitHub's bare "Moved Permanently" long after the code to replace it existed.
+   */
+  const fromStderr = /\(?HTTP (\d{3})\)?/.exec(res.stderr);
   const status = typeof body.status === 'string' ? Number(body.status) : fromStderr ? Number(fromStderr[1]) : undefined;
   const errors = Array.isArray(body.errors) ? (body.errors as Json[]) : [];
   const code = errors.length > 0 ? str(errors[0]?.code) || undefined : undefined;
-  const message = str(body.message) || res.stderr.trim() || 'gh api failed';
-  return new GitHubError(operation, message, Number.isNaN(status) ? undefined : status, code);
+  const moved = status !== undefined && MOVED.has(status);
+  const message = moved ? movedPermanently(repoInArgs(args)) : str(body.message) || res.stderr.trim() || 'gh api failed';
+  return new GitHubError(operation, message, Number.isNaN(status) ? undefined : status, moved ? 'repo_moved' : code);
 }
 
 function toPullRequestDetail(raw: Json): PullRequestDetail {
@@ -462,8 +520,58 @@ function toIssueComment(raw: Json): IssueComment {
  * recorded-response executor (R-4.8 / R-12.3).
  */
 export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAdapter {
-  /** One `gh api` call. Throws `GitHubError` on any non-zero exit. */
-  async function call<T>(operation: string, args: string[], input?: string): Promise<T> {
+  /**
+   * Stale name → the name GitHub currently uses. Cached for the adapter's lifetime.
+   *
+   * A rename does not un-happen, so one read answers every subsequent call. A name that
+   * resolved to itself is cached too: that is the overwhelmingly common case, and caching
+   * it means a repository with no rename in its past never pays for this twice.
+   */
+  const canonicalNames = new Map<string, string | null>();
+
+  /**
+   * What GitHub currently calls this repository, or `null` if it will not say.
+   *
+   * `GET /repos/{owner}/{repo}` is a read, and `gh` follows the permanent redirect on a
+   * read — so asking the OLD name returns the NEW repository, whose `full_name` is the
+   * answer. That asymmetry is the whole trick: the information needed to fix a write is
+   * available over exactly the verb that still works.
+   */
+  async function canonicalRepo(stale: string): Promise<string | null> {
+    const cached = canonicalNames.get(stale);
+    if (cached !== undefined) return cached;
+    const res = await exec(['api', '--method', 'GET', '-H', ACCEPT, `/repos/${stale}`]);
+    let resolved: string | null = null;
+    if (res.exitCode === 0) {
+      try {
+        const body = JSON.parse(res.stdout) as Json;
+        const fullName = str(body.full_name);
+        if (/^[^/]+\/[^/]+$/.test(fullName)) resolved = fullName;
+      } catch {
+        // A non-JSON body is no answer; the caller falls back to the manual instruction.
+      }
+    }
+    canonicalNames.set(stale, resolved);
+    return resolved;
+  }
+
+  /**
+   * One `gh api` call. Throws `GitHubError` on any non-zero exit.
+   *
+   * IT FOLLOWS A REPOSITORY RENAME RATHER THAN REPORTING ONE. GitHub answers a write
+   * against a renamed or transferred repository with a method-preserving redirect (307,
+   * or 301/308), and `gh` will not follow it — so every read kept working while every
+   * write failed, and the failure surfaced as GitHub's two-word "Moved Permanently" on
+   * whatever the reviewer happened to be doing. Reporting that is not the fix a person
+   * wants: the name they have and the name GitHub uses identify the same repository, and
+   * GitHub says so. So the retry resolves the current name over the verb that still works
+   * and sends the write there.
+   *
+   * ONCE, AND ONLY ON A MOVE. `retried` closes the loop against a server that answered a
+   * redirect for some other reason; anything still failing after the retarget is a real
+   * failure and is thrown with its own words.
+   */
+  async function call<T>(operation: string, args: string[], input?: string, retried = false): Promise<T> {
     const res = await exec(args, input);
     if (res.exitCode === null) {
       // R-4.10: `gh` could not be executed — the path is unavailable, not failing.
@@ -474,7 +582,19 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
         'executor_unavailable',
       );
     }
-    if (res.exitCode !== 0) throw classify(operation, res);
+    if (res.exitCode !== 0) {
+      const err = classify(operation, res, args);
+      if (err.ghErrorCode === 'repo_moved' && !retried) {
+        const stale = repoInArgs(args);
+        const canonical = stale ? await canonicalRepo(stale) : null;
+        // A name that resolves to itself is not a move this can act on — falling through
+        // to the throw is what keeps that from becoming a silent second attempt.
+        if (stale && canonical && canonical !== stale) {
+          return call<T>(operation, retargetRepo(args, stale, canonical), input, true);
+        }
+      }
+      throw err;
+    }
     try {
       return JSON.parse(res.stdout) as T;
     } catch {

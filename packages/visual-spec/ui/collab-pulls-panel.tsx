@@ -32,6 +32,8 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { MarkdownSurface } from './markdown-surface';
+import { BusyLabel, LoadingLine } from './spinner';
 import {
   type MountedWorktree,
   type PullRequestListState,
@@ -63,12 +65,50 @@ export type CollabPullsPanelProps = {
   fetchImpl?: typeof fetch;
 };
 
+/** One rendered block of rows. A null `title` is the flat list — see the note at the call. */
+type PullGroup = { key: string; title: string | null; rows: PullRequestSummary[] };
+
+/**
+ * Split the listing into the reader's own pull requests and everyone else's.
+ *
+ * ORDER IS DELIBERATE: yours first. They are the ones you are waiting on an answer for,
+ * and the ones whose comments are addressed to you.
+ *
+ * The comparison is case-insensitive because GitHub logins are, and a `Javierhbr` in the
+ * snapshot against a `javierhbr` on the pull request would silently file the reader's own
+ * work under someone else's — a wrong split being worse than no split at all.
+ */
+export function groupByOwner(pulls: readonly PullRequestSummary[], login: string | null): PullGroup[] {
+  const flat: PullGroup[] = [{ key: 'all', title: null, rows: [...pulls] }];
+  if (!login) return flat;
+  const me = login.toLowerCase();
+  const mine = pulls.filter((p) => (p.author ?? '').toLowerCase() === me);
+  const theirs = pulls.filter((p) => (p.author ?? '').toLowerCase() !== me);
+  if (mine.length === 0 || theirs.length === 0) return flat;
+  return [
+    { key: 'mine', title: 'Yours', rows: mine },
+    { key: 'others', title: 'From others', rows: theirs },
+  ];
+}
+
 /** A commit is named the way git names it in prose: the first seven characters. */
 export function shortSha(sha: string): string {
   return sha.slice(0, 7);
 }
 
-type Status = { kind: 'idle' } | { kind: 'busy'; pullNumber: number } | { kind: 'error'; message: string };
+/**
+ * `action` as well as `pullNumber`, so the spinner lands on the button that was pressed.
+ *
+ * A row-wide busy flag put "Checking out…" on the mount button when the reviewer had
+ * pressed `Resume writing` next to it — the wrong control claiming the wait, and the
+ * pressed one showing nothing at all. Every button on the row still disables together,
+ * because they all act on the same checkout; only the signal is narrowed.
+ */
+type PullAction = 'resume' | 'mount' | 'unmount';
+type Status =
+  | { kind: 'idle' }
+  | { kind: 'busy'; pullNumber: number; action: PullAction }
+  | { kind: 'error'; message: string };
 
 export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: CollabPullsPanelProps) {
   const client = useMemo(() => createCollabClient(fetchImpl), [fetchImpl]);
@@ -76,6 +116,35 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: 
   const [pulls, setPulls] = useState<PullRequestSummary[] | null>(null);
   const [mounted, setMounted] = useState<MountedWorktree[]>([]);
   const [status, setStatus] = useState<Status>({ kind: 'idle' });
+  /** The signed-in login, or null while unknown — which is what turns the split off. */
+  const [login, setLogin] = useState<string | null>(null);
+  /**
+   * The descriptions a reviewer has asked to read, keyed by pull number.
+   *
+   * A listing of titles answers "what is open" and not "what is this", and the second
+   * question was costing a trip to github.com and back. It is a disclosure and not a
+   * column: a body is unbounded prose, and printing every one of them would bury the
+   * listing it belongs to. `undefined` is unopened, `null` is in flight, a string is the
+   * answer — including `''`, which means the author wrote no description.
+   */
+  const [descriptions, setDescriptions] = useState<Record<number, string | null | undefined>>({});
+
+  const toggleDescription = useCallback(
+    async (pullNumber: number) => {
+      // Second press closes it. The body is dropped with it — it is one cheap read, and
+      // keeping it would mean showing a description that may since have been edited.
+      if (descriptions[pullNumber] !== undefined) {
+        setDescriptions((prev) => ({ ...prev, [pullNumber]: undefined }));
+        return;
+      }
+      setDescriptions((prev) => ({ ...prev, [pullNumber]: null }));
+      const res = await client.pullRequestDescription(pullNumber);
+      setDescriptions((prev) => ({ ...prev, [pullNumber]: res.ok ? res.value : '' }));
+      // R-11.4 — the server's own sentence, in the panel's one error line.
+      if (!res.ok) setStatus({ kind: 'error', message: res.message });
+    },
+    [client, descriptions],
+  );
 
   useEffect(() => {
     let live = true;
@@ -109,6 +178,26 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: 
   const mountedFor = (pullNumber: number): MountedWorktree | undefined =>
     mounted.find((w) => w.pullNumber === pullNumber);
 
+  /*
+   * Who is signed in, from the snapshot the whole collaboration UI already gates on.
+   * It is read here rather than passed in because the panel is mounted from two places
+   * (`CollabDrawer` and `CollabApp`'s landing page) and neither holds it; the route is
+   * the same one `useCollabPulls` reads on mount, so this costs no GitHub traffic.
+   */
+  useEffect(() => {
+    let live = true;
+    void client.availability().then((res) => {
+      // An unreadable snapshot costs the split and nothing else — the flat list below is
+      // the same list, and a banner about it would be about a heading.
+      if (live && res.ok && res.value.available) setLogin(res.value.login);
+    });
+    return () => {
+      live = false;
+    };
+  }, [client]);
+
+  const groups = useMemo(() => groupByOwner(pulls ?? [], login), [pulls, login]);
+
   /**
    * R-13.3 / R-13.7 — mount, then read. Re-mounting an already-checked-out PR is the
    * supported way to move it to a head that has since changed (R-13.12), so the button
@@ -117,7 +206,7 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: 
    */
   const mount = useCallback(
     async (pull: PullRequestSummary) => {
-      setStatus({ kind: 'busy', pullNumber: pull.number });
+      setStatus({ kind: 'busy', pullNumber: pull.number, action: 'mount' });
       const res = await client.mountPullRequest(pull.number);
       if (!res.ok) {
         setStatus({ kind: 'error', message: res.message });
@@ -148,7 +237,7 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: 
     async (pull: PullRequestSummary) => {
       const documentId = pull.documentId;
       if (!documentId) return;
-      setStatus({ kind: 'busy', pullNumber: pull.number });
+      setStatus({ kind: 'busy', pullNumber: pull.number, action: 'resume' });
       const res = await client.open({ documentId, pullNumber: pull.number });
       if (!res.ok) {
         setStatus({ kind: 'error', message: res.message });
@@ -162,7 +251,7 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: 
 
   const unmount = useCallback(
     async (pullNumber: number) => {
-      setStatus({ kind: 'busy', pullNumber });
+      setStatus({ kind: 'busy', pullNumber, action: 'unmount' });
       const res = await client.unmountPullRequest(pullNumber);
       if (!res.ok) {
         setStatus({ kind: 'error', message: res.message });
@@ -209,14 +298,32 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: 
       )}
 
       {pulls === null ? (
-        <p style={note}>Loading pull requests…</p>
+        <LoadingLine style={{ ...note, opacity: 1 }}>Loading pull requests…</LoadingLine>
       ) : pulls.length === 0 ? (
         <p style={note}>No {state === 'all' ? '' : `${state} `}pull requests.</p>
       ) : (
-        <ul style={listReset}>
-          {pulls.map((pull) => {
+        /*
+         * YOUR OWN PULL REQUESTS ARE A DIFFERENT JOB, SO THEY GET THEIR OWN SECTION.
+         *
+         * On someone else's pull request a reviewer reads and comments; on their own they
+         * are watching what came back. One undifferentiated list made the reader do that
+         * sorting by eye, matching a login against an author column on every row — and the
+         * login is a fact the server already told us (`GET /__vs/collab`), so the list can
+         * do it once instead.
+         *
+         * THE SPLIT ONLY APPEARS WHEN THERE IS SOMETHING TO SPLIT. Where the login is not
+         * known (collaboration unconfigured, or the snapshot has not landed) or every row
+         * falls on one side of the line, the list renders exactly as it did — flat, with no
+         * heading. A section header over the only group is a label, not a division.
+         */
+        groups.map(({ key, title, rows }) => (
+          <section key={key} data-vs-pull-group={key} style={{ display: 'contents' }}>
+            {title && <h3 style={groupHeading}>{title}</h3>}
+            <ul style={listReset}>
+              {rows.map((pull) => {
             const worktree = mountedFor(pull.number);
             const busy = status.kind === 'busy' && status.pullNumber === pull.number;
+            const running = (a: PullAction) => busy && status.kind === 'busy' && status.action === a;
             return (
               <li key={pull.number} style={card} data-vs-pull={pull.number}>
                 <div style={cardTitle}>
@@ -231,7 +338,7 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: 
                 <div style={actions}>
                   {pull.documentId ? (
                     <button type="button" onClick={() => void resume(pull)} disabled={busy} style={primaryButton}>
-                      Resume writing
+                      <BusyLabel busy={running('resume')}>{running('resume') ? 'Opening…' : 'Resume writing'}</BusyLabel>
                     </button>
                   ) : (
                     /*
@@ -249,33 +356,64 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: 
                     disabled={busy}
                     style={pull.documentId ? button : primaryButton}
                   >
-                    {busy ? 'Checking out…' : 'Review the code'}
+                    <BusyLabel busy={running('mount')}>{running('mount') ? 'Checking out…' : 'Review the code'}</BusyLabel>
                   </button>
                   {worktree && (
                     <button type="button" onClick={() => void unmount(pull.number)} disabled={busy} style={button}>
-                      Remove checkout
+                      <BusyLabel busy={running('unmount')}>{running('unmount') ? 'Removing…' : 'Remove checkout'}</BusyLabel>
                     </button>
                   )}
+                  <button
+                    type="button"
+                    onClick={() => void toggleDescription(pull.number)}
+                    aria-expanded={descriptions[pull.number] !== undefined}
+                    aria-controls={`vs-pr-desc-${pull.number}`}
+                    style={button}
+                  >
+                    <BusyLabel busy={descriptions[pull.number] === null}>
+                      {descriptions[pull.number] !== undefined ? 'Hide description' : 'View description'}
+                    </BusyLabel>
+                  </button>
                   <a href={pull.htmlUrl} target="_blank" rel="noreferrer" style={link}>
                     On GitHub ↗
                   </a>
                 </div>
+                {descriptions[pull.number] !== undefined && descriptions[pull.number] !== null && (
+                  <div id={`vs-pr-desc-${pull.number}`} data-vs-pull-description={pull.number} style={descriptionBox}>
+                    {descriptions[pull.number] ? (
+                      /*
+                       * Rendered, not printed raw. A pull request body is Markdown, and this
+                       * product renders Markdown everywhere else — showing the source here
+                       * would make the one place a reviewer reads prose the one place it is
+                       * not readable.
+                       */
+                      <MarkdownSurface source={descriptions[pull.number] as string} />
+                    ) : (
+                      <span style={quietMark}>No description on this pull request.</span>
+                    )}
+                  </div>
+                )}
               </li>
             );
-          })}
-        </ul>
+              })}
+            </ul>
+          </section>
+        ))
       )}
     </section>
   );
 }
 
-const wrap: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 8, padding: 12, maxWidth: 720 };
+/** No fixed cap: the drawer decides how wide this is, and it grew for the descriptions. */
+const wrap: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 8, padding: 12 };
 const heading: React.CSSProperties = { font: '600 13px/1.4 system-ui, sans-serif', color: '#334155', margin: 0 };
 const note: React.CSSProperties = { fontSize: 12, color: '#64748b', margin: 0 };
 const row: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 6 };
 const label: React.CSSProperties = { fontSize: 11, color: '#64748b', width: 92, flexShrink: 0 };
 const select: React.CSSProperties = { font: '12px system-ui, sans-serif', padding: '3px 6px', border: '1px solid #d1d5db', borderRadius: 4 };
-const listReset: React.CSSProperties = { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 8 };
+/** Quieter than the panel's `h2`: it divides the list, it does not retitle the panel. */
+const groupHeading: React.CSSProperties = { font: '700 11px system-ui, sans-serif', color: '#64748b', textTransform: 'uppercase', letterSpacing: 0.4, margin: '6px 0 0' };
+const listReset: React.CSSProperties ={ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 8 };
 const card: React.CSSProperties = { border: '1px solid #e5e7eb', borderRadius: 6, padding: 10, background: 'white' };
 const cardTitle: React.CSSProperties = { font: '600 13px system-ui, sans-serif', color: '#334155', display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' };
 const meta: React.CSSProperties = { font: '11px ui-monospace, monospace', color: '#94a3b8', marginTop: 3 };
@@ -287,4 +425,20 @@ const badge: React.CSSProperties = { font: '10px system-ui, sans-serif', padding
 const mountedBadge: React.CSSProperties = { font: '10px ui-monospace, monospace', padding: '1px 6px', borderRadius: 99, background: '#ecfdf5', color: '#047857' };
 const error: React.CSSProperties = { fontSize: 12, color: '#b91c1c', margin: 0 };
 /** Quiet, and still a sentence: why this row offers less than the one above it. */
+/**
+ * The body, boxed and height-capped.
+ *
+ * A description can be a page long, and an uncapped one would push every row below it out
+ * of the drawer — so the listing stays navigable and the prose scrolls inside its own box.
+ */
+const descriptionBox: React.CSSProperties = {
+  marginTop: 8,
+  padding: '2px 12px',
+  maxHeight: 260,
+  overflow: 'auto',
+  border: '1px solid #e5e7eb',
+  borderRadius: 6,
+  background: '#f8fafc',
+  font: '13px system-ui, sans-serif',
+};
 const quietMark: React.CSSProperties = { font: '11px system-ui, sans-serif', color: '#94a3b8', fontStyle: 'italic' };
