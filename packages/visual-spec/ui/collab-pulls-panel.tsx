@@ -61,6 +61,13 @@ export type CollabPullsPanelProps = {
    * it on every render would be a loop against git and against GitHub.
    */
   autoReview?: number;
+  /**
+   * Called when an `autoReview` could not be opened — the listing does not have that pull
+   * request, or its mount failed. The caller is showing a focused "opening #n" surface on
+   * the strength of the deep link, and this is what tells it to stop and show the list
+   * instead. Never called on success: the review takes the screen.
+   */
+  onAutoReviewFailed?: () => void;
   /** Injectable for tests; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
 };
@@ -110,7 +117,7 @@ type Status =
   | { kind: 'busy'; pullNumber: number; action: PullAction }
   | { kind: 'error'; message: string };
 
-export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: CollabPullsPanelProps) {
+export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewFailed, fetchImpl }: CollabPullsPanelProps) {
   const client = useMemo(() => createCollabClient(fetchImpl), [fetchImpl]);
   const [state, setState] = useState<PullRequestListState>('open');
   const [pulls, setPulls] = useState<PullRequestSummary[] | null>(null);
@@ -205,28 +212,51 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: 
    * recreating it, and the path the reviewer had stays valid.
    */
   const mount = useCallback(
-    async (pull: PullRequestSummary) => {
+    async (pull: PullRequestSummary): Promise<boolean> => {
       setStatus({ kind: 'busy', pullNumber: pull.number, action: 'mount' });
       const res = await client.mountPullRequest(pull.number);
       if (!res.ok) {
         setStatus({ kind: 'error', message: res.message });
-        return;
+        return false;
       }
       setStatus({ kind: 'idle' });
       await refreshMounted();
       onReview(pull, res.value.worktree);
+      return true;
     },
     [client, onReview, refreshMounted],
   );
 
   const autoReviewed = useRef(false);
+  /**
+   * A deep link is a request to read one pull request, so until it fails this panel is
+   * that one pull request and not the listing.
+   *
+   * `?vspr=2` used to render the whole landing page — every open pull request, the
+   * "open from a URL" form — with the checkout's only sign of life a spinner inside one
+   * row of it. The reader asked for #2 and got a list of everything, then watched it
+   * replace itself. The reads underneath are unchanged (the listing is what carries the
+   * title, author and branches the review header names); what changed is that the page
+   * now says which pull request it is opening.
+   */
+  const [autoPending, setAutoPending] = useState(autoReview !== undefined);
   useEffect(() => {
     if (autoReview === undefined || autoReviewed.current || pulls === null) return;
     const pull = pulls.find((p) => p.number === autoReview);
-    if (!pull) return;
+    if (!pull) {
+      // Not in the listing: closed, merged, another repository, or the read failed. The
+      // list — with whatever error it is carrying — is the honest next screen.
+      setAutoPending(false);
+      onAutoReviewFailed?.();
+      return;
+    }
     autoReviewed.current = true;
-    void mount(pull);
-  }, [autoReview, pulls, mount]);
+    void mount(pull).then((ok) => {
+      if (ok) return;
+      setAutoPending(false);
+      onAutoReviewFailed?.();
+    });
+  }, [autoReview, pulls, mount, onAutoReviewFailed]);
 
   /**
    * R-7.7 — attach to the collaboration this pull request already carries. Same route,
@@ -262,6 +292,17 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: 
     },
     [client, refreshMounted],
   );
+
+  if (autoPending) {
+    return (
+      <section data-vs-collab-pulls data-vs-opening={autoReview} style={wrap}>
+        <h2 style={heading}>Opening #{autoReview}…</h2>
+        <LoadingLine style={{ ...note, opacity: 1 }}>
+          {pulls === null ? 'Finding the pull request…' : 'Checking it out beside your files, read-only…'}
+        </LoadingLine>
+      </section>
+    );
+  }
 
   return (
     <section data-vs-collab-pulls style={wrap}>

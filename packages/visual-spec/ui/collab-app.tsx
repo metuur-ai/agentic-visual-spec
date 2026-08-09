@@ -212,6 +212,8 @@ export function CollabApp({ onExit, initial }: { onExit: () => void; initial?: C
   // come back to the same document, and that is what `vsdoc` is for.
   const [documentId, setDocumentIdState] = useState<string | null>(() => initial?.documentId ?? documentFromUrl());
   const [pullReview, setPullReview] = useState<PullReview | null>(() => initial?.review ?? null);
+  /** True while `?vspr=n` has neither opened its review nor been reported unopenable. */
+  const [deepLinkPending, setDeepLinkPending] = useState(initial?.reviewPull !== undefined);
   const setDocumentId = useCallback((id: string | null) => {
     setDocumentIdState(id);
     rememberInUrl(id);
@@ -275,9 +277,21 @@ export function CollabApp({ onExit, initial }: { onExit: () => void; initial?: C
             onReview={(pull, worktree) => setPullReview({ pull, worktree })}
             onResume={setDocumentId}
             {...(initial?.reviewPull !== undefined ? { autoReview: initial.reviewPull } : {})}
+            onAutoReviewFailed={() => setDeepLinkPending(false)}
           />
-          <hr style={sectionRule} />
-          <CollabOpenPanel onOpened={setDocumentId} />
+          {/*
+            * The rest of the landing page is withheld while a deep link is still opening.
+            * `?vspr=2` names one pull request; a list of every other one, and a form for
+            * opening a third, are answers to questions the URL did not ask — and the panel
+            * above is already saying which one it is fetching. Both come back the moment
+            * the deep link fails, because then the list IS the next thing to do.
+            */}
+          {!deepLinkPending && (
+            <>
+              <hr style={sectionRule} />
+              <CollabOpenPanel onOpened={setDocumentId} />
+            </>
+          )}
         </div>
       )}
     </>

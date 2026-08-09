@@ -110,23 +110,27 @@ export type MountOptions = {
 /**
  * Where to fetch `refs/pull/<n>/head` from.
  *
- * `origin` whenever the configured repository is the one `origin` already points at —
- * the ordinary case, and the one that keeps working when `origin` is an ssh remote, a
- * local path, or anything else `parseRemoteUrl` declines. Otherwise an explicit URL for
- * the configured repository, on the host `origin` names so an Enterprise install is not
- * sent to github.com. Credential helpers key on the URL, so an https fetch here
- * authenticates exactly as a fetch of that repository would anywhere else.
+ * `origin` whenever the configured repository is the one `origin` already points at.
+ * Otherwise an explicit URL for the configured repository, on the host `origin` names so
+ * an Enterprise install is not sent to github.com. Credential helpers key on the URL, so
+ * an https fetch here authenticates exactly as a fetch of that repository would anywhere
+ * else.
+ *
+ * An `origin` that will not parse — a local path, `ssh://`, a port-bearing form — stays
+ * on `origin`. It cannot be shown to be the wrong repository, and redirecting a checkout
+ * away from a remote that was very likely right, on a guess, would break the working case
+ * to fix the broken one. The head check in `mountPullRequest` is what covers it: it needs
+ * no URL parsing to notice the commit is not the pull request's.
  */
 export function fetchSource(originUrl: string, repo?: { owner: string; repo: string }): string {
   if (!repo) return 'origin';
   const parsed = parseRemoteUrl(originUrl.trim());
+  if (parsed === null) return 'origin';
   const same =
-    parsed !== null &&
     parsed.owner.toLowerCase() === repo.owner.toLowerCase() &&
     parsed.repo.toLowerCase() === repo.repo.toLowerCase();
   if (same) return 'origin';
-  const host = parsed?.host ?? 'github.com';
-  return `https://${host}/${repo.owner}/${repo.repo}.git`;
+  return `https://${parsed.host}/${repo.owner}/${repo.repo}.git`;
 }
 
 /**

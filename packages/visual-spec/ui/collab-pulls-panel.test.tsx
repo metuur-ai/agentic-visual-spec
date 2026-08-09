@@ -434,3 +434,59 @@ describe('a pull request can say what it is, without leaving the list', () => {
     await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
   });
 });
+
+/* ================================================================== *
+ * R-7.8 — a deep link opens one pull request, and says which
+ * ================================================================== */
+/*
+ * `?vspr=42` used to render the whole landing page — every open pull request and the
+ * "open from a URL" form — with the checkout's only sign of life a spinner inside one
+ * row, and then replace the lot with the review. The reader asked for #42.
+ */
+describe('opening a pull request from a deep link', () => {
+  it('names the pull request it is opening instead of listing every other one', async () => {
+    // The mount never settles, so the opening state stays on screen to assert.
+    const { impl: base } = fakeFetch();
+    const impl = (async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/mount')) return new Promise<Response>(() => {});
+      return (base as unknown as (u: string, i?: RequestInit) => Promise<Response>)(url, init);
+    }) as unknown as typeof fetch;
+
+    render(<CollabPullsPanel onReview={vi.fn()} autoReview={42} fetchImpl={impl} />);
+
+    await waitFor(() => expect(screen.getByRole('heading', { name: /Opening #42/ })).toBeTruthy());
+    expect(screen.getByText(/Checking it out beside your files/)).toBeTruthy();
+    // The listing is not the answer to this URL, so it is not on screen.
+    expect(screen.queryByText(/Rework the payment rules/)).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Open collaborations' })).toBeNull();
+  });
+
+  it('falls back to the list, with the error, when the checkout fails', async () => {
+    const { impl } = fakeFetch({
+      '/__vs/collab/pulls/42/mount': { ok: false, status: 502, json: { error: 'could not fetch the head', reason: 'fetch-failed' } },
+    });
+    const onAutoReviewFailed = vi.fn();
+    render(<CollabPullsPanel onReview={vi.fn()} autoReview={42} onAutoReviewFailed={onAutoReviewFailed} fetchImpl={impl} />);
+
+    await waitFor(() => expect(screen.getByText('could not fetch the head')).toBeTruthy());
+    // The list comes back, because a retry belongs next to the row it failed on.
+    expect(screen.getByText(/Rework the payment rules/)).toBeTruthy();
+    expect(onAutoReviewFailed).toHaveBeenCalled();
+  });
+
+  it('falls back to the list when the pull request is not in it at all', async () => {
+    const { impl } = fakeFetch();
+    const onAutoReviewFailed = vi.fn();
+    render(<CollabPullsPanel onReview={vi.fn()} autoReview={999} onAutoReviewFailed={onAutoReviewFailed} fetchImpl={impl} />);
+
+    await waitFor(() => expect(onAutoReviewFailed).toHaveBeenCalled());
+    expect(screen.getByRole('heading', { name: 'Open collaborations' })).toBeTruthy();
+  });
+
+  it('leaves the listing alone when no deep link asked for anything', async () => {
+    const { impl } = fakeFetch();
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    expect(screen.queryByRole('heading', { name: /Opening #/ })).toBeNull();
+    await waitFor(() => expect(screen.getByText(/Rework the payment rules/)).toBeTruthy());
+  });
+});

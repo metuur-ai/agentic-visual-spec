@@ -65,6 +65,7 @@ import {
   type ReviewDraftInput,
   createCollabClient,
 } from './collab-client';
+import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import { shortSha } from './collab-pulls-panel';
 import { FileTree } from './file-tree';
 import { MarkdownSurface } from './markdown-surface';
@@ -161,6 +162,10 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
   const [drafts, setDrafts] = useState<ReviewDraft[]>([]);
   const [draftsError, setDraftsError] = useState<string | null>(null);
   const [notices, setNotices] = useState<Record<string, DraftNotice>>({});
+  /** The pull request's own review conversation. `null` until the first read answers. */
+  const [threads, setThreads] = useState<ReviewThreadRecord[] | null>(null);
+  const [threadsError, setThreadsError] = useState<string | null>(null);
+  const [threadsBusy, setThreadsBusy] = useState(false);
 
   // The mount just wrote thousands of files into a directory whose walk is cached for
   // seconds on both sides. Without this the checkout is invisible until the TTL lapses,
@@ -206,6 +211,38 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
   useEffect(() => {
     void loadDrafts();
   }, [loadDrafts]);
+
+  /**
+   * The pull request's review conversation — every thread on every changed file, replies
+   * included — read once when the checkout opens and again whenever the reviewer asks.
+   *
+   * It is a separate read from the drafts and stays one. The drafts are a file on this
+   * machine and cost nothing; this is a REST list plus a GraphQL read against GitHub, and
+   * it is the one that can be slow, rate-limited, or refused. Folding the two together
+   * would mean a failed conversation read taking the reviewer's own held comments off the
+   * screen with it.
+   *
+   * Not polled. A review is read at human pace, and a page that re-reads GitHub on a timer
+   * spends someone's rate limit to tell them nothing changed — `Refresh comments` is the
+   * ask, and it says when it last answered.
+   */
+  const loadThreads = useCallback(async () => {
+    setThreadsBusy(true);
+    const res = await client.reviewComments(pull.number);
+    if (res.ok) {
+      setThreads(res.value ?? []);
+      setThreadsError(null);
+    } else {
+      // The checkout and the drafts are untouched by this failing, so it costs the
+      // conversation and not the review (R-11.4 — the route's own sentence, verbatim).
+      setThreadsError(res.message);
+    }
+    setThreadsBusy(false);
+  }, [client, pull.number]);
+
+  useEffect(() => {
+    void loadThreads();
+  }, [loadThreads]);
 
   const noticeFor = (id: string, notice: DraftNotice | null) =>
     setNotices((prev) => {
@@ -270,7 +307,22 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
   };
 
   const heldCount = drafts.filter((d) => d.status === 'draft').length;
-  const publishedCount = drafts.length - heldCount;
+  /*
+   * What is on the pull request is counted from the pull request, not from the local
+   * outbox. `drafts.length - heldCount` counted the comments *this machine* had sent, so a
+   * checkout that had never published said "0 on GitHub" over a conversation of a dozen.
+   * `threads` is `null` until the first read answers; a count of 0 then is honest —
+   * nothing is known yet — and the chip is hidden while there is nothing to say.
+   */
+  const threadCount = useMemo(() => {
+    const onGitHub = new Set((threads ?? []).map((t) => t.github.reviewCommentId));
+    // Union, not either one: the conversation read is the better answer and may not have
+    // arrived (or may have failed), and a comment this machine published is on the pull
+    // request whether or not GitHub has been asked about it yet.
+    const published = drafts.filter((d) => d.published && !onGitHub.has(d.published.reviewCommentId));
+    return onGitHub.size + published.length;
+  }, [threads, drafts]);
+  const replyCount = (threads ?? []).reduce((n, t) => n + t.replies.length, 0);
 
   const checkout = useMemo(() => entriesUnder(entries, prefix), [entries, prefix]);
   const byPath = useMemo(() => new Map(checkout.map((e) => [e.path, e])), [checkout]);
@@ -286,9 +338,18 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
    */
   const commentsPerFile = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const draft of drafts) counts.set(draft.target.path, (counts.get(draft.target.path) ?? 0) + 1);
+    const onGitHub = new Set((threads ?? []).map((t) => t.github.reviewCommentId));
+    // A published draft and its thread are one comment; counting both would tell the
+    // reviewer a file has two things to read when it has one.
+    for (const draft of drafts) {
+      if (draft.published && onGitHub.has(draft.published.reviewCommentId)) continue;
+      counts.set(draft.target.path, (counts.get(draft.target.path) ?? 0) + 1);
+    }
+    for (const thread of threads ?? []) {
+      counts.set(thread.target.path, (counts.get(thread.target.path) ?? 0) + 1);
+    }
     return counts;
-  }, [drafts]);
+  }, [drafts, threads]);
 
   /**
    * R-13.12 — the changed paths and the checkout must name the same commit. Both were
@@ -347,9 +408,10 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
           </span>
         </span>
         <span style={readOnlyChip}>Read-only checkout — no commit, push or merge</span>
-        {drafts.length > 0 && (
+        {(drafts.length > 0 || threadCount > 0) && (
           <span data-vs-draft-tally style={tallyChip}>
-            {heldCount} held locally · {publishedCount} on GitHub
+            {heldCount} held locally · {threadCount} on GitHub
+            {replyCount > 0 ? ` · ${replyCount} ${replyCount === 1 ? 'reply' : 'replies'}` : ''}
           </span>
         )}
         <span style={{ flex: 1 }} />
@@ -369,6 +431,22 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
           * appear pressed it repeatedly. `useTree`'s own `loading` is the truth here; this
           * button does not need a flag of its own.
           */}
+        {/*
+          * The conversation is read from GitHub, so it goes stale the moment somebody
+          * replies. This is the ask — its own button next to `Refresh files`, because the
+          * two refresh different things and a reviewer waiting for an answer to their
+          * comment should not have to re-walk a checkout to get it.
+          */}
+        <button
+          type="button"
+          data-vs-refresh-comments
+          onClick={() => void loadThreads()}
+          disabled={threadsBusy}
+          title="Re-read the pull request's comments and replies from GitHub"
+          style={backBtn}
+        >
+          <BusyLabel busy={threadsBusy}>{threadsBusy ? 'Reading…' : 'Refresh comments'}</BusyLabel>
+        </button>
         <button
           type="button"
           onClick={() => {
@@ -484,8 +562,11 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
             prefix={prefix}
             headSha={worktree.headSha}
             drafts={drafts.filter((d) => d.target.path === selected.path)}
+            threads={(threads ?? []).filter((t) => t.target.path === selected.path)}
+            pullNumber={pull.number}
             notices={notices}
             error={draftsError}
+            threadsError={threadsError}
             onHold={hold}
             onPublish={publish}
             onDiscard={discard}
@@ -521,8 +602,13 @@ type CheckoutFileViewProps = {
   headSha: string;
   /** This file's held and published comments, in creation order. */
   drafts: ReviewDraft[];
+  /** This file's review threads as they are on the pull request, replies included. */
+  threads: ReviewThreadRecord[];
+  pullNumber: number;
   notices: Record<string, DraftNotice>;
   error: string | null;
+  /** Why the conversation could not be read, when it could not. The file still opens. */
+  threadsError: string | null;
   onHold: (input: ReviewDraftInput) => Promise<boolean>;
   onPublish: (id: string, force?: boolean) => Promise<void>;
   onDiscard: (id: string) => Promise<void>;
@@ -534,7 +620,7 @@ type CheckoutFileViewProps = {
  * viewer already reports, and it is what a held comment anchors to (R-13.13): picking a
  * line is reading, and the composer below writes a comment, never the file.
  */
-function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHold, onPublish, onDiscard }: CheckoutFileViewProps) {
+function CheckoutFileView({ entry, prefix, headSha, drafts, threads, pullNumber, notices, error, threadsError, onHold, onPublish, onDiscard }: CheckoutFileViewProps) {
   const path = checkoutPath(prefix, entry.path);
   const { file, loading } = useFile(entry.type === 'dir' ? '' : path, entry.kind);
   const [selection, setSelection] = useState<LineSelection | null>(null);
@@ -582,6 +668,8 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
         path: entry.path,
         headSha,
         drafts,
+        threads,
+        pullNumber,
         hold: onHold,
         publish: onPublish,
         discard: onDiscard,
@@ -591,7 +679,7 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
           return <DraftNoticeBox notice={n} onPublish={onPublish} draftId={id} />;
         },
       }),
-    [entry.path, headSha, drafts, onHold, onPublish, onDiscard, notices],
+    [entry.path, headSha, drafts, threads, pullNumber, onHold, onPublish, onDiscard, notices],
   );
 
   const body = (
@@ -639,6 +727,17 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
         {error && (
           <div data-vs-drafts-error style={{ ...errorLine, padding: '8px 0' }}>
             {error}
+          </div>
+        )}
+        {/*
+          * Said out loud rather than rendered as an empty panel. "No comments on this
+          * file" and "we could not ask GitHub" look identical when the second one is
+          * silent, and the reviewer would read the wrong one — the file that matters is
+          * the one somebody has already objected to.
+          */}
+        {threadsError && (
+          <div data-vs-threads-error style={{ ...errorLine, padding: '8px 0' }}>
+            The pull request’s comments could not be read — {threadsError}
           </div>
         )}
         {/*
@@ -711,7 +810,7 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
         * same job for a third kind of comment.
         */}
       {rendered && <InspectOverlay />}
-      {rendered && <IndicatorLayer targets={reviewIndicatorTargets(entry.path, drafts)} />}
+      {rendered && <IndicatorLayer targets={reviewIndicatorTargets(entry.path, drafts, threads)} />}
     </main>
   );
 

@@ -346,6 +346,16 @@ export interface CollabClient {
    * (R-13.18); dropping them here would make that impossible one layer up.
    */
   reviewDrafts(pullNumber: number): Promise<CollabResult<ReviewDraft[]>>;
+  /**
+   * `GET /__vs/collab/pulls/:n/comments` — the pull request's review conversation as
+   * GitHub has it: every thread on every changed file, roots and replies.
+   *
+   * The counterpart to `reviewDrafts`, and not a replacement for it. Drafts are what this
+   * machine holds and has sent; this is what is actually on the pull request, including
+   * everything written on github.com or by somebody else. A surface that reads only the
+   * first shows a reviewer their own words and calls it the conversation.
+   */
+  reviewComments(pullNumber: number): Promise<CollabResult<ReviewThreadRecord[]>>;
   /** `POST /__vs/collab/pulls/:n/drafts` — R-13.13, hold a comment locally. No GitHub call. */
   holdReviewDraft(pullNumber: number, input: ReviewDraftInput): Promise<CollabResult<ReviewDraftSaved>>;
   /** `DELETE /__vs/collab/pulls/:n/drafts/:id` — drop a held comment. 409 once published. */
@@ -459,6 +469,8 @@ export function createCollabClient(fetchImpl?: typeof fetch): CollabClient {
       projected(call<{ body: string }>(`/pulls/${pullNumber}/description`), (b) => b.body),
     reviewDrafts: (pullNumber) =>
       projected(call<{ drafts: ReviewDraft[] }>(`/pulls/${pullNumber}/drafts`), (b) => b.drafts),
+    reviewComments: (pullNumber) =>
+      projected(call<{ threads: ReviewThreadRecord[] }>(`/pulls/${pullNumber}/comments`), (b) => b.threads),
     holdReviewDraft: (pullNumber, input) => send<ReviewDraftSaved>(`/pulls/${pullNumber}/drafts`, 'POST', input),
     discardReviewDraft: (pullNumber, draftId) =>
       call<ReviewDraftRemoved>(`/pulls/${pullNumber}/drafts/${draftId}`, { method: 'DELETE' }),

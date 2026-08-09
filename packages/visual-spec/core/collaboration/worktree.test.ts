@@ -22,6 +22,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { GitExecutor } from '../git-context';
 import {
   ensureIgnored,
+  fetchSource,
   listMountedWorktrees,
   mountPullRequest,
   unmountPullRequest,
@@ -170,12 +171,70 @@ describe('worktree', () => {
       expect(result).toEqual({ ok: false, reason });
     });
 
+    it('reports head-mismatch, with both commits, rather than serving the wrong tree', async () => {
+      const result = await mountPullRequest(base, 1, undefined, {
+        expectedHeadSha: '0'.repeat(40),
+      });
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      expect(result.reason).toBe('head-mismatch');
+      // The evidence, not just the verdict: the two shas are what tells the reader the
+      // checkout resolved somewhere else.
+      expect(result.detail).toContain('0000000');
+      expect(result.detail).toContain((await listMountedWorktrees(base))[0]!.headSha.slice(0, 7));
+    });
+
+    it('accepts the mount when the head is the one the caller expected', async () => {
+      const at = (await listMountedWorktrees(base))[0]!.headSha;
+      const result = await mountPullRequest(base, 1, undefined, { expectedHeadSha: at });
+      expect(result.ok).toBe(true);
+    });
+
+    it('fetches the configured repository, not `origin`, when the two are different', async () => {
+      const { exec: stub, calls } = stubExec((args) => ({
+        stdout: args.includes('get-url') ? 'https://github.com/someone/served\n' : '',
+        exitCode: 0,
+      }));
+      await mountPullRequest(base, 1, stub, { repo: { owner: 'metuur-ai', repo: 'other' } });
+      const fetched = calls.find((args) => args.includes('fetch'));
+      expect(fetched).toContain('https://github.com/metuur-ai/other.git');
+      expect(fetched).not.toContain('origin');
+    });
+
     it.each([0, -1, 1.5, Number.NaN])('refuses pullNumber %s before touching git', async (n) => {
       const { exec: stub, calls } = stubExec(() => ({ exitCode: 0 }));
       await expect(mountPullRequest(base, n, stub)).rejects.toThrow('invalid pullNumber');
       // The guard exists to keep `../..` out of a path, so it must fire before the
       // fetch, not after a worktree has already been created somewhere unexpected.
       expect(calls.some((args) => args.includes('worktree'))).toBe(false);
+    });
+  });
+
+  describe('fetchSource', () => {
+    it('stays on `origin` when no repository is named', () => {
+      expect(fetchSource('https://github.com/a/b.git')).toBe('origin');
+    });
+
+    it.each([
+      ['https://github.com/a/b.git', { owner: 'a', repo: 'b' }],
+      ['git@github.com:a/b.git', { owner: 'a', repo: 'b' }],
+      // GitHub is case-insensitive about both halves, and `origin` is often spelled
+      // differently from the configured value by nothing but a capital letter.
+      ['https://github.com/A/B', { owner: 'a', repo: 'b' }],
+    ] as const)('stays on `origin` when %s already is the configured repository', (url, repo) => {
+      expect(fetchSource(url, repo)).toBe('origin');
+    });
+
+    it('addresses the configured repository on origin’s host when they differ', () => {
+      expect(fetchSource('https://ghe.example.com/a/b.git', { owner: 'c', repo: 'd' })).toBe(
+        'https://ghe.example.com/c/d.git',
+      );
+    });
+
+    it('stays on `origin` when origin does not parse, rather than guessing', () => {
+      // A local path, an `ssh://` URL, a port-bearing form: it cannot be shown to be the
+      // wrong repository, so it is left alone and the head check does the catching.
+      expect(fetchSource('/tmp/some/clone', { owner: 'c', repo: 'd' })).toBe('origin');
     });
   });
 

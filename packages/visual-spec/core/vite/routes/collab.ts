@@ -52,7 +52,7 @@ import {
 import type { CollaborationRecord, CompanionFile, GitHubBinding } from '../../collaboration/document-record';
 import { DOCUMENT_ID_RE, newCollaborationRecord } from '../../collaboration/document-record';
 import type { CollaborationStore } from '../../collaboration/record-store';
-import { loadReviewThreadRecords } from '../../collaboration/review-anchoring';
+import { loadPullReviewThreads, loadReviewThreadRecords } from '../../collaboration/review-anchoring';
 import type { JobBody, JobHubRegistry, SseSink } from '../../collaboration/job-hub';
 import {
   projectReviewThread,
@@ -628,7 +628,7 @@ const MOUNT_FAILURE: Record<WorktreeFailure, { status: number; message: string }
   'fetch-failed': {
     status: 502,
     message:
-      'The pull request head could not be fetched from `origin`. Check that you are online, that the pull ' +
+      'The pull request head could not be fetched. Check that you are online, that the pull ' +
       'request number is right, and that `gh auth status` reports a credential that can read the repository.',
   },
   'worktree-failed': {
@@ -636,6 +636,13 @@ const MOUNT_FAILURE: Record<WorktreeFailure, { status: number; message: string }
     message:
       'git refused to create the worktree. Run `git worktree prune` in the served directory and try again — ' +
       'a leftover registration from a previous mount is the usual cause.',
+  },
+  'head-mismatch': {
+    status: 409,
+    message:
+      'The checkout did not land on the pull request head, so it is not this pull request. The usual cause is ' +
+      'the served directory being a clone of a different repository from the collaboration one — check ' +
+      '`VS_COLLAB_REPO` and the directory’s `origin`.',
   },
 };
 
@@ -1017,10 +1024,32 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
           return { status: 200, json: { ok: true, removed } };
         }
 
-        const result = await mountPullRequest(baseDir(), pullNumber, git);
+        /*
+         * The head is read from the API before the fetch, not derived from it, and both
+         * the repository and that commit are handed to the mount.
+         *
+         * The pull number alone does not identify a pull request — it identifies one
+         * *within a repository*. Everything else on this route addresses `gated.repo`,
+         * while the mount used to address the served directory's `origin`, so the moment
+         * those two differ (`VS_COLLAB_REPO`, or a served directory that is a clone of
+         * something else) the number resolved twice, in two repositories, and the reviewer
+         * was shown one pull request's file list over another's tree.
+         */
+        let expectedHeadSha: string;
+        try {
+          expectedHeadSha = (await repoAdapter().getPullRequest(repoRefOf(gated.repo), pullNumber)).headSha;
+        } catch (err) {
+          if (err instanceof GitHubError) return githubFailure(err);
+          throw err;
+        }
+        const result = await mountPullRequest(baseDir(), pullNumber, git, {
+          repo: repoRefOf(gated.repo),
+          expectedHeadSha,
+        });
         if (!result.ok) {
           const { status, message } = MOUNT_FAILURE[result.reason];
-          return { status, json: { error: message, reason: result.reason } };
+          const detailed = result.detail ? `${message} (${result.detail})` : message;
+          return { status, json: { error: detailed, reason: result.reason } };
         }
         return { status: 200, json: { ok: true, worktree: result.worktree } };
       }
@@ -1087,6 +1116,49 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
               files: comparison.files,
             },
           };
+        } catch (err) {
+          if (err instanceof GitHubError) return githubFailure(err);
+          throw err;
+        }
+      }
+
+      /*
+       * GET /__vs/collab/pulls/:n/comments — every review thread ON the pull request,
+       * root and replies, as GitHub has them right now.
+       *
+       * WHY IT EXISTS. The review pane used to list `/pulls/:n/drafts` and nothing else —
+       * the local sidecar of comments *this machine* wrote. So a comment a teammate left,
+       * and every reply to your own comment, was invisible: the row said "On GitHub · #2"
+       * and showed the one sentence this process happened to remember posting. Refreshing
+       * could not help, because nothing on the page had ever asked GitHub.
+       *
+       * It is the whole pull request and not one path. The reviewer moves between changed
+       * files and the panel filters per file, but a count of what is waiting on the other
+       * twenty is part of the answer, and re-reading GitHub on every file click is not.
+       *
+       * Resolution is joined when GraphQL answers and omitted when it does not — the same
+       * three-valued rule as the document route (R-4.12 / R-5.15): `undefined` is "we
+       * could not ask", and flattening it to `false` would claim nobody resolved it.
+       */
+      const pullComments = /^\/pulls\/([^/]+)\/comments$/.exec(pathname);
+      if (pullComments && method === 'GET') {
+        const pullNumber = parsePullNumber(pullComments[1]!);
+        if (pullNumber === null) return bad(`invalid pullNumber: ${pullComments[1]!}`);
+        const gated = await gate('read', null);
+        if (!gated.ok) return gated.result;
+        const repoRef = repoRefOf(gated.repo);
+        try {
+          const adapter = repoAdapter();
+          let resolutions: ThreadResolution[] | undefined;
+          try {
+            resolutions = [...(await adapter.listThreadResolution(repoRef, pullNumber))];
+          } catch {
+            resolutions = undefined;
+          }
+          const threads = await loadPullReviewThreads(adapter, repoRef, pullNumber, {
+            ...(resolutions ? { resolutions } : {}),
+          });
+          return { status: 200, json: { pullNumber, threads } };
         } catch (err) {
           if (err instanceof GitHubError) return githubFailure(err);
           throw err;

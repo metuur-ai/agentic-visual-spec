@@ -80,6 +80,39 @@ export async function captureOutdatedSnippets(
 }
 
 /**
+ * Every review thread on a pull request, projected — the whole PR, not one document.
+ *
+ * The sibling below re-anchors into `documentText`, which a pull request review has no
+ * single one of: a reviewer reading `src/auth.ts` is looking at one of the changed files,
+ * and threads on the other twenty are still part of the answer. So this one stops after
+ * capture, and every thread keeps the position GitHub reported (or, once outdated, the
+ * text it was written about and no position at all). The checkout the review pane serves
+ * is detached at the pull request head, so a live thread's `line` IS a line in the file
+ * on screen — there is nothing to re-anchor against.
+ */
+export async function loadPullReviewThreads(
+  adapter: GitHubAdapter,
+  repo: RepoRef,
+  pullNumber: number,
+  options: { resolutions?: readonly ThreadResolution[] } = {},
+): Promise<ReviewThreadRecord[]> {
+  const threads = groupIntoThreads(await adapter.listReviewComments(repo, pullNumber));
+  const snippets = await captureOutdatedSnippets(adapter, repo, threads);
+
+  const byRoot = new Map<number, ThreadResolution>();
+  for (const r of options.resolutions ?? []) byRoot.set(r.rootCommentId, r);
+
+  return threads.map((thread) => {
+    const snippet = snippets.get(thread.root.id);
+    const resolution = byRoot.get(thread.root.id);
+    return projectReviewThread(thread, {
+      ...(snippet ? { snippet } : {}),
+      ...(resolution ? { resolution } : {}),
+    });
+  });
+}
+
+/**
  * The whole read path, and what the collaboration routes call: list → thread → capture →
  * re-anchor → project (R-6.1 … R-6.9).
  *

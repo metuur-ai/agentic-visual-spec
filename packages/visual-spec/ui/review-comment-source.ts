@@ -28,7 +28,8 @@ import type { ReviewDraftInput } from '../core/collaboration/review-drafts';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { resolveMarkdownAnchors } from './anchor-resolver';
 import { flash } from './comment-history-list';
-import type { CommentAction, CommentOrigin, CommentPanelSource } from './comment-panel';
+import type { CommentAction, CommentOrigin, CommentPanelSource, PanelReply } from './comment-panel';
+import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import type { IndicatorTarget } from './indicator-layer';
 
 export type ReviewCommentSourceDeps = {
@@ -38,6 +39,16 @@ export type ReviewCommentSourceDeps = {
   headSha: string;
   /** Every draft for this pull request; this module keeps the ones on `path`. */
   drafts: readonly ReviewDraft[];
+  /**
+   * Every review thread ON the pull request, from `GET /pulls/:n/comments` — all files.
+   *
+   * These are the conversation; the drafts are this machine's outbox. A published draft
+   * and its thread are the same comment seen from two sides, and the thread wins: it is
+   * the one that knows whether anybody replied.
+   */
+  threads?: readonly ReviewThreadRecord[];
+  /** The pull request number, for the "On GitHub · #N" chip on a thread nobody here drafted. */
+  pullNumber: number;
   hold: (input: ReviewDraftInput) => Promise<boolean>;
   publish: (id: string, force?: boolean) => Promise<void>;
   discard: (id: string) => Promise<void>;
@@ -60,6 +71,28 @@ function draftOrigin(draft: ReviewDraft): CommentOrigin {
   return isHeld(draft)
     ? { where: 'local', label: 'Draft — not sent' }
     : { where: 'github', label: `On GitHub · #${draft.pullNumber}` };
+}
+
+/**
+ * The chip for a thread read back from the pull request.
+ *
+ * Resolution is stated only when GitHub told us (R-4.12 / R-5.15): `isResolved` is
+ * three-valued, and an unknown printed as "open" would be a claim nobody made.
+ */
+function threadOrigin(thread: ReviewThreadRecord, pullNumber: number): CommentOrigin {
+  const resolved = thread.github.isResolved === true ? ' · resolved' : '';
+  return { where: 'github', label: `On GitHub · #${pullNumber}${resolved}` };
+}
+
+/** A thread's reply in the panel's shape. Ids are stringified; the panel keys on them. */
+function toPanelReply(reply: ReviewThreadRecord['replies'][number]): PanelReply {
+  return {
+    id: String(reply.id),
+    user: reply.user,
+    body: reply.body,
+    createdAt: reply.createdAt,
+    htmlUrl: reply.htmlUrl,
+  };
 }
 
 /** The projection the panel lists. See the header on why `status` is always `open`. */
@@ -89,13 +122,30 @@ function startLineOf(comment: CommentRecord): number | null {
  * row action instead, on held drafts only, where it is the honest word for what happens.
  */
 export function reviewCommentPanelSource(deps: ReviewCommentSourceDeps): CommentPanelSource {
-  const onFile = deps.drafts.filter((d) => d.target.path === deps.path);
+  const threadsOnFile = (deps.threads ?? []).filter((t) => t.target.path === deps.path);
+  const byThreadId = new Map(threadsOnFile.map((t) => [t.id, t]));
+  const onGitHub = new Set(threadsOnFile.map((t) => t.github.reviewCommentId));
+
+  /*
+   * A published draft whose thread is in the list is dropped, not shown twice.
+   *
+   * The two are one comment. The draft is what this machine remembers posting — the text
+   * at the moment it was sent, and nothing since; the thread is what the pull request has
+   * now, replies included. Keeping both would print the reviewer's own sentence twice,
+   * once with the answer to it and once without.
+   */
+  const onFile = deps.drafts.filter(
+    (d) => d.target.path === deps.path && !(d.published && onGitHub.has(d.published.reviewCommentId)),
+  );
   const byId = new Map(onFile.map((d) => [d.id, d]));
   const held = onFile.filter(isHeld);
 
+  // Oldest first, across both sources — the conversation in the order it happened.
+  const comments = [...onFile.map(toRecord), ...threadsOnFile].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+
   return {
     path: deps.path,
-    comments: onFile.map(toRecord),
+    comments,
     // Every draft anchors to a line in the checkout at `headSha`; there is no snapshot to
     // have drifted from, so nothing can be orphaned the way a branch's threads can.
     orphans: [],
@@ -104,15 +154,26 @@ export function reviewCommentPanelSource(deps: ReviewCommentSourceDeps): Comment
     // A review comment is sent to GitHub, not handed to a local apply agent.
     supportsWorkflows: false,
     origin: (c) => {
+      const thread = byThreadId.get(c.id);
+      if (thread) return threadOrigin(thread, deps.pullNumber);
       const draft = byId.get(c.id);
       return draft ? draftOrigin(draft) : { where: 'local', label: 'Draft — not sent' };
     },
-    link: (c) => byId.get(c.id)?.published?.htmlUrl,
+    link: (c) => byThreadId.get(c.id)?.github.htmlUrl ?? byId.get(c.id)?.published?.htmlUrl,
+    // Read-only: the panel shows the thread, github.com is where it is answered. Adding
+    // `reply` here would be a write this surface has not been asked for.
+    replies: (c) => (byThreadId.get(c.id)?.replies ?? []).map(toPanelReply),
     notice: (c) => deps.notice?.(c.id) ?? null,
     label: (c) => {
       const line = startLineOf(c);
       const head = c.target.heading ?? '(top)';
       const range = line === null ? '(file)' : `L${line}${c.target.endLine ? `–${c.target.endLine}` : ''}`;
+      const thread = byThreadId.get(c.id);
+      if (thread) {
+        // An outdated thread lost its line to a later commit; the row says so rather than
+        // printing "(file)" and letting the reader think it was always file-level.
+        return `${thread.github.user} · ${range}${thread.github.isOutdated ? ' · outdated' : ''}`;
+      }
       const draft = byId.get(c.id);
       return `${head} · ${range}${draft ? ` · at ${draft.headSha.slice(0, 7)}` : ''}`;
     },
@@ -190,23 +251,38 @@ export function reviewCommentPanelSource(deps: ReviewCommentSourceDeps): Comment
  * Held and published alike get a marker: the question the marker answers is "has anyone
  * said anything about this block", and where the comment currently lives is the chip's
  * job in the panel, not the margin's.
+ *
+ * `threads` are the pull request's own, and they count for the same reason — a block
+ * somebody else commented on is a block that has been said something about. Without them
+ * the margin claimed a file was unremarked when the pull request had a conversation on it.
  */
-export function reviewIndicatorTargets(path: string, drafts: readonly ReviewDraft[]): IndicatorTarget[] {
+export function reviewIndicatorTargets(
+  path: string,
+  drafts: readonly ReviewDraft[],
+  threads: readonly ReviewThreadRecord[] = [],
+): IndicatorTarget[] {
   const byLine = new Map<number, { comments: CommentRecord[]; heading: string | null; endLine?: number }>();
-  for (const draft of drafts) {
-    if (draft.target.path !== path) continue;
-    const record = toRecord(draft);
+  const add = (record: CommentRecord): void => {
+    if (record.target.path !== path) return;
     const line = startLineOf(record);
-    if (line === null) continue;
+    if (line === null) return;
     const group = byLine.get(line);
     if (group) group.comments.push(record);
     else
       byLine.set(line, {
         comments: [record],
-        heading: draft.target.heading ?? null,
-        ...(typeof draft.target.endLine === 'number' ? { endLine: draft.target.endLine } : {}),
+        heading: record.target.heading ?? null,
+        ...(typeof record.target.endLine === 'number' ? { endLine: record.target.endLine } : {}),
       });
+  };
+  // Same de-duplication as the panel: a published draft and its thread are one comment,
+  // and a line with one comment on it must not report two.
+  const onGitHub = new Set(threads.map((t) => t.github.reviewCommentId));
+  for (const draft of drafts) {
+    if (draft.published && onGitHub.has(draft.published.reviewCommentId)) continue;
+    add(toRecord(draft));
   }
+  for (const thread of threads) add(thread);
   return [...byLine.entries()].map(([line, group]) => {
     const count = group.comments.length;
     return {

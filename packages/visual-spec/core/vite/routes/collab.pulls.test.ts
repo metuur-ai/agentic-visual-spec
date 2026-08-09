@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CollaborationPreflight } from '../../collaboration/credentials';
 import { GitHubError, type GitHubAdapter, type PullRequestSummary } from '../../collaboration/github-adapter';
+import type { ReviewComment, ThreadResolution } from '../../collaboration/review-comments';
 import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { GitExecutor } from '../../git-context';
 import type { ResolvedVisualSpecConfig } from '../../config';
@@ -62,9 +63,41 @@ function summary(over: Partial<PullRequestSummary> = {}): PullRequestSummary {
   };
 }
 
+/** One review comment as `toReviewComment` would have flattened it. */
+function reviewComment(over: Partial<ReviewComment> & { id: number }): ReviewComment {
+  return {
+    inReplyToId: null,
+    path: 'docs/spec.md',
+    line: 4,
+    startLine: null,
+    originalLine: 4,
+    side: 'RIGHT',
+    subjectType: 'line',
+    commitId: 'a'.repeat(40),
+    originalCommitId: 'a'.repeat(40),
+    diffHunk: '@@ -0,0 +1,14 @@',
+    body: 'test comments 003',
+    user: 'javierhbr',
+    createdAt: '2026-08-09T20:00:00Z',
+    updatedAt: '2026-08-09T20:00:00Z',
+    htmlUrl: `https://github.com/acme/specs/pull/7#discussion_r${over.id}`,
+    ...over,
+  };
+}
+
 /** The repo-level adapter double, recording what the routes asked for. */
 function repoAdapter(
-  options: { pulls?: PullRequestSummary[]; listFails?: Error; pullFails?: Error; files?: string[]; body?: string } = {},
+  options: {
+    pulls?: PullRequestSummary[];
+    listFails?: Error;
+    pullFails?: Error;
+    files?: string[];
+    body?: string;
+    reviewComments?: ReviewComment[];
+    reviewCommentsFail?: Error;
+    resolutions?: ThreadResolution[];
+    resolutionsFail?: Error;
+  } = {},
 ) {
   const states: (string | undefined)[] = [];
   const compares: { base: string; head: string }[] = [];
@@ -90,6 +123,14 @@ function repoAdapter(
         mergeable: true,
         mergeableState: 'clean',
       };
+    },
+    async listReviewComments(_repo: unknown, _pullNumber: number) {
+      if (options.reviewCommentsFail) throw options.reviewCommentsFail;
+      return options.reviewComments ?? [];
+    },
+    async listThreadResolution(_repo: unknown, _pullNumber: number) {
+      if (options.resolutionsFail) throw options.resolutionsFail;
+      return options.resolutions ?? [];
     },
     async compareCommits(_repo: unknown, base: string, head: string) {
       compares.push({ base, head });
@@ -160,7 +201,7 @@ describe('/pulls is matched before the document-scoped route', () => {
     const text = src('core/vite/routes/collab.ts');
     const scoped = text.indexOf('const scoped = /^\\/([^/]+)(\\/.*)?$/.exec(pathname)');
     expect(scoped).toBeGreaterThan(-1);
-    for (const marker of ["pathname === '/pulls'", "pathname === '/pulls/mounted'", '/^\\/pulls\\/([^/]+)\\/mount$/', '/^\\/pulls\\/([^/]+)\\/files$/', '/^\\/pulls\\/([^/]+)\\/description$/']) {
+    for (const marker of ["pathname === '/pulls'", "pathname === '/pulls/mounted'", '/^\\/pulls\\/([^/]+)\\/mount$/', '/^\\/pulls\\/([^/]+)\\/files$/', '/^\\/pulls\\/([^/]+)\\/description$/', '/^\\/pulls\\/([^/]+)\\/comments$/']) {
       const at = text.indexOf(marker);
       expect(at, marker).toBeGreaterThan(-1);
       expect(at, marker).toBeLessThan(scoped);
@@ -192,10 +233,11 @@ describe('R-9.8 — the /pulls family gates on `read` and nothing stronger', () 
     await call(r, 'GET', '/pulls/mounted');
     await call(r, 'GET', '/pulls/7/files');
     await call(r, 'GET', '/pulls/7/description');
+    await call(r, 'GET', '/pulls/7/comments');
     await r.handle({ method: 'POST', pathname: '/pulls/7/mount', query: {}, body: {} });
     await r.handle({ method: 'DELETE', pathname: '/pulls/7/mount', query: {}, body: {} });
 
-    expect(seen).toHaveLength(6);
+    expect(seen).toHaveLength(7);
     expect(new Set(seen.map((s) => s.op))).toEqual(new Set(['read']));
     expect(seen.every((s) => s.documentId === null)).toBe(true);
   });
@@ -345,7 +387,9 @@ describe('POST /__vs/collab/pulls/:n/mount', () => {
   });
 
   it('answers 200 with the worktree when the mount lands', async () => {
-    const head = 'c'.repeat(40);
+    // The head the adapter double reports for the pull request. The mount is checked
+    // against it, so a checkout at any other commit is not this pull request.
+    const head = 'a'.repeat(40);
     const git = stubGit((args) => {
       if (isCommand(args, 'rev-parse') && args[3] === 'HEAD') return { stdout: `${head}\n`, exitCode: 0 };
       if (isCommand(args, 'rev-parse') && args[3] === '--show-toplevel') return { stdout: `${dir}/.visual-spec/worktrees/pr-7\n`, exitCode: 0 };
@@ -360,6 +404,106 @@ describe('POST /__vs/collab/pulls/:n/mount', () => {
     });
     // The fetch uses the fork-safe refspec, not the head branch by name.
     expect(git.calls.some((c) => c.includes('+refs/pull/7/head:refs/visual-spec/pr/7'))).toBe(true);
+  });
+
+  /*
+   * The bug these two cover, in one sentence: a pull number identifies a pull request
+   * only *within a repository*, and this route used to read the number against the
+   * configured repository and resolve it against the served directory's `origin`. When
+   * those differ the same number names two different pull requests, the fetch succeeds,
+   * and the reviewer is shown one pull request's changed-files list over another's tree —
+   * every row rendering "No preview for this file." because the checkout does not have it.
+   */
+  it('fetches from the configured repository when `origin` is a clone of a different one', async () => {
+    const head = 'a'.repeat(40);
+    const git = stubGit((args) => {
+      if (isCommand(args, 'remote')) return { stdout: 'https://github.com/someone/served.git\n', exitCode: 0 };
+      if (isCommand(args, 'rev-parse') && args[3] === 'HEAD') return { stdout: `${head}\n`, exitCode: 0 };
+      if (isCommand(args, 'rev-parse') && args[1] !== dir) return { exitCode: 1 };
+      return undefined;
+    });
+    const res = await mount(git.exec);
+    expect(res.status).toBe(200);
+    const fetched = git.calls.find((c) => isCommand(c, 'fetch'));
+    expect(fetched).toContain(`https://github.com/${ENABLED.collaboration!.owner}/${ENABLED.collaboration!.repo}.git`);
+  });
+
+  it('reports a checkout that is not at the pull request head as a 409 carrying both commits', async () => {
+    const git = stubGit((args) => {
+      // A remote that will not parse, so the fetch stays on `origin` — the case the URL
+      // rewrite deliberately does not touch, and therefore the one the head check owns.
+      if (isCommand(args, 'remote')) return { stdout: '/tmp/some/other/clone\n', exitCode: 0 };
+      if (isCommand(args, 'rev-parse') && args[3] === 'HEAD') return { stdout: `${'d'.repeat(40)}\n`, exitCode: 0 };
+      if (isCommand(args, 'rev-parse') && args[1] !== dir) return { exitCode: 1 };
+      return undefined;
+    });
+    const res = await mount(git.exec);
+    expect(res.status).toBe(409);
+    expect(res.json).toMatchObject({ reason: 'head-mismatch' });
+    const { error } = res.json as { error: string };
+    expect(error).toContain('ddddddd');
+    expect(error).toContain('aaaaaaa');
+    expect(error).toContain('VS_COLLAB_REPO');
+  });
+});
+
+/* ================================================================== *
+ * The pull request's own review conversation — roots AND replies
+ * ================================================================== */
+describe('GET /__vs/collab/pulls/:n/comments', () => {
+  const comments = (options: Parameters<typeof repoAdapter>[0]) =>
+    call(router({ repoAdapter: () => repoAdapter(options).adapter }), 'GET', '/pulls/7/comments');
+
+  it('answers every thread with its replies, in creation order', async () => {
+    const res = await comments({
+      reviewComments: [
+        reviewComment({ id: 11, body: 'test comments 003' }),
+        reviewComment({ id: 13, inReplyToId: 11, body: 'reply comment 003 -A', createdAt: '2026-08-09T20:01:00Z' }),
+        reviewComment({ id: 12, inReplyToId: 11, body: 'reply comment 003 -B', createdAt: '2026-08-09T20:02:00Z' }),
+        reviewComment({ id: 20, path: 'README.md', body: 'a thread on another file' }),
+      ],
+    });
+    expect(res.status).toBe(200);
+    const { threads } = res.json as { threads: { comment: string; target: { path: string }; replies: { body: string }[] }[] };
+    expect(threads).toHaveLength(2);
+    // The reply the panel could not previously show, and the one after it — ordered by
+    // when they were written, not by id.
+    expect(threads[0]!.comment).toBe('test comments 003');
+    expect(threads[0]!.replies.map((r) => r.body)).toEqual(['reply comment 003 -A', 'reply comment 003 -B']);
+    // Every file's threads, not the one on screen: the panel filters, the route does not.
+    expect(threads.map((t) => t.target.path)).toEqual(['docs/spec.md', 'README.md']);
+  });
+
+  it('joins resolution when GraphQL answers', async () => {
+    const res = await comments({
+      reviewComments: [reviewComment({ id: 11 })],
+      resolutions: [{ rootCommentId: 11, isResolved: true, isOutdated: false }],
+    });
+    const { threads } = res.json as { threads: { github: { isResolved?: boolean } }[] };
+    expect(threads[0]!.github.isResolved).toBe(true);
+  });
+
+  it('still serves the conversation when the resolution read fails, without claiming unresolved', async () => {
+    // R-4.12 / R-5.15 — `undefined` is "we could not ask". `false` would be a claim.
+    const res = await comments({
+      reviewComments: [reviewComment({ id: 11 })],
+      resolutionsFail: new Error('graphql is down'),
+    });
+    expect(res.status).toBe(200);
+    const { threads } = res.json as { threads: { github: { isResolved?: boolean } }[] };
+    expect(threads[0]!.github.isResolved).toBeUndefined();
+  });
+
+  it('reports a GitHub failure as the route family does, rather than throwing', async () => {
+    const res = await comments({
+      reviewCommentsFail: new GitHubError('listReviewComments', 'gone', 404, 'not_found'),
+    });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+  });
+
+  it('refuses a pull number that is not one', async () => {
+    const res = await call(router(), 'GET', '/pulls/-1/comments');
+    expect(res.status).toBe(400);
   });
 });
 

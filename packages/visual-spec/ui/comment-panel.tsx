@@ -58,6 +58,17 @@ type PanelTab = 'open' | 'history';
  */
 export type CommentOrigin = { where: 'local' | 'github'; label: string };
 
+/** One reply already on a comment's thread. Rendered read-only; the panel writes none of it. */
+export type PanelReply = {
+  /** Stable within the thread — the REST comment id, stringified by the source. */
+  id: string;
+  user: string;
+  body: string;
+  /** ISO 8601, as GitHub reported it. */
+  createdAt: string;
+  htmlUrl?: string;
+};
+
 /** How the current selection reads, or why it cannot be commented on at all. */
 export type SelectionDescription = { title: string; detail: string } | { uncommentable: string };
 
@@ -100,6 +111,16 @@ export type CommentPanelSource = {
    * and the row renders no reply affordance.
    */
   reply?: (id: string, text: string) => Promise<void>;
+  /**
+   * The replies already written on this comment's thread, oldest first.
+   *
+   * Reading a thread and adding to it are two different affordances, and the panel had
+   * only the second: `reply` posted into a conversation the reader could not see. A pull
+   * request review is where that shows — someone answers your comment on github.com and
+   * the row keeps showing your sentence alone, with no sign anyone replied. Sources with
+   * no threading (the local sidecar) leave this unset and nothing renders.
+   */
+  replies?: (c: CommentRecord) => PanelReply[];
   /**
    * R-5.14 — where this comment's thread lives on github.com, or `undefined` when it has
    * no such home. Collaboration supplies it because resolving happens there and nowhere
@@ -599,6 +620,20 @@ function CommentList({ source }: { source: CommentPanelSource }) {
               {source.label(c)}
             </div>
             <div style={{ margin: '2px 0' }}>{c.comment}</div>
+            {/*
+              * The rest of the thread. Indented under the root and rendered plainly: this
+              * is the conversation, not a control surface, and every act it offers
+              * (resolve, react, edit) belongs to github.com.
+              */}
+            {(source.replies?.(c) ?? []).map((r) => (
+              <div key={r.id} data-vs-reply={r.id} style={replyCard}>
+                <div style={replyMeta}>
+                  <strong style={{ fontWeight: 600 }}>{r.user}</strong>
+                  <span> · {r.createdAt.slice(0, 10)}</span>
+                </div>
+                <div>{r.body}</div>
+              </div>
+            ))}
             {/* A warning the source needs the reader to see before they act on the row. */}
             {source.notice?.(c)}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4, flexWrap: 'wrap' }}>
@@ -780,6 +815,13 @@ const originChip: React.CSSProperties ={ font: '600 10px system-ui', padding: '1
 const originLocal: React.CSSProperties = { ...originChip, border: '1px solid #fcd34d', background: '#fef3c7', color: '#92400e' };
 const originGithub: React.CSSProperties = { ...originChip, border: '1px solid #bbf7d0', background: '#f0fdf4', color: '#166534' };
 const cardActive: React.CSSProperties = { border: '1px solid #f59e0b', background: '#fffbeb', boxShadow: '0 0 0 2px rgba(245,158,11,0.25)' };
+/*
+ * A reply, indented under its root. The left rule and the indent are the whole visual
+ * grammar: GitHub's own thread reads the same way, and a reviewer who has read one there
+ * needs no second convention here.
+ */
+const replyCard: React.CSSProperties = { margin: '4px 0 0 10px', paddingLeft: 10, borderLeft: '2px solid #e2e8f0', overflowWrap: 'anywhere' };
+const replyMeta: React.CSSProperties = { fontSize: 12, color: '#64748b' };
 /*
  * P3's ring. Violet, where `cardActive` is amber, because the two mean different
  * things and are both momentary: amber says "this is the comment the indicator you

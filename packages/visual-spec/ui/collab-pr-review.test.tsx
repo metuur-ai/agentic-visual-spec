@@ -15,6 +15,7 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import { fireEvent } from '@testing-library/dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ReviewDraft } from '../core/collaboration/review-drafts';
+import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import { worktreeRelPath } from '../core/collaboration/worktree';
 import { CollabPrReview, changedTreeEntries, entriesUnder, worktreePrefix } from './collab-pr-review';
 import { reviewCommentPanelSource } from './review-comment-source';
@@ -234,7 +235,26 @@ describe('R-13.19 — a checkout is a review surface, not a workspace', () => {
  * ================================================================== */
 
 type Reply = { status: number; json: unknown };
-type ServerState = { drafts: ReviewDraft[] };
+type ServerState = { drafts: ReviewDraft[]; threads: ReviewThreadRecord[] };
+
+/** One review thread as `GET /pulls/:n/comments` projects it. */
+const threadRecord = (over: Partial<ReviewThreadRecord> = {}): ReviewThreadRecord => ({
+  id: 'c-0000002b',
+  workflow: 'visual-spec',
+  target: { path: 'spec.md', kind: 'range', startLine: 3 },
+  comment: 'test comments 003',
+  status: 'open',
+  ts: '2026-02-01T09:00:00Z',
+  github: {
+    reviewCommentId: 43,
+    isOutdated: false,
+    htmlUrl: 'https://github.com/acme/docs/pull/42#discussion_r43',
+    user: 'javierhbr',
+    updatedAt: '2026-02-01T09:00:00Z',
+  },
+  replies: [],
+  ...over,
+});
 
 const draftRecord = (over: Partial<ReviewDraft> = {}): ReviewDraft => ({
   id: 'd-aaaa1111',
@@ -254,10 +274,11 @@ const draftRecord = (over: Partial<ReviewDraft> = {}): ReviewDraft => ({
  */
 function fakeDraftServer(opts: {
   drafts?: ReviewDraft[];
+  threads?: ReviewThreadRecord[];
   publish?: (id: string, body: Record<string, unknown>, state: ServerState) => Reply;
   del?: (id: string, state: ServerState) => Reply;
 } = {}) {
-  const state: ServerState = { drafts: opts.drafts ?? [] };
+  const state: ServerState = { drafts: opts.drafts ?? [], threads: opts.threads ?? [] };
   const calls: { url: string; method: string; body?: Record<string, unknown> }[] = [];
   const reply = (r: Reply) =>
     ({ ok: r.status < 400, status: r.status, json: async () => r.json }) as unknown as Response;
@@ -270,6 +291,9 @@ function fakeDraftServer(opts: {
     // `spec.md` is changed too, so the Markdown path is reachable from the entry point
     // a reviewer actually starts at rather than only by walking the tree.
     if (url.endsWith('/files')) return reply({ status: 200, json: changedFiles(['src/pay.ts', 'spec.md']).json });
+    if (url === '/__vs/collab/pulls/42/comments' && method === 'GET') {
+      return reply({ status: 200, json: { pullNumber: 42, threads: state.threads } });
+    }
     if (url === '/__vs/collab/pulls/42/drafts' && method === 'GET') {
       return reply({ status: 200, json: { drafts: state.drafts } });
     }
@@ -914,6 +938,7 @@ describe('the panel says true things about a review comment', () => {
     const source = reviewCommentPanelSource({
       path: 'spec.md',
       headSha: 'abc1234',
+      pullNumber: 7,
       drafts: [
         draftRecord({
           id: 'd-lbl00001',
@@ -935,6 +960,7 @@ describe('the panel says true things about a review comment', () => {
     const source = reviewCommentPanelSource({
       path: 'spec.md',
       headSha: 'abc1234',
+      pullNumber: 7,
       drafts: [],
       hold,
       publish: vi.fn(async () => {}),
@@ -1087,5 +1113,103 @@ describe('the checkout says it is loading rather than looking empty', () => {
     expect(toggle.textContent).toContain('counting files…');
     expect(toggle.textContent).not.toContain('0 files');
     expect(toggle.querySelector('[data-vs-spinner]')).toBeTruthy();
+  });
+});
+
+/* ================================================================== *
+ * The pull request's own conversation — every comment, and its replies
+ * ================================================================== */
+/*
+ * The bug: the panel listed `/pulls/:n/drafts` and nothing else — what THIS machine had
+ * written. A reply left on github.com, and any comment by anybody else, was invisible,
+ * and no amount of refreshing helped because nothing on the page had ever asked GitHub.
+ */
+describe('the review shows the pull request’s comments and replies', () => {
+  const withReplies = threadRecord({
+    replies: [
+      { id: 44, body: 'reply comment 003 -A', user: 'javierhbr', createdAt: '2026-02-01T09:01:00Z', htmlUrl: 'https://github.com/acme/docs/pull/42#discussion_r44' },
+    ],
+  });
+
+  it('reads them when the checkout opens, without being asked', async () => {
+    const server = fakeDraftServer({ threads: [withReplies] });
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
+
+    expect(await screen.findByText('test comments 003')).toBeTruthy();
+    // The reply is the whole point: it exists only on GitHub and nothing local knows it.
+    expect(await screen.findByText('reply comment 003 -A')).toBeTruthy();
+    expect(server.calls.some((c) => c.url === '/__vs/collab/pulls/42/comments')).toBe(true);
+  });
+
+  it('says who wrote a reply and when, so a thread reads as a conversation', async () => {
+    const server = fakeDraftServer({ threads: [withReplies] });
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
+
+    const reply = await screen.findByText('reply comment 003 -A');
+    const card = reply.closest('[data-vs-reply]');
+    expect(card).toBeTruthy();
+    expect(card!.textContent).toContain('javierhbr');
+    expect(card!.textContent).toContain('2026-02-01');
+  });
+
+  it('picks up a new reply when the reviewer presses Refresh comments', async () => {
+    const server = fakeDraftServer({ threads: [threadRecord()] });
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
+    await screen.findByText('test comments 003');
+    expect(screen.queryByText('answered while you were reading')).toBeNull();
+
+    // Somebody answers on github.com. Nothing on this page could know without asking.
+    server.state.threads = [
+      threadRecord({
+        replies: [{ id: 45, body: 'answered while you were reading', user: 'octocat', createdAt: '2026-02-01T09:05:00Z', htmlUrl: 'https://x' }],
+      }),
+    ];
+    fireEvent.click(screen.getByRole('button', { name: /Refresh comments/ }));
+
+    expect(await screen.findByText('answered while you were reading')).toBeTruthy();
+  });
+
+  it('counts what is on the pull request, not what this machine happened to send', async () => {
+    const server = fakeDraftServer({ threads: [withReplies, threadRecord({ id: 'c-0000002d', github: { ...threadRecord().github, reviewCommentId: 45 } })] });
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+
+    const tally = await waitFor(() => {
+      const el = document.querySelector('[data-vs-draft-tally]');
+      expect(el?.textContent).toContain('2 on GitHub');
+      return el!;
+    });
+    expect(tally.textContent).toContain('1 reply');
+  });
+
+  it('shows a comment this machine published once, not twice', async () => {
+    // The published draft and the thread are the same comment seen from two sides.
+    const published = draftRecord({
+      id: 'd-pub00001',
+      status: 'published',
+      target: { path: 'spec.md', kind: 'range', startLine: 3 },
+      comment: 'test comments 003',
+      published: { reviewCommentId: 43, htmlUrl: 'https://github.com/acme/docs/pull/42#discussion_r43', ts: '2026-02-01T09:00:00Z' },
+    });
+    const server = fakeDraftServer({ drafts: [published], threads: [withReplies] });
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
+
+    await screen.findByText('reply comment 003 -A');
+    expect(screen.getAllByText('test comments 003')).toHaveLength(1);
+  });
+
+  it('says the conversation could not be read rather than showing an empty panel', async () => {
+    const impl = (async (url: string) => {
+      if (url.endsWith('/comments')) return { ok: false, status: 502, json: async () => ({ error: 'gh is unreachable' }) } as unknown as Response;
+      if (url.endsWith('/files')) return { ok: true, status: 200, json: async () => changedFiles(['spec.md']).json } as unknown as Response;
+      return { ok: true, status: 200, json: async () => ({ drafts: [] }) } as unknown as Response;
+    }) as unknown as typeof fetch;
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+    fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
+
+    await waitFor(() => expect(document.querySelector('[data-vs-threads-error]')?.textContent).toContain('gh is unreachable'));
   });
 });
