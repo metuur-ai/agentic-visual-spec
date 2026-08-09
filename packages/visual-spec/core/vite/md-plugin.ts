@@ -25,6 +25,7 @@ import { handleGitRequest } from './routes/git';
 import { createApplyHub } from './routes/apply';
 import { createCollabRoutes } from './routes/collab';
 import { createCollabWiring } from './routes/collab-wiring';
+import { collaborationFromOrigin } from '../collaboration/open';
 import { createJobHubRegistry } from '../collaboration/job-hub';
 import { fsCollaborationStore } from '../collaboration/record-store';
 import { type VisualSpecConfig, resolveConfig } from '../config';
@@ -175,7 +176,7 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
     configResolved(config) {
       root = config.root;
     },
-    configureServer(server) {
+    async configureServer(server) {
       // Absolute paths point at a folder outside the app (e.g. a real docs dir);
       // relative paths resolve under the Vite root.
       const resolve = (p: string) => (isAbsolute(p) ? p : join(root, p));
@@ -371,7 +372,33 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       // one registry per server, created here and never at module level — and the same
       // shared router, so neither host owns any collaboration logic of its own (R-7.6).
       // Registered after the guard above, like every other `/__vs` handler (R-9.13).
-      const collabConfig = resolveConfig(opts.config);
+      /*
+       * The same default the CLI applies (`collaborationFromOrigin`): with no
+       * `collaboration` block configured, the served directory's GitHub origin names one.
+       *
+       * IT IS AWAITED, NOT RACED. `config()` below is synchronous and is called per
+       * request, so resolving the inference in the background would leave the first
+       * `GET /__vs/collab` — which the UI issues on mount — answering "not configured"
+       * and needing a reload to correct itself. Vite awaits an async `configureServer`,
+       * so the two git reads happen before the first request can arrive.
+       *
+       * An explicit block always wins: this only fills a gap, and `VS_NO_COLLAB` is the
+       * Vite host's `--no-collab`, since a plugin takes flags from nobody.
+       */
+      let collabConfig = resolveConfig(opts.config);
+      let collabFromOrigin: string | null = null;
+      if (!collabConfig.collaboration && !process.env.VS_NO_COLLAB) {
+        const inferred = await collaborationFromOrigin(specsRoot);
+        if (inferred) {
+          collabConfig = resolveConfig({ ...opts.config, collaboration: inferred });
+          collabFromOrigin = `${inferred.owner}/${inferred.repo}`;
+        }
+      }
+      // Said out loud for the same reason the CLI says it: a repository the developer
+      // wrote into vite.config.ts needs no announcement; one this plugin chose does.
+      if (collabFromOrigin) {
+        server.config.logger.info(`  visual-spec collab: ${collabFromOrigin} (from origin — VS_NO_COLLAB=1 to disable)`);
+      }
       const collabJobs = createJobHubRegistry();
       // The 8.2 job bodies and the interval poller, built once in shared code so both
       // hosts are identical (R-7.6). With no `collaboration` block this constructs no

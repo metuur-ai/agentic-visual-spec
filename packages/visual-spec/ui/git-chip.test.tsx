@@ -346,3 +346,84 @@ describe('the branch at the point of apply (R-4.1 / R-4.2)', () => {
     );
   });
 });
+
+/*
+ * What survives when the chip runs out of room.
+ *
+ * The defect: `metuur-ai/visual-spec-collaboration-test · spike/anchor-test · 3 open`
+ * rendered the repository in full and clipped the branch AND the count off the chip's
+ * right edge. Both were in the accessibility tree and neither was on screen — so the
+ * count, which is a button, was a control that existed and could not be pressed, on
+ * exactly the repositories whose names are long enough to hide it.
+ *
+ * jsdom performs no layout, so no assertion here can prove pixels. What it CAN pin is
+ * the rule that decides the outcome: which children are allowed to give way, and which
+ * are not. That is the part that was never stated and therefore never held.
+ */
+describe('the chip sacrifices the repository name, never the branch or the count', () => {
+  const LONG = {
+    ...REMOTE_GITHUB,
+    owner: 'metuur-ai',
+    repo: 'visual-spec-collaboration-test',
+    branch: 'spike/anchor-test',
+  };
+
+  /** Collaboration configured, so the count renders and can be reasoned about. */
+  function installWithPulls(git: unknown, pulls: number) {
+    const impl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/__vs/git') return jsonRes(git);
+      if (url === '/__vs/git/branches') return jsonRes({ branches: ['main', 'spike/anchor-test'], current: 'spike/anchor-test' });
+      if (url === '/__vs/collab') {
+        return jsonRes({ available: true, login: 'javierhbr', repo: { owner: 'metuur-ai', repo: 'visual-spec-collaboration-test' } });
+      }
+      if (url.startsWith('/__vs/collab/pulls')) {
+        return jsonRes({ pulls: Array.from({ length: pulls }, (_, i) => ({ number: i + 1, title: `pr ${i}`, state: 'open', draft: false, headBranch: 'b', baseBranch: 'main', headSha: 'a', htmlUrl: '', author: 'x', documentId: null })) });
+      }
+      if (url.startsWith('/__vs/comments')) return jsonRes([OPEN_COMMENT]);
+      if (url === '/__vs/source/root') return jsonRes({ root: '/repo' });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', impl);
+  }
+
+  it('lets the repository name truncate', async () => {
+    installWithPulls(LONG, 3);
+    render(<MainHeader file="docs/spec.md" />);
+    const repo = await screen.findByText('metuur-ai/visual-spec-collaboration-test');
+
+    expect(repo.style.textOverflow).toBe('ellipsis');
+    expect(repo.style.overflow).toBe('hidden');
+    // Without `min-width: 0` a flex item refuses to shrink below its content, which is
+    // what let the name push everything after it past the chip's clipped edge.
+    expect(repo.style.minWidth).toBe('0');
+  });
+
+  it('never lets the pull request count shrink', async () => {
+    installWithPulls(LONG, 3);
+    render(<MainHeader file="docs/spec.md" />);
+    const count = await screen.findByTestId('git-pull-count');
+
+    expect(count.textContent).toBe('3 open');
+    expect(count.style.flexShrink).toBe('0');
+    expect(count.style.whiteSpace).toBe('nowrap');
+  });
+
+  /*
+   * The branch keeps its own ceiling, so a long BRANCH cannot do to the count what the
+   * long repository name was doing — the fix has to hold from either direction.
+   */
+  it('caps the branch so it cannot crowd the count out either', async () => {
+    installWithPulls({ ...LONG, branch: 'spike/a-very-long-branch-name-someone-actually-used' }, 3);
+    render(<MainHeader file="docs/spec.md" />);
+    const branch = await screen.findByTestId('git-branch-switch');
+
+    expect(branch.style.maxWidth).toBe('160px');
+    // The label truncates inside the button, so the ▾ is not clipped away with it —
+    // a dropdown whose only affordance is the arrow must keep the arrow.
+    const [label, caret] = [...branch.children] as HTMLElement[];
+    expect(label.style.textOverflow).toBe('ellipsis');
+    expect(caret.textContent).toBe('▾');
+    expect(caret.style.flexShrink).toBe('0');
+  });
+});

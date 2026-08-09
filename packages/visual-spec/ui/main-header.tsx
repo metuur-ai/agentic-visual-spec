@@ -100,7 +100,7 @@ function CopyIcon({ size = 12 }: { size?: number }) {
 /** State `none`: a branch symbol struck through — "there is no repository here". */
 function BranchOffIcon({ size = 12 }: { size?: number }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }} aria-hidden>
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block', flexShrink: 0 }} aria-hidden>
       <line x1="6" y1="3" x2="6" y2="15" />
       <circle cx="18" cy="6" r="3" />
       <circle cx="6" cy="18" r="3" />
@@ -112,7 +112,7 @@ function BranchOffIcon({ size = 12 }: { size?: number }) {
 /** State `local`: an unplugged connector — a repository, but no remote we can follow. */
 function UnplugIcon({ size = 12 }: { size?: number }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }} aria-hidden>
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block', flexShrink: 0 }} aria-hidden>
       <path d="M18.5 3.5 15 7l2 2-3.5 3.5" />
       <path d="M10.5 20.5 14 17l-2-2 3.5-3.5" />
       <line x1="3" y1="21" x2="6" y2="18" />
@@ -124,7 +124,7 @@ function UnplugIcon({ size = 12 }: { size?: number }) {
 /** State `remote`: a chain link — the repository is connected to a known host. */
 function LinkIcon({ size = 12 }: { size?: number }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }} aria-hidden>
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block', flexShrink: 0 }} aria-hidden>
       <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7" />
       <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7" />
     </svg>
@@ -252,7 +252,13 @@ function GitChip({ actions }: { actions?: HeaderActions }) {
         title={detached ? `${DETACHED_TITLE} — choose a branch to check out` : 'Change branch'}
         style={branchBtn}
       >
-        {headText(branch, detached)} <span style={gitDot}>▾</span>
+        {/*
+          Wrapped rather than bare. A bare text node is an anonymous flex item, which
+          cannot take `text-overflow`, so a long branch name was clipped mid-character —
+          and took the ▾ with it, leaving a dropdown with no affordance that it was one.
+        */}
+        <span style={branchBtnLabel}>{headText(branch, detached)}</span>
+        <span style={gitDot}>▾</span>
       </button>
     ) : (
       <BranchLabel branch={branch} detached={detached} />
@@ -1971,12 +1977,31 @@ const pathSep: React.CSSProperties = { color: '#cbd5e1', fontSize: 13, flexShrin
 const pathFile: React.CSSProperties = { font: '600 11.5px ui-monospace, "SF Mono", monospace', color: '#7c3aed', flexShrink: 0 };
 // ---- The git context chip. One shape, four tones — the tone carries the state
 // alongside the icon, never instead of it.
+/*
+ * WHAT GIVES WAY WHEN THE CHIP RUNS OUT OF ROOM.
+ *
+ * It used to be whatever came last. The chip clips its overflow and every child had the
+ * same claim on the width, so `metuur-ai/visual-spec-collaboration-test · spike/anchor-test
+ * · 3 open` rendered the repository in full and cut the branch AND the pull request count
+ * off the right-hand edge entirely. Both were in the accessibility tree and neither was on
+ * screen: the count is a button, so this was a control that existed and could not be
+ * pressed, on the one repository whose name was long enough to hide it.
+ *
+ * The order of sacrifice is now stated rather than incidental, and it is the reverse of
+ * the reading order — the repository is the most expendable of the three, because it is
+ * also the underlined link, its own `title`, and the one fact the user is least likely to
+ * have forgotten about the directory they opened. So `gitRepoText` shrinks and ellipsizes,
+ * and everything after it is `flexShrink: 0`.
+ */
 const gitChip: React.CSSProperties = {
   display: 'inline-flex',
   alignItems: 'center',
   gap: 5,
-  flexShrink: 0,
-  maxWidth: 280,
+  flexShrink: 1,
+  // Wide enough that the common case never truncates at all; `minWidth` keeps the pill
+  // from collapsing past the point where the count is still readable.
+  maxWidth: 420,
+  minWidth: 0,
   overflow: 'hidden',
   padding: '2px 8px',
   borderRadius: 999,
@@ -1993,18 +2018,32 @@ const gitToneRemote: React.CSSProperties = { background: '#f0fdf4', border: '1px
 // A bar rather than a spinner or an ellipsis: it occupies the chip's width so the
 // header does not reflow when the first read lands.
 const gitPlaceholderBar: React.CSSProperties = { display: 'inline-block', width: 68, height: 8, borderRadius: 999, background: '#e2e8f0' };
-const gitBranchText: React.CSSProperties = { font: '600 11px ui-monospace, "SF Mono", monospace', overflow: 'hidden', textOverflow: 'ellipsis' };
-const gitRepoText: React.CSSProperties = { font: '700 11px ui-monospace, "SF Mono", monospace' };
+/**
+ * The branch. It shrinks before the count does but after the repository has, and it
+ * carries its own ceiling so a long branch name cannot do to the count what the long
+ * repository name was doing.
+ */
+const gitBranchText: React.CSSProperties = { font: '600 11px ui-monospace, "SF Mono", monospace', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0, maxWidth: 160 };
+/** First to yield: it is also the link's text, its own tooltip, and the least surprising fact on the chip. */
+const gitRepoText: React.CSSProperties = { font: '700 11px ui-monospace, "SF Mono", monospace', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0, flexShrink: 1 };
 const gitRepoLink: React.CSSProperties = { ...gitRepoText, color: 'inherit', textDecoration: 'underline', textUnderlineOffset: 2 };
-const gitDot: React.CSSProperties = { opacity: 0.5 };
+/** A separator that shrank would render as a half dot. */
+const gitDot: React.CSSProperties = { opacity: 0.5, flexShrink: 0 };
 // The positioned parent for both chip popovers. `gitChip` itself clips its overflow,
 // so a popover inside it would be cut off at the pill's edge.
 const gitChipWrap: React.CSSProperties = { position: 'relative', display: 'inline-flex', flexShrink: 0, minWidth: 0 };
 // The switcher wears the branch's own type, not a button's: it is the same text Unit 3
 // renders, and only the affordance is new.
 const branchBtn: React.CSSProperties = { ...gitBranchText, display: 'inline-flex', alignItems: 'center', gap: 3, maxWidth: 160, padding: 0, border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', whiteSpace: 'nowrap' };
-const pullCountBtn: React.CSSProperties = { padding: 0, border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', font: '600 11px system-ui', textDecoration: 'underline', textUnderlineOffset: 2 };
-const pullRepoNote: React.CSSProperties = { font: '11px ui-monospace, "SF Mono", monospace', opacity: 0.75, overflow: 'hidden', textOverflow: 'ellipsis' };
+/** The branch name inside the switcher: it truncates, and the ▾ beside it does not. */
+const branchBtnLabel: React.CSSProperties = { overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 };
+/**
+ * The count never yields. It is the only control in the chip, and a control clipped to
+ * nothing is worse than one that was never rendered — nothing on screen says it is there.
+ */
+const pullCountBtn: React.CSSProperties = { flexShrink: 0, whiteSpace: 'nowrap', padding: 0, border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', font: '600 11px system-ui', textDecoration: 'underline', textUnderlineOffset: 2 };
+/** R-8.1's disclosure. Prose, so it may shrink — but only after the count is safe. */
+const pullRepoNote: React.CSSProperties = { font: '11px ui-monospace, "SF Mono", monospace', opacity: 0.75, overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0, flexShrink: 1 };
 // Left-aligned, unlike the right-hand popovers: this one hangs off a chip that sits at
 // the left edge of the header.
 const gitPop: React.CSSProperties = { position: 'absolute', left: 0, top: 'calc(100% + 6px)', width: 340, maxWidth: '82vw', background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 16px 48px rgba(76,29,149,0.18)', zIndex: 41, overflow: 'hidden', color: '#334155', font: '13px system-ui', fontWeight: 400 };
