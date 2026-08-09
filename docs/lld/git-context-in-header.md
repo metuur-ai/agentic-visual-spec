@@ -141,11 +141,82 @@ It displays the active branch when one is known. That is what makes the HLD's
 motivating sentence true rather than merely stated: the branch is on screen at the
 moment the decision is made, not only in the corner.
 
+### Changing branch
+
+`core/git-branches.ts`, a sibling of `core/git-context.ts` rather than an extension
+of it. The separation is the point: `core/git-context.ts` states that nothing in it
+writes, and that statement is worth more intact than the one import it would save.
+Both use the same injectable `GitExecutor` seam.
+
+`core/vite/routes/git.ts` gains `GET /__vs/git/branches` and
+`POST /__vs/git/checkout`. Both are absent when configuration has not enabled
+changing branch — absent, not present-and-403, so a client cannot distinguish
+"disabled" from "older server", and neither can reach the working tree by guessing.
+The existing `/__vs` cross-origin guard already covers them on both hosts; nothing
+per-route is added.
+
+**The refusal is decided before `checkout` runs.** `git checkout` succeeds when a
+modified file is identical in both commits, carrying the edit silently onto the new
+branch — which in a repository of documents is the common case. So `git status
+--porcelain` runs first and any output refuses the change (R-5.5). This also settles
+where the reported paths come from: `core/git-context.ts` drains stderr unread
+because git writes absolute paths into it, so git's own "would be overwritten"
+message is unavailable by construction. `--porcelain` puts repository-relative paths
+on stdout, which is the only form allowed across the boundary anyway (R-5.10).
+
+`ensureIgnored` runs again after a successful change (R-5.8). `.gitignore` is
+tracked, so a branch predating the collaboration entry un-ignores `.visual-spec/`
+and every mounted worktree becomes untracked noise in `git status` — the failure
+`core/collaboration/worktree.ts` already exists to prevent, at the one other moment
+it can occur.
+
+**Mounted worktrees do not block a change.** They are detached checkouts holding no
+branch, so git permits it, and the review surface reads them by absolute path, so a
+change to the main tree cannot disturb a review in progress. An earlier draft
+blocked on them; the block described no real constraint.
+
+### Open pull requests in the chip
+
+The count comes from the existing `GET /__vs/collab/pulls?state=open`, refreshed on
+the same focus and visibility events as the context itself and by nothing else —
+the reasoning of R-3.11 applies unchanged, and here it is also a rate limit.
+
+`PullRequestSummary` gains `documentId?: string`, resolved on the server from the
+body trailer with the parser that writes it. The client never sees the body. The
+head repository is deliberately **not** added: it is only interesting for forks, its
+source is null for a deleted fork, and nothing on screen was going to use it.
+
+The count is of all open pull requests so that it agrees with GitHub's own number;
+the list within distinguishes collaborations, which resume through the existing
+`POST /__vs/collab/open`, from the rest, which mount for review. The list is
+bounded, the count is not (R-7.9).
+
+### Two repositories, named
+
+The chip reads `owner/repo` from the served directory's `origin`; the count comes
+from the configured collaboration repository. `POST /__vs/dir/pick` can re-root the
+served directory into a different repository while the configuration stays fixed, so
+the two genuinely diverge. Unit 1 declined to reconcile them, correctly, while
+nothing displayed both at once. R-7.1 does. The response carries both and the chip
+names which repository the count belongs to when they differ — a disclosure, not a
+reconciliation (R-8.3).
+
+### The pull request under review
+
+`CollabApp` renders its own header and the main header is not mounted beneath it, so
+nothing there was ever displaying a stale branch. What it fails to do is say which
+pull request is on screen. `CollabPrReview` already receives `pull` and `worktree`
+as props; the title line is composed from those. No state crosses a surface
+boundary, and no branch is named, because the mounted tree is detached at a commit
+and has none.
+
 ## Constraints
 
 - **No new dependencies.**
 - **`readGitContext` never throws**; every failure is a state.
-- **Read-only**; no git command that writes is invoked.
+- **`core/git-context.ts` stays read-only**; no git command that writes is invoked
+  from it. Writes live in `core/git-branches.ts` and only when enabled.
+- **Dirt refuses the change**; nothing stashes, discards or forces.
 - **`origin` only.**
 - **The served root is mutable**; the handler must not capture it.
 - **Both hosts, one handler.**
@@ -183,11 +254,43 @@ Rejected: refusing to search upward, which reports "not a git repo" in the most
 common case; a confirmation prompt for a read-only lookup; a configuration flag
 nobody asked for.
 
+**Refuse on any dirt, decided before `checkout`.** Rejected: invoking `checkout` and
+mapping git's refusal, which silently carries a modified file onto the new branch
+whenever that file is identical in both commits, and whose message is on a stderr
+stream this package drains unread by design.
+
+**Changing branch is off unless configured.** Rejected: available wherever the
+served directory is a repository — it is the first browser-initiated change to the
+user's own checkout, and read-only remains the default posture.
+
+**Disclose the two repositories; do not reconcile them.** Rejected: assuming the
+configured repository and the served `origin` agree, which `POST /__vs/dir/pick`
+makes false at runtime.
+
+**Name the pull request inside the surface that is on screen.** Rejected: a
+mode-aware chip carrying worktree state into the main header — that header is not
+rendered during review at all, so the misreading it corrected could not occur.
+
+**Omit the head repository.** Rejected: adding it to `PullRequestSummary` for fork
+pull requests, where its source is null once the fork is deleted and no display
+consumes it.
+
 ## Out of Scope
 
-- Any git write operation.
-- Working-tree status.
+- Git writes other than changing branch, which Unit 5 admits deliberately and
+  narrowly. Creating, deleting, renaming, merging, rebasing, committing, pushing and
+  stashing all remain out.
+- Working-tree status beyond the dirty check R-5.4 requires to refuse a change.
 - Remotes other than `origin`.
 - Commit history, log, blame, tags.
 - Bare repositories.
-- Reconciling the served directory's remote against the `--repo` flag.
+- Resolving a difference between the configured collaboration repository and the
+  served `origin`. Unit 8 names it; nothing changes either.
+- The head repository of a pull request, including fork attribution.
+
+> **Reversal note.** The first three entries above previously read "Any git write
+> operation", "Working-tree status" and "Reconciling the served directory's remote
+> against the `--repo` flag", with no qualification. Units 5–8 narrow them on
+> purpose. The original exclusions were right for a chain that only read; they stop
+> being right at the moment the header both changes the branch and displays a count
+> belonging to a repository it may not be naming.

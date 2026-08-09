@@ -76,3 +76,158 @@ where it has consequences.
 | R-4.1 | WHEN the user is presented with the apply scope chooser, THE SYSTEM SHALL display the head the run will edit, as defined by R-4.3. |
 | R-4.2 | WHERE no branch is known — state `none`, or the first read has not completed — THE SYSTEM SHALL display no branch there, and SHALL NOT block the apply run. |
 | R-4.3 | WHERE `detached` is true, THE SYSTEM SHALL present the displayed sha in the scope chooser as a detached HEAD rather than as a branch name; WHERE `detached` is false, THE SYSTEM SHALL display the branch name. |
+
+## Unit 5: Listing and switching branches
+
+**Why:** Units 1–4 are a reader, and the LLD put "any git write operation" out of
+scope on purpose. This unit reverses that, so it has to carry its own justification
+rather than inherit one: the user asked to change branch from the header, and the
+alternative — leaving for a terminal — is the same context switch R-3.10 was written
+to accommodate.
+
+The reversal is contained rather than general. R-1.10 still holds for
+`core/git-context.ts`; the write lives in a separate module, and the capability is
+absent unless configuration turns it on. It is the first browser-initiated change to
+the user's own checkout, which is why it is off by default.
+
+The refusal rule is the load-bearing part. `git checkout` **succeeds** when a
+modified file is identical in both commits, silently carrying the edit onto the new
+branch — for a documentation repository that is the ordinary case, not the exotic
+one. Letting git decide would therefore move uncommitted work while reporting
+success. The switch is refused on any dirt instead, decided before `checkout` runs.
+
+The paths in that refusal cannot come from git's own message: `core/git-context.ts`
+discards stderr because git writes absolute paths into it and R-1.11 forbids those
+crossing the boundary. They come from `git status --porcelain`, which reports
+repository-relative paths on stdout.
+
+Those paths have to survive the trip verbatim. `git status --porcelain` quotes and
+C-escapes any path containing a space or a non-ASCII byte unless `-z` is used, so a
+refusal built on the default output would name `"my notes.md"` — a string that is not
+a path to any file the user has. R-6.6 renders exactly those strings to the user, so
+the escaping is not cosmetic: it is the difference between naming the file that
+blocked the change and naming something that does not exist. A rename or copy record
+carries two paths, and both of them are places the user's uncommitted work currently
+is; reporting only one of them under-reports what the refusal is about. That rule was
+asserted in a test with no requirement above it, which is why it is stated here now.
+
+| ID | EARS statement |
+| --- | --- |
+| R-5.1 | THE SYSTEM SHALL determine the list of local branches, and the branches of `origin`, by invoking `git` against the served directory. |
+| R-5.2 | THE SYSTEM SHALL report, for each local branch, its name, whether it is the current branch, and its ahead and behind counts relative to its upstream WHERE an upstream exists. |
+| R-5.3 | THE branch-writing module SHALL be separate from the git-context module, and R-1.10 SHALL continue to hold for the git-context module. |
+| R-5.4 | THE SYSTEM SHALL determine whether the working tree is dirty by invoking `git status --porcelain`, and SHALL report each reported path repository-relative and verbatim, without quoting or escaping; WHERE a record reports a rename or copy, THE SYSTEM SHALL report both the resulting path and the original. |
+| R-5.5 | BEFORE changing branch, THE SYSTEM SHALL evaluate R-5.4; IF any path is reported, THE SYSTEM SHALL refuse the change and SHALL NOT invoke `checkout`. |
+| R-5.6 | THE SYSTEM SHALL NOT stash, discard, force or otherwise modify uncommitted work in order to change branch. |
+| R-5.7 | THE SYSTEM SHALL change branch only to a branch that already exists locally, or to a branch of `origin` for which a tracking branch is created; THE SYSTEM SHALL NOT create a branch from an arbitrary name supplied by the client. |
+| R-5.8 | WHEN a branch change succeeds, THE SYSTEM SHALL ensure the collaboration ignore entry is present in `.gitignore` before reporting success. |
+| R-5.9 | WHEN a branch change succeeds, THE SYSTEM SHALL report the git context of Unit 1 as read after the change, and the client SHALL NOT infer the resulting context. |
+| R-5.10 | THE SYSTEM SHALL emit only branch names, ahead and behind counts, and repository-relative paths beyond the process boundary, and SHALL NOT emit absolute filesystem paths or git's error output. |
+| R-5.11 | IF `git` cannot be started, exits non-zero, or refuses the directory, THE SYSTEM SHALL report the failure and SHALL NOT throw. |
+| R-5.12 | IF a branch change succeeds and the ignore entry of R-5.8 cannot be written, THE SYSTEM SHALL report the branch as changed, carrying the git context of R-5.9, and SHALL report that the entry was not written without emitting git's or the filesystem's error text. |
+
+**Note on R-5.8:** `.gitignore` is tracked, so a branch whose `.gitignore` predates
+the collaboration entry un-ignores `.visual-spec/` — which turns every mounted
+pull-request worktree into thousands of untracked entries in `git status`. The
+existing guarantee runs when a worktree is mounted and never again; a branch change
+is the second moment it must run.
+
+**Note on R-5.12:** that entry is written through the filesystem rather than through
+git, so it can fail for reasons git never sees — a read-only checkout, a read-only
+volume — and Node puts the absolute path of the file into the error it raises. This is
+the only route in the package that writes, so it is the only place such an error could
+reach the boundary R-1.11 and R-5.10 draw. Reporting the change as a failure would be
+worse than the leak: the branch really did move, R-6.7 has the client adopt the
+returned context and nothing else, so a failure would leave the chip naming a branch
+the repository has already left.
+
+## Unit 6: Changing branch from the header
+
+**Why:** The capability of Unit 5 is only useful where the branch is already
+displayed, and it must be indistinguishable from absent when configuration has not
+enabled it — not present-and-failing.
+
+The confirmation guards the main document editor. The collaboration editor is on a
+surface that replaces this header entirely, so it cannot be unsaved while this
+control is on screen.
+
+| ID | EARS statement |
+| --- | --- |
+| R-6.1 | WHERE branch changing is enabled by configuration, THE SYSTEM SHALL render the branch in the chip as a control that opens a list of the branches of R-5.1. |
+| R-6.2 | WHERE branch changing is not enabled by configuration, THE SYSTEM SHALL render the branch exactly as Unit 3 specifies and SHALL NOT render a control. |
+| R-6.3 | WHERE branch changing is not enabled by configuration, THE SYSTEM SHALL NOT expose the routes of Unit 5. |
+| R-6.4 | WHERE `detached` is true, THE SYSTEM SHALL continue to satisfy R-3.9 and SHALL NOT present the displayed sha as a selectable branch. |
+| R-6.5 | WHEN the user selects a branch AND the main document editor holds unsaved changes, THE SYSTEM SHALL present the existing unsaved-changes confirmation before requesting the change. |
+| R-6.6 | IF a branch change is refused for a dirty working tree, THE SYSTEM SHALL display the reported paths and SHALL NOT offer to discard or stash them. |
+| R-6.7 | WHEN a branch change succeeds, THE SYSTEM SHALL display the context reported by R-5.9 and SHALL re-read the file tree. |
+| R-6.8 | IF the file open before the change does not exist on the new branch, THE SYSTEM SHALL return to the empty state and SHALL NOT display the previous file's contents. |
+| R-6.9 | THE SYSTEM SHALL NOT change branch as a consequence of any collaboration action. |
+
+## Unit 7: Open pull requests in the header
+
+**Why:** Each open pull request that carries a collaboration document is an active
+collaboration, and today the only way back into one is a full-surface swap the user
+has to know exists. Surfacing the count where the repository is already named makes
+them discoverable, and resuming one is a route that already exists.
+
+The count is of every open pull request, not only the collaborations, so that it
+agrees with the number GitHub itself displays. Which of them are collaborations is
+then a distinction drawn within the list.
+
+Whether a pull request is a collaboration is decided by the server from the body
+trailer, using the one parser that writes it. A second implementation in the client
+is how the two formats diverge.
+
+| ID | EARS statement |
+| --- | --- |
+| R-7.1 | WHERE collaboration is configured, THE SYSTEM SHALL display the number of open pull requests of the configured repository in the header chip. |
+| R-7.2 | WHERE collaboration is not configured, THE SYSTEM SHALL NOT display a count and SHALL NOT request it. |
+| R-7.3 | THE count SHALL be the number of all open pull requests, and SHALL NOT be filtered to collaboration documents. |
+| R-7.4 | THE SYSTEM SHALL determine the collaboration document identifier of a pull request on the server, from the pull request body, using the same parser that writes it. |
+| R-7.5 | THE client SHALL NOT parse the pull request body. |
+| R-7.6 | WHEN the user opens the count, THE SYSTEM SHALL display the open pull requests, distinguishing those that carry a collaboration document from those that do not. |
+| R-7.7 | WHERE a pull request carries a collaboration document, THE SYSTEM SHALL offer to resume that collaboration by its document identifier. |
+| R-7.8 | WHERE a pull request carries no collaboration document, THE SYSTEM SHALL offer to review it. |
+| R-7.9 | THE SYSTEM SHALL bound the number of pull requests rendered in the list, and SHALL state that the list is bounded WHERE it has been truncated, and SHALL NOT bound the count of R-7.1. |
+| R-7.10 | WHEN the component mounts, and again whenever the window receives focus or the document becomes visible, THE SYSTEM SHALL read the open pull requests; THE SYSTEM SHALL NOT poll on a timer. |
+| R-7.11 | IF the read fails, THE SYSTEM SHALL retain the last known count and SHALL NOT replace the chip with an error. |
+
+## Unit 8: Naming the repository the count belongs to
+
+**Why:** The chip's `owner/repo` is read from the served directory's `origin`
+(R-1.7). The pull request count is read from the configured collaboration
+repository. Nothing has ever reconciled the two, and the served directory can be
+re-rooted at runtime into a different repository while the configuration stays
+fixed — so the count of one repository can render inside a chip naming another.
+
+Unit 1's out-of-scope list declined to reconcile them, which was correct while
+nothing displayed both. R-7.1 displays both.
+
+The rule is attribution, not difference. Written as a difference test it says nothing
+about states `local` and `none`, where the chip asserts there is no remote repository
+at all and then shows a count of pull requests — a number with no referent anywhere on
+screen. There is nothing for the count to differ from in those states, and that is
+precisely when naming its repository matters most. So the condition is whether the
+chip already names the count's repository, which is false whenever the served
+directory has no recognised `origin` as well as when the two names disagree.
+
+| ID | EARS statement |
+| --- | --- |
+| R-8.1 | WHERE the chip does not already name the `origin` of the served directory as the configured collaboration repository — because the two differ, or because the served directory has no recognised `origin` — THE SYSTEM SHALL name the repository the count belongs to. |
+| R-8.2 | WHEN the configured collaboration repository matches the `origin` of the served directory, THE SYSTEM SHALL NOT add that naming. |
+| R-8.3 | THE SYSTEM SHALL NOT resolve the difference by changing either repository. |
+
+## Unit 9: Naming the pull request under review
+
+**Why:** The collaboration surface replaces this header with its own, which reads
+`Collaboration review` and never says which pull request is on screen — although the
+review component already holds the pull request and the worktree it was mounted
+from. The tree being displayed is a detached checkout at a commit, so there is no
+branch to name and naming one would be false.
+
+| ID | EARS statement |
+| --- | --- |
+| R-9.1 | WHILE a pull request is under review, THE collaboration surface SHALL display its number and the short commit sha of the mounted tree. |
+| R-9.2 | THE SYSTEM SHALL NOT present a branch name for a mounted pull request tree. |
+| R-9.3 | THE SYSTEM SHALL present the mounted tree as read-only. |
+| R-9.4 | THE SYSTEM SHALL derive this from the state the review surface already holds, and SHALL NOT read git or the network to obtain it. |
