@@ -131,6 +131,31 @@ function LinkIcon({ size = 12 }: { size?: number }) {
   );
 }
 
+/** The branch chip's own glyph — it is a pill in its own right now, so it carries a mark. */
+function BranchIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block', flexShrink: 0 }} aria-hidden>
+      <line x1="6" y1="3" x2="6" y2="15" />
+      <circle cx="18" cy="6" r="3" />
+      <circle cx="6" cy="18" r="3" />
+      <path d="M18 9a9 9 0 0 1-9 9" />
+    </svg>
+  );
+}
+
+/** The count chip's glyph. Same shape the sidebar's nav item uses, for the same subject. */
+function PullRequestChipIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block', flexShrink: 0 }} aria-hidden>
+      <circle cx="6" cy="18" r="3" />
+      <circle cx="6" cy="6" r="3" />
+      <path d="M6 9v6" />
+      <circle cx="18" cy="18" r="3" />
+      <path d="M13 6h3a2 2 0 0 1 2 2v7" />
+    </svg>
+  );
+}
+
 /**
  * How a HEAD is worded, in ONE place (R-3.9 / R-4.3). A detached HEAD's "branch"
  * is a 7-character hex string, and rendered bare it reads as a branch literally
@@ -145,12 +170,127 @@ function LinkIcon({ size = 12 }: { size?: number }) {
 const DETACHED_TITLE = 'detached HEAD';
 const headText = (branch: string, detached: boolean) => (detached ? `${DETACHED_TITLE} @ ${branch}` : branch);
 
-/** The chip's branch slot. */
+/* ------------------------------------------------------------------ *
+ * The tooltip the chips wear.
+ *
+ * The chips truncate — a repository or branch name long enough to ellipsize is common,
+ * and the whole point of truncating rather than clipping is that the full value is still
+ * *available*. `title` was how it was available, and `title` is the wrong tool for it: a
+ * ~1s browser delay, no styling, no keyboard reach on a non-focusable element, and it
+ * renders in a font that belongs to the OS rather than to this header.
+ *
+ * SHOWN ON FOCUS AS WELL AS HOVER. A truncated branch name is exactly the sort of thing a
+ * keyboard user needs, and the branch switcher is a button they can already reach.
+ * `aria-describedby` points at the bubble so a screen reader gets the full string too,
+ * which `title` did unreliably and only sometimes.
+ * ------------------------------------------------------------------ */
+
+/**
+ * A short hover delay, so dragging the pointer across a row of three chips does not
+ * strobe three bubbles on the way past. Focus is immediate — a keyboard user asked.
+ */
+const TOOLTIP_DELAY_MS = 320;
+
+/** Reduced motion is honoured, so the fade needs a stylesheet rather than an inline style. */
+const TOOLTIP_CSS =
+  '@keyframes vs-tip-in{from{opacity:0;transform:translate(-50%,-2px)}to{opacity:1;transform:translate(-50%,0)}}' +
+  '.vs-tip{animation:vs-tip-in 120ms ease-out}' +
+  '@media (prefers-reduced-motion: reduce){.vs-tip{animation:none}}';
+
+let tooltipSeq = 0;
+
+function Tooltip({ label, children }: { label: string; children: ReactNode }) {
+  const [shown, setShown] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Focus that arrived by pointer is not a request to be told what the control is. */
+  const pointerDown = useRef(false);
+  // `useId` would be tidier, but this file targets React 18 without it in scope here and
+  // a module counter is stable across renders for the same mounted tooltip.
+  const idRef = useRef<string | null>(null);
+  idRef.current ??= `vs-tip-${(tooltipSeq += 1)}`;
+  const id = idRef.current;
+
+  const cancel = useCallback(() => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = null;
+  }, []);
+  // A tooltip left on screen by an unmount that raced its own timer is the classic leak
+  // here; the pending timer is the thing that has to go, not just the visible state.
+  useEffect(() => cancel, [cancel]);
+
+  const show = useCallback(() => {
+    cancel();
+    timer.current = setTimeout(() => setShown(true), TOOLTIP_DELAY_MS);
+  }, [cancel]);
+  const hide = useCallback(() => {
+    cancel();
+    setShown(false);
+  }, [cancel]);
+
+  return (
+    <span
+      style={tipWrap}
+      onMouseEnter={show}
+      onMouseLeave={hide}
+      /*
+       * Acting on the control dismisses its own hint. Two of these chips open a popover
+       * directly beneath themselves, and the bubble sat on top of it — explaining a
+       * control the user had already used, over the answer they had just asked for.
+       * `mousedown` rather than `click`, so it goes before the popover arrives.
+       */
+      onMouseDown={() => {
+        // `mousedown` → `focus` → `click`, so without this flag the focus handler below
+        // would put the bubble straight back up on the way to opening the popover.
+        pointerDown.current = true;
+        hide();
+      }}
+      onFocus={() => {
+        if (pointerDown.current) {
+          pointerDown.current = false;
+          return;
+        }
+        cancel();
+        setShown(true);
+      }}
+      onBlur={() => {
+        pointerDown.current = false;
+        hide();
+      }}
+      // R-1.x's escape habit: every transient layer in this header closes on Escape.
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') hide();
+      }}
+    >
+      {/*
+        `aria-describedby` names the bubble whether or not it is rendered. Pointing at a
+        missing id is ignored by assistive tech, and wiring it only while shown would mean
+        the description appears mid-interaction rather than being part of the control.
+      */}
+      <span aria-describedby={id} style={tipAnchor}>
+        {children}
+      </span>
+      {shown && (
+        <span role="tooltip" id={id} className="vs-tip" style={tipBubble} data-vs-tooltip>
+          <style>{TOOLTIP_CSS}</style>
+          {label}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * The chip's branch slot, when there is no switcher to make it a button.
+ *
+ * The tooltip carries the full ref rather than only the words "detached HEAD": on a
+ * detached HEAD the visible text is already truncated to something like
+ * `detached HEAD @ a1b2…`, so the thing worth revealing is the whole of it.
+ */
 function BranchLabel({ branch, detached }: { branch: string; detached: boolean }) {
   return (
-    <span style={gitBranchText} title={detached ? DETACHED_TITLE : undefined}>
-      {headText(branch, detached)}
-    </span>
+    <Tooltip label={headText(branch, detached)}>
+      <span style={gitBranchText}>{headText(branch, detached)}</span>
+    </Tooltip>
   );
 }
 
@@ -243,41 +383,66 @@ function GitChip({ actions }: { actions?: HeaderActions }) {
    * one, which is what R-6.2 forbids.
    */
   const switchable = branches.enabled === true;
-  const branchSlot = (branch: string, detached: boolean) =>
-    switchable ? (
-      <button
-        type="button"
-        onClick={() => toggle('branches')}
-        data-testid="git-branch-switch"
-        title={detached ? `${DETACHED_TITLE} — choose a branch to check out` : 'Change branch'}
-        style={branchBtn}
-      >
-        {/*
-          Wrapped rather than bare. A bare text node is an anonymous flex item, which
-          cannot take `text-overflow`, so a long branch name was clipped mid-character —
-          and took the ▾ with it, leaving a dropdown with no affordance that it was one.
-        */}
-        <span style={branchBtnLabel}>{headText(branch, detached)}</span>
-        <span style={gitDot}>▾</span>
-      </button>
-    ) : (
-      <BranchLabel branch={branch} detached={detached} />
-    );
 
+  /*
+   * The branch, as its own chip.
+   *
+   * It used to sit inside the repository's pill behind a `·`, which made one pill mean
+   * two things and forced them to share a width — the arrangement that let a long
+   * repository name push the branch off the edge. Two pills cannot do that to each
+   * other: each truncates its own content and neither can consume the other's room.
+   */
+  const branchChip = (branch: string, detached: boolean, tone: React.CSSProperties) => {
+    const full = headText(branch, detached);
+    return switchable ? (
+      <Tooltip label={detached ? `${full} — choose a branch to check out` : `${full} — change branch`}>
+        <button type="button" onClick={() => toggle('branches')} data-testid="git-branch-switch" style={{ ...gitChip, ...tone, ...branchBtn }}>
+          <BranchIcon />
+          {/*
+            Wrapped rather than bare. A bare text node is an anonymous flex item, which
+            cannot take `text-overflow`, so a long branch name was clipped mid-character —
+            and took the ▾ with it, leaving a dropdown with no affordance that it was one.
+          */}
+          <span style={branchBtnLabel}>{full}</span>
+          <span style={gitDot}>▾</span>
+        </button>
+      </Tooltip>
+    ) : (
+      <span style={{ ...gitChip, ...tone }} data-testid="git-branch-chip">
+        <BranchIcon />
+        <BranchLabel branch={branch} detached={detached} />
+      </span>
+    );
+  };
+
+  /*
+   * `git-chip` names the GROUP, not a pill.
+   *
+   * Splitting the pill would otherwise have split what the id refers to, and every
+   * assertion that reads the chip's text as one string — "it says the repository AND the
+   * branch" — is a claim about the header's git statement rather than about a particular
+   * pill. The statement survived the split; only its packaging changed.
+   */
   const body = (() => {
     if (ctx == null) {
       return (
-        <span style={{ ...gitChip, ...gitTonePending }} data-testid="git-chip" title="Reading git context…" aria-busy="true">
-          <span style={gitPlaceholderBar} aria-hidden />
+        <span style={gitGroup} data-testid="git-chip" aria-busy="true">
+          <span style={{ ...gitChip, ...gitTonePending }}>
+            <span style={gitPlaceholderBar} aria-hidden />
+          </span>
         </span>
       );
     }
 
     if (ctx.state === 'none') {
       return (
-        <span style={{ ...gitChip, ...gitToneNone }} data-testid="git-chip" title="This directory is not inside a git repository">
-          <BranchOffIcon />
-          <span>not a git repo</span>
+        <span style={gitGroup} data-testid="git-chip">
+          <Tooltip label="This directory is not inside a git repository">
+            <span style={{ ...gitChip, ...gitToneNone }} data-testid="git-repo-chip">
+              <BranchOffIcon />
+              <span>not a git repo</span>
+            </span>
+          </Tooltip>
           <PullCount ctx={ctx} pulls={pulls} onOpen={() => toggle('pulls')} />
         </span>
       );
@@ -290,15 +455,14 @@ function GitChip({ actions }: { actions?: HeaderActions }) {
       // remote the user can see in their own git config.
       const unrecognised = Boolean(ctx.url);
       return (
-        <span
-          style={{ ...gitChip, ...gitToneLocal }}
-          data-testid="git-chip"
-          title={unrecognised ? `Remote not recognised · ${ctx.url}` : 'No remote is configured for this repository'}
-        >
-          <UnplugIcon />
-          {branchSlot(ctx.branch, ctx.detached)}
-          <span style={gitDot}>·</span>
-          <span>{unrecognised ? 'unrecognised remote' : 'no remote'}</span>
+        <span style={gitGroup} data-testid="git-chip">
+          <Tooltip label={unrecognised ? `Remote not recognised · ${ctx.url}` : 'No remote is configured for this repository'}>
+            <span style={{ ...gitChip, ...gitToneLocal }} data-testid="git-repo-chip">
+              <UnplugIcon />
+              <span style={gitRepoText}>{unrecognised ? 'unrecognised remote' : 'no remote'}</span>
+            </span>
+          </Tooltip>
+          {branchChip(ctx.branch, ctx.detached, gitToneLocal)}
           <PullCount ctx={ctx} pulls={pulls} onOpen={() => toggle('pulls')} />
         </span>
       );
@@ -311,22 +475,26 @@ function GitChip({ actions }: { actions?: HeaderActions }) {
     const label = `${ctx.owner}/${ctx.repo}`;
     const linkable = ctx.host === 'github.com';
     return (
-      <span style={{ ...gitChip, ...gitToneRemote }} data-testid="git-chip" title={ctx.url}>
-        <LinkIcon />
-        {linkable ? (
-          <a
-            href={`https://github.com/${ctx.owner}/${ctx.repo}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            style={gitRepoLink}
-          >
-            {label}
-          </a>
-        ) : (
-          <span style={gitRepoText}>{label}</span>
-        )}
-        <span style={gitDot}>·</span>
-        {branchSlot(ctx.branch, ctx.detached)}
+      <span style={gitGroup} data-testid="git-chip">
+        {/* The full `owner/repo` and the origin URL — the two things truncation hides. */}
+        <Tooltip label={`${label} · ${ctx.url}`}>
+          <span style={{ ...gitChip, ...gitToneRemote }} data-testid="git-repo-chip">
+            <LinkIcon />
+            {linkable ? (
+              <a
+                href={`https://github.com/${ctx.owner}/${ctx.repo}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={gitRepoLink}
+              >
+                {label}
+              </a>
+            ) : (
+              <span style={gitRepoText}>{label}</span>
+            )}
+          </span>
+        </Tooltip>
+        {branchChip(ctx.branch, ctx.detached, gitToneRemote)}
         <PullCount ctx={ctx} pulls={pulls} onOpen={() => toggle('pulls')} />
       </span>
     );
@@ -381,24 +549,29 @@ function PullCount({ ctx, pulls, onOpen }: { ctx: GitContext; pulls: CollabPulls
   if (pulls.configured !== true || pulls.pulls === null) return null;
   const count = pulls.pulls.length;
   const named = namesCountRepo(ctx, pulls.repo);
+  const plural = `${count} open pull request${count === 1 ? '' : 's'}`;
+  /*
+   * R-8.1's disclosure rides in the tooltip AND stays on screen, because the two say
+   * different things: the visible `on owner/repo` is what stops an unlabelled number
+   * being read as this directory's, and the tooltip is where the *reason* fits without
+   * spending a header row on it.
+   */
+  const disclosure =
+    named && pulls.repo
+      ? ` — in ${pulls.repo.owner}/${pulls.repo.repo}, the configured collaboration repository, which is not this directory's origin`
+      : '';
   return (
-    <>
-      <span style={gitDot}>·</span>
-      <button
-        type="button"
-        onClick={onOpen}
-        data-testid="git-pull-count"
-        title={`${count} open pull request${count === 1 ? '' : 's'} — click to list them`}
-        style={pullCountBtn}
-      >
+    <Tooltip label={`${plural}${disclosure} — click to list them`}>
+      <button type="button" onClick={onOpen} data-testid="git-pull-count" style={{ ...gitChip, ...gitTonePulls, ...pullCountBtn }}>
+        <PullRequestChipIcon />
         {count} open
+        {named && pulls.repo && (
+          <span data-testid="git-pull-count-repo" style={pullRepoNote}>
+            on {pulls.repo.owner}/{pulls.repo.repo}
+          </span>
+        )}
       </button>
-      {named && pulls.repo && (
-        <span data-testid="git-pull-count-repo" style={pullRepoNote} title="The count belongs to the configured collaboration repository, which is not this directory's origin">
-          on {pulls.repo.owner}/{pulls.repo.repo}
-        </span>
-      )}
-    </>
+    </Tooltip>
   );
 }
 
@@ -1978,29 +2151,29 @@ const pathFile: React.CSSProperties = { font: '600 11.5px ui-monospace, "SF Mono
 // ---- The git context chip. One shape, four tones — the tone carries the state
 // alongside the icon, never instead of it.
 /*
- * WHAT GIVES WAY WHEN THE CHIP RUNS OUT OF ROOM.
+ * WHAT GIVES WAY WHEN THE ROW RUNS OUT OF ROOM.
  *
- * It used to be whatever came last. The chip clips its overflow and every child had the
- * same claim on the width, so `metuur-ai/visual-spec-collaboration-test · spike/anchor-test
- * · 3 open` rendered the repository in full and cut the branch AND the pull request count
- * off the right-hand edge entirely. Both were in the accessibility tree and neither was on
- * screen: the count is a button, so this was a control that existed and could not be
- * pressed, on the one repository whose name was long enough to hide it.
+ * These were one pill. Everything in it had the same claim on one width, so
+ * `metuur-ai/visual-spec-collaboration-test · spike/anchor-test · 3 open` rendered the
+ * repository in full and cut the branch AND the count off the clipped right edge — both
+ * still in the accessibility tree, neither on screen. The count is a button, so that was
+ * a control that existed and could not be pressed, on exactly the repositories whose
+ * names are long enough to hide it.
  *
- * The order of sacrifice is now stated rather than incidental, and it is the reverse of
- * the reading order — the repository is the most expendable of the three, because it is
- * also the underlined link, its own `title`, and the one fact the user is least likely to
- * have forgotten about the directory they opened. So `gitRepoText` shrinks and ellipsizes,
- * and everything after it is `flexShrink: 0`.
+ * Three pills cannot do that to each other: each clips its own content, so the worst a
+ * long repository name can now do is ellipsize itself. The order of sacrifice still
+ * matters for the row as a whole, and it is the reverse of reading order — the repository
+ * is the most expendable, being also the link and the tooltip, so it shrinks first and the
+ * count never shrinks at all.
  */
+const gitGroup: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 0 };
 const gitChip: React.CSSProperties = {
   display: 'inline-flex',
   alignItems: 'center',
   gap: 5,
   flexShrink: 1,
-  // Wide enough that the common case never truncates at all; `minWidth` keeps the pill
-  // from collapsing past the point where the count is still readable.
-  maxWidth: 420,
+  // Per pill now, not for the three of them together.
+  maxWidth: 260,
   minWidth: 0,
   overflow: 'hidden',
   padding: '2px 8px',
@@ -2015,6 +2188,16 @@ const gitTonePending: React.CSSProperties = { background: '#f8fafc', border: '1p
 const gitToneNone: React.CSSProperties = { background: '#f1f5f9', border: '1px solid #e2e8f0', color: '#64748b' };
 const gitToneLocal: React.CSSProperties = { background: '#fffbeb', border: '1px solid #fde68a', color: '#b45309' };
 const gitToneRemote: React.CSSProperties = { background: '#f0fdf4', border: '1px solid #bbf7d0', color: '#15803d' };
+/**
+ * The count wears violet, not the git states' green.
+ *
+ * It is the one pill in the row that is not describing git: the others say where you are,
+ * this one is a control that opens a list of pull requests. Violet is what the rest of
+ * this product uses for collaboration — the sidebar's "Pull requests" item, the resume
+ * buttons, the apply run — so the colour is the categorical difference, and it matches the
+ * surface the pill actually opens.
+ */
+const gitTonePulls: React.CSSProperties = { background: '#f5f3ff', border: '1px solid #ddd6fe', color: '#6d28d9' };
 // A bar rather than a spinner or an ellipsis: it occupies the chip's width so the
 // header does not reflow when the first read lands.
 const gitPlaceholderBar: React.CSSProperties = { display: 'inline-block', width: 68, height: 8, borderRadius: 999, background: '#e2e8f0' };
@@ -2034,16 +2217,40 @@ const gitDot: React.CSSProperties = { opacity: 0.5, flexShrink: 0 };
 const gitChipWrap: React.CSSProperties = { position: 'relative', display: 'inline-flex', flexShrink: 0, minWidth: 0 };
 // The switcher wears the branch's own type, not a button's: it is the same text Unit 3
 // renders, and only the affordance is new.
-const branchBtn: React.CSSProperties = { ...gitBranchText, display: 'inline-flex', alignItems: 'center', gap: 3, maxWidth: 160, padding: 0, border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', whiteSpace: 'nowrap' };
+const branchBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: 200, font: '600 11px ui-monospace, "SF Mono", monospace', cursor: 'pointer', whiteSpace: 'nowrap' };
 /** The branch name inside the switcher: it truncates, and the ▾ beside it does not. */
 const branchBtnLabel: React.CSSProperties = { overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 };
 /**
  * The count never yields. It is the only control in the chip, and a control clipped to
  * nothing is worse than one that was never rendered — nothing on screen says it is there.
  */
-const pullCountBtn: React.CSSProperties = { flexShrink: 0, whiteSpace: 'nowrap', padding: 0, border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', font: '600 11px system-ui', textDecoration: 'underline', textUnderlineOffset: 2 };
+const pullCountBtn: React.CSSProperties = { flexShrink: 0, whiteSpace: 'nowrap', cursor: 'pointer', font: '600 11px system-ui' };
 /** R-8.1's disclosure. Prose, so it may shrink — but only after the count is safe. */
 const pullRepoNote: React.CSSProperties = { font: '11px ui-monospace, "SF Mono", monospace', opacity: 0.75, overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0, flexShrink: 1 };
+
+/* The tooltip. Dark, so it reads as an overlay rather than as another chip. */
+const tipWrap: React.CSSProperties = { position: 'relative', display: 'inline-flex', minWidth: 0, maxWidth: '100%' };
+const tipAnchor: React.CSSProperties = { display: 'inline-flex', minWidth: 0, maxWidth: '100%' };
+const tipBubble: React.CSSProperties = {
+  position: 'absolute',
+  top: 'calc(100% + 7px)',
+  left: '50%',
+  transform: 'translateX(-50%)',
+  zIndex: 60,
+  // Wide enough for `owner/repo · git@github.com:owner/repo.git`, and it wraps past that
+  // rather than truncating — a tooltip that elided its own text would have no purpose.
+  maxWidth: 380,
+  width: 'max-content',
+  padding: '5px 9px',
+  borderRadius: 7,
+  background: '#0f172a',
+  color: '#f8fafc',
+  font: '500 11px/1.45 system-ui',
+  whiteSpace: 'normal',
+  overflowWrap: 'anywhere',
+  boxShadow: '0 8px 24px rgba(15,23,42,0.28)',
+  pointerEvents: 'none',
+};
 // Left-aligned, unlike the right-hand popovers: this one hangs off a chip that sits at
 // the left edge of the header.
 const gitPop: React.CSSProperties = { position: 'absolute', left: 0, top: 'calc(100% + 6px)', width: 340, maxWidth: '82vw', background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 16px 48px rgba(76,29,149,0.18)', zIndex: 41, overflow: 'hidden', color: '#334155', font: '13px system-ui', fontWeight: 400 };

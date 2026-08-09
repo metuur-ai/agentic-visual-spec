@@ -88,6 +88,18 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+/**
+ * Hover a chip and wait for its tooltip.
+ *
+ * The delay is real (`TOOLTIP_DELAY_MS`), so this polls rather than asserting on the next
+ * tick — `findByRole` outlasts it comfortably, and using the real delay keeps the test
+ * honest about the fact that there is one.
+ */
+async function hover(el: HTMLElement): Promise<HTMLElement> {
+  fireEvent.mouseEnter(el);
+  return await screen.findByRole('tooltip');
+}
+
 /** Renders the main header over a given git context and hands back the chip. */
 async function mountChip(git: unknown): Promise<HTMLElement> {
   installFetch(git);
@@ -154,7 +166,9 @@ describe('state local (R-3.4 / R-3.5)', () => {
     const chip = await mountChip({ state: 'local', branch: 'main', detached: false, url });
     await waitFor(() => expect(chip.textContent).toContain('unrecognised remote'));
     expect(chip.textContent).toContain('main');
-    expect(chip.getAttribute('title')).toContain(url);
+    // The URL is disclosed on hover — the chip's own tooltip now, not the browser's
+    // `title`. What R-3.5 requires is that the URL be reachable, not which layer shows it.
+    expect((await hover(screen.getByTestId('git-repo-chip'))).textContent).toContain(url);
   });
 
   /*
@@ -219,8 +233,10 @@ describe('a detached HEAD is presented as one (R-3.9)', () => {
       url: 'https://github.com/acme/docs.git',
     });
     await waitFor(() => expect(chip.textContent).toContain('a1b2c3d'));
+    // R-3.9 — the sha is labelled in the visible text, so the tooltip is a second
+    // statement of it rather than the only one.
     expect(chip.textContent).toContain('detached');
-    expect(within(chip).getByTitle('detached HEAD')).toBeTruthy();
+    expect((await hover(within(chip).getByText(/detached HEAD/))).textContent).toContain('detached HEAD');
   });
 
   it('a named branch carries no detached label', async () => {
@@ -418,12 +434,187 @@ describe('the chip sacrifices the repository name, never the branch or the count
     render(<MainHeader file="docs/spec.md" />);
     const branch = await screen.findByTestId('git-branch-switch');
 
-    expect(branch.style.maxWidth).toBe('160px');
+    expect(branch.style.maxWidth).toBe('200px');
     // The label truncates inside the button, so the ▾ is not clipped away with it —
     // a dropdown whose only affordance is the arrow must keep the arrow.
-    const [label, caret] = [...branch.children] as HTMLElement[];
+    // The pill is [glyph, label, caret]; the label is the only part allowed to give way.
+    const [, label, caret] = [...branch.children] as HTMLElement[];
+    expect(label.textContent).toContain('spike/a-very-long-branch-name');
     expect(label.style.textOverflow).toBe('ellipsis');
     expect(caret.textContent).toBe('▾');
     expect(caret.style.flexShrink).toBe('0');
+  });
+});
+
+/*
+ * Three pills, and the tooltip that makes truncation survivable.
+ *
+ * Truncating is only acceptable because the full value stays *available*. It used to be
+ * available through `title` — a ~1s browser delay, no styling, and unreachable by
+ * keyboard on a plain span. These pin the replacement: the full string on hover and on
+ * focus, and described to assistive tech rather than merely drawn.
+ */
+describe('the repository, the branch and the count are separate chips', () => {
+  const LONG_REMOTE = {
+    ...REMOTE_GITHUB,
+    owner: 'metuur-ai',
+    repo: 'visual-spec-collaboration-test',
+    branch: 'spike/anchor-test',
+    url: 'git@github.com:metuur-ai/visual-spec-collaboration-test.git',
+  };
+
+  function installSplit(git: unknown) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/__vs/git') return jsonRes(git);
+        if (url === '/__vs/git/branches') return jsonRes({ branches: ['main'], current: 'spike/anchor-test' });
+        if (url === '/__vs/collab') return jsonRes({ available: true, login: 'x', repo: { owner: 'metuur-ai', repo: 'visual-spec-collaboration-test' } });
+        if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: [{ number: 1, title: 't', state: 'open', draft: false, headBranch: 'b', baseBranch: 'main', headSha: 'a', htmlUrl: '', author: 'x', documentId: null }] });
+        if (url.startsWith('/__vs/comments')) return jsonRes([OPEN_COMMENT]);
+        if (url === '/__vs/source/root') return jsonRes({ root: '/repo' });
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+  }
+
+  it('renders them as three pills rather than one', async () => {
+    installSplit(LONG_REMOTE);
+    render(<MainHeader file="docs/spec.md" />);
+
+    const repo = await screen.findByTestId('git-repo-chip');
+    const branch = await screen.findByTestId('git-branch-switch');
+    const count = await screen.findByTestId('git-pull-count');
+
+    // Separate boxes: neither contains the other, so neither can eat the other's width.
+    expect(repo.contains(branch)).toBe(false);
+    expect(branch.contains(count)).toBe(false);
+    expect(repo.contains(count)).toBe(false);
+    // And each is a pill in its own right.
+    for (const pill of [repo, branch, count]) expect(pill.style.borderRadius).toBe('999px');
+  });
+
+  it('still reads as one git statement, so the group keeps the chip’s identity', async () => {
+    installSplit(LONG_REMOTE);
+    render(<MainHeader file="docs/spec.md" />);
+    const group = await screen.findByTestId('git-chip');
+
+    await waitFor(() => expect(group.textContent).toContain('metuur-ai/visual-spec-collaboration-test'));
+    expect(group.textContent).toContain('spike/anchor-test');
+    expect(group.textContent).toContain('1 open');
+  });
+
+  it('reveals the full repository and origin URL on hover', async () => {
+    installSplit(LONG_REMOTE);
+    render(<MainHeader file="docs/spec.md" />);
+
+    const tip = await hover(await screen.findByTestId('git-repo-chip'));
+    expect(tip.textContent).toContain('metuur-ai/visual-spec-collaboration-test');
+    expect(tip.textContent).toContain('git@github.com:metuur-ai/visual-spec-collaboration-test.git');
+  });
+
+  /* A truncated branch is exactly what a keyboard user needs, and the switcher is focusable. */
+  it('reveals the branch on focus, without waiting for a hover delay', async () => {
+    installSplit(LONG_REMOTE);
+    render(<MainHeader file="docs/spec.md" />);
+
+    fireEvent.focus(await screen.findByTestId('git-branch-switch'));
+    const tip = screen.getByRole('tooltip');
+    expect(tip.textContent).toContain('spike/anchor-test');
+  });
+
+  it('describes the chip to assistive tech rather than only drawing it', async () => {
+    installSplit(LONG_REMOTE);
+    render(<MainHeader file="docs/spec.md" />);
+
+    const branch = await screen.findByTestId('git-branch-switch');
+    fireEvent.focus(branch);
+    const tip = screen.getByRole('tooltip');
+    const described = branch.closest('[aria-describedby]') as HTMLElement;
+    expect(described.getAttribute('aria-describedby')).toBe(tip.id);
+  });
+
+  it('hides again on leave, and on Escape', async () => {
+    installSplit(LONG_REMOTE);
+    render(<MainHeader file="docs/spec.md" />);
+
+    const repo = await screen.findByTestId('git-repo-chip');
+    await hover(repo);
+    fireEvent.mouseLeave(repo);
+    await waitFor(() => expect(screen.queryByRole('tooltip')).toBeNull());
+
+    const branch = screen.getByTestId('git-branch-switch');
+    fireEvent.focus(branch);
+    expect(screen.getByRole('tooltip')).toBeTruthy();
+    fireEvent.keyDown(branch, { key: 'Escape' });
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  /* Nothing shows before the pointer settles, or the row would strobe on the way past. */
+  it('does not appear on the instant the pointer crosses a chip', async () => {
+    installSplit(LONG_REMOTE);
+    render(<MainHeader file="docs/spec.md" />);
+
+    const repo = await screen.findByTestId('git-repo-chip');
+    fireEvent.mouseEnter(repo);
+    expect(screen.queryByRole('tooltip')).toBeNull();
+    fireEvent.mouseLeave(repo);
+    // And a crossing that ended still leaves nothing behind once the delay elapses.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+});
+
+/*
+ * Clicking a chip is not a request to be told what it is.
+ *
+ * Two of these chips open a popover directly beneath themselves, and the bubble sat on
+ * top of it — explaining a control the user had already used, over the answer they had
+ * just asked for. The subtlety is the event order: mousedown → focus → click, so hiding
+ * on mousedown alone let the focus handler put it straight back up.
+ */
+describe('the tooltip gets out of the way when the chip is used', () => {
+  function installOne(git: unknown) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/__vs/git') return jsonRes(git);
+        if (url === '/__vs/git/branches') return jsonRes({ branches: ['main'], current: 'main' });
+        if (url === '/__vs/collab') return jsonRes({ available: true, login: 'x', repo: { owner: 'acme', repo: 'docs' } });
+        if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: [] });
+        if (url.startsWith('/__vs/comments')) return jsonRes([OPEN_COMMENT]);
+        if (url === '/__vs/source/root') return jsonRes({ root: '/repo' });
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+  }
+
+  it('closes on press and stays closed through the focus that follows it', async () => {
+    installOne(REMOTE_GITHUB);
+    render(<MainHeader file="docs/spec.md" />);
+
+    const branch = await screen.findByTestId('git-branch-switch');
+    await hover(branch);
+
+    // The real sequence a browser sends on a click.
+    fireEvent.mouseDown(branch);
+    fireEvent.focus(branch);
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  /* And a genuine keyboard focus, arriving with no pointer press, still shows it. */
+  it('still shows on a keyboard focus that did not follow a press', async () => {
+    installOne(REMOTE_GITHUB);
+    render(<MainHeader file="docs/spec.md" />);
+
+    const branch = await screen.findByTestId('git-branch-switch');
+    fireEvent.mouseDown(branch);
+    fireEvent.focus(branch);
+    fireEvent.blur(branch);
+
+    fireEvent.focus(branch);
+    expect(screen.getByRole('tooltip')).toBeTruthy();
   });
 });
