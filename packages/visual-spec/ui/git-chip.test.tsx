@@ -665,3 +665,43 @@ describe('the repository chip wears GitHub’s mark only where the host is GitHu
     expect(mark.getAttribute('aria-hidden')).toBe('true');
   });
 });
+
+/*
+ * The brand row's shrink contract.
+ *
+ * Splitting one chip into three made this row wider than it had ever been, and the chip
+ * area was `flex-shrink: 0` — fine for one narrow pill, an overflow for three. A
+ * no-shrink item in a row that has run out of width does not truncate; it spills out of
+ * the brand block and paints over the toolbar beside it.
+ *
+ * jsdom has no layout, so what is pinned here is the rule that decides the outcome: the
+ * path yields fastest, the chips yield, "Change…" never does. `flex-wrap` was tried as
+ * an alternative and is worse — flexbox wraps on hypothetical size and shrinks only
+ * afterwards, so the chips took a row of their own and "Change…" a third.
+ */
+describe('the brand row yields the served path before the git chips', () => {
+  it('lets the chip area shrink rather than overflow the brand block', async () => {
+    await mountChip(REMOTE_GITHUB);
+    const area = screen.getByTestId('git-chip-area');
+
+    expect(area.style.flexShrink).not.toBe('0');
+    expect(area.style.minWidth).toBe('0');
+  });
+
+  it('makes the path yield faster than the chips, and Change… not at all', async () => {
+    await mountChip(REMOTE_GITHUB);
+    const area = screen.getByTestId('git-chip-area');
+    const row = area.parentElement as HTMLElement;
+    const [path, , change] = [...row.children] as HTMLElement[];
+
+    expect(Number(path.style.flexShrink)).toBeGreaterThan(Number(area.style.flexShrink || 1));
+    expect(change.style.flexShrink).toBe('0');
+  });
+
+  /* The row is one line. Wrapping is what produced the three-row header. */
+  it('keeps the row on one line', async () => {
+    await mountChip(REMOTE_GITHUB);
+    const row = screen.getByTestId('git-chip-area').parentElement as HTMLElement;
+    expect(row.style.flexWrap === '' || row.style.flexWrap === 'nowrap').toBe(true);
+  });
+});

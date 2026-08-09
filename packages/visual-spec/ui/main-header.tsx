@@ -827,6 +827,19 @@ function Brand({ file, actions }: { file: string; actions?: HeaderActions }) {
           <span style={wordmark}>Visual Specs</span>
           <span style={byline}>by Uncle&#8209;Dev</span>
         </div>
+        {/*
+          NOWRAP, AND THE PATH IS WHAT GIVES. With a document open the toolbar is wide and
+          this row is left about 330px at 1280 for the served path, three git chips and
+          "Change…" — which the three of them fit into only if the path yields almost all
+          of it. `flex-wrap` was tried and is worse: flexbox wraps on an item's
+          hypothetical size and shrinks only afterwards, so the chips took a row of their
+          own and "Change…" a third, turning a tight row into a three-line header.
+
+          Collapsed, the path is an icon-only button that still carries the full path in
+          its tooltip and still copies it on click, and the open file's name is on the
+          content title bar directly below. So the fallback loses the directory from
+          sight, not from reach.
+        */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 5, minWidth: 0 }}>
           <button
             type="button"
@@ -2154,11 +2167,28 @@ const byline: React.CSSProperties = {
   borderRadius: 5,
   padding: '2px 6px',
 };
+/**
+ * The served path yields three times as fast as the git chips beside it.
+ *
+ * Both can shrink, so without a bias the browser takes width from them in proportion to
+ * their size — and the path is the longest thing in the row, so it would drag the chips
+ * down with it while it still had plenty of room to give. It is also the one item whose
+ * full value is a click away (it copies) and whose head is the least interesting part.
+ */
 const pathBtn: React.CSSProperties = {
   display: 'inline-flex',
   alignItems: 'center',
   gap: 6,
+  /*
+   * Yields three times as fast as the git chips beside it, and all the way to its icon.
+   *
+   * Both can shrink, so without a bias the browser takes width from them in proportion to
+   * size — and the path is the longest thing in the row, so it would drag the chips down
+   * with it while it still had plenty to give. It is also the only item here whose full
+   * value survives being hidden: the tooltip has it and a click copies it.
+   */
   minWidth: 0,
+  flexShrink: 3,
   border: '1px solid transparent',
   background: 'transparent',
   borderRadius: 7,
@@ -2236,7 +2266,14 @@ const gitRepoLink: React.CSSProperties = { ...gitRepoText, color: 'inherit', tex
 const gitDot: React.CSSProperties = { opacity: 0.5, flexShrink: 0 };
 // The positioned parent for both chip popovers. `gitChip` itself clips its overflow,
 // so a popover inside it would be cut off at the pill's edge.
-const gitChipWrap: React.CSSProperties = { position: 'relative', display: 'inline-flex', flexShrink: 0, minWidth: 0 };
+/*
+ * `flexShrink: 1`, and it has to be. While the chip was ONE pill it was narrow enough to
+ * refuse to shrink and still fit; three pills are not, and a `flexShrink: 0` chip area in
+ * a row that has run out of width does not truncate — it overflows the brand block and
+ * paints over the toolbar beside it. The pills each ellipsize, so letting the area shrink
+ * pushes the pressure down to where there is a graceful answer for it.
+ */
+const gitChipWrap: React.CSSProperties = { position: 'relative', display: 'inline-flex', flexShrink: 1, minWidth: 0 };
 // The switcher wears the branch's own type, not a button's: it is the same text Unit 3
 // renders, and only the affordance is new.
 const branchBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 4, maxWidth: 200, font: '600 11px ui-monospace, "SF Mono", monospace', cursor: 'pointer', whiteSpace: 'nowrap' };
