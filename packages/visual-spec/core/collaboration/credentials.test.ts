@@ -229,7 +229,12 @@ describe('preflightCollaboration — no credential disables collaboration (R-9.1
     expect(calls).toHaveLength(1);
 
     // Local mode's own config resolution is untouched by collaboration being off.
-    expect(resolveConfig({ surfacesDir: 'surfaces' })).toEqual({ surfacesDir: 'surfaces', collaboration: null });
+    expect(resolveConfig({ surfacesDir: 'surfaces' })).toEqual({
+      surfacesDir: 'surfaces',
+      collaboration: null,
+      // R-6.3 — off by omission, exactly as collaboration is.
+      git: { allowCheckout: false },
+    });
   });
 });
 

@@ -45,8 +45,8 @@ const src = (rel: string) => readFileSync(resolve(pkgRoot, rel), 'utf8');
 
 const REPO = { owner: 'acme', repo: 'specs', baseBranch: 'main' } as const;
 
-const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO } };
-const DISABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: null };
+const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO }, git: { allowCheckout: false } };
+const DISABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: null, git: { allowCheckout: false } };
 
 const OK_PREFLIGHT: CollaborationPreflight = {
   available: true,

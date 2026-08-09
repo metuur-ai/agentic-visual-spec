@@ -91,7 +91,12 @@ beforeAll(async () => {
   contentDir = await mkdtemp(join(tmpdir(), 'vs-xorigin-'));
   await writeFile(join(contentDir, 'a.md'), '# a\n');
 
-  standalone = createVisualSpecServer({ contentDir, uiDir: join(contentDir, 'ui'), port: 0 }).server;
+  // `allowCheckout` is on for this suite alone, and deliberately: with it off the
+  // branch routes do not exist (R-6.3), so a 403 for a cross-site POST would prove
+  // only that the guard covers a path nothing serves. Turned on, the route is really
+  // there and really refused, which is the claim R-2.5 makes about it.
+  const config = { git: { allowCheckout: true } };
+  standalone = createVisualSpecServer({ contentDir, uiDir: join(contentDir, 'ui'), port: 0, config }).server;
   await new Promise<void>((ok) => standalone.listen(0, '127.0.0.1', ok));
   standalonePort = (standalone.address() as AddressInfo).port;
 
@@ -103,7 +108,7 @@ beforeAll(async () => {
     root: contentDir,
     logLevel: 'silent',
     server: { host: '127.0.0.1', port: 0, cors: true, allowedHosts: true },
-    plugins: visualSpecMarkdown({ contentDir }),
+    plugins: visualSpecMarkdown({ contentDir, config }),
   });
   await vite.listen();
   vitePort = (vite.httpServer?.address() as AddressInfo).port;
@@ -186,6 +191,46 @@ describe('R-9.18 — /__vs responses are not readable cross-origin in either hos
       expect(text).not.toMatch(/access-control-allow-origin/i);
     }
   });
+});
+
+/* ================================================================== *
+ * R-2.5 — the branch routes did not escape the guard
+ * ================================================================== *
+ * The guard is already global to `/__vs` by registration order, so this is not
+ * asserting that a new gate was added. It is asserting that a route which reaches
+ * the user's working tree — the only one in this package that does — sits under the
+ * gate that already exists, and keeps sitting under it. The loopback case is
+ * asserted alongside so a 403 that came from the route being absent rather than from
+ * the guard could not pass this test.
+ */
+describe('R-2.5 — POST /__vs/git/checkout is refused cross-origin on both hosts', () => {
+  for (const { name } of hosts()) {
+    it(`${name}: a cross-site checkout is refused before it reaches the handler`, async () => {
+      const { port } = hosts().find((h) => h.name === name)!;
+      for (const headers of [CROSS_SITE(`127.0.0.1:${port}`), REBOUND('evil.example')]) {
+        const r = await raw(port, 'POST', '/__vs/git/checkout', headers, JSON.stringify({ branch: 'main' }));
+        expect(r.status).toBe(403);
+        // Not the handler's own answer — the request never got that far.
+        expect(r.body).not.toContain('unknown-branch');
+        expect(r.body).not.toContain('missing branch');
+        expect(r.body).not.toContain(contentDir);
+      }
+    });
+
+    it(`${name}: the same request from loopback reaches the handler`, async () => {
+      const { port } = hosts().find((h) => h.name === name)!;
+      const r = await raw(port, 'POST', '/__vs/git/checkout', { host: `127.0.0.1:${port}` }, JSON.stringify({ branch: 'main' }));
+      expect(r.status).not.toBe(403);
+      expect(r.status).not.toBe(404);
+    });
+
+    it(`${name}: a cross-site branch listing is refused`, async () => {
+      const { port } = hosts().find((h) => h.name === name)!;
+      const r = await raw(port, 'GET', '/__vs/git/branches', CROSS_SITE(`127.0.0.1:${port}`));
+      expect(r.status).toBe(403);
+      expect(r.body).not.toContain('local');
+    });
+  }
 });
 
 /* ================================================================== *

@@ -288,6 +288,38 @@ describe('R-2.1 / R-2.3 — the git route answers identically on both hosts', ()
 });
 
 /* ================================================================== *
+ * R-6.3 — with no `git` block configured the branch routes do not exist
+ * ================================================================== *
+ * The hosts above are built without one, which is the default every user starts
+ * from. The answer must be the unclaimed-path 404 of R-2.6 and not a 403: a client
+ * that can tell "disabled" from "this server is older than you" is a client that has
+ * been told there is a working tree behind the flag.
+ */
+describe('R-6.3 — the branch routes are absent unless configuration enables them', () => {
+  for (const { name } of hosts()) {
+    it(`${name}: GET /__vs/git/branches is 404 JSON and POST /__vs/git/checkout with it`, async () => {
+      const { port } = hosts().find((h) => h.name === name)!;
+      const listing = await raw(port, 'GET', '/__vs/git/branches', { accept: 'text/html' });
+      expect(listing.status).toBe(404);
+      expect(listing.headers['content-type']).toMatch(/application\/json/);
+      expect(listing.body).not.toContain('<html');
+      expect(JSON.parse(listing.body).error).toBe('no route: GET /__vs/git/branches');
+
+      const checkout = await raw(port, 'POST', '/__vs/git/checkout', {}, JSON.stringify({ branch: 'parity-branch' }));
+      expect(checkout.status).toBe(404);
+      expect(JSON.parse(checkout.body).error).toBe('no route: POST /__vs/git/checkout');
+    });
+
+    it(`${name}: the reader is not gated — GET /__vs/git still answers`, async () => {
+      const { port } = hosts().find((h) => h.name === name)!;
+      const r = await raw(port, 'GET', '/__vs/git');
+      expect(r.status).toBe(200);
+      expect(JSON.parse(r.body)).toHaveProperty('state');
+    });
+  }
+});
+
+/* ================================================================== *
  * R-2.6 — a host without the route answers 404 JSON, not the SPA shell
  * ================================================================== */
 describe('R-2.6 — an unimplemented /__vs route is a reportable 404, not the app shell', () => {
@@ -401,16 +433,170 @@ describe('R-4.4 — the write routes refuse unless the guard provably ran', () =
       expect(text.indexOf('attestGuardRan(req.headers)')).toBeGreaterThan(text.indexOf('checkRequest(req.headers)'));
     });
 
-    it(`${rel} puts no attestation on the read-only git route`, async () => {
+    it(`${rel} attests the guard before dispatching a git write`, async () => {
       const text = await code(rel);
       const git = text.indexOf('handleGitRequest(');
       expect(git).toBeGreaterThan(-1);
-      // The git route is read-only: it inherits the guard by registration order and
-      // has nothing to open up. Attesting there would be cargo-culting the pattern.
-      const preceding = text.lastIndexOf('guardRan(req.headers)', git);
+      // This assertion used to require the opposite, on the grounds that the git
+      // route was read-only. That was true through Units 1–4 and stopped being true
+      // when `POST /__vs/git/checkout` (R-5.5) landed — a route that changes the
+      // user's working tree. The stale test would have kept the omission green, so it
+      // is inverted rather than deleted: the record of why matters more than the line.
       const dispatchOfWrites = text.indexOf('handleFilesRequest(');
-      // The only `guardRan` before it, if any, belongs to the write branch above.
-      if (preceding > -1) expect(preceding).toBeLessThan(dispatchOfWrites);
+      expect(dispatchOfWrites).toBeGreaterThan(-1);
+      // The attestation guarding the git dispatch is the last one before it, and it
+      // must belong to the git block rather than to the file-write branch above.
+      const preceding = text.lastIndexOf('guardRan(req.headers)', git);
+      expect(preceding).toBeGreaterThan(dispatchOfWrites);
+      // And it must be reached only for a write — a GET must not be made to attest.
+      expect(text.slice(preceding - 220, preceding)).toMatch(/!==\s*'GET'/);
     });
   }
+});
+
+/* ================================================================== *
+ * 5.4 — GET /__vs/git/branches and POST /__vs/git/checkout, both hosts
+ * ================================================================== *
+ * A second pair of hosts, because the flag is a startup value and the pair above is
+ * deliberately built without it (R-6.3). They serve their own repository — two
+ * branches, a remote, and a working tree this suite controls — so a `checkout` that
+ * really runs cannot disturb the fixture the rest of the file measures on disk.
+ */
+describe('5.4 — the branch routes answer identically on both hosts', () => {
+  let repo: string;
+  let hasGit = true;
+  let branchStandalone: Server;
+  let branchStandalonePort: number;
+  let branchVite: ViteDevServer;
+  let branchVitePort: number;
+
+  /** Put the repository back on `main` with nothing uncommitted. */
+  async function onMainAndClean(): Promise<void> {
+    await run('git', ['checkout', '-q', '--force', 'main'], { cwd: repo });
+    await run('git', ['clean', '-qfd'], { cwd: repo });
+  }
+
+  beforeAll(async () => {
+    repo = await mkdtemp(join(tmpdir(), 'vs-branch-parity-'));
+    try {
+      await run('git', ['init', '-q', '-b', 'main'], { cwd: repo });
+      await run('git', ['config', 'user.email', 'test@example.invalid'], { cwd: repo });
+      await run('git', ['config', 'user.name', 'Visual Spec Test'], { cwd: repo });
+      await run('git', ['remote', 'add', 'origin', 'git@github.com:acme/widgets.git'], { cwd: repo });
+      await writeFile(join(repo, 'a.md'), '# a\n');
+      await run('git', ['add', '-A'], { cwd: repo });
+      await run('git', ['commit', '-qm', 'first'], { cwd: repo });
+      await run('git', ['branch', 'topic'], { cwd: repo });
+    } catch {
+      // No git on this machine. The assertions below are conditional on this flag
+      // rather than skipped, matching the tolerance the fixture above already has.
+      hasGit = false;
+    }
+
+    const config = { git: { allowCheckout: true } };
+    branchStandalone = createVisualSpecServer({ contentDir: repo, uiDir: join(repo, '__ui'), port: 0, config }).server;
+    await new Promise<void>((ok) => branchStandalone.listen(0, '127.0.0.1', ok));
+    branchStandalonePort = (branchStandalone.address() as AddressInfo).port;
+
+    branchVite = await createViteServer({
+      configFile: false,
+      root: repo,
+      logLevel: 'silent',
+      server: { host: '127.0.0.1', port: 0 },
+      plugins: visualSpecMarkdown({ contentDir: repo, config }),
+    });
+    await branchVite.listen();
+    branchVitePort = (branchVite.httpServer?.address() as AddressInfo).port;
+  }, 60_000);
+
+  afterAll(async () => {
+    await new Promise<void>((ok) => branchStandalone.close(() => ok()));
+    await branchVite?.close();
+    await rm(repo, { recursive: true, force: true });
+  });
+
+  const branchHosts = () => [
+    { name: 'standalone server', port: branchStandalonePort },
+    { name: 'Vite plugin host', port: branchVitePort },
+  ];
+
+  it('both hosts list the same branches (R-5.1, R-5.2, R-2.3)', async () => {
+    if (!hasGit) return;
+    await onMainAndClean();
+    const bodies: unknown[] = [];
+    for (const { port } of branchHosts()) {
+      const r = await raw(port, 'GET', '/__vs/git/branches');
+      expect(r.status).toBe(200);
+      bodies.push(JSON.parse(r.body));
+    }
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[0]).toEqual({
+      local: [
+        { name: 'main', current: true },
+        { name: 'topic', current: false },
+      ],
+      remote: [],
+    });
+  });
+
+  it('both hosts refuse the same dirty working tree, with the same paths (R-5.5)', async () => {
+    if (!hasGit) return;
+    const answers: Array<{ status: number; json: unknown }> = [];
+    for (const { port } of branchHosts()) {
+      await onMainAndClean();
+      await writeFile(join(repo, 'unsaved.md'), '# unsaved\n');
+      const r = await raw(port, 'POST', '/__vs/git/checkout', {}, JSON.stringify({ branch: 'topic' }));
+      answers.push({ status: r.status, json: JSON.parse(r.body) });
+      // R-5.5 in the only form that matters: HEAD did not move.
+      const { stdout } = await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repo });
+      expect(stdout.trim()).toBe('main');
+    }
+    expect(answers[1]).toEqual(answers[0]);
+    expect(answers[0]).toEqual({ status: 409, json: { error: 'dirty', paths: ['unsaved.md'] } });
+  });
+
+  it('both hosts change the branch from a clean tree and report the fresh context (R-5.9)', async () => {
+    if (!hasGit) return;
+    const answers: Array<{ status: number; json: unknown }> = [];
+    for (const { port } of branchHosts()) {
+      await onMainAndClean();
+      const r = await raw(port, 'POST', '/__vs/git/checkout', {}, JSON.stringify({ branch: 'topic' }));
+      answers.push({ status: r.status, json: JSON.parse(r.body) });
+      const { stdout } = await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repo });
+      expect(stdout.trim()).toBe('topic');
+    }
+    expect(answers[1]).toEqual(answers[0]);
+    expect(answers[0]).toEqual({
+      status: 200,
+      json: {
+        context: {
+          state: 'remote',
+          branch: 'topic',
+          detached: false,
+          host: 'github.com',
+          owner: 'acme',
+          repo: 'widgets',
+          url: 'git@github.com:acme/widgets.git',
+        },
+      },
+    });
+    // R-5.8 — the ignore entry is present before success was reported.
+    expect(await readFile(join(repo, '.gitignore'), 'utf8')).toContain('.visual-spec/');
+    await onMainAndClean();
+  });
+
+  it('both hosts reject a name the repository does not have, and emit no path (R-5.7, R-5.10)', async () => {
+    if (!hasGit) return;
+    for (const { port } of branchHosts()) {
+      await onMainAndClean();
+      for (const branch of ['-', '--upload-pack=/usr/bin/evil', 'does-not-exist']) {
+        const r = await raw(port, 'POST', '/__vs/git/checkout', {}, JSON.stringify({ branch }));
+        expect(r.status).toBe(400);
+        expect(JSON.parse(r.body)).toEqual({ error: 'unknown-branch' });
+        expect(r.body).not.toContain(repo);
+      }
+      const { stdout } = await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repo });
+      expect(stdout.trim()).toBe('main');
+    }
+  });
 });

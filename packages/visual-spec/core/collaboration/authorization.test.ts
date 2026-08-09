@@ -43,7 +43,7 @@ const here = fileURLToPath(new URL('.', import.meta.url));
 const fixture = (name: string): string => readFileSync(`${here}fixtures/${name}`, 'utf8');
 
 const REPO = { owner: 'acme', repo: 'specs', baseBranch: 'main' } as const;
-const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO } };
+const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO }, git: { allowCheckout: false } };
 
 /** R-9.5 — the identity every check below compares against comes from here and nowhere else. */
 const PREFLIGHT: CollaborationPreflight = {

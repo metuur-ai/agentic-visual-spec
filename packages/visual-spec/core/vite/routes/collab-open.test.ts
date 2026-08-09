@@ -43,7 +43,7 @@ const fixturesDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../coll
 const fixture = (name: string): string => readFileSync(resolve(fixturesDir, name), 'utf8');
 
 const REPO = { owner: 'acme', repo: 'docs', baseBranch: 'main' } as const;
-const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO } };
+const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO }, git: { allowCheckout: false } };
 const BRANCH = 'visual-spec/doc-1';
 
 const ACCEPT_FLAG_VALUE = 'Accept: application/vnd.github+json';

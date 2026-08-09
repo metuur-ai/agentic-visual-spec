@@ -39,7 +39,7 @@ import type { CollabAuthorizer } from './collab';
 const TEST_ALLOW_ALL: CollabAuthorizer = () => ({ ok: true });
 
 const REPO = { owner: 'acme', repo: 'specs', baseBranch: 'main' } as const;
-const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO } };
+const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO }, git: { allowCheckout: false } };
 const OK_PREFLIGHT: CollaborationPreflight = {
   available: true,
   source: 'gh-auth-state',

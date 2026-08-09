@@ -36,8 +36,8 @@ const fixturesDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../coll
 const fixture = (name: string): string => readFileSync(resolve(fixturesDir, name), 'utf8');
 
 const REPO = { owner: 'acme', repo: 'docs', baseBranch: 'main' } as const;
-const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO } };
-const DISABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: null };
+const ENABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: { ...REPO }, git: { allowCheckout: false } };
+const DISABLED: ResolvedVisualSpecConfig = { surfacesDir: 'surfaces', collaboration: null, git: { allowCheckout: false } };
 
 const OK_PREFLIGHT: CollaborationPreflight = {
   available: true,
