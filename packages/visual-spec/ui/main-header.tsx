@@ -1318,11 +1318,14 @@ async function readMarkdown(path: string): Promise<string> {
 function StartPullRequestButton({
   file,
   ready = false,
+  candidates = [],
   onStarted,
 }: {
   file: string;
   /** The caller's verdict that this document's notes are worked through — see `readyToShare`. */
   ready?: boolean;
+  /** R-8.34 — other local files that carry notes, offerable on the same pull request. */
+  candidates?: string[];
   onStarted?: (documentId: string) => void;
 }) {
   const client = useMemo(() => createCollabClient(), []);
@@ -1331,6 +1334,13 @@ function StartPullRequestButton({
   const [id, setId] = useState(() => documentIdFromPath(file));
   const [title, setTitle] = useState('');
   const [prStatus, setPrStatus] = useState<PrStatus>({ kind: 'idle' });
+  /**
+   * R-8.34 — the companions the author has ticked. Empty by default: the open file alone
+   * is the request, and a file joins a pull request only because someone chose it
+   * (R-8.35). Holding only the *extras* is what makes that default impossible to get
+   * wrong — there is no state in which the document itself is unticked.
+   */
+  const [chosen, setChosen] = useState<ReadonlySet<string>>(() => new Set());
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -1352,6 +1362,9 @@ function StartPullRequestButton({
     setTitle('');
     setPrStatus({ kind: 'idle' });
     setOpen(false);
+    // A different document is a different selection. Carrying the ticks across would put
+    // files on a pull request the author chose them for a *different* document.
+    setChosen(new Set());
   }, [file]);
 
   useEffect(() => {
@@ -1378,18 +1391,32 @@ function StartPullRequestButton({
       return;
     }
     setPrStatus({ kind: 'busy' });
-    let markdown: string;
+    /*
+     * R-8.35 — the selection, read at the moment of sending rather than when it was
+     * ticked. A file the author ticked and then edited must go up as they left it.
+     *
+     * The document is read first and separately because its failure is fatal in a way a
+     * companion's is not — but both are fatal here, and deliberately: a pull request that
+     * quietly contains three of the four files someone chose is worse than one that was
+     * never opened, because nothing afterwards says a file is missing.
+     */
+    const selection = [file, ...candidates.filter((p) => chosen.has(p))];
+    let files: { path: string; markdown: string }[];
     try {
-      markdown = await readMarkdown(file);
+      files = await Promise.all(selection.map(async (path) => ({ path, markdown: await readMarkdown(path) })));
     } catch (err) {
       setPrStatus({ kind: 'error', message: (err as Error).message });
       return;
     }
+    const markdown = files[0]!.markdown;
     const trimmedTitle = title.trim();
     const res = await client.start({
       documentId,
       documentPath: file,
       markdown,
+      // R-8.28 — a single-file start sends no `files` at all, so it is byte-for-byte the
+      // request it always was and cannot regress on the server's new branch.
+      ...(files.length > 1 ? { files } : {}),
       ...(trimmedTitle ? { title: trimmedTitle } : {}),
     });
     if (!res.ok) {
@@ -1436,9 +1463,40 @@ function StartPullRequestButton({
             ) : (
               <>
                 <p style={prNote}>
-                  Commits <code>{file}</code> to <code>visual-spec/&lt;id&gt;</code> at that same path and opens a pull
-                  request against {availability.repo.owner}/{availability.repo.repo}.
+                  Commits {chosen.size > 0 ? <strong>{chosen.size + 1} files</strong> : <code>{file}</code>} to{' '}
+                  <code>visual-spec/&lt;id&gt;</code> at {chosen.size > 0 ? 'their same paths' : 'that same path'} and
+                  opens one pull request against {availability.repo.owner}/{availability.repo.repo}.
                 </p>
+                {/*
+                  R-8.34 / R-8.35 — the other files the author has been noting on, offered
+                  and unticked. Absent entirely when there are none: an empty "also
+                  include" list is a control that explains a capability nobody can use
+                  here, and it would sit in the popover every single time.
+                */}
+                {candidates.length > 0 && (
+                  <fieldset style={prFieldset} data-vs-start-pr-companions>
+                    <legend style={prLegend}>Also include</legend>
+                    {/* The document, stated and not offered — it is not the author's to untick. */}
+                    <p style={prCompanionDoc}>
+                      <code>{file}</code> — the document
+                    </p>
+                    {candidates.map((path) => (
+                      <label key={path} style={prCompanionRow}>
+                        <input
+                          type="checkbox"
+                          checked={chosen.has(path)}
+                          onChange={(e) => {
+                            const next = new Set(chosen);
+                            if (e.target.checked) next.add(path);
+                            else next.delete(path);
+                            setChosen(next);
+                          }}
+                        />
+                        <code style={{ minWidth: 0, overflowWrap: 'anywhere' }}>{path}</code>
+                      </label>
+                    ))}
+                  </fieldset>
+                )}
                 <label style={prRow}>
                   <span style={prLabel}>Document id</span>
                   <input value={id} onChange={(e) => setId(e.target.value)} placeholder="for-comment" style={prInput} />
@@ -1678,6 +1736,26 @@ export function MainHeader({
     return mine.some((c) => c.status === 'applied') && !mine.some((c) => c.status === 'open');
   }, [comments, file]);
 
+  /*
+   * R-8.34 — which OTHER files the author may put on the same pull request.
+   *
+   * "Every markdown file in the tree" would be a file picker, and a file picker is a
+   * worse answer than the file tree the author already has. The useful set is much
+   * smaller and the sidecar already knows it: the files they have been leaving notes on.
+   * That is the honest reading of "files I am working on together" — it is derived from
+   * what they did, not from a folder they have to remember.
+   *
+   * Sorted, because the sidecar's order is the order comments were written in, which is
+   * not an order anyone is looking for a filename in.
+   */
+  const companionCandidates = useMemo(() => {
+    const paths = new Set<string>();
+    for (const c of comments) {
+      if (c.target.path !== file && c.target.path.endsWith('.md')) paths.add(c.target.path);
+    }
+    return [...paths].sort();
+  }, [comments, file]);
+
   const pickCount = () => {
     if (open.length === 0) return;
     if (revealInCommentPanel()) {
@@ -1722,7 +1800,14 @@ export function MainHeader({
                     job commits the bytes as the document (R-0.1), and `actions.onResumeCollab` is
                     the same landing `CollabOpenPanel`'s `onOpened` reaches — the document pane.
                   */}
-                  {isMarkdown && file && <StartPullRequestButton file={file} ready={readyToShare} {...(actions?.onResumeCollab ? { onStarted: actions.onResumeCollab } : {})} />}
+                  {isMarkdown && file && (
+                    <StartPullRequestButton
+                      file={file}
+                      ready={readyToShare}
+                      candidates={companionCandidates}
+                      {...(actions?.onResumeCollab ? { onStarted: actions.onResumeCollab } : {})}
+                    />
+                  )}
                 </>
               ),
             },
@@ -1970,6 +2055,12 @@ const prNote: React.CSSProperties = { margin: 0, fontSize: 12, color: '#64748b',
 const prRow: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 6 };
 const prLabel: React.CSSProperties = { fontSize: 11, color: '#64748b', width: 84, flexShrink: 0 };
 const prInput: React.CSSProperties = { font: '12px ui-monospace, monospace', padding: '3px 6px', border: '1px solid #d1d5db', borderRadius: 4, flex: 1, minWidth: 0 };
+/** The companion picker. A real fieldset/legend, so the group is named to a screen reader. */
+const prFieldset: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 4, margin: 0, padding: '6px 8px 8px', border: '1px solid #e5e7eb', borderRadius: 6, maxHeight: 168, overflowY: 'auto' };
+const prLegend: React.CSSProperties = { padding: '0 4px', font: '600 11px system-ui', color: '#64748b' };
+/** The document's own row: a statement, not a control, because it cannot be unticked. */
+const prCompanionDoc: React.CSSProperties = { margin: 0, font: '11px ui-monospace, monospace', color: '#94a3b8', overflowWrap: 'anywhere' };
+const prCompanionRow: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 7, minHeight: 24, font: '11px ui-monospace, monospace', color: '#475569', cursor: 'pointer' };
 const prOk: React.CSSProperties = { margin: 0, fontSize: 12, color: '#0f766e' };
 const prError: React.CSSProperties = { margin: 0, fontSize: 12, color: '#b91c1c', overflowWrap: 'anywhere' };
 const modelNote: React.CSSProperties = { padding: '7px 12px', borderTop: '1px solid #f1f5f9', color: '#94a3b8', fontSize: 11, fontStyle: 'italic', background: '#fbfaff' };

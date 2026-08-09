@@ -49,7 +49,7 @@ import {
   readReviewDrafts,
   type ReviewDraft,
 } from '../../collaboration/review-drafts';
-import type { CollaborationRecord, GitHubBinding } from '../../collaboration/document-record';
+import type { CollaborationRecord, CompanionFile, GitHubBinding } from '../../collaboration/document-record';
 import { DOCUMENT_ID_RE, newCollaborationRecord } from '../../collaboration/document-record';
 import type { CollaborationStore } from '../../collaboration/record-store';
 import { loadReviewThreadRecords } from '../../collaboration/review-anchoring';
@@ -134,6 +134,8 @@ export type CreateJobInput = JobInputBase & {
   title?: string;
   /** R-0.1 — the document. Seeded by the route; the body commits what the store holds. */
   markdown?: string;
+  /** R-8.29 — the files travelling with it. The body commits what the store holds. */
+  companions?: CompanionFile[];
 };
 
 /** `POST /__vs/collab/open` — task 8.2: attach to an already-open Pull Request. */
@@ -364,6 +366,51 @@ function requireString(body: Record<string, unknown>, key: string): string {
 function optionalKey(body: Record<string, unknown>): string | undefined {
   const key = body.idempotencyKey;
   return typeof key === 'string' && key ? key : undefined;
+}
+
+/**
+ * R-8.27 … R-8.32 — the `files` array on `POST /start`, reduced to the companions.
+ *
+ * THE PRIMARY IS NOT A COMPANION. `documentPath` names the one file that `documentId`
+ * refers to (R-8.30), and clients send it in both places: it is the open file, so it is
+ * naturally first in the selection. Listing it here too would commit it twice and put it
+ * in the Pull Request body's companion row, so it is filtered out rather than rejected —
+ * sending the document among the files is correct, not a mistake to refuse.
+ *
+ * EVERY REFUSAL NAMES THE PATH. These are author mistakes made in a picker, and "invalid
+ * request" would leave someone re-selecting files to find which one it meant.
+ */
+type CompanionParse = { ok: true; files: CompanionFile[] } | { ok: false; message: string };
+
+function parseCompanions(raw: unknown, documentPath: string): CompanionParse {
+  if (raw === undefined || raw === null) return { ok: true, files: [] };
+  if (!Array.isArray(raw)) return { ok: false, message: 'files must be an array of { path, markdown }' };
+
+  const files: CompanionFile[] = [];
+  const seen = new Set<string>([documentPath]);
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return { ok: false, message: 'files must be an array of { path, markdown }' };
+    }
+    const { path, markdown } = entry as Record<string, unknown>;
+    if (typeof path !== 'string' || !path.trim()) return { ok: false, message: 'every file needs a path' };
+    if (typeof markdown !== 'string') return { ok: false, message: `missing markdown for ${path}` };
+    // R-8.32 — the containment rule, applied before anything is written. `safeJoin` in
+    // the store enforces it again at the moment of writing; this is the half that can
+    // refuse the WHOLE request, which is what the requirement asks for.
+    if (path.startsWith('/') || path.includes('\0') || path.split('/').includes('..')) {
+      return { ok: false, message: `invalid path: ${path}` };
+    }
+    // R-8.31 — a duplicate against the document is silently the document (see above); a
+    // duplicate against another companion is the author's mistake and is named.
+    if (seen.has(path)) {
+      if (path === documentPath) continue;
+      return { ok: false, message: `duplicate path: ${path}` };
+    }
+    seen.add(path);
+    files.push({ path, markdown });
+  }
+  return { ok: true, files };
 }
 
 /** The document's GitHub binding, if it carries one an issue-comment store can use. */
@@ -824,11 +871,19 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         };
       }
 
-      /* POST /__vs/collab/start (R-8.5) */
+      /* POST /__vs/collab/start (R-8.5, R-8.27 … R-8.32) */
       if (method === 'POST' && pathname === '/start') {
         const documentId = requireString(body, 'documentId');
         if (!DOCUMENT_ID_RE.test(documentId)) return bad(`invalid documentId: ${documentId}`);
         const documentPath = requireString(body, 'documentPath');
+        /*
+         * R-8.31 / R-8.32 — validated here, before `gate` and long before a branch could
+         * exist. Both requirements say the *whole* request is refused, and the only place
+         * that is cheap to guarantee is the one where nothing has happened yet: once the
+         * create job is running, "reject" means unwinding a branch.
+         */
+        const companions = parseCompanions(body.files, documentPath);
+        if (!companions.ok) return bad(companions.message);
         const gated = await gate('create', documentId);
         if (!gated.ok) return gated.result;
         const idempotencyKey = optionalKey(body);
@@ -851,6 +906,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
               documentPath,
               ...(typeof body.title === 'string' ? { title: body.title } : {}),
               ...(typeof body.markdown === 'string' ? { markdown: body.markdown } : {}),
+              ...(companions.files.length ? { companions: companions.files } : {}),
             }),
           );
         }
@@ -865,6 +921,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
             store: deps.documents(),
             ...(typeof body.title === 'string' ? { title: body.title } : {}),
             ...(typeof body.markdown === 'string' ? { markdown: body.markdown } : {}),
+            ...(companions.files.length ? { companions: companions.files } : {}),
             ...(idempotencyKey ? { idempotencyKey } : {}),
           }),
         });

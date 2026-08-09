@@ -78,18 +78,33 @@ export function fsCollaborationStore(baseDir: string, metaDir = DEFAULT_META_DIR
     async read(documentId) {
       const raw = await readIfPresent(metaPath(documentId));
       if (raw === null) return null;
-      const meta = parseRecordMeta(raw);
+      const { companions: companionPaths, ...meta } = parseRecordMeta(raw);
       // A missing local `.md` is an empty document, not a failure: the metadata is what
       // says the document exists, and `open` writes the file a moment after the sidecar.
       const markdown = (await readIfPresent(safeJoin(baseDir, meta.documentPath))) ?? '';
-      return { ...meta, markdown };
+      // Companions are read on the same terms — the sidecar names them, the tree holds
+      // their bytes, and a missing file reads as empty rather than failing the document.
+      const companions = await Promise.all(
+        (companionPaths ?? []).map(async ({ path }) => ({
+          path,
+          markdown: (await readIfPresent(safeJoin(baseDir, path))) ?? '',
+        })),
+      );
+      return { ...meta, markdown, ...(companions.length ? { companions } : {}) };
     },
 
     async write(record) {
       const meta = metaPath(record.documentId);
-      const doc = safeJoin(baseDir, record.documentPath);
-      await mkdir(dirname(doc), { recursive: true });
-      await writeFile(doc, record.markdown, 'utf8');
+      const write = async (relativePath: string, contents: string) => {
+        const full = safeJoin(baseDir, relativePath);
+        await mkdir(dirname(full), { recursive: true });
+        await writeFile(full, contents, 'utf8');
+      };
+      await write(record.documentPath, record.markdown);
+      // R-8.32 — `safeJoin` refuses an escaping path, and it refuses inside this loop
+      // before any of the remaining companions are written. The route rejects the whole
+      // request earlier for the same reason; this is the layer that cannot be bypassed.
+      for (const companion of record.companions ?? []) await write(companion.path, companion.markdown);
       await mkdir(dirname(meta), { recursive: true });
       await writeFile(meta, serializeRecordMeta(record), 'utf8');
     },

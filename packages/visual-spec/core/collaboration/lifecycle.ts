@@ -184,6 +184,8 @@ export type PullRequestBodyInput = {
   documentId: string;
   documentPath: string;
   title: string;
+  /** R-8.29 — the other files on the branch, named so a reviewer knows the scope. */
+  companionPaths?: string[];
 };
 
 /**
@@ -194,6 +196,7 @@ export type PullRequestBodyInput = {
  */
 export function buildPullRequestBody(input: PullRequestBodyInput): string {
   const { repo, branch, documentId, documentPath, title } = input;
+  const companionPaths = input.companionPaths ?? [];
   const command = openCommandFor(repo, branch, documentId);
   const text = [
     `**${title}** is a visual-spec collaboration document — the Markdown below is the document itself.`,
@@ -203,6 +206,14 @@ export function buildPullRequestBody(input: PullRequestBodyInput): string {
     `| Repository | \`${repo.owner}/${repo.repo}\` |`,
     `| Branch | \`${branch}\` |`,
     `| Document | \`${documentPath}\` (id \`${documentId}\`) |`,
+    /*
+     * Named, and named as *companions*, because a reviewer opening this in visual-spec
+     * gets the document above and not these. A row saying only "3 more files" would set
+     * up exactly that surprise; the paths let them go and read the diff instead.
+     */
+    ...(companionPaths.length
+      ? [`| Also on this branch | ${companionPaths.map((p) => `\`${p}\``).join(', ')} |`]
+      : []),
     '',
     'Open it in your own visual-spec instance:',
     '',
@@ -309,12 +320,45 @@ export function createLifecycleBodies(options: LifecycleBodyOptions): LifecycleJ
       });
       throwIfAborted(ctx);
 
+      /*
+       * R-8.29 — the companions, onto the same branch, each at its own path.
+       *
+       * One commit each, through the same Contents API call for the same reason the
+       * document uses it: a `git add` would normalize line endings and break publish's
+       * byte verification permanently (LLD §7). Sequential rather than concurrent because
+       * each commit moves the branch head, and the Contents API resolves the parent from
+       * the branch — firing them together races them onto the same parent.
+       *
+       * R-8.33 — a failure part way through throws, which leaves the orphan marker
+       * written above in place. That is the same state a failed *document* commit leaves,
+       * and `reconcile` (R-8.18) already knows how to clean it up. Nothing extra is
+       * needed here, and a `try` that swallowed the failure to "finish the rest" would be
+       * the one thing that breaks it — a Pull Request opened over a partial commit.
+       */
+      for (const companion of doc.companions ?? []) {
+        ctx.log(`committing ${companion.path}`, 'progress');
+        await adapter.commitFile(repoRef, {
+          path: companion.path,
+          content: companion.markdown,
+          message: `visual-spec: create ${documentId} — ${companion.path}`,
+          branch,
+        });
+        throwIfAborted(ctx);
+      }
+
       ctx.log(`opening pull request against ${repo.baseBranch}`, 'progress');
       const pr = await adapter.createPullRequest(repoRef, {
         title,
         head: branch,
         base: repo.baseBranch,
-        body: buildPullRequestBody({ repo: repoRef, branch, documentId, documentPath: doc.documentPath, title }),
+        body: buildPullRequestBody({
+          repo: repoRef,
+          branch,
+          documentId,
+          documentPath: doc.documentPath,
+          title,
+          ...(doc.companions?.length ? { companionPaths: doc.companions.map((c) => c.path) } : {}),
+        }),
       });
 
       const github: GitHubBinding = {

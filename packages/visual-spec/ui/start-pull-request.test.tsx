@@ -190,6 +190,104 @@ describe('“Start collaboration” is promoted only when the notes are worked t
   });
 });
 
+/*
+ * R-8.34 / R-8.35 — putting more than one file on the same pull request.
+ *
+ * The candidate set is the load-bearing decision. "Every markdown file" would be a file
+ * picker, and the author already has one of those in the sidebar. The useful set is the
+ * files they have been leaving notes on, which the sidecar already knows — so these pin
+ * that the offer is derived from the author's own work rather than from a folder.
+ */
+describe('starting a collaboration on more than one file', () => {
+  const OTHER = 'docs/rules.md';
+  const OTHER_MARKDOWN = '# Rules\n\nthe companion body.\n';
+
+  const note = (id: string, path: string) => ({
+    id,
+    workflow: 'visual-spec',
+    target: { path, kind: 'range', startLine: 3, heading: 'h' },
+    comment: 'needs a citation',
+    status: 'open',
+    ts: '2026-08-08T00:00:00.000Z',
+    replies: [],
+  });
+
+  /** The file route answers for whichever path is asked for, so companions read too. */
+  const fileRead = () => {
+    const bodies: Record<string, string> = { [FILE]: MARKDOWN, [OTHER]: OTHER_MARKDOWN };
+    return (url: string) => {
+      const path = new URL(url, 'http://x').searchParams.get('path') ?? FILE;
+      const content = bodies[path] ?? '';
+      return jsonRes({ path, kind: 'markdown', content, size: content.length });
+    };
+  };
+
+  async function openWithCandidates(comments: unknown[]) {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    const answer = fileRead();
+    const impl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, ...(init?.body ? { body: JSON.parse(init.body as string) } : {}) });
+      if (url === '/__vs/git') return jsonRes({ state: 'none' });
+      if (url === '/__vs/git/branches') return jsonRes({ error: 'no route' }, 404);
+      if (url === '/__vs/collab') return jsonRes(CONFIGURED);
+      if (url === '/__vs/collab/start') return jsonRes({ ok: true, jobId: 'job-1', kind: 'create' });
+      if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: [] });
+      if (url.startsWith('/__vs/tree/file')) return answer(url);
+      if (url.startsWith('/__vs/comments')) return jsonRes(comments);
+      if (url === '/__vs/source/root') return jsonRes({ root: '/repo' });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', impl);
+    render(<MainHeader file={FILE} isMarkdown onModeChange={() => {}} />);
+    fireEvent.click(await screen.findByRole('button', { name: /Start collaboration/ }));
+    return calls;
+  }
+
+  it('offers the files that carry notes, and offers them unticked', async () => {
+    await openWithCandidates([note('c-1', OTHER), note('c-2', FILE)]);
+
+    const box = await screen.findByRole('checkbox', { name: new RegExp(OTHER) });
+    // R-8.34 — the default selection is the open file alone.
+    expect((box as HTMLInputElement).checked).toBe(false);
+    // The document is stated, not offered: it is not the author's to untick.
+    expect(screen.queryByRole('checkbox', { name: new RegExp(FILE) })).toBeNull();
+  });
+
+  it('offers nothing at all when no other file carries notes', async () => {
+    await openWithCandidates([note('c-2', FILE)]);
+    await screen.findByPlaceholderText('for-comment');
+    expect(screen.queryByRole('checkbox')).toBeNull();
+  });
+
+  /* R-8.35 — offered is not chosen. An untouched picker sends the single-file request. */
+  it('sends no files array when nothing was ticked', async () => {
+    const calls = await openWithCandidates([note('c-1', OTHER)]);
+    await screen.findByRole('checkbox', { name: new RegExp(OTHER) });
+    fireEvent.click(screen.getByRole('button', { name: 'Create pull request' }));
+
+    await waitFor(() => expect(bodyOf(calls, '/__vs/collab/start')).toBeTruthy());
+    const body = bodyOf(calls, '/__vs/collab/start')!;
+    expect(body).toMatchObject({ documentPath: FILE, markdown: MARKDOWN });
+    expect(body).not.toHaveProperty('files');
+  });
+
+  it('sends the document and every ticked file, each with its own bytes', async () => {
+    const calls = await openWithCandidates([note('c-1', OTHER)]);
+    fireEvent.click(await screen.findByRole('checkbox', { name: new RegExp(OTHER) }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create pull request' }));
+
+    await waitFor(() => expect(bodyOf(calls, '/__vs/collab/start')?.files).toBeTruthy());
+    const body = bodyOf(calls, '/__vs/collab/start')!;
+    // The document stays `documentPath` — the collaboration still has exactly one (R-8.30).
+    expect(body.documentPath).toBe(FILE);
+    expect(body.files).toEqual([
+      { path: FILE, markdown: MARKDOWN },
+      { path: OTHER, markdown: OTHER_MARKDOWN },
+    ]);
+  });
+});
+
 describe('R-8.5 — the request carries the open file, not a new empty one', () => {
   it('posts the file’s own path and the bytes it holds', async () => {
     const { calls, onResumeCollab } = await openForm();

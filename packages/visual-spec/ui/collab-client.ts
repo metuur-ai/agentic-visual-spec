@@ -244,6 +244,13 @@ export type StartDocumentInput = Idempotent & {
   title?: string;
   /** R-0.1 — the document itself. Committed to the branch verbatim by the create job. */
   markdown?: string;
+  /**
+   * R-8.27 — the whole selection, the open file included. The server treats the entry
+   * matching `documentPath` as the document rather than as a companion (R-8.30), so a
+   * caller sends its selection as it stands and does not have to subtract the primary.
+   * Omitted entirely for a single-file start, which behaves exactly as before (R-8.28).
+   */
+  files?: { path: string; markdown: string }[];
 };
 
 export type OpenDocumentInput = Idempotent & { documentId: string; pullNumber: number; discardLocal?: boolean };

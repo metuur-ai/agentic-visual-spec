@@ -55,11 +55,39 @@ export type CollaborationRecord = {
   title: string;
   /** The document itself (R-0.1). */
   markdown: string;
+  /** R-8.29 — the other files travelling on the same branch. Absent means just the one. */
+  companions?: CompanionFile[];
   github?: GitHubBinding;
 };
 
-/** The metadata half, which is what actually gets persisted beside the Markdown. */
-export type CollaborationRecordMeta = Omit<CollaborationRecord, 'markdown'>;
+/**
+ * A file that travels with the document on the same branch and Pull Request (R-8.29).
+ *
+ * IT IS NOT A SECOND DOCUMENT. A collaboration has exactly one `documentId`, because
+ * resume resolves exactly one from the Pull Request body (R-7.4, R-7.7) and the review
+ * surface mounts exactly one. Companions have no id, no title and no GitHub binding of
+ * their own — they are bytes at a path, committed alongside, reviewed in the same
+ * conversation. R-8.30 is what this shape enforces: the set has a head.
+ *
+ * `path` means what `documentPath` means — where the file sits on the branch *and* where
+ * the local copy sits under the content directory. One meaning, so the apply agent finds
+ * the file it was told to edit.
+ */
+export type CompanionFile = {
+  path: string;
+  markdown: string;
+};
+
+/**
+ * The metadata half, which is what actually gets persisted beside the Markdown.
+ *
+ * Companions lose their bytes here for the same reason the document does: the bytes are
+ * the file, and the file is already on disk at `path`. Persisting them twice would let
+ * the sidecar and the tree disagree, and the sidecar would be the copy nobody edits.
+ */
+export type CollaborationRecordMeta = Omit<CollaborationRecord, 'markdown' | 'companions'> & {
+  companions?: { path: string }[];
+};
 
 /** The record a document starts life as, before it has ever met GitHub. */
 export function newCollaborationRecord(input: {
@@ -67,12 +95,16 @@ export function newCollaborationRecord(input: {
   documentPath: string;
   title?: string;
   markdown?: string;
+  companions?: CompanionFile[];
 }): CollaborationRecord {
   return {
     documentId: input.documentId,
     documentPath: input.documentPath,
     title: input.title?.trim() || input.documentId,
     markdown: input.markdown ?? '',
+    // Absent, not empty: a record with `companions: []` and one with none are the same
+    // fact, and only one of them survives a round trip through the sidecar unchanged.
+    ...(input.companions?.length ? { companions: input.companions } : {}),
   };
 }
 
@@ -105,17 +137,45 @@ export function parseRecordMeta(raw: string | null | undefined): CollaborationRe
   }
   const rec = parsed as Record<string, unknown>;
   const github = rec.github;
+  const companions = parseCompanionPaths(rec.companions);
   return {
     ...(rec as object),
     documentId: String(rec.documentId ?? ''),
     documentPath: String(rec.documentPath ?? ''),
     title: typeof rec.title === 'string' ? rec.title : '',
+    ...(companions.length ? { companions } : {}),
     ...(github && typeof github === 'object' && !Array.isArray(github) ? { github: github as GitHubBinding } : {}),
   } as CollaborationRecordMeta;
 }
 
+/**
+ * The companion list as the sidecar holds it: paths only, and only the well-formed ones.
+ *
+ * A malformed entry is dropped rather than thrown on. This parser already tolerates a
+ * missing `documentId` and an absent `title`, because a sidecar that cannot be read at
+ * all strands the document it describes — and a companion is the *least* load-bearing
+ * thing in the file. Dropping one loses a file from the next commit; throwing loses the
+ * collaboration.
+ */
+function parseCompanionPaths(raw: unknown): { path: string }[] {
+  if (!Array.isArray(raw)) return [];
+  const paths: { path: string }[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const path = (entry as Record<string, unknown>).path;
+    if (typeof path === 'string' && path) paths.push({ path });
+  }
+  return paths;
+}
+
 /** Write the metadata half. The Markdown is never folded in — it is its own file. */
 export function serializeRecordMeta(record: CollaborationRecord | CollaborationRecordMeta): string {
-  const { markdown: _markdown, ...meta } = record as CollaborationRecord;
+  const { markdown: _markdown, companions, ...rest } = record as CollaborationRecord;
+  const meta = {
+    ...rest,
+    // Same rule as `markdown`, applied one level down: the path is bookkeeping, the bytes
+    // are the file. `CompanionFile` and the persisted shape differ by exactly this.
+    ...(companions?.length ? { companions: companions.map((c) => ({ path: c.path })) } : {}),
+  };
   return `${JSON.stringify(meta, null, 2)}\n`;
 }

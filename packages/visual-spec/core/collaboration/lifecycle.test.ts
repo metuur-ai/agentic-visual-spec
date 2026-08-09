@@ -268,6 +268,94 @@ describe('createLifecycle.start — partial failure (leaves 8.4 a tractable orph
 });
 
 // ---------------------------------------------------------------------------
+// R-8.29 / R-8.33 — companions ride the same branch and the same pull request
+// ---------------------------------------------------------------------------
+
+describe('createLifecycle.start with companion files (R-8.29)', () => {
+  const withCompanions = () =>
+    makeDoc({
+      companions: [
+        { path: 'docs/rules.md', markdown: '# Rules\n' },
+        { path: 'notes/context.md', markdown: '# Context\n' },
+      ],
+    });
+
+  /** One extra `contents` PUT per companion, before the single pull request. */
+  const CREATE_MULTI: Array<Partial<GhResult>> = [
+    { stdout: fixture('git-ref.json') }, // getBranch(main)
+    { stdout: fixture('create-ref.json') }, // createBranch
+    { stdout: fixture('contents-put.json') }, // commitFile — the document
+    { stdout: fixture('contents-put.json') }, // commitFile — docs/rules.md
+    { stdout: fixture('contents-put.json') }, // commitFile — notes/context.md
+    { stdout: fixture('pull-create.json') }, // createPullRequest
+  ];
+
+  it('commits every file to the one branch, then opens exactly one pull request', async () => {
+    const h = harness(CREATE_MULTI, withCompanions());
+    h.lifecycle.start({ documentId: 'doc-1' });
+    await settled();
+
+    expect(h.calls.map((c) => endpointOf(c.args))).toEqual([
+      '/repos/acme/docs/git/ref/heads/main',
+      '/repos/acme/docs/git/refs',
+      '/repos/acme/docs/contents/documents/doc-1.json',
+      '/repos/acme/docs/contents/docs/rules.md',
+      '/repos/acme/docs/contents/notes/context.md',
+      '/repos/acme/docs/pulls',
+    ]);
+    // R-8.29 — one pull request, whatever the file count.
+    expect(h.calls.filter((c) => endpointOf(c.args) === '/repos/acme/docs/pulls')).toHaveLength(1);
+    // Every companion goes onto the branch the document went onto, not a branch of its own.
+    for (const call of h.calls.slice(2, 5)) {
+      expect(JSON.parse(call.input ?? '{}')).toMatchObject({ branch: 'visual-spec/doc-1' });
+    }
+  });
+
+  it('names the companions in the pull request body, so the scope is readable on GitHub', async () => {
+    const h = harness(CREATE_MULTI, withCompanions());
+    h.lifecycle.start({ documentId: 'doc-1' });
+    await settled();
+
+    const sent = JSON.parse(h.calls[5]?.input ?? '{}') as { body: string };
+    expect(sent.body).toContain('`docs/rules.md`');
+    expect(sent.body).toContain('`notes/context.md`');
+    // R-8.30 — and the document is still the one the trailer names.
+    expect(parseCommentBody(sent.body).trailer?.documentPath).toBe('documents/doc-1.json');
+  });
+
+  /*
+   * R-8.33 — a companion that will not commit must not become a pull request over a
+   * partial branch. The orphan the failure leaves behind is 8.4's to reconcile, and is
+   * the same orphan a failed *document* commit leaves; what must not happen is a PR.
+   */
+  it('opens no pull request when a companion fails to commit', async () => {
+    const h = harness([
+      { stdout: fixture('git-ref.json') },
+      { stdout: fixture('create-ref.json') },
+      { stdout: fixture('contents-put.json') }, // the document commits
+      { stdout: '{"message":"Validation Failed"}', stderr: 'gh: Validation Failed (HTTP 422)', exitCode: 1 }, // the companion does not
+    ], withCompanions());
+    h.lifecycle.start({ documentId: 'doc-1' });
+    await settled();
+
+    expect(h.calls.map((c) => endpointOf(c.args))).not.toContain('/repos/acme/docs/pulls');
+    expect(h.events.find((e) => e.type === 'job-done')).toMatchObject({ ok: false });
+    // The orphan marker is on the record — branch known, no pull request — which is
+    // exactly what `reconcile` reads (R-8.18).
+    const binding = await readGitHubBinding(h.store, 'doc-1');
+    expect(binding).toMatchObject({ branch: 'visual-spec/doc-1' });
+    expect(binding?.pullNumber).toBeUndefined();
+  });
+
+  it('says nothing about companions in the body of a single-file pull request', async () => {
+    const h = harness(CREATE_OK);
+    h.lifecycle.start({ documentId: 'doc-1' });
+    await settled();
+    expect(JSON.parse(h.calls[3]?.input ?? '{}').body).not.toContain('Also on this branch');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // R-11.1 — the PR body
 // ---------------------------------------------------------------------------
 

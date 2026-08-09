@@ -137,3 +137,76 @@ describe('titles come out of the bytes, because there is nowhere else', () => {
     });
   });
 });
+
+/*
+ * R-8.29 — companion files travel with the document, and the store treats them exactly
+ * as it treats the document: bytes at their own path in the tree, paths in the sidecar.
+ *
+ * The claim that matters is the *asymmetry that is not there*. If companions were held
+ * as content inside the sidecar, the tree and the record would hold two copies of one
+ * file, the apply agent would edit the tree's, and the next commit would send the
+ * sidecar's — silently discarding the work. So these pin bytes-on-disk, paths-in-meta.
+ */
+describe('companion files are files, on the same terms as the document', () => {
+  const withCompanions = () =>
+    record({
+      companions: [
+        { path: 'docs/rules.md', markdown: '# Rules\n' },
+        { path: 'notes/context.md', markdown: '# Context\n' },
+      ],
+    });
+
+  it('writes each companion to its own path in the tree', async () => {
+    const store = fsCollaborationStore(dir);
+    await store.write(withCompanions());
+    expect(await readFile(join(dir, 'docs/rules.md'), 'utf8')).toBe('# Rules\n');
+    expect(await readFile(join(dir, 'notes/context.md'), 'utf8')).toBe('# Context\n');
+  });
+
+  it('keeps only the paths in the sidecar, never the bytes', async () => {
+    const store = fsCollaborationStore(dir);
+    await store.write(withCompanions());
+    const raw = await readFile(join(dir, DEFAULT_META_DIR, 'doc-1.json'), 'utf8');
+    expect(JSON.parse(raw).companions).toEqual([{ path: 'docs/rules.md' }, { path: 'notes/context.md' }]);
+    expect(raw).not.toContain('# Rules');
+  });
+
+  it('reads the bytes back from the tree, so an edit on disk is what comes out', async () => {
+    const store = fsCollaborationStore(dir);
+    await store.write(withCompanions());
+    // The apply agent's edit: the file changes, the sidecar does not.
+    await writeFile(join(dir, 'docs/rules.md'), '# Rules\n\nedited by the agent\n', 'utf8');
+
+    const read = await store.read('doc-1');
+    expect(read?.companions).toEqual([
+      { path: 'docs/rules.md', markdown: '# Rules\n\nedited by the agent\n' },
+      { path: 'notes/context.md', markdown: '# Context\n' },
+    ]);
+  });
+
+  it('reads a companion whose file has gone as empty, rather than failing the document', async () => {
+    const store = fsCollaborationStore(dir);
+    await store.write(record({ companions: [{ path: 'docs/rules.md', markdown: '# Rules\n' }] }));
+    await rm(join(dir, 'docs/rules.md'));
+
+    const read = await store.read('doc-1');
+    expect(read?.markdown).toBe('# Spec\n\nhello\n');
+    expect(read?.companions).toEqual([{ path: 'docs/rules.md', markdown: '' }]);
+  });
+
+  it('says nothing about companions when there are none', async () => {
+    const store = fsCollaborationStore(dir);
+    await store.write(record());
+    const meta = JSON.parse(await readFile(join(dir, DEFAULT_META_DIR, 'doc-1.json'), 'utf8'));
+    expect('companions' in meta).toBe(false);
+    expect((await store.read('doc-1'))?.companions).toBeUndefined();
+  });
+
+  /* R-8.32 — the containment rule is the document's, applied to every file. */
+  it('refuses a companion path that would escape the content directory', async () => {
+    const store = fsCollaborationStore(dir);
+    await expect(store.write(record({ companions: [{ path: '../escaped.md', markdown: 'x' }] }))).rejects.toThrow(
+      /invalid documentPath/,
+    );
+  });
+});

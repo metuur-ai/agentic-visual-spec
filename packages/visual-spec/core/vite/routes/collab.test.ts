@@ -515,6 +515,109 @@ describe('R-7.1 — POST /start', () => {
     expect((await call(r, 'POST', '/start', { documentId: 'doc-1', documentPath: 'a.md' })).status).toBe(200);
     expect((await call(r, 'POST', '/start', { documentId: 'doc-1', documentPath: 'a.md' })).status).toBe(409);
   });
+
+  /* ---------------------------------------------------------------- *
+   * R-8.27 … R-8.32 — starting on more than one file
+   *
+   * Every refusal here is asserted to happen with an EMPTY STORE. R-8.31 and R-8.32 say
+   * the whole request is rejected, and the only way to mean that is for nothing to have
+   * been written when the 400 comes back — a route that seeded four files and then
+   * refused would satisfy the status code and none of the requirement.
+   * ---------------------------------------------------------------- */
+  describe('more than one file on one pull request', () => {
+    const files = [
+      { path: 'docs/spec.md', markdown: '# Spec\n' },
+      { path: 'docs/rules.md', markdown: '# Rules\n' },
+      { path: 'notes/context.md', markdown: '# Context\n' },
+    ];
+
+    it('carries the companions to the job and seeds them into the store', async () => {
+      const store = memoryDocuments();
+      const create = vi.fn<CollabJobBodies['create']>(() => async () => {});
+      const r = router({ documents: () => store, bodies: { create } });
+
+      const res = await call(r, 'POST', '/start', { documentId: 'doc-1', documentPath: 'docs/spec.md', markdown: '# Spec\n', files });
+      expect(res.status).toBe(200);
+
+      // R-8.30 — the entry matching `documentPath` is the document, not a companion, so
+      // it appears once as the document and never in the companion list.
+      const expected = [
+        { path: 'docs/rules.md', markdown: '# Rules\n' },
+        { path: 'notes/context.md', markdown: '# Context\n' },
+      ];
+      expect(create.mock.calls[0]![0]).toMatchObject({ documentPath: 'docs/spec.md', companions: expected });
+      expect((await store.read('doc-1'))?.companions).toEqual(expected);
+    });
+
+    /* R-8.28 — the single-file request is untouched, and says nothing about companions. */
+    it('adds no companions when only the document is sent', async () => {
+      const store = memoryDocuments();
+      const create = vi.fn<CollabJobBodies['create']>(() => async () => {});
+      const r = router({ documents: () => store, bodies: { create } });
+
+      await call(r, 'POST', '/start', { documentId: 'doc-1', documentPath: 'docs/spec.md', markdown: '# Spec\n' });
+
+      expect(create.mock.calls[0]![0]).not.toHaveProperty('companions');
+      expect((await store.read('doc-1'))?.companions).toBeUndefined();
+    });
+
+    it('treats a files array holding only the document as a single-file start', async () => {
+      const create = vi.fn<CollabJobBodies['create']>(() => async () => {});
+      const r = router({ bodies: { create } });
+
+      await call(r, 'POST', '/start', {
+        documentId: 'doc-1',
+        documentPath: 'docs/spec.md',
+        files: [{ path: 'docs/spec.md', markdown: '# Spec\n' }],
+      });
+
+      expect(create.mock.calls[0]![0]).not.toHaveProperty('companions');
+    });
+
+    /* R-8.31 — and it names the path, because this is a mistake made in a picker. */
+    it('rejects a duplicated companion path, writing nothing', async () => {
+      const store = memoryDocuments();
+      const r = router({ documents: () => store, bodies: { create: () => async () => {} } });
+
+      const res = await call(r, 'POST', '/start', {
+        documentId: 'doc-1',
+        documentPath: 'docs/spec.md',
+        files: [
+          { path: 'docs/rules.md', markdown: 'a' },
+          { path: 'docs/rules.md', markdown: 'b' },
+        ],
+      });
+
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(res.json)).toContain('docs/rules.md');
+      expect(await store.read('doc-1')).toBeNull();
+    });
+
+    /* R-8.32 — one bad path refuses the request, not just that file. */
+    it('rejects an escaping companion path and commits none of the others', async () => {
+      const store = memoryDocuments();
+      const r = router({ documents: () => store, bodies: { create: () => async () => {} } });
+
+      for (const bad of ['../escaped.md', '/etc/passwd', 'docs/../../escaped.md']) {
+        const res = await call(r, 'POST', '/start', {
+          documentId: 'doc-1',
+          documentPath: 'docs/spec.md',
+          files: [{ path: 'docs/rules.md', markdown: 'fine' }, { path: bad, markdown: 'x' }],
+        });
+        expect(res.status, bad).toBe(400);
+      }
+      expect(await store.read('doc-1')).toBeNull();
+    });
+
+    it('rejects a malformed files entry rather than dropping it silently', async () => {
+      const r = router({ bodies: { create: () => async () => {} } });
+      const start = (files: unknown) => call(r, 'POST', '/start', { documentId: 'doc-1', documentPath: 'docs/spec.md', files });
+
+      expect((await start('docs/rules.md')).status).toBe(400);
+      expect((await start([{ path: 'docs/rules.md' }])).status).toBe(400);
+      expect((await start([{ markdown: 'orphaned bytes' }])).status).toBe(400);
+    });
+  });
 });
 
 describe('R-7.1 — POST /open', () => {
