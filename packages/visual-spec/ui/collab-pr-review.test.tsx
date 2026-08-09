@@ -665,6 +665,38 @@ describe('the review row carries the whole identity, once', () => {
     expect(row.textContent).not.toContain('abc1234');
   });
 
+  /*
+   * A reviewer reading a checkout could tell which pull request it was and which commit,
+   * but not whose work it was, and had no route to the conversation — both facts were on
+   * the record this row already renders from. Everything this surface does is local and
+   * read-only, so the pull request itself is where the rest of the review happens.
+   */
+  it('names the author and links out to the pull request', async () => {
+    const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+
+    const row = await screen.findByTestId('vs-review-pull');
+    expect(row.textContent).toContain('reviewer-rita');
+
+    // A new tab: the checkout on screen is state a navigation would cost the reviewer.
+    const link = screen.getByRole('link', { name: /On GitHub/ });
+    expect(link.getAttribute('href')).toBe(PULL.htmlUrl);
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(link.getAttribute('rel')).toBe('noreferrer');
+  });
+
+  /*
+   * The listing says `unknown author` where GitHub gave no login, and this row is the
+   * same fact on a different surface — a blank where a name goes reads as a bug.
+   */
+  it('says so when there is no author, rather than showing a gap', async () => {
+    const { impl } = fakeCollabFetch(changedFiles([]));
+    render(<CollabPrReview pull={{ ...PULL, author: '' }} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+
+    const row = await screen.findByTestId('vs-review-pull');
+    expect(row.textContent).toContain('unknown author');
+  });
+
   it('says read-only exactly once on the surface', async () => {
     const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
     const { container } = render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
@@ -694,7 +726,9 @@ describe('the review title truncates instead of running under the controls', () 
     render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
 
     const heading = await screen.findByText(/#42 Rework the payment rules/);
-    expect(heading.style.minWidth).toMatch(/^0(px)?$/);
+    // The permission to shrink sits on the identity block — a flex child defaults to
+    // `min-width: auto` — and the ellipsis sits on the line that may lose characters.
+    expect(screen.getByTestId('vs-review-pull').style.minWidth).toMatch(/^0(px)?$/);
     expect(heading.style.textOverflow).toBe('ellipsis');
     expect(heading.style.overflow).toBe('hidden');
     // The number is the first thing in the string, so the ellipsis takes the title.

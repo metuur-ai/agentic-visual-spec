@@ -2294,7 +2294,7 @@ const gitToneRemote: React.CSSProperties = { background: '#f0fdf4', border: '1px
  *
  * It is the one pill in the row that is not describing git: the others say where you are,
  * this one is a control that opens a list of pull requests. Violet is what the rest of
- * this product uses for collaboration — the sidebar's "Pull requests" item, the resume
+ * this product uses for collaboration — the sidebar's "Collaborate on pull requests" item, the resume
  * buttons, the apply run — so the colour is the categorical difference, and it matches the
  * surface the pill actually opens.
  */

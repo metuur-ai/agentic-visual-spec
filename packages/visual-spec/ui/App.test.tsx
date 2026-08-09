@@ -12,7 +12,7 @@
  * comments and back.
  */
 import './prism-global'; // must precede @lyfie/luthor
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CollaborationRecord } from '../core/collaboration/document-record';
 import type { CommentRecord } from '../core/editing/comment-doc';
@@ -64,6 +64,9 @@ const OPEN_PULLS = [
   { number: 43, title: 'Unrelated', author: 'dev-dan', state: 'open', draft: false, headBranch: 'fix/thing', baseBranch: 'main', headSha: 'b'.repeat(40), htmlUrl: 'https://github.com/acme/docs/pull/43', documentId: null },
 ];
 
+/** What `POST /pulls/42/mount` answers with — git's own path (R-13.8), never a guessed one. */
+const WORKTREE = { pullNumber: 42, path: '/repo/.visual-spec/worktrees/pr-42', headSha: 'a'.repeat(40) };
+
 function jsonRes(body: unknown, ok = true, status = ok ? 200 : 500) {
   return { ok, status, json: async () => body } as Response;
 }
@@ -78,7 +81,11 @@ function installFetch(availability: unknown = AVAILABILITY) {
     // Nothing is checked out, so `CollabPullsPanel` gets an empty worktree list. Matched
     // before the listing below, whose prefix would otherwise swallow it.
     if (url === '/__vs/collab/pulls/mounted') return jsonRes({ worktrees: [] });
-    // The sidebar's "Pull requests" item and the header chip both count these (R-7.1).
+    // R-13.3 — the checkout git produced, plus the two reads `CollabPrReview` opens with.
+    if (url === '/__vs/collab/pulls/42/mount' && method === 'POST') return jsonRes({ worktree: WORKTREE });
+    if (url === '/__vs/collab/pulls/42/files') return jsonRes({ files: ['docs/spec.md'] });
+    if (url === '/__vs/collab/pulls/42/drafts') return jsonRes({ drafts: [] });
+    // The sidebar's collaborate item and the header chip both count these (R-7.1).
     if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: OPEN_PULLS });
     if (url === '/__vs/collab/open' && method === 'POST') return jsonRes({ ok: true });
     if (url === '/__vs/collab/doc-1') {
@@ -137,7 +144,7 @@ describe('the sidebar offers pull requests as navigation, not as footer text', (
 
   it('sits above the file tree rather than in the footer', async () => {
     const { container } = render(<App />);
-    const item = await screen.findByRole('button', { name: /Pull requests/ });
+    const item = await screen.findByRole('button', { name: /Collaborate on pull requests/ });
     expect(item.closest('footer')).toBeNull();
 
     // Ahead of the "Files" heading in document order — DOCUMENT_POSITION_FOLLOWING is
@@ -155,7 +162,7 @@ describe('the sidebar offers pull requests as navigation, not as footer text', (
   it('shows no count where collaboration is unconfigured, and asks for none', async () => {
     const impl = installFetch({ available: false, reason: 'no_credential', message: 'Collaboration is unavailable.' });
     render(<App />);
-    await waitFor(() => expect(screen.getByRole('button', { name: /Pull requests/ })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole('button', { name: /Collaborate on pull requests/ })).toBeTruthy());
 
     expect(screen.queryByTestId('sidebar-pull-count')).toBeNull();
     expect(impl.mock.calls.map((c) => String(c[0])).some((u) => u.startsWith('/__vs/collab/pulls'))).toBe(false);
@@ -171,18 +178,67 @@ describe('the collaboration UI is mounted from App.tsx (task U-1)', () => {
     expect(screen.queryByText(/Open a document from a pull request/)).toBeNull();
 
     // The entry point lives in the file shell, not inside any TreeEntry.
-    fireEvent.click(screen.getByRole('button', { name: /Pull requests/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Collaborate on pull requests/ }));
 
-    // The whole shell swapped — file view is gone, the open panel is up.
-    expect(screen.queryByText(/Select a file or folder/)).toBeNull();
+    // The picker arrives as a modal drawer beside the file shell rather than in place of
+    // it: choosing what to review is a detour, and the work behind it stays on screen.
+    const drawer = await screen.findByRole('dialog', { name: 'Collaborate on pull requests' });
+    expect(screen.getByText(/Select a file or folder/)).toBeTruthy();
     await screen.findByText(/Open a document from a pull request/);
     await screen.findByText(/Signed in as reviewer-rita/);
+
+    // The ✕ is the way out, and it holds focus from the moment the drawer opens —
+    // the standing-in-for-Escape half of the "only the ✕ closes it" decision.
+    const close = screen.getByRole('button', { name: 'Close' });
+    expect(drawer.contains(close)).toBe(true);
+    expect(document.activeElement).toBe(close);
+
+    // Escape is deliberately inert: the panel's buttons run git, and a stray keypress
+    // must not tear the surface down around a checkout already in flight.
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByRole('dialog', { name: 'Collaborate on pull requests' })).toBeTruthy();
+
+    fireEvent.click(close);
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Collaborate on pull requests' })).toBeNull());
+    expect(screen.queryByText(/Signed in as reviewer-rita/)).toBeNull();
+    expect(screen.getByText(/Select a file or folder/)).toBeTruthy();
+  });
+
+  /*
+   * The drawer is a picker, so what it picks has to leave it. A pull request's code needs
+   * the whole window — a file list, a diff and a comment column do not fit in 480px — and
+   * the checkout the drawer already paid git for has to travel with the choice rather than
+   * being mounted a second time on the other side.
+   */
+  it('hands a checked-out pull request to the full-width surface, mounting it once', async () => {
+    const impl = installFetch();
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Collaborate on pull requests/ }));
+    const drawer = await screen.findByRole('dialog', { name: 'Collaborate on pull requests' });
+
+    const row = drawer.querySelector('[data-vs-pull="42"]') as HTMLElement;
+    fireEvent.click(within(row).getByRole('button', { name: /Review the code/ }));
+
+    // The drawer is gone and the review has the window to itself.
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Collaborate on pull requests' })).toBeNull());
+    await waitFor(() => expect(screen.queryByText(/Select a file or folder/)).toBeNull());
+    await screen.findByText(/The Spec/);
+
+    const mounts = impl.mock.calls.filter(([u, i]) => String(u).endsWith('/pulls/42/mount') && (i as RequestInit | undefined)?.method === 'POST');
+    expect(mounts).toHaveLength(1);
+
+    // The review's way back is labelled `← Pull requests`, so it lands on the list — and
+    // the list is the drawer now. Landing on the file view instead would make the button
+    // name something the click does not do.
+    fireEvent.click(screen.getByRole('button', { name: '← Pull requests' }));
+    await screen.findByRole('dialog', { name: 'Collaborate on pull requests' });
   });
 
   it('opens a document from a PR reference and renders it read-only beside the real comment panel', async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByRole('button', { name: /Pull requests/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /Collaborate on pull requests/ }));
     await screen.findByText(/Signed in as reviewer-rita/);
 
     // The manual URL form is a disclosure now — the pull request list above it is the

@@ -137,14 +137,24 @@ export function CollabHeader({ onExit, review }: { onExit: () => void; review: P
  * panels to find the same row a second time is the "full-surface swap you have to know
  * exists" that Unit 7 exists to remove. An empty intent is the sidebar link, which
  * knows nothing more.
+ *
+ * A `review` is a pull request the caller has ALREADY checked out — `CollabDrawer` runs
+ * the same mount button the landing page ran, so by the time the drawer closes git has
+ * done the work and the worktree is in hand. It is carried rather than reduced to
+ * `reviewPull` because that arm re-runs the mount route: a second checkout of a commit
+ * that is already on disk, and a visible pause between clicking and reading.
  */
-export type CollabIntent = { documentId?: string; reviewPull?: number };
+export type CollabIntent = {
+  documentId?: string;
+  reviewPull?: number;
+  review?: { pull: PullRequestSummary; worktree: MountedWorktree };
+};
 
 export function CollabApp({ onExit, initial }: { onExit: () => void; initial?: CollabIntent }) {
   // The URL still wins where no intent named a document: a reload during a review must
   // come back to the same document, and that is what `vsdoc` is for.
   const [documentId, setDocumentIdState] = useState<string | null>(() => initial?.documentId ?? documentFromUrl());
-  const [pullReview, setPullReview] = useState<PullReview | null>(null);
+  const [pullReview, setPullReview] = useState<PullReview | null>(() => initial?.review ?? null);
   const setDocumentId = useCallback((id: string | null) => {
     setDocumentIdState(id);
     rememberInUrl(id);
@@ -173,7 +183,14 @@ export function CollabApp({ onExit, initial }: { onExit: () => void; initial?: C
           key={pullReview.pull.number}
           pull={pullReview.pull}
           worktree={pullReview.worktree}
-          onExit={() => setPullReview(null)}
+          /*
+           * Where "back" goes depends on where the reviewer came from, and the button says
+           * `← Pull requests` either way — so both arms have to land on a list. A checkout
+           * handed in by `CollabDrawer` was picked from a panel this component does not
+           * own, so it hands the exit up and `App.tsx` reopens the drawer; one picked from
+           * the landing page below returns to it here.
+           */
+          onExit={initial?.review ? onExit : () => setPullReview(null)}
         />
       ) : (
         <div style={{ flex: 1, overflow: 'auto' }}>

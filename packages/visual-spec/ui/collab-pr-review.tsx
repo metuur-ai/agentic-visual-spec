@@ -282,14 +282,30 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
           ← Pull requests
         </button>
         {/*
-          * P4 — the title used to run under the buttons beside it, because a flex child
-          * defaults to `min-width: auto` and so refuses to shrink below its own content.
-          * `minWidth: 0` lets it, and the number leads the string so the ellipsis can only
-          * take the title — the identifying part is never what is cut.
+          * WHO WROTE IT, AND HOW TO GET TO IT. The row named the pull request and the
+          * commit but not the person, and offered no way to github.com — so a reviewer
+          * reading a checkout could not tell whose work it was without going back to the
+          * list, and could not reach the conversation at all. Both are on the pull request
+          * record this component already holds; neither was being shown.
+          *
+          * TWO LINES, BECAUSE ONE COULD NOT HOLD IT. Number, title, author, both branches
+          * and the sha on a single ellipsised line meant the tail — which is where the sha
+          * lives — was the first thing cut on a narrow window. The identity leads on its
+          * own line; the provenance sits under it, quieter, in the row's own monospace.
+          *
+          * P4 — `minWidth: 0` is what lets either line shrink at all: a flex child defaults
+          * to `min-width: auto` and refuses to go below its own content. The number leads
+          * line one so an ellipsis on the tail can only ever take the title.
           */}
-        <strong data-testid="vs-review-pull" data-vs-review-pull={pull.number} style={pullIdentity} title={pull.title}>
-          #{pull.number} {pull.title} · {pull.headBranch} → {pull.baseBranch} · at {shortSha(worktree.headSha)}
-        </strong>
+        <span data-testid="vs-review-pull" data-vs-review-pull={pull.number} style={pullIdentity}>
+          <strong style={identityLine} title={pull.title}>
+            #{pull.number} {pull.title}
+          </strong>
+          <span style={identityMeta}>
+            {pull.author || 'unknown author'} · {pull.headBranch} → {pull.baseBranch} · at{' '}
+            {shortSha(worktree.headSha)}
+          </span>
+        </span>
         <span style={readOnlyChip}>Read-only checkout — no commit, push or merge</span>
         {drafts.length > 0 && (
           <span data-vs-draft-tally style={tallyChip}>
@@ -297,6 +313,16 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
           </span>
         )}
         <span style={{ flex: 1 }} />
+        {/*
+          * The way out to the conversation. Everything this surface does is local and
+          * read-only — nothing here comments, resolves or merges — so the pull request
+          * itself is where the rest of the work happens, and it was reachable from the
+          * list but not from inside a review. New tab, because the checkout on screen is
+          * state a reviewer does not want to lose to a navigation.
+          */}
+        <a href={pull.htmlUrl} target="_blank" rel="noreferrer" style={ghLink}>
+          On GitHub ↗
+        </a>
         <button
           type="button"
           onClick={() => {
@@ -773,7 +799,12 @@ function DraftCard({
 // is the two-row problem this row exists to end. It truncates instead.
 const banner: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'nowrap', padding: '10px 16px', borderBottom: '1px solid #e5e7eb', background: '#fffbeb', font: '13px system-ui', color: '#334155' };
 /** P4 — the one element that may shrink, and the ellipsis can only reach the title. */
-const pullIdentity: React.CSSProperties = { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+const pullIdentity: React.CSSProperties = { flex: '1 1 auto', minWidth: 0, display: 'flex', flexDirection: 'column', gap: 1 };
+const identityLine: React.CSSProperties = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+/** Provenance, in the row's own monospace so the author and the sha line up as facts. */
+const identityMeta: React.CSSProperties = { font: '11px ui-monospace, monospace', color: '#92766a', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+/** A link, dressed as one: the two neighbours are buttons and this must not read as a third. */
+const ghLink: React.CSSProperties = { flexShrink: 0, font: '12px system-ui, sans-serif', color: '#92400e', textDecoration: 'underline' };
 const readOnlyChip: React.CSSProperties = { flexShrink: 0, font: '600 10px system-ui', padding: '2px 8px', borderRadius: 99, border: '1px solid #fcd34d', background: '#fef3c7', color: '#92400e' };
 const backBtn: React.CSSProperties = { flexShrink: 0, font: '12px system-ui, sans-serif', padding: '4px 10px', border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#334155', cursor: 'pointer' };
 const sidebar: React.CSSProperties = { width: 300, flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid #e5e7eb', background: 'white', overflow: 'hidden' };
