@@ -60,6 +60,7 @@
  * `@lyfie/luthor`, no react (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
  */
 import type { ResolvedCollaborationConfig, VisualSpecConfig } from '../config';
+import { type GitContext, readGitContext } from '../git-context';
 import { parseCommentBody } from './comment-projection';
 import { type GitHubBinding, titleFromMarkdown } from './document-record';
 import type { CollaborationStore } from './record-store';
@@ -249,6 +250,38 @@ export function parseServeCollaborationFlags(
   const ref = parseRepoFlag(repoFlag);
   if (!ref) return null;
   return { collaboration: baseBranchFlag === undefined ? ref : { ...ref, baseBranch: baseBranchFlag } };
+}
+
+/**
+ * The collaboration repository the served directory's `origin` already names.
+ *
+ * WHY THIS EXISTS. `--repo` asked the user to restate a fact the tool was displaying two
+ * inches away: the header chip reads `origin` and prints `owner/repo` (R-1.7), and the
+ * collaboration surface next to it said "not configured — restart with `--repo
+ * <owner>/<name>`". Someone sitting in the repository they want to collaborate on had to
+ * type its name to be told what was already on screen.
+ *
+ * GITHUB ONLY, DELIBERATELY. `parseRemoteUrl` recognises other hosts, and the chip is
+ * host-independent on purpose — a GitLab user still sees who owns their repository. But
+ * every collaboration operation underneath this goes through `gh`, so inferring a
+ * collaboration repository from a GitLab origin would configure a mode that cannot work
+ * and replace an honest "not configured" with a failure further in.
+ *
+ * IT DOES NOT DECIDE WHETHER COLLABORATION RUNS. No credential, and the preflight reports
+ * `no_credential` and collaboration stays off (R-9.19) — this only supplies the *repo*,
+ * so an inferred one is exactly as gated as a flagged one. That is what keeps this from
+ * reaching GitHub on behalf of someone who never authenticated to it.
+ *
+ * `null` when there is nothing to infer, which the caller reads as "no flag, no origin" —
+ * the pre-existing `undefined` case, unchanged.
+ */
+export async function collaborationFromOrigin(
+  dir: string,
+  read: (dir: string) => Promise<GitContext> = readGitContext,
+): Promise<RepoRef | null> {
+  const ctx = await read(dir);
+  if (ctx.state !== 'remote' || ctx.host !== 'github.com') return null;
+  return { owner: ctx.owner, repo: ctx.repo };
 }
 
 /**

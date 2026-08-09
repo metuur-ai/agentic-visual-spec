@@ -3,8 +3,10 @@
  * ranges, and folders; an agent applies the comments via the bundled skills.
  *
  *   visual-spec <dir> [--port 5180] [--no-open]   start the browser on <dir> (default cmd)
- *                     [--repo <owner/name>] [--base-branch <branch>]
- *                                                 …with collaboration on that repository
+ *                     [--repo <owner/name>] [--base-branch <branch>] [--no-collab]
+ *                                                 collaboration defaults to the directory's
+ *                                                 GitHub origin; --repo overrides it and
+ *                                                 --no-collab turns it off
  *   visual-spec init <dir> [--name <pkg>]         scaffold a new surface project
  *   visual-spec install-skills [--dest <dir>]     copy the agent skills (default ~/.claude/skills)
  *   visual-spec collab open --repo o/r --branch b --document d
@@ -25,6 +27,7 @@ import {
   classifyBranchLookupFailure,
   findPullNumberForBranch,
   parseOpenCommand,
+  collaborationFromOrigin,
   parseServeCollaborationFlags,
 } from '../core/collaboration/open';
 import { createVisualSpecServer } from './server';
@@ -56,13 +59,31 @@ async function serve(args: string[]) {
   const explicitPort = args.includes('--port');
   const noOpen = args.includes('--no-open');
   const assetsDir = flag(args, '--assets-dir');
-  // Collaboration is off unless `--repo` names one (R-9.19): with no flag `config` stays
-  // undefined, exactly as before, and the server reports collaboration not configured.
-  const config = parseServeCollaborationFlags(flag(args, '--repo'), flag(args, '--base-branch'));
+  const repoFlag = flag(args, '--repo');
+  const baseBranchFlag = flag(args, '--base-branch');
+  let config = parseServeCollaborationFlags(repoFlag, baseBranchFlag);
   if (config === null) {
     console.error('Usage: visual-spec <dir> [--repo <owner/name>] [--base-branch <branch>]');
     process.exit(1);
     return;
+  }
+
+  /*
+   * No `--repo`? Then the served directory's `origin` names one, and typing it out again
+   * was never information the tool did not have (see `collaborationFromOrigin`).
+   *
+   * `--no-collab` is the way out, and it is a flag rather than the default because the
+   * default that made someone restate their own origin is the thing being fixed. Nothing
+   * reaches GitHub on an inference alone: with no credential the preflight reports
+   * `no_credential` and collaboration stays off exactly as it does today (R-9.19).
+   */
+  let inferredFrom: string | null = null;
+  if (config === undefined && !args.includes('--no-collab')) {
+    const inferred = await collaborationFromOrigin(contentDir);
+    if (inferred) {
+      config = { collaboration: baseBranchFlag === undefined ? inferred : { ...inferred, baseBranch: baseBranchFlag } };
+      inferredFrom = `${inferred.owner}/${inferred.repo}`;
+    }
   }
 
   const { server, commentsPath } = createVisualSpecServer({ contentDir, uiDir: UI_DIR, port: requestedPort, assetsDir, config });
@@ -75,6 +96,9 @@ async function serve(args: string[]) {
     console.log(`\n  visual-spec`);
     console.log(`  ➜  dir:      ${contentDir}`);
     console.log(`  ➜  comments: ${commentsPath}`);
+    // Said out loud, because it was inferred rather than asked for. A repository the user
+    // named needs no announcement; one this tool chose for them does.
+    if (inferredFrom) console.log(`  ➜  collab:   ${inferredFrom} (from origin — --no-collab to disable)`);
     console.log(`  ➜  open:     ${url}\n`);
     if (!noOpen) openBrowser(url);
   });

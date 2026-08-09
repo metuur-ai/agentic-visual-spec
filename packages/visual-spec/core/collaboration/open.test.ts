@@ -9,6 +9,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { resolveConfig } from '../config';
+import type { GitContext } from '../git-context';
 import type { CollaborationRecord } from './document-record';
 import type { CollaborationStore } from './record-store';
 import { createGitHubAdapter } from './github-adapter';
@@ -23,6 +24,7 @@ import {
   findPullNumberForBranch,
   parseOpenCommand,
   parseRepoFlag,
+  collaborationFromOrigin,
   parseServeCollaborationFlags,
   readPullRequestReference,
 } from './open';
@@ -252,6 +254,70 @@ describe('serve collaboration flags', () => {
   it('shares one owner/name parser with `collab open`', () => {
     expect(parseRepoFlag('acme/docs')).toEqual(REPO_REF);
     expect(parseOpenCommand('visual-spec collab open --repo a/b/c --branch b --document d')).toBeNull();
+  });
+});
+
+/*
+ * The repository `origin` already names.
+ *
+ * `--repo` asked the user to restate a fact the header chip was displaying two inches
+ * away, and the collaboration surface answered "not configured — restart with `--repo
+ * <owner>/<name>`" to someone sitting in the repository they wanted to collaborate on.
+ */
+describe('collaboration inferred from the directory’s origin', () => {
+  const gitAt = (ctx: GitContext) => async () => ctx;
+
+  const REMOTE: GitContext = {
+    state: 'remote',
+    branch: 'main',
+    detached: false,
+    owner: 'metuur-ai',
+    repo: 'visual-spec-collaboration-test',
+    host: 'github.com',
+    url: 'https://github.com/metuur-ai/visual-spec-collaboration-test.git',
+  };
+
+  it('names the origin repository, so no flag has to repeat it', async () => {
+    expect(await collaborationFromOrigin('/repo', gitAt(REMOTE))).toEqual({
+      owner: 'metuur-ai',
+      repo: 'visual-spec-collaboration-test',
+    });
+  });
+
+  it('infers nothing outside a repository, or from one with no usable origin', async () => {
+    expect(await collaborationFromOrigin('/repo', gitAt({ state: 'none' }))).toBeNull();
+    expect(
+      await collaborationFromOrigin('/repo', gitAt({ state: 'local', branch: 'main', detached: false })),
+    ).toBeNull();
+  });
+
+  /*
+   * Every operation underneath this goes through `gh`. Inferring a collaboration
+   * repository from a GitLab origin would configure a mode that cannot work and replace
+   * an honest "not configured" with a failure further in — so the chip stays
+   * host-independent (R-1.7) and this does not.
+   */
+  it('infers nothing from an origin that is not GitHub', async () => {
+    expect(
+      await collaborationFromOrigin('/repo', gitAt({ ...REMOTE, host: 'gitlab.com' })),
+    ).toBeNull();
+  });
+
+  /* A detached HEAD is still the same repository — the branch is not what is read here. */
+  it('reads the repository even when HEAD is detached', async () => {
+    expect(await collaborationFromOrigin('/repo', gitAt({ ...REMOTE, detached: true, branch: 'a1b2c3d' }))).toEqual({
+      owner: 'metuur-ai',
+      repo: 'visual-spec-collaboration-test',
+    });
+  });
+
+  it('produces a config resolveConfig accepts, with its own base-branch default', async () => {
+    const inferred = await collaborationFromOrigin('/repo', gitAt(REMOTE));
+    expect(resolveConfig({ collaboration: inferred! }).collaboration).toEqual({
+      owner: 'metuur-ai',
+      repo: 'visual-spec-collaboration-test',
+      baseBranch: 'main',
+    });
   });
 });
 
