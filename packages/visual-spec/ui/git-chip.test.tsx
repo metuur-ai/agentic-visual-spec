@@ -688,14 +688,54 @@ describe('the brand row yields the served path before the git chips', () => {
     expect(area.style.minWidth).toBe('0');
   });
 
-  it('makes the path yield faster than the chips, and Change… not at all', async () => {
+  it('makes the path yield faster than the chips', async () => {
     await mountChip(REMOTE_GITHUB);
     const area = screen.getByTestId('git-chip-area');
     const row = area.parentElement as HTMLElement;
-    const [path, , change] = [...row.children] as HTMLElement[];
+    const [path] = [...row.children] as HTMLElement[];
 
     expect(Number(path.style.flexShrink)).toBeGreaterThan(Number(area.style.flexShrink || 1));
-    expect(change.style.flexShrink).toBe('0');
+  });
+
+  /*
+   * The group clips rather than paints outside itself. The count pill cannot shrink, so
+   * an over-subscribed row leaves the group's children wider than its box — and without
+   * this they render over "Change…" next door: a button drawn under a chip, still at its
+   * own coordinates, still clickable, and unreadable.
+   */
+  it('clips its own chips instead of painting over its neighbour', async () => {
+    await mountChip(REMOTE_GITHUB);
+    expect(screen.getByTestId('git-chip').style.overflow).toBe('hidden');
+  });
+
+  /*
+   * The tooltip wrapper is the flex item, not the chip. Left shrinkable around a
+   * non-shrinking child it absorbed the whole deficit and let the child overflow it —
+   * the count was clipped to "3 o" while the repository chip beside it sat at a
+   * comfortable width, never having been asked to give anything up.
+   */
+  it('does not let the count’s wrapper absorb the row’s deficit', async () => {
+    // Needs collaboration configured — `mountChip`'s server reports it off, so there is
+    // no count pill there to reason about.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/__vs/git') return jsonRes(REMOTE_GITHUB);
+        if (url === '/__vs/git/branches') return ({ ok: false, status: 404, json: async () => ({ error: 'no route' }) } as Response);
+        if (url === '/__vs/collab') return jsonRes({ available: true, login: 'x', repo: { owner: 'acme', repo: 'docs' } });
+        if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: [] });
+        if (url.startsWith('/__vs/comments')) return jsonRes([OPEN_COMMENT]);
+        if (url === '/__vs/source/root') return jsonRes({ root: '/repo' });
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+    render(<MainHeader file="docs/spec.md" />);
+    const count = await screen.findByTestId('git-pull-count');
+    const wrapper = count.parentElement?.parentElement as HTMLElement;
+
+    expect(count.style.flexShrink).toBe('0');
+    expect(wrapper.style.flexShrink).toBe('0');
   });
 
   /* The row is one line. Wrapping is what produced the three-row header. */

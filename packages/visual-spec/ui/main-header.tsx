@@ -220,7 +220,23 @@ const TOOLTIP_CSS =
 
 let tooltipSeq = 0;
 
-function Tooltip({ label, children }: { label: string; children: ReactNode }) {
+function Tooltip({
+  label,
+  children,
+  shrink = true,
+}: {
+  label: string;
+  children: ReactNode;
+  /**
+   * Whether this wrapper may give up width when its row is tight.
+   *
+   * It has to be told, because the wrapper — not the chip — is the flex item. Left
+   * shrinkable around a `flex-shrink: 0` child, it absorbs the whole deficit and the
+   * child simply overflows it: the pull count was clipped to "3 o" while the repository
+   * chip beside it sat at a comfortable width, having never been asked to give anything.
+   */
+  shrink?: boolean;
+}) {
   const [shown, setShown] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Focus that arrived by pointer is not a request to be told what the control is. */
@@ -250,7 +266,7 @@ function Tooltip({ label, children }: { label: string; children: ReactNode }) {
 
   return (
     <span
-      style={tipWrap}
+      style={shrink ? tipWrap : { ...tipWrap, flexShrink: 0 }}
       onMouseEnter={show}
       onMouseLeave={hide}
       /*
@@ -583,7 +599,7 @@ function PullCount({ ctx, pulls, onOpen }: { ctx: GitContext; pulls: CollabPulls
       ? ` — in ${pulls.repo.owner}/${pulls.repo.repo}, the configured collaboration repository, which is not this directory's origin`
       : '';
   return (
-    <Tooltip label={`${plural}${disclosure} — click to list them`}>
+    <Tooltip label={`${plural}${disclosure} — click to list them`} shrink={false}>
       <button type="button" onClick={onOpen} data-testid="git-pull-count" style={{ ...gitChip, ...gitTonePulls, ...pullCountBtn }}>
         <PullRequestChipIcon />
         {count} open
@@ -800,7 +816,16 @@ function PullMenu({
 }
 
 /** Brand lockup + the full on-disk path of the file shown in the main section. */
-function Brand({ file, actions }: { file: string; actions?: HeaderActions }) {
+function Brand({
+  file,
+  actions,
+  inline = true,
+}: {
+  file: string;
+  actions?: HeaderActions;
+  /** Whether this header has room for "Change…" in the brand row — see below. */
+  inline?: boolean;
+}) {
   const root = useSpecsRoot();
   const [pathCopied, setPathCopied] = useState(false);
 
@@ -862,7 +887,17 @@ function Brand({ file, actions }: { file: string; actions?: HeaderActions }) {
           {/* R-3.1 — adjacent to the served path, in both headers: `Brand` is what
               `MainHeader` and `BrandHeader` share, so one placement covers both. */}
           <GitChip actions={actions} />
-          <ChangeDirButton />
+          {/*
+            R-1.x — "Change…" only where the row has room for it.
+
+            With a document open the toolbar is wide, and the served path, three git chips
+            and this button together want about 25px more than the brand block gets at
+            1280. Something had to leave, and this is the one to go: changing the served
+            directory is a once-a-session act, while the chips are read constantly. In
+            `MainHeader` it moves into the ⋯ menu that already holds Help and History; in
+            `BrandHeader`, which has no toolbar competing for the row, it stays put.
+          */}
+          {inline && <ChangeDirButton />}
         </div>
       </div>
     </div>
@@ -1981,7 +2016,7 @@ export function MainHeader({
 
   return (
     <header style={bar}>
-      <Brand file={file} actions={actions} />
+      <Brand file={file} actions={actions} inline={false} />
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
         <HeaderZones
@@ -2053,6 +2088,7 @@ export function MainHeader({
           ]}
         />
         <OverflowMenu>
+          <ChangeDirButton />
           <HelpButton />
           <HistoryButton file={file} comments={comments} />
         </OverflowMenu>
@@ -2218,7 +2254,20 @@ const pathFile: React.CSSProperties = { font: '600 11.5px ui-monospace, "SF Mono
  * is the most expendable, being also the link and the tooltip, so it shrinks first and the
  * count never shrinks at all.
  */
-const gitGroup: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 0 };
+/*
+ * `overflow: hidden` is the invariant, not a nicety.
+ *
+ * The pull-count pill is `flex-shrink: 0` — it is a control and must stay legible — so
+ * when the row is over-subscribed the group's children are wider than the group's box.
+ * Without this they simply paint outside it, and what they paint over is "Change…"
+ * next door: a button rendered *under* a chip, at its own coordinates, still clickable,
+ * still in the accessibility tree, and unreadable.
+ *
+ * It clips the CHIPS only. Both popovers are siblings of this element inside
+ * `gitChipWrap`, which is why that wrapper exists and why it is the one that stays
+ * unclipped.
+ */
+const gitGroup: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 0, overflow: 'hidden' };
 const gitChip: React.CSSProperties = {
   display: 'inline-flex',
   alignItems: 'center',
