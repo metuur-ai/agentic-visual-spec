@@ -253,15 +253,32 @@ export function createVisualSpecServer(opts: ServeOptions) {
           return sendJson(res, r.status, r.json);
         }
 
-        // R-2.1 (git). Read-only, so unlike the write routes above it needs no
-        // attestation — it inherits the `/__vs/` guard by position and has nothing
-        // to open up if that were to break. The root is passed as a getter because
-        // `setRoot` reassigns `contentDir` at runtime; capturing the string once
-        // would report the first directory ever served for the life of the process
-        // (R-2.2).
+        // R-2.1 (git). This block was read-only through Units 1–4 and said so; it
+        // stopped being read-only when `POST /__vs/git/checkout` (R-5.5) joined it,
+        // and a checkout changes the user's own working tree. So the write method
+        // attests like every other write route: registration order is invisible at
+        // runtime and the two hosts express the guard differently, which is the whole
+        // argument in `core/vite/guard-attestation.ts`. The reads keep inheriting the
+        // guard by position — they open nothing if it breaks. The root is passed as a
+        // getter because `setRoot` reassigns `contentDir` at runtime; capturing the
+        // string once would report the first directory ever served for the life of
+        // the process (R-2.2).
         if (url.pathname === '/__vs/git' || url.pathname.startsWith('/__vs/git/')) {
+          if (method !== 'GET' && !guardRan(req.headers)) {
+            req.resume();
+            return sendJson(res, 500, { error: GUARD_NOT_RUN });
+          }
           const sub = url.pathname.slice('/__vs/git'.length);
-          const r = await handleGitRequest(() => contentDir, method, sub);
+          // R-6.3. The branch routes are absent unless configuration enabled them,
+          // and the flag is read from the same resolved configuration the
+          // collaboration routes use. The body is read for a POST for the same
+          // reason the `/__vs/tree` block reads one: the Vite host's `middleware`
+          // helper always does, and a body read on one host only is the same POST
+          // answering differently on the two (R-2.3).
+          const body = method === 'POST' ? await readJsonBody(req) : undefined;
+          const r = await handleGitRequest(() => contentDir, method, sub, body, {
+            allowCheckout: collabConfig.git.allowCheckout,
+          });
           return sendJson(res, r.status, r.json);
         }
 

@@ -258,12 +258,27 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         return handleTree(tree, method, pathname, query, body);
       }));
 
-      // R-2.1 (git). Read-only, so it inherits the `/__vs` guard registered above by
-      // position and needs no attestation of its own. The root is a getter because
+      // R-2.1 (git). The reads inherit the `/__vs` guard registered above by position
+      // and need no attestation — they open nothing if it breaks. `POST
+      // /__vs/git/checkout` (R-5.5) does: it changes the user's own working tree, so
+      // it attests like every other write route, for the reason set out in
+      // `core/vite/guard-attestation.ts` — registration order is invisible at runtime
+      // and the two hosts express the guard differently. The root is a getter because
       // `setRoot` reassigns `specsRoot` at runtime; a captured string would report
       // the startup directory forever (R-2.2).
-      server.middlewares.use('/__vs/git', middleware((req, _query, pathname) =>
-        handleGitRequest(() => specsRoot, req.method ?? 'GET', pathname)));
+      // R-6.3: the branch routes of Unit 5 are absent unless configuration enabled
+      // them. `gitConfig` is resolved once here rather than read from the
+      // `collabConfig` further down, which is constructed after this registration —
+      // same call, same answer, and the flag is a startup value in both hosts.
+      const gitConfig = resolveConfig(opts.config).git;
+      server.middlewares.use('/__vs/git', middleware((req, _query, pathname, body) => {
+        if ((req.method ?? 'GET') !== 'GET' && !guardRan(req.headers)) {
+          return Promise.resolve({ status: 500, json: { error: GUARD_NOT_RUN } });
+        }
+        return handleGitRequest(() => specsRoot, req.method ?? 'GET', pathname, body, {
+          allowCheckout: gitConfig.allowCheckout,
+        });
+      }));
 
       // Raw bytes for image previews / downloads. Streams (not JSON), so it's not
       // wrapped in the json `middleware` helper.
