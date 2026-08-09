@@ -1,9 +1,35 @@
 import { type CommentRecord, buildApplyPrompt, useComments, useInspector, useSpecsRoot } from '../core/app';
-import { memo, useEffect, useReducer, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { HelpButton } from './help-page';
 import { CommentHistoryList } from './comment-history-list';
 import { toPath } from './md-path';
-import { useGitContext } from './use-git-context';
+import type { PullRequestSummary } from './collab-client';
+import { type CollabPulls, type ConfiguredRepo, useCollabPulls } from './use-collab-pulls';
+import { type BranchListing, useGitBranches } from './use-git-branches';
+import { type GitContext, useGitContext } from './use-git-context';
+
+/**
+ * What the chip needs from the shell around it, and the whole of it.
+ *
+ * Every entry is optional because `BrandHeader` renders the same `Brand` with none of
+ * them: there is no document open behind the empty state, so there is nothing to
+ * confirm, no pane to re-point and no surface to swap to. A missing handler is not a
+ * degraded mode — it is a header with less of an app underneath it.
+ */
+export type HeaderActions = {
+  /**
+   * R-6.5 — run `proceed` once the main document editor's unsaved work is resolved,
+   * or immediately where there is none. The dirty buffer and the dialog both live in
+   * `ui/App.tsx`; this is the header asking, not deciding.
+   */
+  confirmUnsaved?: (proceed: () => void) => void;
+  /** R-6.7 / R-6.8 — the branch moved, so the file tree and the open file are stale. */
+  onBranchChanged?: () => void;
+  /** R-7.7 — open the collaboration surface on a document that is already attached. */
+  onResumeCollab?: (documentId: string) => void;
+  /** R-7.8 — open the collaboration surface on a pull request to be checked out. */
+  onReviewPull?: (pullNumber: number) => void;
+};
 
 function CommentIcon({ size = 14 }: { size?: number }) {
   return (
@@ -111,84 +137,452 @@ function BranchLabel({ branch, detached }: { branch: string; detached: boolean }
   );
 }
 
+/** Which of the chip's two popovers is on screen, if either. */
+type ChipMenu = 'closed' | 'branches' | 'pulls';
+
 /**
- * The git context chip (R-3.1 … R-3.9). Lives beside the served path because the
+ * The git context chip (R-3.1 … R-3.9), the branch switcher (R-6.1 … R-6.8) and the
+ * open pull request count (R-7.1 … R-7.9). Lives beside the served path because the
  * directory and the branch checked out in it are one fact, not two.
  *
  * The `null` case is not a fourth cosmetic state — it is the requirement (R-3.2).
  * Before the first read returns, the chip asserts none of the three states; if it
  * defaulted to "not a git repo" it would flash a falsehood and then correct
- * itself, which is exactly the confusion the three states exist to prevent.
+ * itself, which is exactly the confusion the three states exist to prevent. The count
+ * waits for the same moment for the same reason: it renders *inside* a chip that has
+ * not yet said what it is describing.
+ *
+ * WHY THE POPOVERS SIT OUTSIDE THE CHIP ELEMENT. `gitChip` clips its overflow so a
+ * long `owner/repo` truncates instead of pushing the path button off the row — which
+ * would clip a popover too. The chip and its two popovers therefore share a
+ * positioned wrapper, and the open/refusal state lives here rather than in either
+ * popover, because both are dismissed by the same click-outside.
  */
-function GitChip() {
+function GitChip({ actions }: { actions?: HeaderActions }) {
   const ctx = useGitContext();
+  const branches = useGitBranches();
+  const pulls = useCollabPulls();
+  const [menu, setMenu] = useState<ChipMenu>('closed');
+  /** R-6.6 — the paths git reported, held until the menu is dismissed. */
+  const [refusal, setRefusal] = useState<string[] | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+  const [changing, setChanging] = useState<string | null>(null);
+  const rootRef = useRef<HTMLSpanElement>(null);
 
-  if (ctx == null) {
-    return (
-      <span style={{ ...gitChip, ...gitTonePending }} data-testid="git-chip" title="Reading git context…" aria-busy="true">
-        <span style={gitPlaceholderBar} aria-hidden />
-      </span>
-    );
-  }
+  useEffect(() => {
+    if (menu === 'closed') return;
+    const onDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setMenu('closed');
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [menu]);
 
-  if (ctx.state === 'none') {
-    return (
-      <span style={{ ...gitChip, ...gitToneNone }} data-testid="git-chip" title="This directory is not inside a git repository">
-        <BranchOffIcon />
-        <span>not a git repo</span>
-      </span>
-    );
-  }
+  const change = useCallback(
+    async (name: string) => {
+      setChanging(name);
+      const outcome = await branches.checkout(name);
+      setChanging(null);
+      if (outcome.ok) {
+        // The chip itself needs nothing: `checkout` published the server's own context
+        // (R-6.7) and `useGitContext` has already adopted it. What the shell owns is
+        // the file tree and the pane, which the branch may just have emptied.
+        setMenu('closed');
+        actions?.onBranchChanged?.();
+        return;
+      }
+      if (outcome.kind === 'dirty') {
+        setRefusal(outcome.paths);
+        return;
+      }
+      setFailure(outcome.message);
+    },
+    [branches, actions],
+  );
 
-  if (ctx.state === 'local') {
-    // Two different situations land here and they are NOT the same claim. No
-    // `origin` at all (R-3.4) versus an `origin` whose URL matched none of the
-    // supported shapes (R-3.5) — saying "no remote" in the second case denies a
-    // remote the user can see in their own git config.
-    const unrecognised = Boolean(ctx.url);
-    return (
-      <span
-        style={{ ...gitChip, ...gitToneLocal }}
-        data-testid="git-chip"
-        title={unrecognised ? `Remote not recognised · ${ctx.url}` : 'No remote is configured for this repository'}
+  /**
+   * R-6.5 — the confirmation belongs to the shell, and the request waits behind it.
+   * Where no shell passed one there is no main document editor mounted to have
+   * dirtied, so proceeding immediately is not a shortcut past the guard.
+   */
+  const select = (name: string) => {
+    setRefusal(null);
+    setFailure(null);
+    const run = () => void change(name);
+    if (actions?.confirmUnsaved) actions.confirmUnsaved(run);
+    else run();
+  };
+
+  const toggle = (which: Exclude<ChipMenu, 'closed'>) => {
+    setRefusal(null);
+    setFailure(null);
+    setMenu((current) => (current === which ? 'closed' : which));
+  };
+
+  /*
+   * R-6.1 / R-6.2 — a control only where configuration has enabled one. `enabled` is
+   * still `null` while the probe is in flight, and that renders as Unit 3 too: a
+   * control that appears a beat later is as distinguishable from absent as a disabled
+   * one, which is what R-6.2 forbids.
+   */
+  const switchable = branches.enabled === true;
+  const branchSlot = (branch: string, detached: boolean) =>
+    switchable ? (
+      <button
+        type="button"
+        onClick={() => toggle('branches')}
+        data-testid="git-branch-switch"
+        title={detached ? `${DETACHED_TITLE} — choose a branch to check out` : 'Change branch'}
+        style={branchBtn}
       >
-        <UnplugIcon />
-        <BranchLabel branch={ctx.branch} detached={ctx.detached} />
+        {headText(branch, detached)} <span style={gitDot}>▾</span>
+      </button>
+    ) : (
+      <BranchLabel branch={branch} detached={detached} />
+    );
+
+  const body = (() => {
+    if (ctx == null) {
+      return (
+        <span style={{ ...gitChip, ...gitTonePending }} data-testid="git-chip" title="Reading git context…" aria-busy="true">
+          <span style={gitPlaceholderBar} aria-hidden />
+        </span>
+      );
+    }
+
+    if (ctx.state === 'none') {
+      return (
+        <span style={{ ...gitChip, ...gitToneNone }} data-testid="git-chip" title="This directory is not inside a git repository">
+          <BranchOffIcon />
+          <span>not a git repo</span>
+          <PullCount ctx={ctx} pulls={pulls} onOpen={() => toggle('pulls')} />
+        </span>
+      );
+    }
+
+    if (ctx.state === 'local') {
+      // Two different situations land here and they are NOT the same claim. No
+      // `origin` at all (R-3.4) versus an `origin` whose URL matched none of the
+      // supported shapes (R-3.5) — saying "no remote" in the second case denies a
+      // remote the user can see in their own git config.
+      const unrecognised = Boolean(ctx.url);
+      return (
+        <span
+          style={{ ...gitChip, ...gitToneLocal }}
+          data-testid="git-chip"
+          title={unrecognised ? `Remote not recognised · ${ctx.url}` : 'No remote is configured for this repository'}
+        >
+          <UnplugIcon />
+          {branchSlot(ctx.branch, ctx.detached)}
+          <span style={gitDot}>·</span>
+          <span>{unrecognised ? 'unrecognised remote' : 'no remote'}</span>
+          <PullCount ctx={ctx} pulls={pulls} onOpen={() => toggle('pulls')} />
+        </span>
+      );
+    }
+
+    // Owner, repository and branch are host-independent facts, so they render the
+    // same everywhere; only the URL *shape* for a link is GitHub-specific, so only
+    // the link is conditional (R-3.7 / R-3.8). A GitLab user still sees who owns
+    // the repository they are commenting on.
+    const label = `${ctx.owner}/${ctx.repo}`;
+    const linkable = ctx.host === 'github.com';
+    return (
+      <span style={{ ...gitChip, ...gitToneRemote }} data-testid="git-chip" title={ctx.url}>
+        <LinkIcon />
+        {linkable ? (
+          <a
+            href={`https://github.com/${ctx.owner}/${ctx.repo}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={gitRepoLink}
+          >
+            {label}
+          </a>
+        ) : (
+          <span style={gitRepoText}>{label}</span>
+        )}
         <span style={gitDot}>·</span>
-        <span>{unrecognised ? 'unrecognised remote' : 'no remote'}</span>
+        {branchSlot(ctx.branch, ctx.detached)}
+        <PullCount ctx={ctx} pulls={pulls} onOpen={() => toggle('pulls')} />
       </span>
     );
-  }
+  })();
 
-  // Owner, repository and branch are host-independent facts, so they render the
-  // same everywhere; only the URL *shape* for a link is GitHub-specific, so only
-  // the link is conditional (R-3.7 / R-3.8). A GitLab user still sees who owns
-  // the repository they are commenting on.
-  const label = `${ctx.owner}/${ctx.repo}`;
-  const linkable = ctx.host === 'github.com';
   return (
-    <span style={{ ...gitChip, ...gitToneRemote }} data-testid="git-chip" title={ctx.url}>
-      <LinkIcon />
-      {linkable ? (
-        <a
-          href={`https://github.com/${ctx.owner}/${ctx.repo}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          style={gitRepoLink}
-        >
-          {label}
-        </a>
-      ) : (
-        <span style={gitRepoText}>{label}</span>
+    <span ref={rootRef} style={gitChipWrap} data-testid="git-chip-area">
+      {body}
+      {menu === 'branches' && (
+        <BranchMenu
+          listing={branches.listing}
+          current={ctx && ctx.state !== 'none' && !ctx.detached ? ctx.branch : null}
+          changing={changing}
+          refusal={refusal}
+          failure={failure}
+          onSelect={select}
+          onClose={() => setMenu('closed')}
+        />
       )}
-      <span style={gitDot}>·</span>
-      <BranchLabel branch={ctx.branch} detached={ctx.detached} />
+      {menu === 'pulls' && (
+        <PullMenu
+          pulls={pulls.pulls ?? []}
+          onResume={(pull) => {
+            // R-7.7 — the id the *server* resolved from the body (R-7.4/R-7.5), passed
+            // through untouched. Nothing here re-derives it, and nothing here could:
+            // the body it was read from is not in this process.
+            const documentId = pull.documentId;
+            if (!documentId) return;
+            setMenu('closed');
+            void pulls.resume(documentId, pull.number).then(() => actions?.onResumeCollab?.(documentId));
+          }}
+          onReview={(pull) => {
+            setMenu('closed');
+            actions?.onReviewPull?.(pull.number);
+          }}
+          onClose={() => setMenu('closed')}
+        />
+      )}
     </span>
   );
 }
 
+/**
+ * The open pull request count (R-7.1 … R-7.3) and, where they differ, the name of the
+ * repository it belongs to (R-8.1).
+ *
+ * Renders nothing at all where collaboration is not configured (R-7.2) or before the
+ * first listing lands — and `useCollabPulls` has issued no request in the first case,
+ * which is the half of R-7.2 an absent element cannot demonstrate on its own.
+ */
+function PullCount({ ctx, pulls, onOpen }: { ctx: GitContext; pulls: CollabPulls; onOpen: () => void }) {
+  if (pulls.configured !== true || pulls.pulls === null) return null;
+  const count = pulls.pulls.length;
+  const named = namesCountRepo(ctx, pulls.repo);
+  return (
+    <>
+      <span style={gitDot}>·</span>
+      <button
+        type="button"
+        onClick={onOpen}
+        data-testid="git-pull-count"
+        title={`${count} open pull request${count === 1 ? '' : 's'} — click to list them`}
+        style={pullCountBtn}
+      >
+        {count} open
+      </button>
+      {named && pulls.repo && (
+        <span data-testid="git-pull-count-repo" style={pullRepoNote} title="The count belongs to the configured collaboration repository, which is not this directory's origin">
+          on {pulls.repo.owner}/{pulls.repo.repo}
+        </span>
+      )}
+    </>
+  );
+}
+
+/**
+ * R-8.1 / R-8.2 — must the chip say which repository the count is of?
+ *
+ * The chip's `owner/repo` comes from the served directory's `origin` (R-1.7); the
+ * count comes from `config.collaboration`. `POST /__vs/dir/pick` re-roots the served
+ * directory at runtime while the configuration stays fixed, so the two genuinely
+ * diverge and the count can render inside a chip naming a different repository.
+ *
+ * Where they agree, nothing is added (R-8.2). Where the served directory names no
+ * remote repository at all — `local`, or `none` — the naming is added too: there the
+ * chip names nothing beside the count, so an unlabelled number belongs to whichever
+ * repository the reader assumes. Neither repository is changed either way (R-8.3);
+ * this is a disclosure, not a reconciliation.
+ */
+function namesCountRepo(ctx: GitContext, repo: ConfiguredRepo | null): boolean {
+  if (!repo) return false;
+  if (ctx.state === 'remote') return ctx.owner !== repo.owner || ctx.repo !== repo.repo;
+  return true;
+}
+
+/**
+ * The branch list (R-6.1) and what a refusal looks like (R-6.6).
+ *
+ * THERE IS NO WAY PAST THE REFUSAL, AND THAT IS THE FEATURE. R-5.5 refuses on any
+ * uncommitted work because `git checkout` silently carries an edit onto the new branch
+ * whenever the file is identical in both commits — the ordinary case in a repository
+ * of documents. A "change anyway" control here would hand back precisely the outcome
+ * the server refused to produce, so the refusal names the files and stops. Committing
+ * or setting the work aside is the user's decision to make in their own terminal.
+ */
+function BranchMenu({
+  listing,
+  current,
+  changing,
+  refusal,
+  failure,
+  onSelect,
+  onClose,
+}: {
+  listing: BranchListing | null;
+  /** The branch `HEAD` is on, or `null` on a detached HEAD — where none is current. */
+  current: string | null;
+  changing: string | null;
+  refusal: string[] | null;
+  failure: string | null;
+  onSelect: (branch: string) => void;
+  onClose: () => void;
+}) {
+  // R-6.4 — the list is built from names git reported as branches, and a detached
+  // HEAD's sha is not one of them. It cannot appear here to be selected.
+  const local = listing?.local ?? [];
+  const localNames = new Set(local.map((b) => b.name));
+  const remoteOnly = (listing?.remote ?? []).filter((name) => !localNames.has(name));
+
+  return (
+    <div style={gitPop} data-testid="git-branch-menu">
+      <div style={applyPopHead}>
+        <span style={{ fontWeight: 700 }}>Change branch</span>
+        <button type="button" onClick={onClose} style={closeBtn} title="Close" aria-label="Close">
+          ✕
+        </button>
+      </div>
+
+      {refusal && (
+        <div style={refusalBox} data-testid="git-branch-refusal">
+          <div style={{ fontWeight: 700, marginBottom: 4 }}>
+            Uncommitted work is in the way, so the branch was not changed.
+          </div>
+          <ul style={refusalList}>
+            {refusal.map((path) => (
+              <li key={path}>
+                <code style={targetChip}>{path}</code>
+              </li>
+            ))}
+          </ul>
+          <div style={{ marginTop: 6 }}>Commit these, or set them aside yourself, and try again.</div>
+        </div>
+      )}
+      {failure && <div style={refusalBox}>{failure}</div>}
+
+      {listing === null ? (
+        <div style={{ padding: '12px', color: '#94a3b8', fontSize: 12.5 }}>Reading branches…</div>
+      ) : (
+        <div style={{ maxHeight: 300, overflow: 'auto', padding: 8 }}>
+          {local.map((branch) => (
+            <button
+              key={branch.name}
+              type="button"
+              onClick={() => onSelect(branch.name)}
+              disabled={branch.name === current || changing !== null}
+              data-testid={`git-branch-${branch.name}`}
+              style={{ ...scopeRow, opacity: branch.name === current ? 0.55 : 1 }}
+            >
+              <span style={scopeTitle}>{branch.name}</span>
+              <span style={branchMeta}>
+                {branch.name === current
+                  ? 'current'
+                  : changing === branch.name
+                    ? 'changing…'
+                    : // Absent counts are absent, not zero: R-5.2 distinguishes "level
+                      // with an upstream" from "has no upstream to be level with".
+                      branch.ahead === undefined
+                      ? 'no upstream'
+                      : `↑${branch.ahead} ↓${branch.behind ?? 0}`}
+              </span>
+            </button>
+          ))}
+          {remoteOnly.map((name) => (
+            <button
+              key={`origin/${name}`}
+              type="button"
+              onClick={() => onSelect(name)}
+              disabled={changing !== null}
+              data-testid={`git-branch-${name}`}
+              style={scopeRow}
+            >
+              <span style={scopeTitle}>{name}</span>
+              <span style={branchMeta}>{changing === name ? 'changing…' : 'on origin'}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * How many pull requests the list renders before it stops (R-7.9).
+ *
+ * The count beside the chip is NOT bounded by this and must never be: it is the
+ * number github.com shows for the same repository, and a header that quietly reported
+ * "8 open" on a repository with sixty would be wrong in the one place the user checks
+ * it against another screen. So the two numbers are allowed to disagree, and the list
+ * says which of them it is.
+ */
+const PULL_LIST_BOUND = 8;
+
+/**
+ * The open pull requests, with the one action each of them has (R-7.6 … R-7.9).
+ *
+ * A pull request carrying a collaboration document is an active collaboration and the
+ * thing to do with it is resume it; one that carries none is somebody's code and the
+ * thing to do with it is read it. Offering both on every row would ask the user to
+ * know which kind they are looking at — which is the distinction this list exists to
+ * draw for them.
+ */
+function PullMenu({
+  pulls,
+  onResume,
+  onReview,
+  onClose,
+}: {
+  pulls: PullRequestSummary[];
+  onResume: (pull: PullRequestSummary) => void;
+  onReview: (pull: PullRequestSummary) => void;
+  onClose: () => void;
+}) {
+  const shown = pulls.slice(0, PULL_LIST_BOUND);
+  return (
+    <div style={gitPop} data-testid="git-pull-menu">
+      <div style={applyPopHead}>
+        <span style={{ fontWeight: 700 }}>Open pull requests</span>
+        <button type="button" onClick={onClose} style={closeBtn} title="Close" aria-label="Close">
+          ✕
+        </button>
+      </div>
+      {pulls.length === 0 ? (
+        <div style={{ padding: 12, color: '#94a3b8', fontSize: 12.5 }}>No open pull requests.</div>
+      ) : (
+        <div style={{ maxHeight: 320, overflow: 'auto', padding: 8 }}>
+          {shown.map((pull) => (
+            <div key={pull.number} style={pullRow} data-testid={`git-pull-${pull.number}`}>
+              <span style={scopeTitle}>
+                <span style={gitDot}>#{pull.number}</span> {pull.title}
+              </span>
+              {pull.documentId ? (
+                <>
+                  <span style={collabBadge} data-testid={`git-pull-${pull.number}-collab`}>
+                    collaboration
+                  </span>
+                  <button type="button" onClick={() => onResume(pull)} style={rerunBtn}>
+                    Resume
+                  </button>
+                </>
+              ) : (
+                <button type="button" onClick={() => onReview(pull)} style={rerunBtn}>
+                  Review
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {pulls.length > shown.length && (
+        <div style={modelNote} data-testid="git-pull-truncated">
+          Showing {shown.length} of {pulls.length}. The rest are on GitHub.
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Brand lockup + the full on-disk path of the file shown in the main section. */
-function Brand({ file }: { file: string }) {
+function Brand({ file, actions }: { file: string; actions?: HeaderActions }) {
   const root = useSpecsRoot();
   const [pathCopied, setPathCopied] = useState(false);
 
@@ -236,7 +630,7 @@ function Brand({ file }: { file: string }) {
           </button>
           {/* R-3.1 — adjacent to the served path, in both headers: `Brand` is what
               `MainHeader` and `BrandHeader` share, so one placement covers both. */}
-          <GitChip />
+          <GitChip actions={actions} />
           <ChangeDirButton />
         </div>
       </div>
@@ -857,6 +1251,7 @@ export function MainHeader({
   isMarkdown = false,
   mode = 'view',
   onModeChange,
+  actions,
 }: {
   file: string;
   onNavigate?: (f: string) => void;
@@ -864,6 +1259,7 @@ export function MainHeader({
   isMarkdown?: boolean;
   mode?: ViewMode;
   onModeChange?: (m: ViewMode) => void;
+  actions?: HeaderActions;
 }) {
   const { comments } = useComments(); // all files = the cart
   const open = comments.filter((c) => c.status === 'open');
@@ -895,7 +1291,7 @@ export function MainHeader({
 
   return (
     <header style={bar}>
-      <Brand file={file} />
+      <Brand file={file} actions={actions} />
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
         <HelpButton />
@@ -986,11 +1382,17 @@ function AllComments({ open, onPick }: { open: CommentRecord[]; onPick: (surface
   );
 }
 
-/** Brand-only header for the empty state (no specs loaded → no comment controls). */
-export function BrandHeader() {
+/**
+ * Brand-only header for the empty state (no specs loaded → no comment controls).
+ *
+ * It still takes the actions: there is no document open to have unsaved work in, but
+ * the sidebar behind it is showing a file tree, and R-6.7 does not stop applying
+ * because nothing is selected.
+ */
+export function BrandHeader({ actions }: { actions?: HeaderActions } = {}) {
   return (
     <header style={bar}>
-      <Brand file="" />
+      <Brand file="" actions={actions} />
       <div style={{ flexShrink: 0 }}>
         <HelpButton />
       </div>
@@ -1081,6 +1483,22 @@ const gitBranchText: React.CSSProperties = { font: '600 11px ui-monospace, "SF M
 const gitRepoText: React.CSSProperties = { font: '700 11px ui-monospace, "SF Mono", monospace' };
 const gitRepoLink: React.CSSProperties = { ...gitRepoText, color: 'inherit', textDecoration: 'underline', textUnderlineOffset: 2 };
 const gitDot: React.CSSProperties = { opacity: 0.5 };
+// The positioned parent for both chip popovers. `gitChip` itself clips its overflow,
+// so a popover inside it would be cut off at the pill's edge.
+const gitChipWrap: React.CSSProperties = { position: 'relative', display: 'inline-flex', flexShrink: 0, minWidth: 0 };
+// The switcher wears the branch's own type, not a button's: it is the same text Unit 3
+// renders, and only the affordance is new.
+const branchBtn: React.CSSProperties = { ...gitBranchText, display: 'inline-flex', alignItems: 'center', gap: 3, maxWidth: 160, padding: 0, border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', whiteSpace: 'nowrap' };
+const pullCountBtn: React.CSSProperties = { padding: 0, border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', font: '600 11px system-ui', textDecoration: 'underline', textUnderlineOffset: 2 };
+const pullRepoNote: React.CSSProperties = { font: '11px ui-monospace, "SF Mono", monospace', opacity: 0.75, overflow: 'hidden', textOverflow: 'ellipsis' };
+// Left-aligned, unlike the right-hand popovers: this one hangs off a chip that sits at
+// the left edge of the header.
+const gitPop: React.CSSProperties = { position: 'absolute', left: 0, top: 'calc(100% + 6px)', width: 340, maxWidth: '82vw', background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 16px 48px rgba(76,29,149,0.18)', zIndex: 41, overflow: 'hidden', color: '#334155', font: '13px system-ui', fontWeight: 400 };
+const branchMeta: React.CSSProperties = { flexShrink: 0, font: '11px ui-monospace, "SF Mono", monospace', color: '#94a3b8' };
+const refusalBox: React.CSSProperties = { padding: '9px 12px', borderBottom: '1px solid #fde68a', background: '#fffbeb', color: '#92400e', fontSize: 12.5 };
+const refusalList: React.CSSProperties = { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexWrap: 'wrap', gap: 4 };
+const pullRow: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '8px 10px', margin: '2px 0', border: '1px solid #ece6fb', borderRadius: 9, background: '#fbfaff', fontSize: 12.5 };
+const collabBadge: React.CSSProperties = { flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: '#6d28d9', background: '#ede9fe', borderRadius: 5, padding: '1px 6px' };
 const scopeBranch: React.CSSProperties = { flexShrink: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', font: '600 11px ui-monospace, "SF Mono", monospace', color: '#15803d', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 999, padding: '1px 8px' };
 // Detached overrides the green pill with the same amber the chip's `local` tone
 // uses (R-4.3). Green here reads as "settled, a branch, safe to run"; a detached

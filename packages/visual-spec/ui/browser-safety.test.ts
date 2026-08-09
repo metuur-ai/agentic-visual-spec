@@ -154,9 +154,22 @@ describe('the browser bundle reaches no node builtin', () => {
  */
 describe('the browser bundle does not reach the git reader (R-1.3)', () => {
   const GIT_CONTEXT = 'core/git-context.ts';
+  /*
+   * `core/git-branches.ts` arrived with Unit 5 and shells out through the same
+   * `GitExecutor` seam, so it imports `node:child_process` by the same route. It is
+   * named here for a reason the reader is not: it is the module the branch switcher
+   * in the chip is actively pulling on, and it is the one that *writes*. A copy of
+   * `checkoutBranch` in the browser graph would be a bundle failure and a working
+   * tree reachable from a page at once.
+   */
+  const GIT_BRANCHES = 'core/git-branches.ts';
 
   it(`${GIT_CONTEXT} is not value-reachable from ${ENTRY}`, () => {
     expect([...valueReachableModules(ENTRY)]).not.toContain(GIT_CONTEXT);
+  });
+
+  it(`${GIT_BRANCHES} is not value-reachable from ${ENTRY}`, () => {
+    expect([...valueReachableModules(ENTRY)]).not.toContain(GIT_BRANCHES);
   });
 
   it(`nothing value-reachable from ${ENTRY} imports node:child_process`, () => {
@@ -183,5 +196,11 @@ describe('the browser bundle does not reach the git reader (R-1.3)', () => {
    */
   it(`${GIT_CONTEXT} really does import node:child_process`, () => {
     expect(nodeBuiltinChains(GIT_CONTEXT).join('\n')).toMatch(/node:child_process/);
+  });
+
+  it(`${GIT_BRANCHES} really does import node:child_process`, () => {
+    // Through `git-context.ts`, which owns the executor both modules spawn with —
+    // so the chain, not just the module, is what the guard above is drawn over.
+    expect(nodeBuiltinChains(GIT_BRANCHES).join('\n')).toMatch(/node:child_process/);
   });
 });

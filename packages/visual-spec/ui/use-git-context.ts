@@ -21,6 +21,15 @@
  * event. A timer would only win while someone stares at an untouched tab. This is
  * also the pattern the repository already ships and already tests
  * (`core/app/lib/use-comments.ts:56-57`).
+ *
+ * THERE IS A THIRD WAY IN, ADDED BY R-6.7: `publishGitContext`. When the branch is
+ * changed from the header, the checkout route answers with the context git reported
+ * *after* the change (R-5.9), and that answer is authoritative — re-reading
+ * `GET /__vs/git` to learn what the server has just told us would be a second, later,
+ * possibly different answer to a settled question. It arrives as a window event
+ * rather than as a returned setter so this hook keeps one state and one source of
+ * truth; the repository already moves cross-component facts this way
+ * (`vs:comments-changed`, `vs:source-changed` in `ui/main-header.tsx`).
  */
 import { useEffect, useState } from 'react';
 
@@ -36,6 +45,20 @@ export type GitContext =
       host: string;
       url: string;
     };
+
+/** Carries a `GitContext` the server has just reported. `detail` is that context. */
+const ADOPT_EVENT = 'vs:git-context';
+
+/**
+ * Hand every mounted `useGitContext` a context the server just returned (R-6.7).
+ *
+ * Deliberately not a re-fetch: the caller already holds the server's answer, and
+ * asking again would let a change made elsewhere land between the two reads and be
+ * displayed as the outcome of *this* one.
+ */
+export function publishGitContext(next: GitContext): void {
+  window.dispatchEvent(new CustomEvent(ADOPT_EVENT, { detail: next }));
+}
 
 /**
  * The current git context, or `null` while the first read is still in flight.
@@ -68,12 +91,19 @@ export function useGitContext(): GitContext | null {
 
     read(); // on mount (R-3.10)
     const onRefresh = () => read();
+    // R-6.7 — a context the server returned from a change it just made, adopted
+    // without a read of its own.
+    const onAdopt = (e: Event) => {
+      if (live) setContext((e as CustomEvent<GitContext>).detail);
+    };
     window.addEventListener('focus', onRefresh);
     document.addEventListener('visibilitychange', onRefresh);
+    window.addEventListener(ADOPT_EVENT, onAdopt);
     return () => {
       live = false;
       window.removeEventListener('focus', onRefresh);
       document.removeEventListener('visibilitychange', onRefresh);
+      window.removeEventListener(ADOPT_EVENT, onAdopt);
     };
   }, []);
 

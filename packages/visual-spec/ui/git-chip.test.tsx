@@ -7,6 +7,13 @@
  * R-3.1 is a claim about where the chip *is* — beside the served path, in both
  * headers — and a test that mounted the chip directly would hold whether or not
  * either header ever rendered it.
+ *
+ * THIS SUITE IS ALSO R-6.2's, AND THAT IS WHY IT WAS NOT COPIED. Everything below
+ * runs against a server with `git.allowCheckout` off (`/__vs/git/branches` answers
+ * 404) and collaboration unconfigured — the default posture of both. R-6.2 says the
+ * chip must then render *exactly as Unit 3 specifies*, so the honest test of it is
+ * Unit 3's own assertions still passing, not a second set of assertions written
+ * beside them that could drift. A regression in the default path fails here.
  */
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -46,6 +53,14 @@ function installFetch(git: unknown) {
     if (url === '/__vs/git') {
       if (git === PENDING) return new Promise<Response>(() => {}); // never settles
       return jsonRes(git);
+    }
+    // R-6.3 — with the flag off the branch routes do not exist. This is the answer a
+    // default server gives, and every assertion in this file is made against it.
+    if (url === '/__vs/git/branches') return { ok: false, status: 404, json: async () => ({ error: 'no route' }) } as Response;
+    // Likewise collaboration: no block configured, so no count and — R-7.2 — no
+    // request for one. `unexpectedPulls` below is what asserts the second half.
+    if (url === '/__vs/collab') {
+      return jsonRes({ available: false, reason: 'not-configured', message: 'Collaboration is not configured.', missingScopes: [] });
     }
     if (url.startsWith('/__vs/comments')) return jsonRes([OPEN_COMMENT]);
     if (url === '/__vs/source/root') return jsonRes({ root: '/repo/docs' });
@@ -96,8 +111,9 @@ describe('the chip is in both headers, beside the served path (R-3.1)', () => {
   it('sits next to the path button, not somewhere else in the bar', async () => {
     const chip = await mountChip(REMOTE_GITHUB);
     // The path button and the chip share one row: the directory and the branch
-    // checked out in it are the same fact.
-    const row = chip.parentElement as HTMLElement;
+    // checked out in it are the same fact. The chip's immediate parent is the
+    // positioned wrapper its popovers hang off, so the row is one step further out.
+    const row = (chip.closest('[data-testid="git-chip-area"]') as HTMLElement).parentElement as HTMLElement;
     expect(within(row).getByText('/repo/docs')).toBeTruthy();
   });
 });
@@ -211,6 +227,37 @@ describe('a detached HEAD is presented as one (R-3.9)', () => {
     const chip = await mountChip(REMOTE_GITHUB);
     await waitFor(() => expect(chip.textContent).toContain('main'));
     expect(chip.textContent).not.toContain('detached');
+  });
+});
+
+/*
+ * What the default server does NOT add to the chip. Both halves are the same claim:
+ * a capability that configuration has not granted is absent, not present-and-refusing.
+ */
+describe('with neither capability configured (R-6.2 / R-7.2)', () => {
+  it('renders the branch as text, with no control to open a branch list', async () => {
+    const chip = await mountChip(REMOTE_GITHUB);
+    await waitFor(() => expect(chip.textContent).toContain('main'));
+    // Not a *disabled* control — no control. A disabled one advertises a capability
+    // the user cannot have and cannot be told how to get.
+    expect(screen.queryByTestId('git-branch-switch')).toBeNull();
+    expect(chip.querySelector('button')).toBeNull();
+    expect(screen.queryByTestId('git-branch-menu')).toBeNull();
+  });
+
+  it('displays no pull request count, and asks for none', async () => {
+    const chip = await mountChip(REMOTE_GITHUB);
+    await waitFor(() => expect(chip.textContent).toContain('acme/docs'));
+    // Wait for availability to have answered — before it does, "no request was made"
+    // is true of any implementation, including one that is about to make it.
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([u]) => String(u) === '/__vs/collab')).toBe(true));
+
+    expect(screen.queryByTestId('git-pull-count')).toBeNull();
+    // R-7.2's second half, which an absent element cannot demonstrate: the listing was
+    // never requested, so an unconfigured server is not being asked about a repository
+    // it was never given.
+    const pullReads = vi.mocked(fetch).mock.calls.filter(([u]) => String(u).startsWith('/__vs/collab/pulls'));
+    expect(pullReads).toEqual([]);
   });
 });
 

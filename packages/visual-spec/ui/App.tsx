@@ -1,9 +1,9 @@
 import { InspectorProvider, useComments } from '../core/app';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { CollabApp } from './collab-app';
+import { CollabApp, type CollabIntent } from './collab-app';
 import { FileTree } from './file-tree';
 import { GenericEditor } from './generic-editor';
-import { BrandHeader, MainHeader, type ViewMode } from './main-header';
+import { BrandHeader, type HeaderActions, MainHeader, type ViewMode } from './main-header';
 import { MarkdownEditor } from './markdown-editor';
 import { MarkdownDocEditor } from './markdown-doc-editor';
 import { toSurfaceId } from './md-path';
@@ -21,7 +21,13 @@ export function App() {
   // A collaboration document has no local-file entry (ui/use-tree.ts enumerates the
   // file tree only), so it cannot be reached through `selected`/`pick()`. It is a
   // genuinely separate top-level route that swaps the whole shell instead.
-  const [collabOpen, setCollabOpen] = useState(false);
+  //
+  // It carries an intent rather than a boolean because there are now three ways in and
+  // they arrive at different places: the sidebar link opens the surface's own two
+  // entry panels, while the header's pull request list already knows which document to
+  // resume (R-7.7) or which pull request to check out (R-7.8) and would otherwise ask
+  // the user to find it again on the screen they just came from.
+  const [collab, setCollab] = useState<CollabIntent | null>(null);
   const [width, setWidth] = useState<number>(() => {
     const saved = Number(localStorage.getItem('vs:sidebarWidth'));
     return saved >= MIN_W && saved <= MAX_W ? saved : 280;
@@ -121,6 +127,59 @@ export function App() {
     [reload],
   );
 
+  /**
+   * R-6.5 — the branch switcher's half of the unsaved-changes guard.
+   *
+   * It reuses the machinery the mode switch and the file pick already run through
+   * rather than growing a second dialog: `editorState` is the live dirty flag the
+   * document editor reports, `pending` is the deferred action, and `UnsavedDialog`
+   * below is the prompt. Note which editor this guards — `MarkdownDocEditor`, the one
+   * on screen. `CollabEditor` can also be dirty, but it lives inside `CollabApp`,
+   * which this component returns early, so the switcher and it are never mounted
+   * together and a guard naming it would protect nothing.
+   */
+  const confirmUnsaved = useCallback((proceed: () => void) => {
+    if (!editorState.current.dirty) {
+      proceed();
+      return;
+    }
+    setPending({
+      run: proceed,
+      primaryLabel: 'Save & Change',
+      message: 'You have edits that aren’t saved yet. Save them before changing branch?',
+    });
+  }, []);
+
+  /**
+   * R-6.7 / R-6.8 — the branch moved, so the tree is a different tree.
+   *
+   * The chip needs nothing back: the checkout route answered with the context git
+   * reported after the change and `useGitContext` has already adopted it (R-5.9). What
+   * only this component can do is re-read the tree and decide what happens to the open
+   * pane — and a file that is not on the new branch must not go on rendering the
+   * previous branch's bytes under the new branch's name.
+   */
+  const onBranchChanged = useCallback(async () => {
+    invalidateTree();
+    const next = await reload();
+    setSelected((current) => {
+      if (!current || next.some((e) => e.path === current.path)) return current;
+      editorState.current = { dirty: false, save: async () => true };
+      setMode('view');
+      return null; // R-6.8 — back to the empty state
+    });
+  }, [reload]);
+
+  const headerActions = useMemo<HeaderActions>(
+    () => ({
+      confirmUnsaved,
+      onBranchChanged: () => void onBranchChanged(),
+      onResumeCollab: (documentId: string) => setCollab({ documentId }),
+      onReviewPull: (reviewPull: number) => setCollab({ reviewPull }),
+    }),
+    [confirmUnsaved, onBranchChanged],
+  );
+
   // Jump to a path from the cart dropdown.
   const navigate = (path: string) => {
     const e = entries.find((x) => x.path === path);
@@ -135,12 +194,12 @@ export function App() {
   const shell = (
     <>
       {selected ? (
-        <MainHeader file={current} onNavigate={navigate} withInspector={isMarkdown} isMarkdown={isMarkdown} mode={mode} onModeChange={requestMode} />
+        <MainHeader file={current} onNavigate={navigate} withInspector={isMarkdown} isMarkdown={isMarkdown} mode={mode} onModeChange={requestMode} actions={headerActions} />
       ) : (
-        <BrandHeader />
+        <BrandHeader actions={headerActions} />
       )}
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-        <Sidebar entries={entries} current={current} loading={loading} onPick={pick} width={width} onOpenCollab={() => setCollabOpen(true)} onCreated={onCreated} onRenamed={onRenamed} />
+        <Sidebar entries={entries} current={current} loading={loading} onPick={pick} width={width} onOpenCollab={() => setCollab({})} onCreated={onCreated} onRenamed={onRenamed} />
         <Splitter onResize={resize} />
         {selected ? (
           editing ? (
@@ -177,10 +236,10 @@ export function App() {
     </>
   );
 
-  if (collabOpen) {
+  if (collab) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-        <CollabApp onExit={() => setCollabOpen(false)} />
+        <CollabApp initial={collab} onExit={() => setCollab(null)} />
       </div>
     );
   }
