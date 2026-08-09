@@ -101,7 +101,7 @@ describe('R-13.3 — checking a pull request out', () => {
     render(<CollabPullsPanel onReview={onReview} fetchImpl={impl} />);
     await waitFor(() => expect(screen.getByText(/Rework the payment rules/)).toBeTruthy());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Check out & review' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review the code' }));
 
     await waitFor(() => expect(onReview).toHaveBeenCalledWith(PULL, WORKTREE));
     expect(calls.filter((c) => c.url === '/__vs/collab/pulls/42/mount')).toEqual([
@@ -120,7 +120,7 @@ describe('R-13.3 — checking a pull request out', () => {
     render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
 
     await waitFor(() => expect(screen.getByText(/checked out · abc1234/)).toBeTruthy());
-    expect(screen.getByRole('button', { name: 'Open review' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Review the code' })).toBeTruthy();
   });
 
   it('removes a checkout through DELETE and re-reads what is mounted', async () => {
@@ -173,10 +173,72 @@ describe('R-13.9 — each way a checkout can fail says which one it was', () => 
     render(<CollabPullsPanel onReview={onReview} fetchImpl={impl} />);
     await waitFor(() => expect(screen.getByText(/Rework the payment rules/)).toBeTruthy());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Check out & review' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review the code' }));
 
     await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
     // A failed mount opens no review: there is no checkout to read.
     expect(onReview).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * P6 — the list already holds both answers, so it offers both.
+ *
+ * The landing page used to lead with a form asking for a pull request URL and a document
+ * id typed by hand, with this list third — although since the server started resolving
+ * `documentId` from the pull request body (R-7.4) every row that has a document already
+ * knows it. So the row offers the two things a reviewer can actually do with it, and a row
+ * that can only offer one of them says why rather than looking broken beside its
+ * neighbours.
+ */
+const WITH_DOC = { ...PULL, number: 44, title: 'The style guide', documentId: 'style-guide' };
+
+describe('a pull request that carries a document offers to resume it (P6)', () => {
+  it('offers Resume writing first, and Review the code beside it', async () => {
+    const { impl, calls } = fakeFetch({
+      '/__vs/collab/pulls?state=open': { ok: true, status: 200, json: { pulls: [WITH_DOC] } },
+      '/__vs/collab/open': { ok: true, status: 200, json: { ok: true, kind: 'sync' } },
+    });
+    const onResume = vi.fn();
+    render(<CollabPullsPanel onReview={vi.fn()} onResume={onResume} fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(/The style guide/)).toBeTruthy());
+
+    expect(screen.getByRole('button', { name: 'Review the code' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Resume writing' }));
+
+    // R-7.7 — through the route that already attaches to a collaboration, with the id the
+    // server resolved. Nothing here parses a pull request body, and nothing here could.
+    await waitFor(() => expect(onResume).toHaveBeenCalledWith('style-guide'));
+    expect(calls.map((c) => c.url)).toContain('/__vs/collab/open');
+  });
+
+  it('says why a row without a document offers less than its neighbours', async () => {
+    const { impl } = fakeFetch({
+      '/__vs/collab/pulls?state=open': { ok: true, status: 200, json: { pulls: [PULL, WITH_DOC] } },
+    });
+    render(<CollabPullsPanel onReview={vi.fn()} onResume={vi.fn()} fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(/The style guide/)).toBeTruthy());
+
+    const bare = document.querySelector('[data-vs-pull="42"]') as HTMLElement;
+    expect(bare.textContent).toContain('no document');
+    expect(bare.querySelector('[data-vs-pull-nodoc]')).toBeTruthy();
+    // And it is not offered a resume it cannot honour.
+    expect(bare.textContent).not.toContain('Resume writing');
+  });
+
+  it('shows the server’s words when the resume is refused', async () => {
+    const message = 'cannot open acme/docs#44: read access denied (HTTP 403).';
+    const { impl } = fakeFetch({
+      '/__vs/collab/pulls?state=open': { ok: true, status: 200, json: { pulls: [WITH_DOC] } },
+      '/__vs/collab/open': { ok: false, status: 403, json: { error: message } },
+    });
+    const onResume = vi.fn();
+    render(<CollabPullsPanel onReview={vi.fn()} onResume={onResume} fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(/The style guide/)).toBeTruthy());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume writing' }));
+
+    await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
+    expect(onResume).not.toHaveBeenCalled();
   });
 });

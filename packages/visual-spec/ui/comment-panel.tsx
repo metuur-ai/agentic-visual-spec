@@ -11,6 +11,14 @@
  * heading/line labels, same `add` payload. Collaboration supplies a source keyed
  * on `nodeId` (`ui/collab-comment-source.ts`) and reuses this same panel rather
  * than forking it.
+ *
+ * **P3 — this panel is the one surface that lists these comments.** The header's
+ * comment count chip used to open a popover listing them too, on top of a panel
+ * already showing the same rows. Two surfaces over one dataset is not redundancy a
+ * reader can ignore — they scroll independently and can disagree about what is
+ * selected. So the chip now asks *this* panel to reveal the comment instead, through
+ * `revealInCommentPanel` below, and keeps its popover only for the case the panel
+ * cannot serve: no panel on screen, or nothing on this file to reveal.
  */
 import { collectSection, headingBlockOf, useComments, useInspector } from '../core/app';
 import type { SelectedTarget } from '../core/app';
@@ -96,15 +104,81 @@ export type CommentPanelSource = {
    */
   link?: (c: CommentRecord) => string | undefined;
   /**
-   * R-13.18 — the provenance chip. Unset means every comment on this surface is local,
-   * which is true of the sidecar panel: it reads and writes a file on this machine and
-   * has never heard of a pull request.
+   * R-13.18 — the provenance chip. Unset means every comment on this surface is one of
+   * the reader's own notes, which is true of the sidecar panel: it reads and writes a
+   * file on this machine and has never heard of a pull request.
    */
   origin?: (c: CommentRecord) => CommentOrigin;
 };
 
-/** The sidecar's answer, and the default for any source that does not supply one. */
-const LOCAL_ONLY: CommentOrigin = { where: 'local', label: 'Local only — not on GitHub' };
+/**
+ * The sidecar's answer, and the default for any source that does not supply one.
+ *
+ * It names the KIND of comment — a note the reader wrote as author, on their own files —
+ * and not a stage in some journey towards GitHub. There is no such journey: nothing here
+ * is destined for a pull request, which is why the row offers nothing that would send it.
+ * Describing it by what it is not ("not on GitHub") made a personal note read as an unsent
+ * pull-request comment, and the two are different things (see `collab-pr-review.tsx`,
+ * where "draft" is the state of a comment that genuinely is on its way out).
+ */
+const LOCAL_ONLY: CommentOrigin = { where: 'local', label: 'Your note' };
+
+/* ------------------------------------------------------------------ *
+ * P3 — how the header's count chip reaches the open list.
+ *
+ * A module-level registry rather than a context or a prop, because the two ends are
+ * not in one tree: `MainHeader` and `CommentPanel` are siblings under `ui/App.tsx`,
+ * and threading a callback between them would mean an App-level store whose only
+ * subscriber is a highlight that lasts a third of a second.
+ *
+ * A panel registers ONLY while it has an open comment to reveal. That is what makes
+ * the chip's fallback correct rather than merely tolerable: with nothing on this file
+ * the chip has nothing to scroll to here, and its popover — which lists every file's
+ * comments and navigates to them — is the surface that can actually answer. So an
+ * empty registry is a real answer, not a missing one.
+ * ------------------------------------------------------------------ */
+type RevealHandler = () => boolean;
+const revealHandlers = new Set<RevealHandler>();
+const presenceWatchers = new Set<() => void>();
+
+function registerReveal(handler: RevealHandler): () => void {
+  revealHandlers.add(handler);
+  for (const watch of presenceWatchers) watch();
+  return () => {
+    revealHandlers.delete(handler);
+    for (const watch of presenceWatchers) watch();
+  };
+}
+
+/** Subscribe to panels appearing and disappearing. For `useSyncExternalStore`. */
+export function subscribeCommentPanel(watch: () => void): () => void {
+  presenceWatchers.add(watch);
+  return () => {
+    presenceWatchers.delete(watch);
+  };
+}
+
+/** Whether a mounted panel has an open comment it could reveal. */
+export function isCommentPanelListening(): boolean {
+  return revealHandlers.size > 0;
+}
+
+/**
+ * Ask the open list to scroll to its comment and ring it. Answers `false` where no
+ * panel took it, which is the caller's cue to fall back to its own popover.
+ */
+export function revealInCommentPanel(): boolean {
+  for (const handler of revealHandlers) if (handler()) return true;
+  return false;
+}
+
+/** How long the ring stays. Short enough to read as a pointer, not as a selection. */
+const REVEAL_MS = 300;
+
+/** Motion is an accent here, never the message — the ring is legible without it. */
+function prefersReducedMotion(): boolean {
+  return typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
 
 export function CommentPanel({ file, width, source }: { file?: string; width: number; source?: CommentPanelSource }) {
   return source ? <Panel width={width} source={source} /> : <LocalCommentPanel file={file ?? ''} width={width} />;
@@ -165,7 +239,7 @@ function LocalCommentPanel({ file, width }: { file: string; width: number }) {
 }
 
 function Panel({ width, source }: { width: number; source: CommentPanelSource }) {
-  const { active, selection, setSelection } = useInspector();
+  const { active, selection, setSelection, setActive } = useInspector();
   const selected = selection[0] ?? null;
   const isRange = selection.length > 1;
   const path = source.path;
@@ -188,7 +262,7 @@ function Panel({ width, source }: { width: number; source: CommentPanelSource })
         <Header />
         <SelectionHelp />
         <TabBar tab={tab} onTab={setTab} />
-        <p style={hint}>Press <kbd>I</kbd> to start commenting.</p>
+        <StartCommenting onStart={() => setActive(true)} nothingYet={!source.comments.some((c) => c.status === 'open')} />
         {tab === 'open' ? (
           <>
             <OrphanList orphans={source.orphans} />
@@ -261,6 +335,43 @@ function Panel({ width, source }: { width: number; source: CommentPanelSource })
     </aside>
   );
 }
+
+/**
+ * P1 — the way in, as a control rather than as an instruction.
+ *
+ * This slot used to read "Press I to start commenting." and hold nothing else. The
+ * shortcut works and still does, but a reviewer opening the panel for the first time
+ * has no reason to suspect a keyboard shortcut exists, so `I` was the entire way in
+ * and it was invisible: a control nobody can see is a control that is not there.
+ *
+ * The button is now the control and `setActive(true)` is exactly what the `I` handler
+ * in `InspectorProvider` does, so the two cannot drift apart into different behaviours.
+ * The shortcut stays, demoted to what it actually is — the shorthand for the button —
+ * and the hint spells out what happens next, because "start commenting" does not on
+ * its own tell you that a click on the document comes before any typing.
+ *
+ * THE FOCUS RING IS A STYLESHEET RULE, NOT AN INLINE STYLE. Everything else in this
+ * file styles inline, and `:focus-visible` cannot be expressed that way. Handling
+ * focus/blur in state would paint a ring on mouse clicks too, which is the thing
+ * `:focus-visible` exists to avoid.
+ */
+function StartCommenting({ onStart, nothingYet }: { onStart: () => void; nothingYet: boolean }) {
+  return (
+    <div style={startBox}>
+      <style>{FOCUS_RING_CSS}</style>
+      {nothingYet && <p style={startLead}>Nothing on this file yet.</p>}
+      <button type="button" onClick={onStart} className="vs-focus-ring" style={startPrimary}>
+        Start commenting
+      </button>
+      <p style={startHint} data-vs-start-hint>
+        or press <kbd style={kbd}>I</kbd> — picks a line, then you write
+      </p>
+    </div>
+  );
+}
+
+const FOCUS_RING_CSS =
+  '.vs-focus-ring:focus-visible{outline:2px solid #6d28d9;outline-offset:2px;border-radius:8px}';
 
 /**
  * R-6.5 — comments whose block is no longer in the document. They are never
@@ -353,13 +464,50 @@ function CommentList({ source }: { source: CommentPanelSource }) {
       rows.current[activeId]!.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
   }, [activeId]);
+
+  /*
+   * P3 — the header's count chip, answered here.
+   *
+   * It reveals the FIRST open comment rather than asking the chip which one it meant.
+   * The chip is a count, not a selection: it says "there are three", and the useful
+   * reply is to put the reader at the top of the three. `activeId` above is the other
+   * direction — an inline indicator naming one specific comment — and the two stay
+   * separate because this one must not leave a comment active after it fades.
+   */
+  const [revealed, setRevealed] = useState<string | null>(null);
+  const firstId = mine[0]?.id ?? null;
+  useEffect(() => {
+    if (!firstId) return;
+    return registerReveal(() => {
+      setRevealed(firstId);
+      return true;
+    });
+  }, [firstId]);
+  useEffect(() => {
+    if (!revealed) return;
+    const still = prefersReducedMotion();
+    rows.current[revealed]?.scrollIntoView({ behavior: still ? 'auto' : 'smooth', block: 'nearest' });
+    const timer = window.setTimeout(() => setRevealed(null), REVEAL_MS);
+    return () => window.clearTimeout(timer);
+  }, [revealed]);
+
   if (!mine.length) return null;
   return (
     <div style={{ padding: 12, borderTop: '1px solid #e5e7eb' }}>
       <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 8 }}>{mine.length} open on this file</div>
       <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 8 }}>
         {mine.map((c) => (
-          <li key={c.id} ref={(el) => { rows.current[c.id] = el; }} style={{ ...card, ...(c.id === activeId ? cardActive : {}) }}>
+          <li
+            key={c.id}
+            ref={(el) => { rows.current[c.id] = el; }}
+            {...(c.id === revealed ? { 'data-vs-revealed': '' } : {})}
+            style={{
+              ...card,
+              ...(c.id === activeId ? cardActive : {}),
+              ...(c.id === revealed ? cardRevealed : {}),
+              ...(c.id === revealed && !prefersReducedMotion() ? { transition: 'box-shadow 160ms ease-out' } : {}),
+            }}
+          >
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
               <span
                 data-vs-comment-origin={origin(c).where}
@@ -500,6 +648,12 @@ const tabBase: React.CSSProperties = { flex: 1, padding: '7px 0', border: 'none'
 const tabActive: React.CSSProperties = { ...tabBase, borderBottom: '2px solid #2563eb', color: '#1d4ed8', background: 'white' };
 const tabInactive: React.CSSProperties = { ...tabBase, borderBottom: '2px solid transparent' };
 const hint: React.CSSProperties = { padding: 12, opacity: 0.6, fontSize: 13 };
+// P1's block. The button is the only filled control in the panel's empty state, so
+// weight is doing the pointing rather than a second line of prose.
+const startBox: React.CSSProperties = { padding: 12, display: 'grid', justifyItems: 'start', gap: 8 };
+const startLead: React.CSSProperties = { margin: 0, color: '#64748b', fontSize: 13 };
+const startPrimary: React.CSSProperties = { padding: '7px 14px', border: '1px solid #7c3aed', borderRadius: 8, background: '#7c3aed', color: 'white', cursor: 'pointer', font: '600 13px system-ui' };
+const startHint: React.CSSProperties = { margin: 0, color: '#94a3b8', fontSize: 12 };
 const helpBox: React.CSSProperties = { borderBottom: '1px solid #f1f5f9', background: '#f8fafc' };
 const helpToggle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '8px 12px', border: 'none', background: 'transparent', cursor: 'pointer', font: '12px system-ui', fontWeight: 600, color: '#475569' };
 const helpList: React.CSSProperties = { listStyle: 'none', margin: 0, padding: '0 14px 12px', display: 'grid', gap: 7, fontSize: 12.5, lineHeight: 1.5, color: '#475569' };
@@ -513,6 +667,13 @@ const originChip: React.CSSProperties = { font: '600 10px system-ui', padding: '
 const originLocal: React.CSSProperties = { ...originChip, border: '1px solid #fcd34d', background: '#fef3c7', color: '#92400e' };
 const originGithub: React.CSSProperties = { ...originChip, border: '1px solid #bbf7d0', background: '#f0fdf4', color: '#166534' };
 const cardActive: React.CSSProperties = { border: '1px solid #f59e0b', background: '#fffbeb', boxShadow: '0 0 0 2px rgba(245,158,11,0.25)' };
+/*
+ * P3's ring. Violet, where `cardActive` is amber, because the two mean different
+ * things and are both momentary: amber says "this is the comment the indicator you
+ * clicked belongs to" and stays until you pick another, violet says "here is where
+ * the header's count was pointing" and lets go on its own.
+ */
+const cardRevealed: React.CSSProperties = { border: '1px solid #7c3aed', background: '#f5f3ff', boxShadow: '0 0 0 3px rgba(124,58,237,0.25)' };
 const locateBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, width: 22, height: 22, padding: 0, border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer' };
 const delBtn: React.CSSProperties = { ...locateBtn, color: '#ef4444' };
 /** Green, not red: resolving closes a thread and destroys nothing. */

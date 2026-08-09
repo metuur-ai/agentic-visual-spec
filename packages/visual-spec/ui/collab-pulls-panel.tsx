@@ -19,6 +19,16 @@
  *
  * IT NEVER TALKS TO GITHUB. Both calls go to `/__vs/collab/pulls*`; there is no token
  * in the browser to have.
+ *
+ * IT IS THE LANDING PAGE NOW, NOT THE THIRD SECTION OF IT. `CollabOpenPanel` used to lead
+ * the surface with a form asking for a pull request URL *and* a document id typed by
+ * hand — while this list, underneath it, already held both for every open pull request.
+ * Since the server resolves `documentId` from the pull request body (R-7.4) it arrives on
+ * `PullRequestSummary`, so a row that has one offers to resume writing it (R-7.7, through
+ * `POST /__vs/collab/open`, the route the header chip already uses) as well as to read the
+ * code. A row that has none offers only the read, AND SAYS SO: the listing is every open
+ * pull request (R-7.3), so a row with fewer buttons than the one above it has to explain
+ * itself or it reads as broken.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -37,6 +47,12 @@ export type CollabPullsPanelProps = {
    */
   onReview: (pull: PullRequestSummary, worktree: MountedWorktree) => void;
   /**
+   * R-7.7 — called with the document id once `POST /__vs/collab/open` has accepted, for a
+   * row whose pull request carries one. The id is the server's (R-7.4/R-7.5); nothing here
+   * parses a pull request body, and nothing here could — the body is not in this process.
+   */
+  onResume?: (documentId: string) => void;
+  /**
    * R-7.8 — a pull request the caller has already chosen, checked out as soon as the
    * listing confirms it is there. Exactly one attempt: a mount that failed leaves its
    * error on screen and the button beside it, which is where a retry belongs. Repeating
@@ -54,7 +70,7 @@ export function shortSha(sha: string): string {
 
 type Status = { kind: 'idle' } | { kind: 'busy'; pullNumber: number } | { kind: 'error'; message: string };
 
-export function CollabPullsPanel({ onReview, autoReview, fetchImpl }: CollabPullsPanelProps) {
+export function CollabPullsPanel({ onReview, onResume, autoReview, fetchImpl }: CollabPullsPanelProps) {
   const client = useMemo(() => createCollabClient(fetchImpl), [fetchImpl]);
   const [state, setState] = useState<PullRequestListState>('open');
   const [pulls, setPulls] = useState<PullRequestSummary[] | null>(null);
@@ -123,6 +139,27 @@ export function CollabPullsPanel({ onReview, autoReview, fetchImpl }: CollabPull
     void mount(pull);
   }, [autoReview, pulls, mount]);
 
+  /**
+   * R-7.7 — attach to the collaboration this pull request already carries. Same route,
+   * same precedence on failure as everything else here: the server's own sentence, never
+   * a rewritten one (R-11.4).
+   */
+  const resume = useCallback(
+    async (pull: PullRequestSummary) => {
+      const documentId = pull.documentId;
+      if (!documentId) return;
+      setStatus({ kind: 'busy', pullNumber: pull.number });
+      const res = await client.open({ documentId, pullNumber: pull.number });
+      if (!res.ok) {
+        setStatus({ kind: 'error', message: res.message });
+        return;
+      }
+      setStatus({ kind: 'idle' });
+      onResume?.(documentId);
+    },
+    [client, onResume],
+  );
+
   const unmount = useCallback(
     async (pullNumber: number) => {
       setStatus({ kind: 'busy', pullNumber });
@@ -139,9 +176,10 @@ export function CollabPullsPanel({ onReview, autoReview, fetchImpl }: CollabPull
 
   return (
     <section data-vs-collab-pulls style={wrap}>
-      <h2 style={heading}>Review a pull request’s code</h2>
+      <h2 style={heading}>Open collaborations</h2>
       <p style={note}>
-        Checks the pull request out beside your files, detached at its head. It is a read-only view — nothing here
+        Every open pull request in this repository. One with a visual-spec document can be picked up where it was left;
+        any of them can be checked out beside your files, detached at its head, as a read-only view — nothing here
         commits, pushes or merges.
       </p>
 
@@ -191,8 +229,27 @@ export function CollabPullsPanel({ onReview, autoReview, fetchImpl }: CollabPull
                   {pull.state}
                 </div>
                 <div style={actions}>
-                  <button type="button" onClick={() => void mount(pull)} disabled={busy} style={primaryButton}>
-                    {busy ? 'Checking out…' : worktree ? 'Open review' : 'Check out & review'}
+                  {pull.documentId ? (
+                    <button type="button" onClick={() => void resume(pull)} disabled={busy} style={primaryButton}>
+                      Resume writing
+                    </button>
+                  ) : (
+                    /*
+                      * The listing is unfiltered (R-7.3), so most rows will not carry a
+                      * document. Saying which ones do not is what keeps a row with one
+                      * button from reading as a row whose other button failed to render.
+                      */
+                    <span data-vs-pull-nodoc style={quietMark} title="No visual-spec document is named in this pull request’s body, so there is nothing to resume writing.">
+                      no document
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void mount(pull)}
+                    disabled={busy}
+                    style={pull.documentId ? button : primaryButton}
+                  >
+                    {busy ? 'Checking out…' : 'Review the code'}
                   </button>
                   {worktree && (
                     <button type="button" onClick={() => void unmount(pull.number)} disabled={busy} style={button}>
@@ -229,3 +286,5 @@ const link: React.CSSProperties = { font: '11px system-ui, sans-serif', color: '
 const badge: React.CSSProperties = { font: '10px system-ui, sans-serif', padding: '1px 6px', borderRadius: 99, background: '#f1f5f9', color: '#64748b' };
 const mountedBadge: React.CSSProperties = { font: '10px ui-monospace, monospace', padding: '1px 6px', borderRadius: 99, background: '#ecfdf5', color: '#047857' };
 const error: React.CSSProperties = { fontSize: 12, color: '#b91c1c', margin: 0 };
+/** Quiet, and still a sentence: why this row offers less than the one above it. */
+const quietMark: React.CSSProperties = { font: '11px system-ui, sans-serif', color: '#94a3b8', fontStyle: 'italic' };

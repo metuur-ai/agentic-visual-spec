@@ -516,7 +516,13 @@ describe('R-13.18 — provenance is a label, not an inference', () => {
     expect((document.querySelector('[data-vs-comment-origin]') as HTMLElement).textContent).toBe('On GitHub');
   });
 
-  it('labels the sidecar panel’s own comments as local, for a source that declares no origin', async () => {
+  /*
+   * The other kind. A sidecar comment is a note the reader wrote as author, on their own
+   * file; it is not a pull-request comment waiting to go out, and the panel offers nothing
+   * that would send it. So the chip names what it IS — and it must stay plainly different
+   * from the GitHub label above, which is the whole of R-13.18.
+   */
+  it('labels the sidecar panel’s own comments as the reader’s own note, for a source that declares no origin', async () => {
     const local: CommentRecord = {
       id: 'c-local',
       workflow: 'visual-spec',
@@ -534,6 +540,10 @@ describe('R-13.18 — provenance is a label, not an inference', () => {
     await waitFor(() => expect(screen.getByText('local comment')).toBeTruthy());
     const chip = document.querySelector('[data-vs-comment-origin]') as HTMLElement;
     expect(chip.getAttribute('data-vs-comment-origin')).toBe('local');
-    expect(chip.textContent).toBe('Local only — not on GitHub');
+    expect(chip.textContent).toBe('Your note');
+    // Distinguishable from the GitHub label, and stated positively — a reader is never left
+    // inferring the origin from the absence of a control, so there is none to offer here.
+    expect(chip.textContent).not.toContain('On GitHub');
+    expect(screen.queryByRole('button', { name: /publish|send/i })).toBeNull();
   });
 });

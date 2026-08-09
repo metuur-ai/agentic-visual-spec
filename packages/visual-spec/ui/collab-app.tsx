@@ -103,6 +103,15 @@ type PullReview = { pull: PullRequestSummary; worktree: MountedWorktree };
  * describe something other than the thing being displayed. The commit is the worktree's
  * own `headSha`, not the pull request record's, for the same reason — they diverge the
  * moment the pull request is pushed to while the checkout stays where it was mounted.
+ *
+ * IT STANDS DOWN WHILE A PULL REQUEST IS UNDER REVIEW. This header and `CollabPrReview`'s
+ * own banner both said the number, both said the sha and both said "read-only", stacked
+ * one on top of the other. Two rows about one subject is not two pieces of information.
+ * `CollabApp` renders only one of them, and the survivor is the review banner, because it
+ * is the row that can also say *what* the pull request is. R-9.1 … R-9.4 move with it and
+ * are asserted there; the `review` prop stays because those obligations are this
+ * component's contract wherever it is the row on screen, and dropping it would leave the
+ * requirement expressed nowhere as a component boundary.
  */
 export function CollabHeader({ onExit, review }: { onExit: () => void; review: PullReview | null }) {
   return (
@@ -148,10 +157,15 @@ export function CollabApp({ onExit, initial }: { onExit: () => void; initial?: C
     if (opened) rememberInUrl(opened);
   }, [opened]);
 
+  // P5 — one row, not two. While a checkout is on screen `CollabPrReview` renders the row
+  // that carries the number, the mounted commit and the read-only statement (R-9.1 …
+  // R-9.4) *and* names the pull request, so this header would only repeat it.
+  const reviewing = !documentId && pullReview !== null;
+
   return (
     <>
       {/* A document is not a pull request review, so the header claims none while one is open. */}
-      <CollabHeader onExit={onExit} review={documentId ? null : pullReview} />
+      {!reviewing && <CollabHeader onExit={onExit} review={null} />}
       {documentId ? (
         <CollabDocumentPane documentId={documentId} />
       ) : pullReview ? (
@@ -164,22 +178,25 @@ export function CollabApp({ onExit, initial }: { onExit: () => void; initial?: C
       ) : (
         <div style={{ flex: 1, overflow: 'auto' }}>
           {/*
-            * Two entries, and they answer different questions. `CollabOpenPanel` opens a
-            * *document* whose pull request the reviewer already holds a link to;
-            * `CollabPullsPanel` starts from "what is there to review at all?" and ends in
-            * a read-only checkout of a pull request's code (R-13.1 / R-13.11).
-            */}
-          <CollabOpenPanel onOpened={setDocumentId} />
-          <hr style={sectionRule} />
-          {/*
+            * Two entries, and they answer different questions — but they no longer answer
+            * them in the wrong order. `CollabOpenPanel` used to lead, asking for a pull
+            * request URL and a document id typed by hand; `CollabPullsPanel` came third and
+            * already had both, for every open pull request, as buttons. Since the server
+            * resolves `documentId` from the pull request body (R-7.4), the list is the
+            * primary path and the form is the fallback for a pull request that is not in
+            * this repository's listing.
+            *
             * R-7.8 — a pull request named by the header is checked out through the panel's
             * own mount path rather than through a second one written here. It is the same
             * button the reviewer would have pressed, pressed for them.
             */}
           <CollabPullsPanel
             onReview={(pull, worktree) => setPullReview({ pull, worktree })}
+            onResume={setDocumentId}
             {...(initial?.reviewPull !== undefined ? { autoReview: initial.reviewPull } : {})}
           />
+          <hr style={sectionRule} />
+          <CollabOpenPanel onOpened={setDocumentId} />
         </div>
       )}
     </>
@@ -312,10 +329,19 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
         <main style={docPane}>
           <div style={docTitleBar}>
-            <strong>{document.title}</strong>
+            {/*
+              * P4 — the title used to run underneath the buttons beside it. A flex child
+              * defaults to `min-width: auto`, which means "never shrink below your own
+              * content", so the title simply overflowed its lane and slid under `Edit` /
+              * `Copy agent prompt` / `Reload`. `minWidth: 0` lets it shrink and the
+              * ellipsis takes the tail; the pull request reference is a separate,
+              * unshrinkable element, so the identifying part is never what gets cut.
+              */}
+            <strong style={docTitleText} title={document.title}>
+              {document.title}
+            </strong>
             {document.github?.pullNumber !== undefined && (
-              <span style={{ opacity: 0.6 }}>
-                {' '}
+              <span data-vs-doc-pull style={docPullRef}>
                 · {document.github.owner}/{document.github.repo}#{document.github.pullNumber}
               </span>
             )}
@@ -490,6 +516,8 @@ const backBtn: React.CSSProperties = {
   background: 'white',
   color: '#334155',
   cursor: 'pointer',
+  // P4 — a control keeps its size and its touch target; the title beside it is what gives.
+  flexShrink: 0,
 };
 const title: React.CSSProperties = { fontWeight: 700, color: '#334155' };
 /** Same read-only chip vocabulary the review banner uses, so the two read as one surface. */
@@ -504,7 +532,23 @@ const reviewChip: React.CSSProperties = {
 const sectionRule: React.CSSProperties = { border: 0, borderTop: '1px solid #e5e7eb', margin: '4px 12px', maxWidth: 720 };
 const centerMsg: React.CSSProperties = { flex: 1, display: 'grid', placeItems: 'center', opacity: 0.6 };
 const docPane: React.CSSProperties = { flex: 1, minWidth: 0, position: 'relative', overflow: 'auto', background: '#f8fafc' };
-const docTitleBar: React.CSSProperties = { padding: '14px 56px 0', font: '14px system-ui', color: '#334155' };
+const docTitleBar: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  padding: '14px 56px 0',
+  font: '14px system-ui',
+  color: '#334155',
+};
+/** P4 — the one element allowed to shrink, and the only one an ellipsis may touch. */
+const docTitleText: React.CSSProperties = {
+  flex: '0 1 auto',
+  minWidth: 0,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+};
+const docPullRef: React.CSSProperties = { flexShrink: 0, opacity: 0.6, font: '12px ui-monospace, monospace' };
 
 const publishBtn: React.CSSProperties = {
   padding: '4px 14px',
@@ -514,6 +558,7 @@ const publishBtn: React.CSSProperties = {
   color: '#fff',
   cursor: 'pointer',
   fontSize: 12,
+  flexShrink: 0,
 };
 
 const blockedBanner: React.CSSProperties = {

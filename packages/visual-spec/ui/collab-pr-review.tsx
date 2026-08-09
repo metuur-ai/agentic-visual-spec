@@ -37,9 +37,13 @@
  * the comment is on the pull request, so the drafts are re-read and the card flips to its
  * "On GitHub" chip with the link.
  *
- * R-13.18 IS A LABEL, NOT AN INFERENCE. Every comment card carries a chip that says where
- * it lives — "Local draft" or "On GitHub · #n" — and the published chip renders even when
- * the permalink is missing. A reviewer must never have to read the absence of a button.
+ * R-13.18 IS A LABEL, NOT AN INFERENCE. Every comment card sits under a chip that says
+ * where it lives — "draft — not sent yet" or "On GitHub · #n" — and the published chip
+ * renders even when the permalink is missing. A reviewer must never have to read the
+ * absence of a button. The word here is "draft", not "local": every comment on this
+ * surface belongs on the pull request, and the only question a chip answers is whether it
+ * has got there yet. "Local" is the sidecar panel's word for a different kind of comment
+ * entirely — the reader's own notes, which are going nowhere.
  *
  * IT IMPORTS ONLY TYPES FROM `core/`. `worktree.ts` reads `node:fs/promises`; the one
  * thing needed from it here is the shape of a mounted worktree and the shape of its
@@ -55,6 +59,7 @@ import {
   type ReviewDraftInput,
   createCollabClient,
 } from './collab-client';
+import { shortSha } from './collab-pulls-panel';
 import { FileTree } from './file-tree';
 import { MarkdownSurface } from './markdown-surface';
 import { type TreeEntry, invalidateTree, rawUrl, useFile, useTree } from './use-tree';
@@ -112,6 +117,8 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
   const [changedError, setChangedError] = useState<string | null>(null);
   const [selected, setSelected] = useState<TreeEntry | null>(null);
   const [filter, setFilter] = useState('');
+  /** P7 — the rest of the checkout is context, so it starts out of the way. */
+  const [restOpen, setRestOpen] = useState(false);
   const [drafts, setDrafts] = useState<ReviewDraft[]>([]);
   const [draftsError, setDraftsError] = useState<string | null>(null);
   const [notices, setNotices] = useState<Record<string, DraftNotice>>({});
@@ -169,7 +176,7 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
       return next;
     });
 
-  /** R-13.13 — hold the comment. Nothing reaches GitHub until someone presses Publish. */
+  /** R-13.13 — hold the comment. Nothing reaches GitHub until someone presses Send. */
   const hold = async (input: ReviewDraftInput): Promise<boolean> => {
     const res = await client.holdReviewDraft(pull.number, input);
     if (!res.ok) {
@@ -228,6 +235,20 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
 
   const checkout = useMemo(() => entriesUnder(entries, prefix), [entries, prefix]);
   const byPath = useMemo(() => new Map(checkout.map((e) => [e.path, e])), [checkout]);
+  const checkoutFiles = useMemo(() => checkout.filter((e) => e.type === 'file').length, [checkout]);
+
+  /**
+   * How many review comments each file carries, for the count on its row.
+   *
+   * A count and not a dot: a dot says "something is here" only if you already know the
+   * colour means that, and colour alone is not allowed to carry meaning. The number says
+   * how much there is to read before you open it.
+   */
+  const commentsPerFile = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const draft of drafts) counts.set(draft.target.path, (counts.get(draft.target.path) ?? 0) + 1);
+    return counts;
+  }, [drafts]);
 
   /**
    * R-13.12 — the changed paths and the checkout must name the same commit. Both were
@@ -239,16 +260,36 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+      {/*
+        * ONE ROW FOR THE WHOLE IDENTITY (R-9.1 … R-9.4).
+        *
+        * `CollabApp`'s header used to sit directly above this one saying `Collaboration
+        * review` and then the number, the sha and "read-only" — all three of which this row
+        * also said. Two rows, one subject, everything printed twice. This is the row that
+        * survived, because it is the only one that can also say what the pull request is,
+        * and `CollabApp` now renders no header of its own while a checkout is on screen.
+        *
+        * THE SHA IS THE MOUNTED TREE'S, not `pull.headSha`. They are the same at mount and
+        * diverge the moment the pull request is pushed to, and the thing on screen is the
+        * checkout — so naming the pull request's head here would be naming a commit the
+        * reviewer is not reading. The branches on either side of the arrow are the pull
+        * request's own, which is not R-9.2's prohibition: R-9.2 forbids naming a branch
+        * *for the mounted tree*, which is detached (R-13.6) and on none. `· at <sha>` is
+        * how the tree is named, and it is named as a commit.
+        */}
       <div data-vs-pr-readonly style={banner}>
         <button type="button" onClick={onExit} style={backBtn}>
           ← Pull requests
         </button>
-        <strong>
-          #{pull.number} {pull.title}
+        {/*
+          * P4 — the title used to run under the buttons beside it, because a flex child
+          * defaults to `min-width: auto` and so refuses to shrink below its own content.
+          * `minWidth: 0` lets it, and the number leads the string so the ellipsis can only
+          * take the title — the identifying part is never what is cut.
+          */}
+        <strong data-testid="vs-review-pull" data-vs-review-pull={pull.number} style={pullIdentity} title={pull.title}>
+          #{pull.number} {pull.title} · {pull.headBranch} → {pull.baseBranch} · at {shortSha(worktree.headSha)}
         </strong>
-        <span style={bannerMeta}>
-          {pull.headBranch} → {pull.baseBranch} · at {pull.headSha.slice(0, 7)}
-        </span>
         <span style={readOnlyChip}>Read-only checkout — no commit, push or merge</span>
         {drafts.length > 0 && (
           <span data-vs-draft-tally style={tallyChip}>
@@ -269,46 +310,81 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
       </div>
 
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+        {/*
+          * R-13.11 IS ONE REQUIREMENT WITH A FRONT AND A BACK, AND THE SIDEBAR NOW SHOWS
+          * WHICH IS WHICH. `CHANGED FILES (1)` and `ALL FILES IN THE CHECKOUT` were two
+          * headings of equal weight, one of them over a whole repository — so a reviewer's
+          * eye landed on files the pull request never touched. The changed files lead, are
+          * heavier, and never collapse; the checkout keeps its half of R-13.11 behind one
+          * line that says what it is for. It is a disclosure and not a removal: reading a
+          * change means reading what it calls into, which was the second half's whole
+          * argument and is unchanged.
+          */}
         <nav style={sidebar}>
-          <div style={sectionHead}>
+          <div style={leadHead}>
             Changed files{changed ? ` (${changed.length})` : ''}
           </div>
+          <div style={leadNote}>What this pull request changes. This is what is under review.</div>
           {changedError && (
             <div data-vs-pr-changed-error style={errorLine}>
               {changedError}
             </div>
           )}
           <ul style={listReset}>
-            {(changed ?? []).map((path) => (
-              <li key={path}>
-                <button
-                  type="button"
-                  onClick={() => open(path)}
-                  title={path}
-                  style={{ ...changedRow, ...(selected?.path === path ? rowActive : {}) }}
-                >
-                  {path}
-                </button>
-              </li>
-            ))}
+            {(changed ?? []).map((path) => {
+              const comments = commentsPerFile.get(path) ?? 0;
+              return (
+                <li key={path} style={changedRowWrap}>
+                  <button
+                    type="button"
+                    onClick={() => open(path)}
+                    title={path}
+                    style={{ ...changedRow, ...(selected?.path === path ? rowActive : {}) }}
+                  >
+                    {path}
+                  </button>
+                  {comments > 0 && (
+                    // Outside the button on purpose: it is a property of the row, not part
+                    // of the control's name — a reviewer looking for `src/pay.ts` should
+                    // still find a control called `src/pay.ts`.
+                    <span data-vs-file-comments={path} style={countBadge}>
+                      {comments}
+                      <span style={srOnly}> review comments</span>
+                      <span aria-hidden="true" style={countWord}>
+                        {comments === 1 ? 'comment' : 'comments'}
+                      </span>
+                    </span>
+                  )}
+                </li>
+              );
+            })}
           </ul>
           {changed !== null && changed.length === 0 && !changedError && (
             <div style={emptyLine}>This pull request changes no files.</div>
           )}
 
-          {/*
-            * R-13.11's second half. The tree is the *whole* checkout, not the changed
-            * subset, because reading a change means reading what it calls into.
-            */}
-          <div style={sectionHead}>All files in the checkout</div>
-          <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="filter…" style={filterInput} />
-          <div style={{ flex: 1, overflow: 'auto', padding: 6 }}>
-            {loading ? (
-              <div style={emptyLine}>Loading…</div>
-            ) : (
-              <FileTree entries={checkout} current={selected?.path ?? ''} filter={filter} onPick={setSelected} readOnly />
-            )}
-          </div>
+          <button
+            type="button"
+            onClick={() => setRestOpen((v) => !v)}
+            aria-expanded={restOpen}
+            aria-controls="vs-checkout-rest"
+            style={restToggle}
+          >
+            <span aria-hidden="true">{restOpen ? '▾' : '▸'}</span> Rest of the checkout · {checkoutFiles} files — read
+            for context, not under review
+          </button>
+          {restOpen && (
+            <div id="vs-checkout-rest" style={restBody}>
+              <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="filter…" style={filterInput} />
+              <div style={{ flex: 1, overflow: 'auto', padding: 6 }}>
+                {loading ? (
+                  <div style={emptyLine}>Loading…</div>
+                ) : (
+                  <FileTree entries={checkout} current={selected?.path ?? ''} filter={filter} onPick={setSelected} readOnly />
+                )}
+              </div>
+            </div>
+          )}
         </nav>
 
         {selected ? (
@@ -373,6 +449,19 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
   const [asSource, setAsSource] = useState(false);
   const rendered = entry.kind === 'markdown' && !asSource;
 
+  const held = drafts.filter((d) => d.status !== 'published');
+  const sent = drafts.filter((d) => d.status === 'published');
+  /**
+   * The group's publish, which is the per-card one applied to each member in turn.
+   *
+   * Sequential and not `Promise.all`: each call re-reads the drafts afterwards (see
+   * `loadDrafts`), and the 409s each one can return — stale, already published — are
+   * per-comment answers the reviewer has to be able to read one at a time.
+   */
+  const publishHeld = async () => {
+    for (const draft of held) await onPublish(draft.id);
+  };
+
   /*
    * `I` starts commenting everywhere else in this app, so it has to start commenting
    * here. Without it the only way in was a small pill in the breadcrumb, and a reviewer
@@ -430,10 +519,24 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
           <div style={placeholder}>No preview for this file.</div>
         ) : rendered ? (
           <div style={mdWrap}>
-            {/* The affordance stated where the reader is looking. The pill in the crumb
-                reads as metadata, not as the way in. */}
+            {/*
+              * The affordance stated where the reader is looking, and stated as a control.
+              *
+              * The pill in the crumb reads as metadata, not as the way in, and a keyboard
+              * shortcut printed as a sentence is something you have to already know to
+              * look for. Both still work — this is the same `setAsSource(true)` the `I`
+              * handler below performs, and the pill still toggles. What changed is that
+              * the primary way in is now a button a reviewer can see and press, with the
+              * shortcut demoted to a hint under it. Rendered only on the rendered Markdown
+              * view, because that is the view with no lines to anchor a comment to.
+              */}
             <div style={commentHint} data-vs-comment-hint>
-              Press <kbd style={kbd}>I</kbd> — or <b>Source</b> above — to comment on a line.
+              <button type="button" onClick={() => setAsSource(true)} style={startCommentBtn}>
+                Start commenting
+              </button>
+              <span style={hintLine}>
+                or press <kbd style={kbd}>I</kbd> — picks a line, then you write
+              </span>
             </div>
             <MarkdownSurface source={content} />
           </div>
@@ -465,9 +568,51 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, notices, error, onHo
           </div>
         )}
         {drafts.length > 0 && (
+          /*
+            * R-13.18, SAID ONCE PER GROUP INSTEAD OF ONCE PER CARD.
+            *
+            * The requirement is that a reviewer never infers a comment's origin from the
+            * absence of a control — not that the sentence be repeated. Every card used to
+            * carry its own "not sent yet" sentence, which on a file with four held comments
+            * printed the same sentence four times and made the provenance read as noise.
+            * It is one header per group now, with the send action attached to the group
+            * that has something to send; each card still declares its own status in the
+            * DOM (`data-vs-draft-status`), so nothing is carried by position alone, and the
+            * published group renders whether or not any of its members has a permalink.
+            */
           <section data-vs-draft-list style={{ marginTop: 16, display: 'grid', gap: 8 }}>
             <div style={sectionHead}>Review comments on this file</div>
-            {drafts.map((draft) => (
+            {held.length > 0 && (
+              <div data-vs-draft-origin="local" style={groupHead}>
+                <span style={localChip}>{`${held.length} draft${held.length === 1 ? '' : 's'} — not sent yet`}</span>
+                <span style={{ flex: 1 }} />
+                <button
+                  type="button"
+                  onClick={() => void publishHeld()}
+                  style={primaryBtn}
+                  title="Post these to the pull request"
+                >
+                  {held.length === 1 ? 'Send the draft' : `Send all ${held.length}`}
+                </button>
+              </div>
+            )}
+            {held.map((draft) => (
+              <DraftCard
+                key={draft.id}
+                draft={draft}
+                notice={notices[draft.id] ?? null}
+                onPublish={onPublish}
+                onDiscard={onDiscard}
+              />
+            ))}
+            {sent.length > 0 && (
+              <div data-vs-draft-origin="github" style={groupHead}>
+                <span style={githubChip}>
+                  {sent.length} on GitHub · #{sent[0]!.pullNumber}
+                </span>
+              </div>
+            )}
+            {sent.map((draft) => (
               <DraftCard
                 key={draft.id}
                 draft={draft}
@@ -546,11 +691,13 @@ function anchorLabel(draft: ReviewDraft): string {
 }
 
 /**
- * One comment, and — R-13.18 — where it lives, said out loud.
+ * One comment. Where it lives is stated by the group header above it (R-13.18) rather than
+ * by a chip repeated on every card, and by `data-vs-draft-status` here.
  *
- * The chip is driven by `status`, which is the record's own account of itself, and not by
- * whether a link or a button happens to be renderable. A published comment whose permalink
- * is missing still reads "On GitHub"; it simply has no link to offer.
+ * The grouping is driven by `status`, which is the record's own account of itself, and not
+ * by whether a link or a button happens to be renderable — that was the original point of
+ * the chip and it survives the move. A published comment whose permalink is missing still
+ * sits under "on GitHub"; it simply has no link to offer.
  */
 function DraftCard({
   draft,
@@ -565,11 +712,8 @@ function DraftCard({
 }) {
   const published = draft.status === 'published';
   return (
-    <div data-vs-draft={draft.id} style={draftCard}>
+    <div data-vs-draft={draft.id} data-vs-draft-status={draft.status} style={draftCard}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <span data-vs-draft-origin={published ? 'github' : 'local'} style={published ? githubChip : localChip}>
-          {published ? `On GitHub · #${draft.pullNumber}` : 'Local draft — not on GitHub'}
-        </span>
         <span style={{ font: '11px ui-monospace, monospace', color: '#64748b' }}>{anchorLabel(draft)}</span>
         <span style={{ font: '11px ui-monospace, monospace', color: '#94a3b8' }}>at {draft.headSha.slice(0, 7)}</span>
       </div>
@@ -581,10 +725,10 @@ function DraftCard({
             <>
               <div>
                 Written against <code>{notice.draftHeadSha}</code>; the pull request is now at{' '}
-                <code>{notice.currentHeadSha}</code>. Publishing now would anchor it to whatever sits at that line today.
+                <code>{notice.currentHeadSha}</code>. Sending it now would anchor it to whatever sits at that line today.
               </div>
               <button type="button" onClick={() => void onPublish(draft.id, true)} style={{ ...primaryBtn, marginTop: 6 }}>
-                Publish anyway
+                Send anyway
               </button>
             </>
           ) : (
@@ -602,11 +746,21 @@ function DraftCard({
           )
         ) : (
           <>
-            <button type="button" onClick={() => void onDiscard(draft.id)} style={backBtn}>
+            {/*
+              * Discard throws the comment away and Send puts it on the pull request, so they must not
+              * look like the same kind of act. The destructive one wears the destructive
+              * colour and names what it destroys for anything reading the accessible name.
+              */}
+            <button
+              type="button"
+              onClick={() => void onDiscard(draft.id)}
+              title={`Discard the comment on ${anchorLabel(draft)} — it is not on GitHub, so this is the end of it`}
+              style={dangerBtn}
+            >
               Discard
             </button>
             <button type="button" onClick={() => void onPublish(draft.id)} style={primaryBtn}>
-              Publish
+              Send
             </button>
           </>
         )}
@@ -615,13 +769,27 @@ function DraftCard({
   );
 }
 
-const banner: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', padding: '10px 16px', borderBottom: '1px solid #e5e7eb', background: '#fffbeb', font: '13px system-ui', color: '#334155' };
-const bannerMeta: React.CSSProperties = { font: '11px ui-monospace, monospace', color: '#92400e' };
-const readOnlyChip: React.CSSProperties = { font: '600 10px system-ui', padding: '2px 8px', borderRadius: 99, border: '1px solid #fcd34d', background: '#fef3c7', color: '#92400e' };
-const backBtn: React.CSSProperties = { font: '12px system-ui, sans-serif', padding: '4px 10px', border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#334155', cursor: 'pointer' };
+// P4 — `nowrap`, deliberately: wrapping would push the identity onto a second line, which
+// is the two-row problem this row exists to end. It truncates instead.
+const banner: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'nowrap', padding: '10px 16px', borderBottom: '1px solid #e5e7eb', background: '#fffbeb', font: '13px system-ui', color: '#334155' };
+/** P4 — the one element that may shrink, and the ellipsis can only reach the title. */
+const pullIdentity: React.CSSProperties = { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+const readOnlyChip: React.CSSProperties = { flexShrink: 0, font: '600 10px system-ui', padding: '2px 8px', borderRadius: 99, border: '1px solid #fcd34d', background: '#fef3c7', color: '#92400e' };
+const backBtn: React.CSSProperties = { flexShrink: 0, font: '12px system-ui, sans-serif', padding: '4px 10px', border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#334155', cursor: 'pointer' };
 const sidebar: React.CSSProperties = { width: 300, flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid #e5e7eb', background: 'white', overflow: 'hidden' };
 const sectionHead: React.CSSProperties = { padding: '10px 12px 6px', font: '700 11px system-ui', color: '#64748b', textTransform: 'uppercase', letterSpacing: 0.4 };
-const listReset: React.CSSProperties = { listStyle: 'none', margin: 0, padding: '0 6px', maxHeight: 220, overflow: 'auto' };
+/** P7 — the changed files lead, so their heading is the heavy one on the sidebar. */
+const leadHead: React.CSSProperties = { padding: '12px 12px 2px', font: '700 13px system-ui', color: '#0f172a' };
+const leadNote: React.CSSProperties = { padding: '0 12px 6px', font: '11px system-ui', color: '#64748b' };
+const listReset: React.CSSProperties = { listStyle: 'none', margin: 0, padding: '0 6px', maxHeight: 320, overflow: 'auto' };
+const changedRowWrap: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 6 };
+/** The count, in violet, and never the colour on its own — the numeral is the message. */
+const countBadge: React.CSSProperties = { flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 3, padding: '1px 7px', borderRadius: 99, border: '1px solid #ddd6fe', background: '#f5f3ff', color: '#5b21b6', font: '600 10px system-ui' };
+const countWord: React.CSSProperties = { fontWeight: 400 };
+const srOnly: React.CSSProperties = { position: 'absolute', width: 1, height: 1, padding: 0, margin: -1, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap', border: 0 };
+/** The whole second half of R-13.11, folded into the line that says what it is for. */
+const restToggle: React.CSSProperties = { display: 'block', width: 'calc(100% - 12px)', margin: '10px 6px 0', textAlign: 'left', padding: '8px 8px', border: '1px solid #e2e8f0', borderRadius: 6, background: '#f8fafc', color: '#64748b', font: '11px system-ui', lineHeight: 1.45, cursor: 'pointer' };
+const restBody: React.CSSProperties = { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, paddingTop: 8 };
 const changedRow: React.CSSProperties = { display: 'block', width: '100%', textAlign: 'left', padding: '3px 6px', border: 'none', borderRadius: 4, background: 'transparent', cursor: 'pointer', font: '12px ui-monospace, monospace', color: '#475569', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' };
 const rowActive: React.CSSProperties = { background: '#eff6ff', color: '#1d4ed8', fontWeight: 600 };
 const filterInput: React.CSSProperties = { margin: '0 12px 6px', padding: '4px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: '12px system-ui' };
@@ -629,19 +797,25 @@ const emptyLine: React.CSSProperties = { padding: '4px 12px', font: '12px system
 const errorLine: React.CSSProperties = { padding: '4px 12px', font: '12px system-ui', color: '#b91c1c' };
 const pane: React.CSSProperties = { flex: 1, minWidth: 0, overflow: 'auto', background: '#f8fafc' };
 const crumb: React.CSSProperties = { font: '12px ui-monospace, monospace', color: '#64748b', marginBottom: 12 };
-const commentHint: React.CSSProperties = { margin: '-4px 0 14px', padding: '7px 11px', borderRadius: 8, background: '#f5f3ff', border: '1px solid #ddd6fe', color: '#5b21b6', font: '12px system-ui' };
+const commentHint: React.CSSProperties = { display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 6, margin: '-4px 0 14px', padding: '10px 12px', borderRadius: 8, background: '#f5f3ff', border: '1px solid #ddd6fe', color: '#5b21b6', font: '12px system-ui' };
+/** The way in, as a control. The shortcut is the hint under it, not the mechanism. */
+const startCommentBtn: React.CSSProperties = { padding: '6px 14px', border: '1px solid #6d28d9', borderRadius: 6, background: '#7c3aed', color: 'white', font: '600 12px system-ui', cursor: 'pointer' };
+const hintLine: React.CSSProperties = { font: '11px system-ui', color: '#6d28d9' };
 const kbd: React.CSSProperties = { padding: '1px 6px', borderRadius: 4, border: '1px solid #c4b5fd', background: 'white', font: '11px ui-monospace, monospace' };
 const viewToggle: React.CSSProperties = { marginLeft: 10, padding: '2px 8px', border: '1px solid #cbd5e1', borderRadius: 999, background: 'white', color: '#475569', font: '600 11px system-ui', cursor: 'pointer' };
 const mdWrap: React.CSSProperties = { background: 'white', border: '1px solid #e2e8f0', borderRadius: 8, padding: '16px 24px' };
 const placeholder: React.CSSProperties = { padding: '48px 24px', textAlign: 'center', color: '#64748b', background: 'white', border: '1px dashed #cbd5e1', borderRadius: 12 };
 const centerMsg: React.CSSProperties = { flex: 1, display: 'grid', placeItems: 'center', opacity: 0.6, font: '13px system-ui' };
-const tallyChip: React.CSSProperties = { font: '600 10px system-ui', padding: '2px 8px', borderRadius: 99, border: '1px solid #cbd5e1', background: 'white', color: '#475569' };
+const tallyChip: React.CSSProperties = { flexShrink: 0, font: '600 10px system-ui', padding: '2px 8px', borderRadius: 99, border: '1px solid #cbd5e1', background: 'white', color: '#475569' };
 const composer: React.CSSProperties = { display: 'grid', gap: 6, marginTop: 10, padding: 10, background: 'white', border: '1px solid #e2e8f0', borderRadius: 8 };
 const composerText: React.CSSProperties = { width: '100%', height: 70, padding: '6px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: '13px system-ui', resize: 'vertical', boxSizing: 'border-box' };
 const primaryBtn: React.CSSProperties = { padding: '4px 12px', border: '1px solid #2563eb', borderRadius: 4, background: '#2563eb', color: 'white', cursor: 'pointer', font: '12px system-ui' };
 const linkBtn: React.CSSProperties = { padding: '4px 10px', border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#1d4ed8', font: '12px system-ui', textDecoration: 'none' };
 const draftCard: React.CSSProperties = { padding: 10, background: 'white', border: '1px solid #e2e8f0', borderRadius: 8 };
-/** R-13.18 — two chips, two colours, two sentences. Never one chip and an empty space. */
+/** R-13.18 — one header per group, and both groups say a sentence rather than a colour. */
+const groupHead: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 };
+/** Destructive, and visibly not the same kind of thing as the button beside it. */
+const dangerBtn: React.CSSProperties = { padding: '4px 12px', border: '1px solid #fecaca', borderRadius: 4, background: 'white', color: '#dc2626', cursor: 'pointer', font: '12px system-ui' };
 const chipBase: React.CSSProperties = { font: '600 10px system-ui', padding: '2px 8px', borderRadius: 99, whiteSpace: 'nowrap' };
 const localChip: React.CSSProperties = { ...chipBase, border: '1px solid #fcd34d', background: '#fef3c7', color: '#92400e' };
 const githubChip: React.CSSProperties = { ...chipBase, border: '1px solid #bbf7d0', background: '#f0fdf4', color: '#166534' };

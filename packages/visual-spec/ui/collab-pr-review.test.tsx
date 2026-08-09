@@ -152,12 +152,22 @@ describe('R-13.11 — the changed files are the entry point', () => {
   });
 });
 
+/**
+ * The rest of the checkout is behind a disclosure now, so every test that reaches a file
+ * the pull request did not touch has to open it first — which is the point: the changed
+ * files are what a reviewer lands on.
+ */
+async function openTheRest(): Promise<void> {
+  fireEvent.click(await screen.findByRole('button', { name: /Rest of the checkout/ }));
+  await waitFor(() => expect(screen.getByPlaceholderText('filter…')).toBeTruthy());
+}
+
 describe('R-13.11 — any other file in the checkout can be opened', () => {
   it('browses the whole checkout, not only the changed subset', async () => {
     mount();
     // The filter force-opens the tree, which is how a reviewer reaches a file the pull
     // request did not touch without clicking through every folder.
-    await waitFor(() => expect(screen.getByPlaceholderText('filter…')).toBeTruthy());
+    await openTheRest();
     fireEvent.change(screen.getByPlaceholderText('filter…'), { target: { value: 'util' } });
 
     const row = await screen.findByRole('button', { name: /util\.ts/ });
@@ -168,7 +178,7 @@ describe('R-13.11 — any other file in the checkout can be opened', () => {
 
   it('shows nothing from outside the checkout', async () => {
     mount();
-    await waitFor(() => expect(screen.getByPlaceholderText('filter…')).toBeTruthy());
+    await openTheRest();
     fireEvent.change(screen.getByPlaceholderText('filter…'), { target: { value: 'notes' } });
     await waitFor(() => expect(screen.queryByRole('button', { name: /notes\.md/ })).toBeNull());
   });
@@ -185,14 +195,14 @@ describe('R-13.19 — a checkout is a review surface, not a workspace', () => {
 
   it('offers no way to create a file', async () => {
     mount();
-    await waitFor(() => expect(screen.getByPlaceholderText('filter…')).toBeTruthy());
+    await openTheRest();
     expect(screen.queryByRole('button', { name: '+ New file' })).toBeNull();
     expect(screen.queryByLabelText('New file path')).toBeNull();
   });
 
   it('offers no way to rename a file, even on the row under the cursor', async () => {
     mount();
-    await waitFor(() => expect(screen.getByPlaceholderText('filter…')).toBeTruthy());
+    await openTheRest();
     fireEvent.change(screen.getByPlaceholderText('filter…'), { target: { value: 'util' } });
 
     const row = await screen.findByRole('button', { name: /util\.ts/ });
@@ -415,9 +425,8 @@ describe('R-13.13 — a comment is held locally, and never sent by typing it', (
     });
     // Nothing was published by writing it.
     expect(server.calls.some((c) => c.url.endsWith('/publish'))).toBe(false);
-    expect((document.querySelector('[data-vs-draft-origin]') as HTMLElement).textContent).toBe(
-      'Local draft — not on GitHub',
-    );
+    expect(document.querySelector('[data-vs-draft-origin="local"]')!.textContent).toContain('not sent yet');
+    expect(document.querySelector('[data-vs-draft]')!.getAttribute('data-vs-draft-status')).toBe('draft');
   });
 
   it('offers no composer until a line is picked — a viewer has no idle buffer', async () => {
@@ -442,17 +451,17 @@ describe('R-13.15 / R-13.16 — publishing is a second, explicit act', () => {
     render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: 'src/pay.ts' }));
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Publish' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }));
 
     await waitFor(() =>
-      expect((document.querySelector('[data-vs-draft-origin]') as HTMLElement).textContent).toBe('On GitHub · #42'),
+      expect(document.querySelector('[data-vs-draft-origin="github"]')!.textContent).toContain('1 on GitHub · #42'),
     );
     expect(document.querySelector('[data-vs-draft-origin]')!.getAttribute('data-vs-draft-origin')).toBe('github');
     expect((screen.getByText('Open on GitHub') as HTMLAnchorElement).getAttribute('href')).toBe(
       'https://github.com/acme/docs/pull/42#discussion_r700123',
     );
     // Once it is on the pull request there is nothing left to publish or to discard here.
-    expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Send' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Discard' })).toBeNull();
     expect(server.calls.filter((c) => c.url.endsWith('/publish'))).toHaveLength(1);
   });
@@ -467,7 +476,7 @@ describe('R-13.15 / R-13.16 — publishing is a second, explicit act', () => {
     });
     render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: 'src/pay.ts' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Publish' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }));
 
     await waitFor(() => expect(screen.getByText(/already on the pull request/i)).toBeTruthy());
     expect(document.querySelector('[data-vs-draft-notice="note"]')).toBeTruthy();
@@ -496,7 +505,7 @@ describe('R-13.14 — a stale draft is refused with both shas, and forced only o
     const server = staleServer();
     render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: 'src/pay.ts' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Publish' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }));
 
     await waitFor(() => expect(document.querySelector('[data-vs-draft-notice="stale"]')).toBeTruthy());
     const notice = document.querySelector('[data-vs-draft-notice="stale"]') as HTMLElement;
@@ -506,22 +515,21 @@ describe('R-13.14 — a stale draft is refused with both shas, and forced only o
     const attempts = server.calls.filter((c) => c.url.endsWith('/publish'));
     expect(attempts).toHaveLength(1);
     expect(attempts[0]!.body).toEqual({});
-    // And it is still a local draft — the refusal did not pretend anything went out.
-    expect((document.querySelector('[data-vs-draft-origin]') as HTMLElement).textContent).toBe(
-      'Local draft — not on GitHub',
-    );
+    // And it is still an unsent draft — the refusal did not pretend anything went out.
+    expect(document.querySelector('[data-vs-draft-origin="local"]')!.textContent).toContain('not sent yet');
+    expect(document.querySelector('[data-vs-draft-origin="github"]')).toBeNull();
   });
 
   it('retries with force only when the reviewer asks for it', async () => {
     const server = staleServer();
     render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: 'src/pay.ts' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Publish' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Send' }));
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Publish anyway' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Send anyway' }));
 
     await waitFor(() =>
-      expect((document.querySelector('[data-vs-draft-origin]') as HTMLElement).textContent).toBe('On GitHub · #42'),
+      expect(document.querySelector('[data-vs-draft-origin="github"]')!.textContent).toContain('1 on GitHub · #42'),
     );
     const attempts = server.calls.filter((c) => c.url.endsWith('/publish'));
     expect(attempts.map((c) => c.body)).toEqual([{}, { force: true }]);
@@ -550,7 +558,7 @@ describe('R-13.17 — discarding a comment that already went out is not the revi
     expect(document.querySelector('[data-vs-draft-notice="note"]')!.textContent).toMatch(/already on the pull request/i);
     // Not rendered as a failure: the card flips to its GitHub identity, with the way there.
     expect(document.querySelector('[data-vs-draft-notice="error"]')).toBeNull();
-    expect((document.querySelector('[data-vs-draft-origin]') as HTMLElement).textContent).toBe('On GitHub · #42');
+    expect(document.querySelector('[data-vs-draft-origin="github"]')!.textContent).toContain('1 on GitHub · #42');
     expect((screen.getByText('Open on GitHub') as HTMLAnchorElement).getAttribute('href')).toBe(
       'https://github.com/acme/docs/pull/42#discussion_r700123',
     );
@@ -573,6 +581,40 @@ describe('R-13.17 — discarding a comment that already went out is not the revi
 });
 
 describe('R-13.18 — a held comment and a published one are told apart by a label', () => {
+  /*
+   * The label used to be a chip repeated on every card, which said the same sentence four
+   * times on a file with four held comments. R-13.18 asks that a reviewer never infer a
+   * comment's origin from the absence of a control; it does not ask that the sentence be
+   * repeated. So the provenance is stated once per group, above the cards it covers, with
+   * the send action attached to it — and each card still declares its own status in the
+   * DOM, so nothing here is carried by position alone.
+   */
+  it('states provenance once per group, with the send action on the group that needs it', async () => {
+    const server = fakeDraftServer({
+      drafts: [
+        draftRecord({ id: 'd-held0001', comment: 'still mine' }),
+        draftRecord({
+          id: 'd-sent0002',
+          comment: 'already sent',
+          status: 'published',
+          published: { reviewCommentId: 700124, htmlUrl: '', ts: '2026-02-01T12:00:00Z' },
+        }),
+      ],
+    });
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'src/pay.ts' }));
+
+    await waitFor(() => expect(screen.getByText('already sent')).toBeTruthy());
+    const groups = Array.from(document.querySelectorAll('[data-vs-draft-origin]')) as HTMLElement[];
+    expect(groups.map((g) => g.getAttribute('data-vs-draft-origin'))).toEqual(['local', 'github']);
+    expect(groups[0]!.textContent).toContain('1 draft — not sent yet');
+    expect(groups[1]!.textContent).toContain('1 on GitHub · #42');
+    // The card is not left saying nothing: its own status is on it, for anything that
+    // reads a card rather than the group above it.
+    const cards = Array.from(document.querySelectorAll('[data-vs-draft]')) as HTMLElement[];
+    expect(cards.map((c) => c.getAttribute('data-vs-draft-status'))).toEqual(['draft', 'published']);
+  });
+
   it('labels each card by what it is, not by which control it happens to have', async () => {
     const server = fakeDraftServer({
       drafts: [
@@ -591,12 +633,153 @@ describe('R-13.18 — a held comment and a published one are told apart by a lab
     fireEvent.click(await screen.findByRole('button', { name: 'src/pay.ts' }));
 
     await waitFor(() => expect(screen.getByText('already sent')).toBeTruthy());
-    const chips = Array.from(document.querySelectorAll('[data-vs-draft-origin]')) as HTMLElement[];
-    expect(chips.map((c) => c.getAttribute('data-vs-draft-origin'))).toEqual(['local', 'github']);
-    expect(chips.map((c) => c.textContent)).toEqual(['Local draft — not on GitHub', 'On GitHub · #42']);
-    // The published one has nothing to link to, and still says where it lives.
+    // The published one has nothing to link to, and still says where it lives — under a
+    // group header that names GitHub, not by having lost a button.
     expect(screen.queryByText('Open on GitHub')).toBeNull();
+    expect(document.querySelector('[data-vs-draft-origin="github"]')!.textContent).toContain('on GitHub');
     // And the tally in the banner counts the two apart.
     expect(document.querySelector('[data-vs-draft-tally]')!.textContent).toBe('1 held locally · 1 on GitHub');
+  });
+});
+
+/*
+ * ONE ROW, NOT TWO (R-9.1 … R-9.4).
+ *
+ * `CollabApp`'s header said `← Files | Collaboration review | #10 · at bd4a496 · read-only`
+ * and this surface said the number, the sha and the read-only warning again directly under
+ * it. The number appeared twice, the sha appeared twice and "read-only" appeared twice.
+ * The surviving row is this one, so the R-9 obligations are asserted here: the number, the
+ * short sha OF THE MOUNTED TREE — which is not the pull request record's, they diverge on a
+ * push — and read-only, stated once.
+ */
+describe('the review row carries the whole identity, once', () => {
+  it('names the number, the mounted tree’s commit and read-only, from props alone', async () => {
+    const moved = { pullNumber: 42, path: WORKTREE.path, headSha: 'f00dbee9999' };
+    const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
+    render(<CollabPrReview pull={PULL} worktree={moved} onExit={vi.fn()} fetchImpl={impl} />);
+
+    const row = await screen.findByTestId('vs-review-pull');
+    expect(row.textContent).toContain('#42');
+    // The mounted tree's, not `PULL.headSha` — the checkout stayed where it was mounted.
+    expect(row.textContent).toContain('f00dbee');
+    expect(row.textContent).not.toContain('abc1234');
+  });
+
+  it('says read-only exactly once on the surface', async () => {
+    const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
+    const { container } = render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+
+    await screen.findByTestId('vs-review-pull');
+    expect((container.textContent ?? '').match(/read-only/gi) ?? []).toHaveLength(1);
+  });
+
+  it('keeps a way back', async () => {
+    const onExit = vi.fn();
+    const { impl } = fakeCollabFetch(changedFiles([]));
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={onExit} fetchImpl={impl} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '← Pull requests' }));
+    expect(onExit).toHaveBeenCalled();
+  });
+});
+
+/*
+ * P4 — the title used to slide under the buttons beside it, because a flex child defaults
+ * to `min-width: auto` and refuses to shrink below its content. The number leads the
+ * string, so an ellipsis on the tail cannot eat it.
+ */
+describe('the review title truncates instead of running under the controls', () => {
+  it('shrinks the title and never the number', async () => {
+    const { impl } = fakeCollabFetch(changedFiles([]));
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+
+    const heading = await screen.findByText(/#42 Rework the payment rules/);
+    expect(heading.style.minWidth).toMatch(/^0(px)?$/);
+    expect(heading.style.textOverflow).toBe('ellipsis');
+    expect(heading.style.overflow).toBe('hidden');
+    // The number is the first thing in the string, so the ellipsis takes the title.
+    expect((heading.textContent ?? '').startsWith('#42')).toBe(true);
+    // And the controls beside it hold their size rather than being squeezed.
+    expect((screen.getByRole('button', { name: 'Refresh files' }) as HTMLElement).style.flexShrink).toBe('0');
+  });
+});
+
+/*
+ * P1 — the `I` shortcut and the `Source · to comment` pill both worked and neither was
+ * findable. The way in is a button now; the shortcut is a hint under it.
+ */
+describe('commenting on a rendered document is offered, not remembered', () => {
+  it('offers a Start commenting button that does what `I` does', async () => {
+    const server = fakeDraftServer();
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'spec.md' }));
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Refunds' })).toBeTruthy());
+    expect(document.querySelector('[data-line="1"]')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start commenting' }));
+
+    await waitFor(() => expect(document.querySelector('[data-line="1"]')).toBeTruthy());
+  });
+
+  it('demotes the shortcut to a hint below the button', async () => {
+    const server = fakeDraftServer();
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'spec.md' }));
+    const hint = await waitFor(() => {
+      const el = document.querySelector('[data-vs-comment-hint]') as HTMLElement | null;
+      expect(el).toBeTruthy();
+      return el!;
+    });
+    expect(hint.textContent).toMatch(/or press/i);
+    expect(hint.textContent).toContain('picks a line, then you write');
+  });
+});
+
+/*
+ * P7 — `CHANGED FILES (1)` and `ALL FILES IN THE CHECKOUT` sat at the same weight, so a
+ * reviewer's eye landed on files the pull request never touched. The changed files lead
+ * and stay open; the checkout collapses into one line that says what it is for.
+ */
+describe('the changed files lead and the rest of the checkout stands down', () => {
+  it('collapses the checkout behind one summary line, expandable in one click', async () => {
+    mount();
+
+    const toggle = await screen.findByRole('button', { name: /Rest of the checkout/ });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.textContent).toContain('3 files');
+    expect(toggle.textContent).toContain('read for context, not under review');
+    // Nothing of the tree is on screen while it is closed.
+    expect(screen.queryByPlaceholderText('filter…')).toBeNull();
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(screen.getByPlaceholderText('filter…')).toBeTruthy());
+    expect(screen.getByRole('button', { name: /Rest of the checkout/ }).getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('keeps the changed files expanded and named as the review', async () => {
+    mount();
+    // No disclosure over them, and no click needed to see them.
+    expect(await screen.findByRole('button', { name: 'src/pay.ts' })).toBeTruthy();
+  });
+
+  it('counts a file’s comments on its row rather than marking it with a colour', async () => {
+    const server = fakeDraftServer({
+      drafts: [draftRecord({ id: 'd-aaaa1111' }), draftRecord({ id: 'd-bbbb2222', comment: 'and this' })],
+    });
+    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+
+    const badge = await waitFor(() => {
+      const el = document.querySelector('[data-vs-file-comments="src/pay.ts"]') as HTMLElement | null;
+      expect(el).toBeTruthy();
+      return el!;
+    });
+    // The number is the message. A bare dot would be colour carrying meaning.
+    expect(badge.textContent).toContain('2');
+    expect(badge.textContent).toMatch(/comment/i);
+    // The file with no comments carries no badge at all.
+    expect(document.querySelector('[data-vs-file-comments="spec.md"]')).toBeNull();
   });
 });
