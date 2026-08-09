@@ -618,3 +618,50 @@ describe('the tooltip gets out of the way when the chip is used', () => {
     expect(screen.getByRole('tooltip')).toBeTruthy();
   });
 });
+
+/*
+ * The GitHub mark says "GitHub", so it may only appear where that is true.
+ *
+ * R-3.7 / R-3.8 keep owner, repository and branch host-independent — only the *link* is
+ * GitHub-specific — and a brand mark is a stronger claim than a link, not a weaker one.
+ * Stamping it on every remote would tell a GitLab user their repository is on GitHub,
+ * which is the one thing the `remote` state is careful not to say.
+ */
+describe('the repository chip wears GitHub’s mark only where the host is GitHub', () => {
+  const markOf = (chip: HTMLElement) => chip.querySelector('svg[viewBox="0 0 16 16"]');
+
+  it('shows the mark for a github.com origin', async () => {
+    await mountChip(REMOTE_GITHUB);
+    const chip = await screen.findByTestId('git-repo-chip');
+    expect(markOf(chip)).toBeTruthy();
+  });
+
+  it('shows the generic link glyph for a recognised non-GitHub host', async () => {
+    await mountChip({
+      state: 'remote',
+      branch: 'main',
+      detached: false,
+      owner: 'acme',
+      repo: 'docs',
+      host: 'gitlab.com',
+      url: 'git@gitlab.com:acme/docs.git',
+    });
+    const chip = await screen.findByTestId('git-repo-chip');
+
+    expect(markOf(chip)).toBeNull();
+    // The repository is still named — the host changes the glyph, never the facts.
+    expect(chip.textContent).toContain('acme/docs');
+    expect(chip.querySelector('svg')).toBeTruthy();
+  });
+
+  /* A brand mark is not ours to restyle: official path, inheriting the chip's tone. */
+  it('renders the mark as GitHub ships it, tinted by the chip rather than recoloured', async () => {
+    await mountChip(REMOTE_GITHUB);
+    const mark = markOf(await screen.findByTestId('git-repo-chip')) as SVGElement;
+
+    expect(mark.getAttribute('fill')).toBe('currentColor');
+    expect(mark.getAttribute('viewBox')).toBe('0 0 16 16');
+    // Decorative: the repository name beside it already carries the meaning.
+    expect(mark.getAttribute('aria-hidden')).toBe('true');
+  });
+});
