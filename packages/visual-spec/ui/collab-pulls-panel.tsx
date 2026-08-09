@@ -20,7 +20,7 @@
  * IT NEVER TALKS TO GITHUB. Both calls go to `/__vs/collab/pulls*`; there is no token
  * in the browser to have.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   type MountedWorktree,
@@ -36,6 +36,13 @@ export type CollabPullsPanelProps = {
    * are — and it is git's own path (R-13.8), never one recomputed here.
    */
   onReview: (pull: PullRequestSummary, worktree: MountedWorktree) => void;
+  /**
+   * R-7.8 — a pull request the caller has already chosen, checked out as soon as the
+   * listing confirms it is there. Exactly one attempt: a mount that failed leaves its
+   * error on screen and the button beside it, which is where a retry belongs. Repeating
+   * it on every render would be a loop against git and against GitHub.
+   */
+  autoReview?: number;
   /** Injectable for tests; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
 };
@@ -47,7 +54,7 @@ export function shortSha(sha: string): string {
 
 type Status = { kind: 'idle' } | { kind: 'busy'; pullNumber: number } | { kind: 'error'; message: string };
 
-export function CollabPullsPanel({ onReview, fetchImpl }: CollabPullsPanelProps) {
+export function CollabPullsPanel({ onReview, autoReview, fetchImpl }: CollabPullsPanelProps) {
   const client = useMemo(() => createCollabClient(fetchImpl), [fetchImpl]);
   const [state, setState] = useState<PullRequestListState>('open');
   const [pulls, setPulls] = useState<PullRequestSummary[] | null>(null);
@@ -106,6 +113,15 @@ export function CollabPullsPanel({ onReview, fetchImpl }: CollabPullsPanelProps)
     },
     [client, onReview, refreshMounted],
   );
+
+  const autoReviewed = useRef(false);
+  useEffect(() => {
+    if (autoReview === undefined || autoReviewed.current || pulls === null) return;
+    const pull = pulls.find((p) => p.number === autoReview);
+    if (!pull) return;
+    autoReviewed.current = true;
+    void mount(pull);
+  }, [autoReview, pulls, mount]);
 
   const unmount = useCallback(
     async (pullNumber: number) => {

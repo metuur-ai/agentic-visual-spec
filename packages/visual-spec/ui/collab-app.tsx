@@ -24,7 +24,7 @@
  * a `surfaceId` — so the real panel is mounted and the parallel list is gone.
  *
  */
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { InspectOverlay, InspectorProvider } from '../core/app';
 import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 // From the pure module, not `failure-states`: that one reaches `cache-lifecycle` and
@@ -37,7 +37,7 @@ import type { MountedWorktree, PullRequestSummary } from './collab-client';
 import { CollabEditor, type CollabEditorHandle } from './collab-editor';
 import { CollabOpenPanel } from './collab-open-panel';
 import { CollabPrReview } from './collab-pr-review';
-import { CollabPullsPanel } from './collab-pulls-panel';
+import { CollabPullsPanel, shortSha } from './collab-pulls-panel';
 import { ActiveCommentProvider } from './active-comment';
 import { CommentPanel, type CommentPanelSource } from './comment-panel';
 import { IndicatorLayer } from './indicator-layer';
@@ -89,22 +89,69 @@ function rememberInUrl(documentId: string | null): void {
  */
 type PullReview = { pull: PullRequestSummary; worktree: MountedWorktree };
 
-export function CollabApp({ onExit }: { onExit: () => void }) {
-  const [documentId, setDocumentIdState] = useState<string | null>(documentFromUrl);
+/**
+ * The surface's own header, and — R-9.1 — which pull request is on screen.
+ *
+ * An earlier draft made the *main* header mode-aware instead. `ui/App.tsx` returns this
+ * component early, so that header is not rendered during a review at all and the draft's
+ * premise was false. The number and the commit come from `pullReview`, which this
+ * component already holds, so nothing is read and no state crosses a surface boundary
+ * (R-9.4).
+ *
+ * NO BRANCH IS NAMED (R-9.2), the pull request's head branch included. The tree on screen
+ * is checked out `--detach` at a commit (R-13.6) and is on no branch; naming one would
+ * describe something other than the thing being displayed. The commit is the worktree's
+ * own `headSha`, not the pull request record's, for the same reason — they diverge the
+ * moment the pull request is pushed to while the checkout stays where it was mounted.
+ */
+export function CollabHeader({ onExit, review }: { onExit: () => void; review: PullReview | null }) {
+  return (
+    <header style={bar}>
+      <button type="button" onClick={onExit} style={backBtn}>
+        ← Files
+      </button>
+      <span style={title}>Collaboration review</span>
+      {review && (
+        <span data-testid="vs-review-pull" data-vs-review-pull={review.pull.number} style={reviewChip}>
+          #{review.pull.number} · at {shortSha(review.worktree.headSha)} · read-only
+        </span>
+      )}
+    </header>
+  );
+}
+
+/**
+ * Where to land when the surface opens, for a caller that already knows (R-7.7 / R-7.8).
+ *
+ * The header's pull request list has both answers in hand — the document id the server
+ * resolved, or the pull request number to check out — and sending the user to the entry
+ * panels to find the same row a second time is the "full-surface swap you have to know
+ * exists" that Unit 7 exists to remove. An empty intent is the sidebar link, which
+ * knows nothing more.
+ */
+export type CollabIntent = { documentId?: string; reviewPull?: number };
+
+export function CollabApp({ onExit, initial }: { onExit: () => void; initial?: CollabIntent }) {
+  // The URL still wins where no intent named a document: a reload during a review must
+  // come back to the same document, and that is what `vsdoc` is for.
+  const [documentId, setDocumentIdState] = useState<string | null>(() => initial?.documentId ?? documentFromUrl());
   const [pullReview, setPullReview] = useState<PullReview | null>(null);
   const setDocumentId = useCallback((id: string | null) => {
     setDocumentIdState(id);
     rememberInUrl(id);
   }, []);
 
+  // An intent-opened document is in state but not yet in the URL, so a reload would
+  // lose it — the one thing `vsdoc` exists to prevent.
+  const opened = initial?.documentId;
+  useEffect(() => {
+    if (opened) rememberInUrl(opened);
+  }, [opened]);
+
   return (
     <>
-      <header style={bar}>
-        <button type="button" onClick={onExit} style={backBtn}>
-          ← Files
-        </button>
-        <span style={title}>Collaboration review</span>
-      </header>
+      {/* A document is not a pull request review, so the header claims none while one is open. */}
+      <CollabHeader onExit={onExit} review={documentId ? null : pullReview} />
       {documentId ? (
         <CollabDocumentPane documentId={documentId} />
       ) : pullReview ? (
@@ -124,7 +171,15 @@ export function CollabApp({ onExit }: { onExit: () => void }) {
             */}
           <CollabOpenPanel onOpened={setDocumentId} />
           <hr style={sectionRule} />
-          <CollabPullsPanel onReview={(pull, worktree) => setPullReview({ pull, worktree })} />
+          {/*
+            * R-7.8 — a pull request named by the header is checked out through the panel's
+            * own mount path rather than through a second one written here. It is the same
+            * button the reviewer would have pressed, pressed for them.
+            */}
+          <CollabPullsPanel
+            onReview={(pull, worktree) => setPullReview({ pull, worktree })}
+            {...(initial?.reviewPull !== undefined ? { autoReview: initial.reviewPull } : {})}
+          />
         </div>
       )}
     </>
@@ -437,6 +492,15 @@ const backBtn: React.CSSProperties = {
   cursor: 'pointer',
 };
 const title: React.CSSProperties = { fontWeight: 700, color: '#334155' };
+/** Same read-only chip vocabulary the review banner uses, so the two read as one surface. */
+const reviewChip: React.CSSProperties = {
+  font: '600 10px ui-monospace, monospace',
+  padding: '2px 8px',
+  borderRadius: 99,
+  border: '1px solid #fcd34d',
+  background: '#fef3c7',
+  color: '#92400e',
+};
 const sectionRule: React.CSSProperties = { border: 0, borderTop: '1px solid #e5e7eb', margin: '4px 12px', maxWidth: 720 };
 const centerMsg: React.CSSProperties = { flex: 1, display: 'grid', placeItems: 'center', opacity: 0.6 };
 const docPane: React.CSSProperties = { flex: 1, minWidth: 0, position: 'relative', overflow: 'auto', background: '#f8fafc' };
