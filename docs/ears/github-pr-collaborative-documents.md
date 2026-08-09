@@ -227,6 +227,34 @@ gate reads GitHub's own resolution state rather than a marker protocol of our ow
 | R-8.25 | IF resolution state is unknown because the GraphQL read failed, THE SYSTEM SHALL NOT report the document as Ready, and SHALL name the unknown state as the reason. |
 | R-8.26 | THE SYSTEM SHALL NOT mark a document Ready on the basis of local state alone. |
 
+### Starting a collaboration on more than one file
+
+**Why:** R-8.5 creates a Pull Request from exactly one file, because `POST
+/__vs/collab/start` accepts one `documentPath` and one `markdown`. Authors do not work
+that way. A change to a specification is usually a change to several documents that only
+make sense reviewed together, and the single-file contract forces either one Pull Request
+per file — which splits one conversation across several review threads — or a manual
+commit outside the tool, which loses the document/Pull Request link that resume (R-7.4,
+R-7.7) depends on.
+
+The constraint these preserve is that **a collaboration still has exactly one document
+id**. Resume resolves a single `documentId` from the Pull Request body, and the review
+surface mounts a single document; making a collaboration a set of equals would change
+both. So a multi-file start is one *named* document travelling with companion files, not
+a set without a head.
+
+| ID | EARS statement |
+| --- | --- |
+| R-8.27 | THE SYSTEM SHALL accept at `POST /__vs/collab/start` one or more files, each carrying its own repository-relative path and its own Markdown bytes. |
+| R-8.28 | WHERE exactly one file is supplied, THE SYSTEM SHALL behave as R-8.5 requires, so that a single-file caller observes no change. |
+| R-8.29 | WHEN more than one file is supplied, THE SYSTEM SHALL commit every supplied file to the same branch, each at its own path, within the same create job, and SHALL open exactly one Pull Request covering all of them. |
+| R-8.30 | THE SYSTEM SHALL designate exactly one supplied file as the collaboration document that `documentId` names in the Pull Request body, so that resume continues to resolve a single document (R-7.4, R-7.7). |
+| R-8.31 | IF two supplied files declare the same path, THE SYSTEM SHALL reject the request before creating a branch and SHALL name the duplicated path. |
+| R-8.32 | IF any supplied path fails the containment rule a single path must already satisfy, THE SYSTEM SHALL reject the whole request and SHALL commit none of the supplied files. |
+| R-8.33 | IF the create job fails after committing some but not all supplied files, THE SYSTEM SHALL report the failure and SHALL leave no orphaned branch behind, as R-8.18 already requires of the single-file case. |
+| R-8.34 | WHEN offering the author a multi-file start, THE SYSTEM SHALL default the selection to the open file alone, and SHALL offer as candidates only local files that carry notes. |
+| R-8.35 | THE SYSTEM SHALL include in the request only the files the author selected, and SHALL NOT add a file to a Pull Request because it was merely offered. |
+
 ## Unit 9: Authentication and authorization
 
 **Why:** The proposal explicitly requires backend enforcement, not UI-only hiding.

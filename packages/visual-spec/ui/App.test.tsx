@@ -58,17 +58,28 @@ const ORPHAN_COMMENT: CommentRecord = {
 
 const AVAILABILITY = { available: true, login: 'reviewer-rita', repo: { owner: 'acme', repo: 'docs' } };
 
+/** Two open pull requests, so the sidebar's badge has a number that is not 0 or 1. */
+const OPEN_PULLS = [
+  { number: 42, title: 'The Spec', author: 'author-ana', state: 'open', draft: false, headBranch: 'vs/doc-1', baseBranch: 'main', headSha: 'a'.repeat(40), htmlUrl: 'https://github.com/acme/docs/pull/42', documentId: 'doc-1' },
+  { number: 43, title: 'Unrelated', author: 'dev-dan', state: 'open', draft: false, headBranch: 'fix/thing', baseBranch: 'main', headSha: 'b'.repeat(40), htmlUrl: 'https://github.com/acme/docs/pull/43', documentId: null },
+];
+
 function jsonRes(body: unknown, ok = true, status = ok ? 200 : 500) {
   return { ok, status, json: async () => body } as Response;
 }
 
 /** Routes every fetch this render tree can issue: the file tree plus the collab API. */
-function installFetch() {
+function installFetch(availability: unknown = AVAILABILITY) {
   const impl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method ?? 'GET';
     if (url === '/__vs/tree') return jsonRes([]);
-    if (url === '/__vs/collab') return jsonRes(AVAILABILITY);
+    if (url === '/__vs/collab') return jsonRes(availability);
+    // Nothing is checked out, so `CollabPullsPanel` gets an empty worktree list. Matched
+    // before the listing below, whose prefix would otherwise swallow it.
+    if (url === '/__vs/collab/pulls/mounted') return jsonRes({ worktrees: [] });
+    // The sidebar's "Pull requests" item and the header chip both count these (R-7.1).
+    if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: OPEN_PULLS });
     if (url === '/__vs/collab/open' && method === 'POST') return jsonRes({ ok: true });
     if (url === '/__vs/collab/doc-1') {
       return jsonRes({
@@ -108,6 +119,49 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+/*
+ * The way in to pull requests, and where it sits.
+ *
+ * It used to be the first line of the sidebar FOOTER — 11px muted, between the
+ * copyright and a buy-me-a-coffee link, which is how this sidebar dresses chrome.
+ * Reviewing a pull request is one of the two jobs the tool does, and the only one the
+ * file tree cannot lead anyone to, so these pin it as navigation: above the tree, with
+ * the count that says whether there is anything waiting.
+ */
+describe('the sidebar offers pull requests as navigation, not as footer text', () => {
+  it('carries the count of open pull requests', async () => {
+    render(<App />);
+    const badge = await screen.findByTestId('sidebar-pull-count');
+    expect(badge.textContent).toBe('2');
+  });
+
+  it('sits above the file tree rather than in the footer', async () => {
+    const { container } = render(<App />);
+    const item = await screen.findByRole('button', { name: /Pull requests/ });
+    expect(item.closest('footer')).toBeNull();
+
+    // Ahead of the "Files" heading in document order — DOCUMENT_POSITION_FOLLOWING is
+    // the browser's own answer to "does this come after that".
+    const files = screen.getByText('Files');
+    expect(item.compareDocumentPosition(files) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(container.querySelector('footer')?.textContent).not.toMatch(/pull request/i);
+  });
+
+  /*
+   * R-7.2 — where collaboration is not configured the count is not merely hidden, it is
+   * never asked for. The badge is absent rather than `0`, because `0` is a claim about a
+   * repository nobody named.
+   */
+  it('shows no count where collaboration is unconfigured, and asks for none', async () => {
+    const impl = installFetch({ available: false, reason: 'no_credential', message: 'Collaboration is unavailable.' });
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole('button', { name: /Pull requests/ })).toBeTruthy());
+
+    expect(screen.queryByTestId('sidebar-pull-count')).toBeNull();
+    expect(impl.mock.calls.map((c) => String(c[0])).some((u) => u.startsWith('/__vs/collab/pulls'))).toBe(false);
+  });
+});
+
 describe('the collaboration UI is mounted from App.tsx (task U-1)', () => {
   it('is unreachable through the file tree but reachable through its own route', async () => {
     render(<App />);
@@ -117,7 +171,7 @@ describe('the collaboration UI is mounted from App.tsx (task U-1)', () => {
     expect(screen.queryByText(/Open a document from a pull request/)).toBeNull();
 
     // The entry point lives in the file shell, not inside any TreeEntry.
-    fireEvent.click(screen.getByText('Review a pull request…'));
+    fireEvent.click(screen.getByRole('button', { name: /Pull requests/ }));
 
     // The whole shell swapped — file view is gone, the open panel is up.
     expect(screen.queryByText(/Select a file or folder/)).toBeNull();
@@ -128,9 +182,12 @@ describe('the collaboration UI is mounted from App.tsx (task U-1)', () => {
   it('opens a document from a PR reference and renders it read-only beside the real comment panel', async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByText('Review a pull request…'));
+    fireEvent.click(await screen.findByRole('button', { name: /Pull requests/ }));
     await screen.findByText(/Signed in as reviewer-rita/);
 
+    // The manual URL form is a disclosure now — the pull request list above it is the
+    // primary path, and this form is the answer for a pull request that is not in it.
+    fireEvent.click(screen.getByRole('button', { name: /Open a document from a pull request URL/ }));
     fireEvent.change(screen.getByPlaceholderText('https://github.com/owner/repo/pull/42'), {
       target: { value: 'https://github.com/acme/docs/pull/42' },
     });

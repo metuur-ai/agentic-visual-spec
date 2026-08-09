@@ -42,6 +42,14 @@ function fakeFetch(openResponse: { ok: boolean; status: number; json: unknown },
 const type = (labelText: string, value: string) =>
   fireEvent.change(screen.getByText(labelText).parentElement?.querySelector('input') as HTMLInputElement, { target: { value } });
 
+/**
+ * P6 — the manual URL + document-id form is a disclosure now, collapsed by default,
+ * because the pull request list next door already holds both answers for every row it
+ * shows. It is still the way in for a pull request in another repository, so every test
+ * that uses it opens it first.
+ */
+const openByUrl = () => fireEvent.click(screen.getByRole('button', { name: /Open a document from a pull request URL/ }));
+
 describe('R-11.5 — the reviewer sees their own GitHub identity', () => {
   it('names the login comments will be attributed to', async () => {
     const { impl } = fakeFetch({ ok: true, status: 200, json: { ok: true } });
@@ -59,6 +67,7 @@ describe('R-11.5 — the reviewer sees their own GitHub identity', () => {
     );
     render(<CollabOpenPanel fetchImpl={impl} />);
     await waitFor(() => expect(screen.getByText(/no GitHub credential is configured/)).toBeTruthy());
+    openByUrl();
     expect((screen.getByRole('button', { name: 'Open' }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
@@ -90,83 +99,22 @@ describe('R-12.5 — a session that cannot publish says so, and says why', () =>
 });
 
 /*
- * R-8.5 — the author's entry. Before this existed, `POST /__vs/collab/start` was
- * implemented, exported on the client, and called by nothing: an author could not create
- * a first document at all. These pin the caller, not just the route.
+ * R-8.5 IS NO LONGER THIS PANEL'S. A "New document" form used to sit here and post
+ * `POST /__vs/collab/start` with an empty body — a create action on the reviewer's
+ * screen, which made an author's first act a publish of a document nobody had written.
+ * The author's entry is `StartPullRequestButton` in the main header, which sends the
+ * file they actually wrote at the path it already has; `ui/start-pull-request.test.tsx`
+ * carries R-8.5's assertions. What stays here is the one below: this panel creates
+ * nothing, so no request it makes may be a create.
  */
-describe('R-8.5 — starting a new document', () => {
-  const authoring = { ...AVAILABLE, canPublish: true };
-
-  it('posts the document id, the store path and the title', async () => {
-    const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true, kind: 'create' } }, authoring);
-    const onOpened = vi.fn();
-    render(<CollabOpenPanel fetchImpl={impl} onOpened={onOpened} />);
-    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
-
-    type('New document id', 'doc-7');
-    type('Title', 'Payment rules');
-    fireEvent.click(screen.getByRole('button', { name: 'Create pull request' }));
-
-    await waitFor(() => expect(onOpened).toHaveBeenCalledWith('doc-7'));
-    expect(calls.at(-1)).toEqual({
-      url: '/__vs/collab/start',
-      // A `.md` path, not `.json`: the create job commits `doc.markdown` to
-      // `documentPath` verbatim (R-0.1), so the extension has to match the bytes.
-      body: { documentId: 'doc-7', documentPath: 'documents/doc-7.md', title: 'Payment rules' },
-    });
-  });
-
-  it('omits the title entirely rather than sending an empty one', async () => {
-    const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true } }, authoring);
-    render(<CollabOpenPanel fetchImpl={impl} onOpened={vi.fn()} />);
-    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
-
-    type('New document id', 'doc-8');
-    fireEvent.click(screen.getByRole('button', { name: 'Create pull request' }));
-
-    await waitFor(() => expect(calls.at(-1)?.url).toBe('/__vs/collab/start'));
-    expect(calls.at(-1)?.body).toEqual({ documentId: 'doc-8', documentPath: 'documents/doc-8.md' });
-  });
-
-  it('refuses to post without a document id', async () => {
-    const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true } }, authoring);
+describe('the panel creates nothing', () => {
+  it('offers no way to start a document, even to a credential that could publish', async () => {
+    const { impl } = fakeFetch({ ok: true, status: 200, json: { ok: true } }, { ...AVAILABLE, canPublish: true });
     render(<CollabOpenPanel fetchImpl={impl} />);
     await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Create pull request' }));
-
-    await waitFor(() => expect(screen.getByText(/Enter a document id/)).toBeTruthy());
-    expect(calls.map((c) => c.url)).toEqual(['/__vs/collab']);
-  });
-
-  it('shows the server’s refusal verbatim', async () => {
-    const message = 'create is available to the document author only: the GitHub credential has no write access to acme/docs.';
-    const { impl } = fakeFetch({ ok: false, status: 403, json: { error: message } }, authoring);
-    render(<CollabOpenPanel fetchImpl={impl} />);
-    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
-
-    type('New document id', 'doc-9');
-    fireEvent.click(screen.getByRole('button', { name: 'Create pull request' }));
-
-    await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
-  });
-
-  /*
-   * R-9.11 — hiding a control is never the enforcement, but offering a reviewer a button
-   * that exists only to be refused is its own defect. `false` is a definite answer.
-   */
-  it('is hidden for a session the server said cannot publish', async () => {
-    const { impl } = fakeFetch({ ok: true, status: 200, json: { ok: true } }, { ...AVAILABLE, canPublish: false });
-    render(<CollabOpenPanel fetchImpl={impl} />);
-    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
-    expect(screen.queryByRole('button', { name: 'Create pull request' })).toBeNull();
-  });
-
-  it('is shown when write access is undeterminable, because the route still refuses', async () => {
-    const { impl } = fakeFetch({ ok: true, status: 200, json: { ok: true } });
-    render(<CollabOpenPanel fetchImpl={impl} />);
-    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
-    expect(screen.getByRole('button', { name: 'Create pull request' })).toBeTruthy();
+    expect(screen.queryByText(/New document/)).toBeNull();
+    expect(screen.queryByRole('button', { name: /Create pull request/ })).toBeNull();
   });
 });
 
@@ -177,6 +125,7 @@ describe('R-11.2 — opening by pull request reference', () => {
     render(<CollabOpenPanel fetchImpl={impl} onOpened={onOpened} />);
     await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
 
+    openByUrl();
     type('Pull request', 'https://github.com/acme/docs/pull/42');
     type('Document id', 'doc-1');
     fireEvent.click(screen.getByRole('button', { name: 'Open' }));
@@ -190,6 +139,7 @@ describe('R-11.2 — opening by pull request reference', () => {
     render(<CollabOpenPanel fetchImpl={impl} />);
     await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
 
+    openByUrl();
     type('Pull request', 'acme/docs');
     type('Document id', 'doc-1');
     fireEvent.click(screen.getByRole('button', { name: 'Open' }));
@@ -206,10 +156,53 @@ describe('R-11.4 — the server’s specific cause reaches the reviewer verbatim
     render(<CollabOpenPanel fetchImpl={impl} />);
     await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
 
+    openByUrl();
     type('Pull request', '#42');
     type('Document id', 'doc-1');
     fireEvent.click(screen.getByRole('button', { name: 'Open' }));
 
     await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
+  });
+});
+
+/*
+ * P6 — the landing page asked you to type what it already knew.
+ *
+ * It led with a form wanting a pull request URL *and* a document id typed by hand, then
+ * "Start a new document", and only third the list of pull requests — which already
+ * contains those same pull requests as buttons, each carrying the `documentId` the server
+ * resolved from the body (R-7.4). Nothing is removed here: the form is still the answer for
+ * a pull request in another repository, which is what it is now labelled as.
+ */
+describe('the manual form is a disclosure, labelled for what it is for (P6)', () => {
+  it('is collapsed until it is asked for, and says why it exists', async () => {
+    const { impl } = fakeFetch({ ok: true, status: 200, json: { ok: true } });
+    render(<CollabOpenPanel fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
+
+    const toggle = screen.getByRole('button', { name: /Open a document from a pull request URL/ });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.textContent).toContain('another repository');
+    expect(screen.queryByRole('button', { name: 'Open' })).toBeNull();
+
+    fireEvent.click(toggle);
+
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByRole('button', { name: 'Open' })).toBeTruthy();
+  });
+
+  it('still opens a document once expanded', async () => {
+    const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true, kind: 'sync' } });
+    const onOpened = vi.fn();
+    render(<CollabOpenPanel fetchImpl={impl} onOpened={onOpened} />);
+    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
+
+    openByUrl();
+    type('Pull request', '#7');
+    type('Document id', 'doc-7');
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
+
+    await waitFor(() => expect(onOpened).toHaveBeenCalledWith('doc-7'));
+    expect(calls.at(-1)).toEqual({ url: '/__vs/collab/open', body: { documentId: 'doc-7', pullNumber: 7 } });
   });
 });

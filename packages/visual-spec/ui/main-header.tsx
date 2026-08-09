@@ -1,7 +1,8 @@
 import { type CommentRecord, buildApplyPrompt, useComments, useInspector, useSpecsRoot } from '../core/app';
-import { memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { Fragment, type ReactNode, memo, useCallback, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from 'react';
 import { HelpButton } from './help-page';
 import { CommentHistoryList } from './comment-history-list';
+import { isCommentPanelListening, revealInCommentPanel, subscribeCommentPanel } from './comment-panel';
 import { toPath } from './md-path';
 // `document-record.ts` imports nothing (see its header), so the id pattern crosses into
 // the browser as a value without dragging `node:*` behind it.
@@ -65,6 +66,18 @@ function FolderIcon({ size = 13 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }}>
       <path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+    </svg>
+  );
+}
+
+/**
+ * The promoted "Start collaboration" carries this so the state is not colour alone —
+ * a violet fill says "ready" only to someone who can see violet.
+ */
+function CheckIcon({ size = 13 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }} aria-hidden>
+      <path d="M20 6 9 17l-5-5" />
     </svg>
   );
 }
@@ -862,6 +875,17 @@ function ApplyButton({ open, file, onRunningChange }: { open: CommentRecord[]; f
   const titles: Record<ApplyPhase, string> = { running: 'Applying comments', done: 'Done', cancelled: 'Cancelled', error: 'Stopped', idle: 'Apply' };
   const title = titles[state.phase];
 
+  /*
+   * P2 — the button names what it is about to do to, rather than naming the verb.
+   *
+   * "Apply" beside a separate count chip asks the reader to join two controls into one
+   * sentence, and the join is where the mistake lives: this is the control that lets an
+   * agent edit files, so how many of them it is about to act on belongs in its own
+   * label. With none there is no count to state and the bare verb is the honest form —
+   * the button is disabled there anyway.
+   */
+  const applyLabel = openCount === 0 ? 'Apply' : `Apply ${openCount} comment${openCount === 1 ? '' : 's'}`;
+
   return (
     <div ref={rootRef} style={{ position: 'relative' }}>
       <button
@@ -877,7 +901,7 @@ function ApplyButton({ open, file, onRunningChange }: { open: CommentRecord[]; f
             Applying · <ElapsedTimer startedAt={state.startedAt} running={running} />
           </>
         ) : (
-          'Apply'
+          applyLabel
         )}
       </button>
 
@@ -1278,8 +1302,29 @@ async function readMarkdown(path: string): Promise<string> {
  * the form is replaced by the server's own reason (R-12.5) rather than by a button that
  * exists to fail. An *absent* `canPublish` means the server could not determine write
  * access; the form is shown, because the route refuses server-side regardless (R-9.11).
+ *
+ * IT IS LABELLED "Start collaboration". This control CREATES — a branch, a commit and a
+ * pull request. It was briefly relabelled "Open pull request" during the P2 header pass,
+ * which was wrong twice over: "open a pull request" is how people say *go look at one
+ * that exists*, and the git chip two zones away opens a popover titled "Open pull
+ * requests" that does exactly that. The author reported the create action as missing —
+ * it was on screen the whole time, wearing the name of the thing beside it.
+ *
+ * "Collaboration" rather than "pull request" because that is the object this makes: a
+ * collaboration document, which happens to be carried by a pull request. The popover
+ * below still says what it will do to the repository, so nobody has to infer the
+ * mechanics from the verb.
  */
-function StartPullRequestButton({ file, onStarted }: { file: string; onStarted?: (documentId: string) => void }) {
+function StartPullRequestButton({
+  file,
+  ready = false,
+  onStarted,
+}: {
+  file: string;
+  /** The caller's verdict that this document's notes are worked through — see `readyToShare`. */
+  ready?: boolean;
+  onStarted?: (documentId: string) => void;
+}) {
   const client = useMemo(() => createCollabClient(), []);
   const [availability, setAvailability] = useState<CollabAvailabilitySnapshot | null>(null);
   const [open, setOpen] = useState(false);
@@ -1361,15 +1406,23 @@ function StartPullRequestButton({ file, onStarted }: { file: string; onStarted?:
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        title={blocked ? 'This session cannot create a pull request' : `Open a pull request for ${file}`}
-        style={blocked ? { ...secondary, color: '#94a3b8' } : secondary}
+        data-vs-start-pr-ready={ready && !blocked ? 'true' : undefined}
+        title={
+          blocked
+            ? 'This session cannot create a pull request'
+            : ready
+              ? `Your notes on ${file} are all applied — start a collaboration, which creates a branch and a pull request`
+              : `Start a collaboration on ${file} — creates a branch and a pull request`
+        }
+        style={blocked ? { ...secondary, color: '#94a3b8' } : ready ? startPrimary : secondary}
       >
-        Start pull request
+        {ready && !blocked && <CheckIcon />}
+        Start collaboration
       </button>
       {open && (
         <div style={historyPop} data-vs-start-pr>
           <div style={applyPopHead}>
-            <span style={{ fontWeight: 700 }}>Start pull request</span>
+            <span style={{ fontWeight: 700 }}>Start collaboration</span>
             <button type="button" onClick={() => setOpen(false)} style={closeBtn} title="Close" aria-label="Close">
               ✕
             </button>
@@ -1412,6 +1465,111 @@ function StartPullRequestButton({ file, onStarted }: { file: string; onStarted?:
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * P2 — the header as three zones and an overflow.
+ *
+ * The bar used to be eight controls at one weight in one row: Help, History,
+ * View/Edit, Start comments, Start pull request, the count, Copy prompt, Apply. Three
+ * of them read as the primary action and none of them was grouped, so the row offered
+ * no answer to "where do I start" — the reader had to read all eight and infer the
+ * three jobs they belong to.
+ *
+ * The zones ARE those three jobs, in the order the work happens: what the document is
+ * (Document), what is being said about it (Review), what an agent does with that
+ * (Agent). Only dividers mark them. Rendering the zone names as labels was rejected:
+ * three words of chrome to explain seven controls costs more room than the grouping
+ * saves, and grouping that has to be captioned has not worked.
+ * ------------------------------------------------------------------ */
+type HeaderZone = { name: string; label: string; content: ReactNode };
+
+/**
+ * An empty zone contributes no divider. A rule with nothing on one side of it does not
+ * separate anything, and both Document (markdown only) and Review (inspector only)
+ * genuinely empty out depending on what is open.
+ */
+function HeaderZones({ zones }: { zones: HeaderZone[] }) {
+  const filled = zones.filter((z) => z.content !== null);
+  return (
+    <>
+      {filled.map((z, i) => (
+        <Fragment key={z.name}>
+          {i > 0 && <span style={zoneDivider} data-vs-header-divider aria-hidden="true" />}
+          {/*
+            The divider is decoration, so it is hidden — a screen reader announcing
+            "separator" three times says nothing about what was separated. The grouping
+            itself is not decoration, and a rule on screen is invisible to a reader who
+            is not looking at it, so each zone names itself to assistive technology.
+            That name is deliberately NOT rendered: on screen the spacing and the rule
+            already group these, and a caption over three controls costs more room than
+            the grouping saves.
+          */}
+          <div style={zoneRow} data-vs-header-zone={z.name} role="group" aria-label={z.label}>
+            {z.content}
+          </div>
+        </Fragment>
+      ))}
+    </>
+  );
+}
+
+/**
+ * Help and History, behind one control at the far right.
+ *
+ * Neither is part of doing the work — one explains the app and one reads what already
+ * happened — so at full weight in the bar they competed with the controls that are.
+ *
+ * R-5.1 SURVIVES THIS. "History is always available, in both modes" is a claim about
+ * gating, and nothing here gates it: `HistoryButton` is rendered unconditionally, in
+ * every mode, exactly as before — it is one click further away, not conditional. The
+ * panel's own History tab, which is the route most readers take, is untouched.
+ *
+ * THE PANEL IS HIDDEN, NOT UNMOUNTED, AND THAT IS LOAD-BEARING. `HelpButton` owns the
+ * full-screen help overlay it opens, and the overlay renders as that button's sibling.
+ * Unmounting the panel on dismiss would take the open overlay down with it — the user
+ * would click Help, click anywhere in the page it opened, and watch it vanish.
+ * `display: none` also takes the two buttons out of the tab order while closed, which
+ * a hidden-but-mounted panel otherwise would not.
+ */
+function OverflowMenu({ children }: { children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  return (
+    <div ref={rootRef} style={{ position: 'relative', flexShrink: 0 }}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-label="More: help and history"
+        aria-expanded={open}
+        aria-controls="vs-header-more"
+        title="More: help and history"
+        style={overflowBtn}
+      >
+        ⋯
+      </button>
+      <div id="vs-header-more" style={{ ...overflowPop, display: open ? 'grid' : 'none' }}>
+        {children}
+      </div>
     </div>
   );
 }
@@ -1484,51 +1642,121 @@ export function MainHeader({
     setTimeout(() => setCopied(false), 2000);
   };
 
+  /*
+   * P3 — the count chip, when the panel is already showing what it would list.
+   *
+   * `AllComments` renders over the Comments panel, and on the ordinary screen — a
+   * markdown file open, the panel beside it — the two showed the same comments at the
+   * same time, one on top of the other. The popover is not deleted, because it is still
+   * the only surface that lists OTHER files' comments and navigates to them, which is
+   * exactly the case where no panel can answer: `revealInCommentPanel` returns false
+   * when nothing on screen is listing a comment, and the popover opens as it always did.
+   */
+  const panelListening = useSyncExternalStore(subscribeCommentPanel, isCommentPanelListening, () => false);
+
+  /*
+   * WHEN "Start collaboration" IS THE NEXT THING TO DO, AND ONLY THEN.
+   *
+   * The draft loop is: leave notes, let the agent apply them, share the result. The
+   * header rendered the last step at the same weight throughout — `secondary`,
+   * unconditionally — so nothing on screen ever marked the moment the document became
+   * shareable. The author had to decide that for themselves, and the UI read identically
+   * whether they had a page of unaddressed notes or a finished document.
+   *
+   * The condition is the honest reading of "done with my notes": this file has notes
+   * that were applied, and none still open. Both halves matter. Without the first, a
+   * file nobody has commented on would promote the instant it opened — a claim of
+   * readiness about a document that has been through nothing. Without the second, it
+   * would promote over outstanding work.
+   *
+   * It is a promotion, never a gate: the button is in the same place, with the same
+   * label and the same behaviour, at every other moment. Nothing here disables it,
+   * because "I want to share this now" is always a legitimate thing to mean.
+   */
+  const readyToShare = useMemo(() => {
+    const mine = comments.filter((c) => c.target.path === file);
+    return mine.some((c) => c.status === 'applied') && !mine.some((c) => c.status === 'open');
+  }, [comments, file]);
+
+  const pickCount = () => {
+    if (open.length === 0) return;
+    if (revealInCommentPanel()) {
+      setShowAll(false);
+      return;
+    }
+    setShowAll((v) => !v);
+  };
+
   return (
     <header style={bar}>
       <Brand file={file} actions={actions} />
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
-        <HelpButton />
-        <HistoryButton file={file} comments={comments} />
-        {isMarkdown && onModeChange && <ModeToggle mode={mode} onModeChange={onModeChange} />}
-        {withInspector && mode === 'view' && <InspectorToggle />}
-        {/*
-          R-8.5 — the open file's own way onto a pull request. Markdown only: the create
-          job commits the bytes as the document (R-0.1), and `actions.onResumeCollab` is
-          the same landing `CollabOpenPanel`'s `onOpened` reaches — the document pane.
-        */}
-        {isMarkdown && file && <StartPullRequestButton file={file} {...(actions?.onResumeCollab ? { onStarted: actions.onResumeCollab } : {})} />}
-
-        {copied && <span style={toast}>✓ Copied</span>}
-        <div ref={cartRef} style={{ position: 'relative' }}>
-          <button
-            type="button"
-            onClick={() => open.length > 0 && setShowAll((v) => !v)}
-            title="View all collected comments"
-            style={{ ...cart, border: 'none', cursor: open.length > 0 ? 'pointer' : 'default' }}
-          >
-            <CommentIcon size={13} /> {open.length}
-          </button>
-          {showAll && open.length > 0 && (
-            <AllComments
-              open={open}
-              onPick={(f) => { onNavigate?.(f); setShowAll(false); }}
-            />
-          )}
-        </div>
-
-        <button
-          type="button"
-          onClick={copy}
-          disabled={open.length === 0}
-          title="Copy a prompt for your agent to apply these comments"
-          style={{ ...secondary, opacity: open.length === 0 ? 0.5 : 1 }}
-        >
-          📋 Copy prompt
-        </button>
-
-        <ApplyButton open={open} file={file} onRunningChange={setApplying} />
+        <HeaderZones
+          zones={[
+            { name: 'document', label: 'Document', content: isMarkdown && onModeChange ? <ModeToggle mode={mode} onModeChange={onModeChange} /> : null },
+            {
+              name: 'review',
+              label: 'Review',
+              content: (
+                <>
+                  {withInspector && mode === 'view' && <InspectorToggle />}
+                  <div ref={cartRef} style={{ position: 'relative' }}>
+                    <button
+                      type="button"
+                      onClick={pickCount}
+                      title={panelListening ? 'Show these comments in the panel' : 'View all collected comments'}
+                      style={{ ...cart, border: 'none', cursor: open.length > 0 ? 'pointer' : 'default' }}
+                    >
+                      <CommentIcon size={13} /> {open.length}
+                    </button>
+                    {showAll && open.length > 0 && (
+                      <AllComments
+                        open={open}
+                        onPick={(f) => { onNavigate?.(f); setShowAll(false); }}
+                      />
+                    )}
+                  </div>
+                  {/*
+                    R-8.5 — the open file's own way onto a pull request. Markdown only: the create
+                    job commits the bytes as the document (R-0.1), and `actions.onResumeCollab` is
+                    the same landing `CollabOpenPanel`'s `onOpened` reaches — the document pane.
+                  */}
+                  {isMarkdown && file && <StartPullRequestButton file={file} ready={readyToShare} {...(actions?.onResumeCollab ? { onStarted: actions.onResumeCollab } : {})} />}
+                </>
+              ),
+            },
+            {
+              name: 'agent',
+              label: 'Agent',
+              content: (
+                <>
+                  {copied && <span style={toast}>✓ Copied</span>}
+                  <button
+                    type="button"
+                    onClick={copy}
+                    disabled={open.length === 0}
+                    title="Copy a prompt for your agent to apply these comments"
+                    style={{ ...secondary, display: 'inline-flex', alignItems: 'center', gap: 6, opacity: open.length === 0 ? 0.5 : 1 }}
+                  >
+                    {/*
+                      `CopyIcon` rather than 📋. Every other glyph in this header is an
+                      inline SVG that inherits `currentColor`, so the emoji was the one
+                      mark that ignored the button's disabled colour and rendered in a
+                      different family on every platform.
+                    */}
+                    <CopyIcon size={13} /> Copy prompt
+                  </button>
+                  <ApplyButton open={open} file={file} onRunningChange={setApplying} />
+                </>
+              ),
+            },
+          ]}
+        />
+        <OverflowMenu>
+          <HelpButton />
+          <HistoryButton file={file} comments={comments} />
+        </OverflowMenu>
       </div>
       {applying && <ApplyProgressLine />}
       <style>{'@keyframes vs-pulse{0%,100%{opacity:1}50%{opacity:0.35}}@keyframes vs-apply-flow{0%{background-position:0% 0}100%{background-position:-200% 0}}'}</style>
@@ -1706,6 +1934,14 @@ const scopeBranch: React.CSSProperties = { flexShrink: 1, minWidth: 0, overflow:
 // HEAD is none of those, and the tone must not contradict the words beside it.
 // Tone alone never carries the fact — the label already says "detached HEAD".
 const scopeBranchDetached: React.CSSProperties = { color: '#b45309', background: '#fffbeb', border: '1px solid #fde68a' };
+// P2's grouping, and the whole of it: a zone is a row of its own controls, and the
+// divider is a hairline the same slate as the header's own bottom border. Tighter gaps
+// inside a zone than between zones is what makes the grouping readable before the
+// divider is even noticed.
+const zoneRow: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8 };
+const zoneDivider: React.CSSProperties = { width: 1, alignSelf: 'stretch', minHeight: 24, background: '#e5e7eb', flexShrink: 0 };
+const overflowBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 34, height: 32, padding: 0, border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#475569', cursor: 'pointer', font: '16px system-ui', fontWeight: 700, lineHeight: 1, flexShrink: 0 };
+const overflowPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc(100% + 6px)', gap: 6, padding: 8, background: 'white', border: '1px solid #e5e7eb', borderRadius: 10, boxShadow: '0 12px 40px rgba(76,29,149,0.16)', zIndex: 41, justifyItems: 'stretch' };
 const cart: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 5, background: '#f1f5f9', borderRadius: 99, padding: '3px 10px', fontSize: 13, color: '#475569' };
 const segWrap: React.CSSProperties = { display: 'inline-flex', padding: 2, gap: 2, background: '#f1f5f9', border: '1px solid #e5e7eb', borderRadius: 9 };
 const segBtn: React.CSSProperties = { padding: '5px 12px', border: 'none', borderRadius: 7, background: 'transparent', color: '#64748b', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
@@ -1713,6 +1949,16 @@ const segBtnActive: React.CSSProperties = { ...segBtn, background: 'white', colo
 const startBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 12px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#334155', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
 const startBtnActive: React.CSSProperties = { ...startBtn, border: '1px solid #2563eb', background: '#eff6ff', color: '#1d4ed8' };
 const secondary: React.CSSProperties = { padding: '7px 14px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#334155', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
+/**
+ * "Start collaboration", promoted — tinted fill, coloured border, coloured text.
+ *
+ * Deliberately NOT `applyBtn`'s solid violet. Apply sits in the next zone along and is
+ * solid violet already; a second solid violet button beside it would put two primary
+ * actions in one row, and the reader would have to work out which of the two the header
+ * meant. This is the same idiom `startBtnActive` above uses for "the live control" —
+ * clearly lifted above `secondary`, without claiming the row.
+ */
+const startPrimary: React.CSSProperties = { ...secondary, display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid #7c3aed', background: '#f5f3ff', color: '#6d28d9' };
 const applyBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 7, padding: '7px 14px', border: 'none', borderRadius: 8, background: '#7c3aed', color: 'white', cursor: 'pointer', font: '13px system-ui', fontWeight: 600, minWidth: 92, justifyContent: 'center' };
 const applyPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc(100% + 6px)', width: 440, maxWidth: '82vw', background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 16px 48px rgba(76,29,149,0.18)', zIndex: 41, overflow: 'hidden' };
 const historyPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc(100% + 6px)', width: 380, maxWidth: '82vw', background: 'white', border: '1px solid #e5e7eb', borderRadius: 12, boxShadow: '0 16px 48px rgba(76,29,149,0.18)', zIndex: 41, overflow: 'hidden' };

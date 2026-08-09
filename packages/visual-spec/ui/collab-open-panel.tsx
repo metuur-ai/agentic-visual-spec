@@ -5,6 +5,25 @@
  * (`--document <id>` in the copyable command 8.2 writes). This panel turns those two into
  * a `POST /__vs/collab/open` and reports what happened in the reviewer's own words.
  *
+ * THE FORM IS NO LONGER THE FIRST THING ANYONE SEES. It used to lead the collaboration
+ * surface, asking for a pull request URL *and* a document id typed by hand — while
+ * `CollabPullsPanel` sat underneath it holding both, as buttons, for every open pull
+ * request, because the server resolves `documentId` from the pull request body (R-7.4).
+ * Asking someone to type what the page already knows is a worse first screen than the
+ * list. So the list leads, and this form folds into a disclosure labelled for the case it
+ * is genuinely the only answer to: a pull request that is not in this repository's
+ * listing. Nothing is removed — expanded, it posts exactly what it always did.
+ *
+ * IT NO LONGER CREATES ANYTHING. A "New document" form used to sit here and post
+ * `POST /__vs/collab/start` with an *empty* body, creating a branch and a pull request
+ * for a document nobody had written yet. Two things were wrong with it. It made the
+ * author's first act a publish, when the whole point of the local sidecar is to draft
+ * first and share when ready; and it was the second create path in the product, on a
+ * screen only reviewers ever open — the author's own is `StartPullRequestButton` in the
+ * main header, which commits the file they have actually written, at the path it already
+ * has. Creating a *file* is `+ New file` in the tree. Neither of those is here, and this
+ * panel is one job again: turning a pull request reference into a mounted document.
+ *
  * IT SHOWS WHO THEY ARE BEFORE THEY WRITE ANYTHING (R-11.5). `GET /__vs/collab` carries
  * the login the 4.2 preflight resolved from the credential the *server* holds — which is
  * not necessarily the account the reviewer is signed into on github.com. Comments are
@@ -62,8 +81,8 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
   const [reference, setReference] = useState('');
   const [documentId, setDocumentId] = useState('');
   const [status, setStatus] = useState<Status>({ kind: 'idle' });
-  const [newId, setNewId] = useState('');
-  const [newTitle, setNewTitle] = useState('');
+  /** The manual form, collapsed until someone has the case it exists for. */
+  const [byUrlOpen, setByUrlOpen] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -115,46 +134,8 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
     onOpened?.(id);
   }
 
-  /**
-   * R-8.5 — create the branch and the pull request for a document that does not exist
-   * yet. This is the author's entry; `open` above is the reviewer's.
-   *
-   * No `markdown` is sent. The server seeds an empty record (`newCollaborationRecord`)
-   * and the create job commits it, so the branch exists with the file on it; the author
-   * writes the body in the editor and the first publish puts real content there.
-   */
-  async function create() {
-    const id = newId.trim();
-    if (!id) {
-      setStatus({ kind: 'error', message: 'Enter a document id — it names the branch and the file, e.g. doc-1.' });
-      return;
-    }
-    setStatus({ kind: 'busy' });
-    const title = newTitle.trim();
-    const res = await client.start({
-      documentId: id,
-      // R-0.1 — the artifact is the Markdown, so the path the create job commits to is a
-      // `.md`. It means the same thing on the branch and under the content directory
-      // (see `CollaborationRecord.documentPath`), so the author never has to know either
-      // convention. It was `.json` until the envelope was retired; committing Markdown
-      // bytes to a `.json` path is what that leftover did.
-      documentPath: `documents/${id}.md`,
-      ...(title ? { title } : {}),
-    });
-    if (!res.ok) {
-      // Same rule as `open`: the server's own words. A reviewer's credential is refused
-      // here by `authorize` with a message naming write access.
-      setStatus({ kind: 'error', message: res.message });
-      return;
-    }
-    setStatus({ kind: 'ok', message: `Creating ${id} — opening a pull request…` });
-    onOpened?.(id);
-  }
-
   return (
     <section data-vs-collab-open style={wrap}>
-      <h2 style={heading}>Open a document from a pull request</h2>
-
       {/* R-11.5 — who the comments will be from, stated before any are written. */}
       <p data-vs-collab-identity style={identity}>
         {availability === null
@@ -183,82 +164,77 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
         </p>
       )}
 
-      <label style={row}>
-        <span style={label}>Pull request</span>
-        <input
-          value={reference}
-          onChange={(e) => setReference(e.target.value)}
-          placeholder="https://github.com/owner/repo/pull/42"
-          style={input}
-        />
-      </label>
-      <label style={row}>
-        <span style={label}>Document id</span>
-        <input value={documentId} onChange={(e) => setDocumentId(e.target.value)} placeholder="doc-1" style={input} />
-      </label>
-
-      <button
-        type="button"
-        onClick={() => void open()}
-        disabled={status.kind === 'busy' || availability?.available === false}
-        style={button}
-      >
-        {status.kind === 'busy' ? 'Opening…' : 'Open'}
-      </button>
-
       {(status.kind === 'error' || status.kind === 'ok') && (
         <p data-vs-collab-status style={status.kind === 'error' ? error : note}>
           {status.message}
         </p>
       )}
 
+      <hr style={rule} />
       {/*
-        The author's half. Rendered only when the credential can actually publish:
-        `create` is author-only (`OPERATION_POLICY`), so offering it to a reviewer would
-        be a control that exists to be refused. Absent `canPublish` means the server
-        could not determine write access — the form is shown, because hiding it on an
-        unknown would strand an author who is merely offline from the permission probe,
-        and the route refuses server-side regardless (R-9.11).
+        The fallback, said as one. The list above answers this repository; this answers a
+        pull request that is not in it — which is the only case where typing the URL and
+        the document id by hand is the shortest route rather than the longest.
       */}
-      {availability?.available === true && availability.canPublish !== false && (
-        <>
-          <hr style={rule} />
-          <h2 style={heading}>Start a new document</h2>
-          <p style={identity}>
-            Creates the branch <code>visual-spec/&lt;id&gt;</code>, commits an empty document and opens a pull request.
-            You write it in the editor, then publish.
-          </p>
+      <button
+        type="button"
+        onClick={() => setByUrlOpen((v) => !v)}
+        aria-expanded={byUrlOpen}
+        aria-controls="vs-collab-open-by-url"
+        style={disclosure}
+      >
+        <span aria-hidden="true">{byUrlOpen ? '▾' : '▸'}</span> Open a document from a pull request URL — for a pull
+        request in another repository
+      </button>
 
+      {byUrlOpen && (
+        <div id="vs-collab-open-by-url" style={disclosureBody}>
           <label style={row}>
-            <span style={label}>New document id</span>
-            <input value={newId} onChange={(e) => setNewId(e.target.value)} placeholder="payment-rules" style={input} />
-          </label>
-          <label style={row}>
-            <span style={label}>Title</span>
+            <span style={label}>Pull request</span>
             <input
-              value={newTitle}
-              onChange={(e) => setNewTitle(e.target.value)}
-              placeholder="Optional — defaults to the document id"
+              value={reference}
+              onChange={(e) => setReference(e.target.value)}
+              placeholder="https://github.com/owner/repo/pull/42"
               style={input}
             />
           </label>
+          <label style={row}>
+            <span style={label}>Document id</span>
+            <input value={documentId} onChange={(e) => setDocumentId(e.target.value)} placeholder="doc-1" style={input} />
+          </label>
 
-          <button type="button" onClick={() => void create()} disabled={status.kind === 'busy'} style={button}>
-            {status.kind === 'busy' ? 'Creating…' : 'Create pull request'}
+          <button
+            type="button"
+            onClick={() => void open()}
+            disabled={status.kind === 'busy' || availability?.available === false}
+            style={button}
+          >
+            {status.kind === 'busy' ? 'Opening…' : 'Open'}
           </button>
-        </>
+        </div>
       )}
     </section>
   );
 }
 
 const wrap: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 8, padding: 12, maxWidth: 520 };
-const heading: React.CSSProperties = { font: '600 13px/1.4 system-ui, sans-serif', color: '#334155', margin: 0 };
 const identity: React.CSSProperties = { fontSize: 12, color: '#64748b', margin: 0 };
 const row: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 6 };
 const label: React.CSSProperties = { fontSize: 11, color: '#64748b', width: 92, flexShrink: 0 };
 const input: React.CSSProperties = { font: '12px ui-monospace, monospace', padding: '3px 6px', border: '1px solid #d1d5db', borderRadius: 4, flex: 1 };
 const button: React.CSSProperties = { font: '12px system-ui, sans-serif', padding: '4px 10px', border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#334155', alignSelf: 'flex-start' };
 const rule: React.CSSProperties = { border: 0, borderTop: '1px solid #e5e7eb', margin: '4px 0 0' };
+/** A disclosure, not a heading: it is a control, so it looks and behaves like one. */
+const disclosure: React.CSSProperties = {
+  font: '12px system-ui, sans-serif',
+  textAlign: 'left',
+  padding: '6px 8px',
+  border: '1px solid #e5e7eb',
+  borderRadius: 6,
+  background: '#f8fafc',
+  color: '#475569',
+  cursor: 'pointer',
+};
+const disclosureBody: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 8, padding: '4px 8px 0' };
 const note: React.CSSProperties = { fontSize: 12, color: '#0f766e', margin: 0 };
 const error: React.CSSProperties = { fontSize: 12, color: '#b91c1c', margin: 0 };

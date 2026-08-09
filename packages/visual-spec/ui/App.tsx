@@ -7,6 +7,7 @@ import { BrandHeader, type HeaderActions, MainHeader, type ViewMode } from './ma
 import { MarkdownEditor } from './markdown-editor';
 import { MarkdownDocEditor } from './markdown-doc-editor';
 import { toSurfaceId } from './md-path';
+import { useCollabPulls } from './use-collab-pulls';
 import { type TreeEntry, invalidateTree, useTree } from './use-tree';
 
 const MIN_W = 180;
@@ -353,6 +354,7 @@ function Sidebar({
 
   return (
     <nav style={{ ...sidebar, width }}>
+      <ReviewPullRequestsItem onOpenCollab={onOpenCollab} />
       <div style={{ padding: 12, borderBottom: '1px solid #e5e7eb', background: 'white', flexShrink: 0 }}>
         <div style={{ fontWeight: 700, marginBottom: 8 }}>
           Files <span style={{ opacity: 0.5, fontWeight: 400 }}>({fileCount})</span>
@@ -362,20 +364,73 @@ function Sidebar({
       <div style={{ padding: 8, flex: 1, overflow: 'auto' }}>
         {loading ? <div style={{ opacity: 0.6, padding: 8 }}>Loading…</div> : <FileTree entries={entries} current={current} filter={q} onPick={onPick} commentCounts={commentCounts} onCreated={onCreated} onRenamed={onRenamed} />}
       </div>
-      <SidebarFooter onOpenCollab={onOpenCollab} />
+      <SidebarFooter />
     </nav>
+  );
+}
+
+/** A branch with a commit on it — the shape git hosts draw for a pull request. */
+function PullRequestIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }} aria-hidden>
+      <circle cx="6" cy="18" r="3" />
+      <circle cx="6" cy="6" r="3" />
+      <path d="M6 9v6" />
+      <circle cx="18" cy="18" r="3" />
+      <path d="M13 6h3a2 2 0 0 1 2 2v7" />
+    </svg>
+  );
+}
+
+/**
+ * The way in to pull requests, at the top of the sidebar where navigation belongs.
+ *
+ * It used to be the first line of the *footer*, between the copyright and the
+ * buy-me-a-coffee link, at 11px muted — which is how this sidebar dresses chrome.
+ * Reviewing a pull request is not chrome: it is one of the two jobs this tool does,
+ * and the only one the file tree below cannot lead anyone to. Everything else on the
+ * route to it (the git chip's count, `CollabPullsPanel`) already assumed the user had
+ * decided to look; nothing offered the decision.
+ *
+ * THE COUNT IS THE HEADER CHIP'S COUNT (R-7.1 … R-7.3), on the chip's own terms.
+ * `useCollabPulls` reads `GET /__vs/collab` first and requests nothing at all where
+ * collaboration is unconfigured (R-7.2), so mounting it a second time here adds no
+ * GitHub traffic — and the badge stays absent until the first listing lands, rather
+ * than rendering a `0` that would be a claim the server has not made yet.
+ */
+function ReviewPullRequestsItem({ onOpenCollab }: { onOpenCollab: () => void }) {
+  const pulls = useCollabPulls();
+  // Same gate as `PullCount` in the header: unconfigured says nothing, and neither
+  // does a listing that has not arrived.
+  const count = pulls.configured === true && pulls.pulls !== null ? pulls.pulls.length : null;
+
+  return (
+    <div style={navSection}>
+      <button
+        type="button"
+        onClick={onOpenCollab}
+        className="vs-focus-ring"
+        style={navItem}
+        title="Browse the repository’s pull requests and check one out to review"
+      >
+        <PullRequestIcon />
+        <span style={{ flex: 1, textAlign: 'left' }}>Pull requests</span>
+        {count !== null && (
+          <span style={navCount} data-testid="sidebar-pull-count">
+            {count}
+          </span>
+        )}
+      </button>
+    </div>
   );
 }
 
 declare const __APP_VERSION__: string;
 
 /** A gentle, muted footer pinned to the bottom of the sidebar. */
-function SidebarFooter({ onOpenCollab }: { onOpenCollab: () => void }) {
+function SidebarFooter() {
   return (
     <footer style={footer}>
-      <button type="button" onClick={onOpenCollab} style={collabLink}>
-        Review a pull request…
-      </button>
       <div>© 2026 Visual Specs v{__APP_VERSION__}</div>
       <div style={{ marginTop: 2 }}>
         Made with <span style={{ color: '#ef4444' }}>❤</span> by{' '}
@@ -392,7 +447,15 @@ function SidebarFooter({ onOpenCollab }: { onOpenCollab: () => void }) {
 const sidebar: React.CSSProperties = { height: '100%', flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid #e5e7eb', background: 'white', overflow: 'hidden', font: '13px system-ui' };
 const footer: React.CSSProperties = { flexShrink: 0, padding: '10px 12px', borderTop: '1px solid #f1f5f9', background: '#fbfaff', font: '11px system-ui', color: '#94a3b8', lineHeight: 1.5 };
 const footerLink: React.CSSProperties = { color: '#a78bca', textDecoration: 'none', fontWeight: 600 };
-const collabLink: React.CSSProperties = { display: 'block', width: '100%', textAlign: 'left', padding: 0, marginBottom: 6, border: 'none', background: 'transparent', color: '#7c3aed', font: '600 11px system-ui', cursor: 'pointer' };
+const navSection: React.CSSProperties = { flexShrink: 0, padding: 8, borderBottom: '1px solid #e5e7eb', background: 'white' };
+/**
+ * Sized as navigation, not as a link: a 36px row is a comfortable pointer target and
+ * matches the density of the tree rows below it, so the two read as one column of
+ * places to go rather than a caption sitting above a list.
+ */
+const navItem: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, width: '100%', minHeight: 36, padding: '0 10px', border: '1px solid transparent', borderRadius: 6, background: '#f8f5ff', color: '#6d28d9', font: '600 13px system-ui', cursor: 'pointer' };
+/** The count, quiet enough to read as a fact about the row rather than a second control. */
+const navCount: React.CSSProperties = { font: '600 11px ui-monospace, monospace', padding: '1px 7px', borderRadius: 99, background: '#ede9fe', color: '#6d28d9' };
 const splitter: React.CSSProperties = { width: 6, flexShrink: 0, cursor: 'col-resize', background: 'transparent', transition: 'background 120ms', marginLeft: -3, zIndex: 5 };
 const filter: React.CSSProperties = { width: '100%', padding: '5px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: 'inherit' };
 const dialogBackdrop: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 100, display: 'grid', placeItems: 'center', background: 'rgba(15,23,42,0.35)' };
