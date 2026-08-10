@@ -600,3 +600,184 @@ describe('5.4 — the branch routes answer identically on both hosts', () => {
     }
   });
 });
+
+/* ================================================================== *
+ * R-W5.7 — reviewing without a clone is the same on both hosts
+ * ================================================================== */
+/**
+ * Story 5.4, the live half. `bundle-guard.test.ts` reads both hosts' source and asserts
+ * each dispatches `/__vs/collab/*` into `createCollabRoutes` and builds no review source of
+ * its own; that catches a pasted-in copy, and nothing else. It cannot see a host that
+ * slices the `/__vs/collab` prefix one character differently, forgets to read the POST
+ * body, or never registers the middleware at all — each of which imports cleanly and
+ * answers differently.
+ *
+ * So both servers are started for real, against one directory, and driven through the same
+ * review requests. Every answer must match: status and body, and the served directory
+ * afterwards.
+ *
+ * WHY THESE REQUESTS AND NOT A REVIEW OF A REAL PULL REQUEST. Everything past the gate
+ * needs a GitHub credential, and a test that reaches for one answers differently depending
+ * on whose machine it runs on — which is the opposite of a parity claim. What is left is
+ * everything decided *before* the credential: the repository-scoped route form itself, the
+ * refusals R-W3.1 and R-W3.7 specify, and the availability verdict every route in the
+ * family passes through. Those are the parts a host can plausibly get wrong on its own.
+ * The credentialed half is driven against the router directly, with an injected adapter, in
+ * `routes/collab.repo-scoped.test.ts` and `routes/collab.pulls.test.ts` — one router, so
+ * one behaviour, which is what `routes-host-agnostic.test.ts` asserts structurally.
+ *
+ * Collaboration is left unconfigured on BOTH hosts on purpose. The Vite host infers a
+ * repository from the served directory's `origin` and the standalone host does not, so a
+ * fixture with a remote would be comparing two different configurations and calling the
+ * difference a host-specific implementation. `VS_NO_COLLAB` is the switch that exists for
+ * exactly this, and it makes the pair comparable — which R-W5.1 then also covers: with no
+ * collaboration configured, both hosts answer as they did before this feature.
+ */
+describe('R-W5.7 — the review routes answer identically on both hosts', () => {
+  let reviewDir: string;
+  let reviewStandalone: Server;
+  let reviewStandalonePort: number;
+  let reviewVite: ViteDevServer;
+  let reviewVitePort: number;
+
+  beforeAll(async () => {
+    reviewDir = await mkdtemp(join(tmpdir(), 'vs-review-parity-'));
+    await writeFile(join(reviewDir, 'README.md'), '# served\n');
+
+    reviewStandalone = createVisualSpecServer({ contentDir: reviewDir, uiDir: join(reviewDir, '__ui'), port: 0 }).server;
+    await new Promise<void>((ok) => reviewStandalone.listen(0, '127.0.0.1', ok));
+    reviewStandalonePort = (reviewStandalone.address() as AddressInfo).port;
+
+    // Set only around the Vite host's construction, because that is the only host that
+    // reads it, and restored immediately so no later suite inherits it.
+    const previous = process.env.VS_NO_COLLAB;
+    process.env.VS_NO_COLLAB = '1';
+    try {
+      reviewVite = await createViteServer({
+        configFile: false,
+        root: reviewDir,
+        logLevel: 'silent',
+        server: { host: '127.0.0.1', port: 0 },
+        plugins: visualSpecMarkdown({ contentDir: reviewDir }),
+      });
+      await reviewVite.listen();
+    } finally {
+      if (previous === undefined) delete process.env.VS_NO_COLLAB;
+      else process.env.VS_NO_COLLAB = previous;
+    }
+    reviewVitePort = (reviewVite.httpServer?.address() as AddressInfo).port;
+  }, 60_000);
+
+  afterAll(async () => {
+    await new Promise<void>((ok) => reviewStandalone.close(() => ok()));
+    await reviewVite?.close();
+    await rm(reviewDir, { recursive: true, force: true });
+  });
+
+  const reviewHosts = () => [
+    { name: 'standalone server', port: reviewStandalonePort },
+    { name: 'Vite plugin host', port: reviewVitePort },
+  ];
+
+  /**
+   * The same review request put on the wire to each host, from the same directory, with
+   * the directory read back afterwards. A review may not write to the served directory
+   * (R-W2.9 / R-W5.3), so the disk is part of the answer rather than a separate claim.
+   */
+  async function bothReviewHosts(method: string, path: string) {
+    const answers = [];
+    for (const { name, port } of reviewHosts()) {
+      const before = await snapshot(reviewDir);
+      const r = await raw(port, method, `/__vs/collab${path}`);
+      answers.push({
+        name,
+        status: r.status,
+        json: r.body ? (JSON.parse(r.body) as unknown) : null,
+        disk: await snapshot(reviewDir),
+        before,
+      });
+    }
+    return answers;
+  }
+
+  /*
+   * Every route a review travels through, on the form story 3.1 introduced and the legacy
+   * one it left in place. The list is the point: R-W5.7 is about the whole behaviour, and a
+   * host that dispatched four of these and dropped the fifth would pass any one of them.
+   */
+  const REVIEW_REQUESTS: Array<{ what: string; method: string; path: string }> = [
+    { what: 'listing a repository’s pull requests', method: 'GET', path: '/repos/acme/widgets/pulls' },
+    { what: 'opening a review', method: 'POST', path: '/repos/acme/widgets/pulls/7/mount' },
+    { what: 'the changed paths', method: 'GET', path: '/repos/acme/widgets/pulls/7/files' },
+    { what: 'one directory of the tree', method: 'GET', path: '/repos/acme/widgets/pulls/7/tree?path=' },
+    { what: 'one file of the review', method: 'GET', path: '/repos/acme/widgets/pulls/7/raw?path=README.md' },
+    { what: 'the pull request description', method: 'GET', path: '/repos/acme/widgets/pulls/7/description' },
+    { what: 'the held review comments', method: 'GET', path: '/repos/acme/widgets/pulls/7/drafts' },
+    { what: 'the legacy form of the listing', method: 'GET', path: '/pulls' },
+    { what: 'a path naming half a repository', method: 'GET', path: '/repos/acme/pulls' },
+    { what: 'a repository identifier in encoded traversal spelling', method: 'GET', path: '/repos/acme/%2e%2e/pulls' },
+    { what: 'a repository name with a character a repository name cannot have', method: 'GET', path: '/repos/acme/wid~gets/pulls' },
+    { what: 'a pull number that is not one', method: 'GET', path: '/repos/acme/widgets/pulls/abc/tree' },
+  ];
+
+  for (const request of REVIEW_REQUESTS) {
+    it(`${request.what} — same status and body on both hosts`, async () => {
+      const [fromStandalone, fromVite] = await bothReviewHosts(request.method, request.path);
+      expect(fromVite!.status).toBe(fromStandalone!.status);
+      expect(fromVite!.json).toEqual(fromStandalone!.json);
+      // A review writes nothing to the directory it is served from, on either host.
+      expect(fromStandalone!.disk).toEqual(fromStandalone!.before);
+      expect(fromVite!.disk).toEqual(fromVite!.before);
+    });
+  }
+
+  /*
+   * The parity assertions above would pass just as happily if both hosts answered 404 to
+   * everything — two identical wrong answers are identical. These pin the answers.
+   */
+  it('answers the repository-scoped review family on both hosts, refusing only for want of a credential', async () => {
+    for (const { name, port } of reviewHosts()) {
+      const r = await raw(port, 'GET', '/__vs/collab/repos/acme/widgets/pulls');
+      // 503 and not 404: the route EXISTS on both hosts and was reached; what it lacks is
+      // a configured repository, and it says so in the words the UI already renders.
+      expect(r.status, name).toBe(503);
+      expect(JSON.parse(r.body), name).toMatchObject({ available: false, reason: 'not-configured' });
+    }
+  });
+
+  it('refuses a path naming no repository, and a malformed one, in the two different ways (R-W3.1, R-W3.7)', async () => {
+    for (const { name, port } of reviewHosts()) {
+      // A path that names no repository is a route that does not exist.
+      const missing = await raw(port, 'GET', '/__vs/collab/repos/acme/pulls');
+      expect(missing.status, name).toBe(404);
+      // A path that names something in the repository position that is not a repository is
+      // a request that was understood and is malformed — 400, carrying the segment.
+      const malformed = await raw(port, 'GET', '/__vs/collab/repos/acme/wid~gets/pulls');
+      expect(malformed.status, name).toBe(400);
+      expect(JSON.parse(malformed.body).error, name).toBe('invalid repository: acme/wid~gets');
+    }
+  });
+
+  /*
+   * WHAT THE WIRE DOES TO `%2e%2e` BEFORE THE ROUTER EVER SEES IT, on both hosts alike.
+   *
+   * `repoSegment` decodes then refuses `..` (R-W3.7), and that is the router's own guard —
+   * asserted where it lives, in `routes/collab.repo-scoped.test.ts`, by calling `handle`
+   * directly. Over HTTP it is never reached: both hosts read `new URL(req.url, …).pathname`,
+   * and WHATWG URL parsing decodes `%2e` and then removes double-dot segments, so
+   * `/repos/acme/%2e%2e/pulls` arrives as `/repos/pulls` — a path that names no repository,
+   * which is a 404.
+   *
+   * Recorded rather than left as a surprising line in the table above, because the two
+   * layers refuse the same input for two different reasons and somebody comparing them will
+   * otherwise conclude one of them is broken. Both hosts agree, which is the R-W5.7 claim;
+   * neither normalises it into a repository, which is the R-W3.7 one.
+   */
+  it('never lets an encoded traversal reach a repository, and both hosts lose it at the same place', async () => {
+    for (const { name, port } of reviewHosts()) {
+      const r = await raw(port, 'GET', '/__vs/collab/repos/acme/%2e%2e/pulls');
+      expect(r.status, name).toBe(404);
+      expect(r.body, name).not.toContain('..');
+    }
+  });
+});

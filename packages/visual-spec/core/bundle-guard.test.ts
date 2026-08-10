@@ -109,6 +109,32 @@ describe('both hosts reach one shared module for the write and git routes', () =
     expect(text).toMatch(/handleGitRequest\(\(\) => \w+,/);
   });
 
+  /*
+   * R-W5.7 — the same claim for reviewing without a clone, which had no entry here.
+   *
+   * Both hosts construct `createCollabRoutes` and dispatch `/__vs/collab/*` into it, and
+   * that is the whole of their involvement: which source supplies a review is decided by
+   * `resolveReviewSource` behind that router, from the served directory alone. The failure
+   * this guards is the tempting one — a host that "just checks" whether its directory is a
+   * clone before handing over, or builds a source of its own for the case it thinks it
+   * knows better about. Two answers to "where does this review read from" is the same class
+   * of defect as two answers to "which subpaths are writes", and it is worse here, because
+   * the two hosts would disagree only for the users who have no checkout.
+   */
+  it.each(HOSTS)('%s dispatches the collaboration routes into the shared router and builds no review source of its own', (host) => {
+    const text = code(host);
+    expect(text).toMatch(/import \{[^}]*createCollabRoutes[^}]*\} from '[^']*routes\/collab'/);
+    expect(text).toContain('createCollabRoutes({');
+    for (const forbidden of [
+      'resolveReviewSource(',
+      'createApiReviewSource(',
+      'createWorktreeReviewSource(',
+      'mountPullRequest(',
+    ]) {
+      expect(`${host}:${forbidden}${text.includes(forbidden)}`).toBe(`${host}:${forbidden}false`);
+    }
+  });
+
   it.each(HOSTS)('%s declares no create/rename/git implementation of its own', (host) => {
     const text = code(host);
     // The write half: no host may reach the filesystem write primitives these

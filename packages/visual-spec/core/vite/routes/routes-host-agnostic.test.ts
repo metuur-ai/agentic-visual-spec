@@ -53,6 +53,13 @@ function viteReachableFrom(entry: string): string[] {
   return violations;
 }
 
+/** Every module reachable from `entry`, package-relative. */
+function reachedFrom(entry: string): string[] {
+  const files: string[] = [];
+  walkImportGraph(pkgRoot, entry, ({ chain }) => files.push(chain[chain.length - 1]!));
+  return files;
+}
+
 describe('core/vite/routes is host-agnostic (R-4.6)', () => {
   const modules = routeModules();
 
@@ -80,6 +87,34 @@ describe('core/vite/routes is host-agnostic (R-4.6)', () => {
       expect(viteReachableFrom(entry).join('\n')).toBe('');
     });
   }
+
+  /*
+   * R-W5.7 — WHERE A REVIEW READS FROM IS DECIDED IN THE SHARED LAYER, FOR BOTH HOSTS.
+   *
+   * The loop above already covers `collab.ts` because it is in this directory, and the
+   * walk is transitive, so the review-source modules are covered too. That is exactly why
+   * this is stated rather than left implicit: the coverage is real and invisible, and the
+   * first person to move source selection somewhere a host can reach it directly would
+   * break R-W5.7 without failing a single test that names it.
+   *
+   * Two claims, and the second is what stops the first being vacuous. `resolveReviewSource`
+   * must be REACHED from the shared route module — if it is not, the guard below is walking
+   * a graph that no longer contains the thing it is guarding. And nothing on that graph may
+   * reach `vite`, because the standalone host imports `routes/collab` and never loads Vite:
+   * a `vite` edge anywhere under it is a review that only one of the two hosts can build.
+   */
+  it('decides where a review reads from inside the shared route layer, reachable from neither host’s own code (R-W5.7)', () => {
+    const reached = reachedFrom('core/vite/routes/collab.ts');
+    expect(reached).toEqual(
+      expect.arrayContaining([
+        'core/collaboration/review-source.ts',
+        'core/collaboration/review-source-resolve.ts',
+        'core/collaboration/review-source-api.ts',
+        'core/collaboration/review-source-worktree.ts',
+      ]),
+    );
+    expect(viteReachableFrom('core/collaboration/review-source-resolve.ts').join('\n')).toBe('');
+  });
 
   /*
    * The negative control. Without it this test passes just as happily when the traversal
