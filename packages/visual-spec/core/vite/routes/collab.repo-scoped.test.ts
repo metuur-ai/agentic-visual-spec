@@ -425,6 +425,94 @@ describe('R-W3.7 — a repository identifier is decoded before it is validated',
   });
 });
 
+/* ================================================================== *
+ * R-W3.5 — a review is a repository AND a number
+ * ================================================================== */
+describe('R-W3.5 — the same pull request number in two repositories denotes two reviews', () => {
+  /*
+   * WHAT THIS DOES NOT COVER, AND WHY IT IS SAID HERE RATHER THAN NOWHERE. The identity of
+   * a review — the source held per open review, and every read that goes through it — is
+   * repository plus number, and that is what these two assert. The CHECKOUT a review may
+   * be supplied from is not: `worktree.ts` mounts at `<servedDir>/.visual-spec/worktrees/
+   * pr-<n>`, keyed by the number alone, so two repositories' #42 supplied from checkouts
+   * would contend for one directory. `mountPullRequest` is handed `expectedHeadSha` and
+   * refuses a checkout that landed on another commit, so the outcome is a `head-mismatch`
+   * refusal rather than one repository's bytes served under the other's name — wrong, but
+   * loudly wrong. Fixing it means renaming the worktree directory, which is `worktree.ts`,
+   * which this unit does not touch. These tests therefore drive the host source, where
+   * there is no directory to contend for.
+   */
+  /**
+   * An adapter whose answers differ per repository, so a review that resolved the wrong
+   * one is visible in the bytes rather than only in a call log. Pull request 42 exists in
+   * both, which is the whole point — it exists in most repositories.
+   */
+  function twoRepos() {
+    const reads: string[] = [];
+    const shaOf = (repo: RepoRef) => (repo.repo === 'one' ? '1'.repeat(40) : '2'.repeat(40));
+    const adapter = {
+      async getPullRequest(repo: RepoRef, pullNumber: number) {
+        return {
+          number: pullNumber,
+          headSha: shaOf(repo),
+          baseBranch: 'main',
+          headBranch: 'patch-1',
+          state: 'open',
+          htmlUrl: `https://github.com/${repo.owner}/${repo.repo}/pull/${pullNumber}`,
+          body: '',
+          merged: false,
+          mergeable: true,
+          mergeableState: 'clean',
+        };
+      },
+      async getFile(repo: RepoRef, path: string, ref?: string) {
+        reads.push(`${repo.owner}/${repo.repo}:${path}@${ref ?? ''}`);
+        return { path, content: `# ${repo.repo}\n`, sha: 'c'.repeat(40) };
+      },
+      async listFiles(repo: RepoRef, path: string, ref?: string) {
+        reads.push(`${repo.owner}/${repo.repo}:${path}/@${ref ?? ''}`);
+        return [];
+      },
+      async compareCommits() {
+        return { mergeBaseSha: 'b'.repeat(40), aheadBy: 1, behindBy: 0, files: ['docs/spec.md'] };
+      },
+    } as unknown as GitHubAdapter;
+    return { adapter, reads, shaOf };
+  }
+
+  it('holds two sources, one per repository, for the same number', async () => {
+    const gh = twoRepos();
+    const r = router({ repoAdapter: () => gh.adapter });
+
+    const one = await r.handle({ method: 'POST', pathname: '/repos/acme/one/pulls/42/mount', query: {}, body: {} });
+    const two = await r.handle({ method: 'POST', pathname: '/repos/acme/two/pulls/42/mount', query: {}, body: {} });
+    expect(one.json).toMatchObject({ headSha: '1'.repeat(40) });
+    expect(two.json).toMatchObject({ headSha: '2'.repeat(40) });
+
+    // The decisive half: the second open did not replace the first. Reading each review
+    // afterwards still lands on its own repository at its own pinned commit — which it
+    // could not, if one number meant one review.
+    await call(r, 'GET', '/repos/acme/one/pulls/42/raw', { path: 'docs/spec.md' });
+    await call(r, 'GET', '/repos/acme/two/pulls/42/raw', { path: 'docs/spec.md' });
+    expect(gh.reads).toEqual([
+      `acme/one:docs/spec.md@${'1'.repeat(40)}`,
+      `acme/two:docs/spec.md@${'2'.repeat(40)}`,
+    ]);
+  });
+
+  it('treats the configured repository named in the path as the same review as the legacy form', async () => {
+    const gh = twoRepos();
+    const r = router({ repoAdapter: () => gh.adapter });
+    // Opened through the legacy form, read through the scoped form naming the same
+    // repository. One review, not two — which is what lets a pasted URL for the
+    // configured repository (story 4.1) join a review already open rather than re-pin it.
+    await r.handle({ method: 'POST', pathname: '/pulls/42/mount', query: {}, body: {} });
+    const res = await call(r, 'GET', '/repos/acme/specs/pulls/42/raw', { path: 'docs/spec.md' });
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({ headSha: '2'.repeat(40) });
+  });
+});
+
 describe('R-W3.2 — the route form that predates this requirement applies the configured repository', () => {
   it('resolves the configured repository for the legacy listing', async () => {
     const gh = repoAdapter();
