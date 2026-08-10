@@ -539,6 +539,8 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
    */
   const checkoutRow = (worktree: MountedWorktree) => {
     const pull = listed.get(worktree.pullNumber);
+    const busy = status.kind === 'busy' && status.pullNumber === worktree.pullNumber;
+    const removing = busy && status.kind === 'busy' && status.action === 'unmount';
     return (
       <li key={worktree.pullNumber} style={card} data-vs-checkout={worktree.pullNumber}>
         <div style={cardTitle}>
@@ -547,6 +549,38 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
         {/* Where it is, because the point of the section is a copy of the repository you
             can go and look at — or delete by hand, which git's registry will then report. */}
         <div style={meta}>{worktree.path}</div>
+        {!pull && (
+          /*
+           * R-C1.3 — say what is true and nothing more.
+           *
+           * "Merged" is the tempting word here and the one this panel cannot know: the
+           * join is against the *current* listing, so a pull request filtered out by the
+           * `Show` setting is indistinguishable from one that merged. Naming the listing
+           * is the claim the panel can actually stand behind, and the note under the
+           * heading says the setting is what "the listing" means.
+           */
+          <p data-vs-checkout-unlisted={worktree.pullNumber} style={checkoutStateLine}>
+            <span aria-hidden="true">?</span> Not in the listing — #{worktree.pullNumber} is not among the pull
+            requests listed below. Removing the checkout frees its copy of the repository on disk.
+          </p>
+        )}
+        {/*
+          * R-C1.3 / R-C1.4 — offered here only where the listing does not offer it, and
+          * pressed by the user or not at all. A checkout can hold uncommitted work, so
+          * the section makes it reachable and stops; deleting it stays a decision.
+          */}
+        {!pull && (
+          <div style={actions}>
+            <button
+              type="button"
+              onClick={() => void unmount(worktree.pullNumber)}
+              disabled={busy}
+              style={button}
+            >
+              <BusyLabel busy={removing}>{removing ? 'Removing…' : 'Remove checkout'}</BusyLabel>
+            </button>
+          </div>
+        )}
       </li>
     );
   };
@@ -566,9 +600,22 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
   const checkoutsSection = () => {
     // R-C1.5 — no rows, no section. A heading over nothing claims something is half-done.
     if (mounted.length === 0) return null;
+    const anyUnlisted = mounted.some((w) => !listed.has(w.pullNumber));
     return (
       <section key="checkouts" data-vs-checkouts style={{ display: 'contents' }}>
         <h3 style={groupHeading}>Checked out on disk</h3>
+        {/*
+          * The `Show` setting is what "the listing" means, said out loud only when a row
+          * has leaned on it. With the toggle on `Closed only`, an open pull request's
+          * checkout reads as absent from the listing — which is true, and which reads as
+          * a defect unless the setting it is measured against is named.
+          */}
+        {anyUnlisted && state !== 'all' && (
+          <p data-vs-checkouts-listing-note style={quietMark}>
+            “The listing” is the “Show” setting above — a checkout of a pull request in another state reads as absent
+            from it.
+          </p>
+        )}
         <ul style={listReset}>{mounted.map(checkoutRow)}</ul>
       </section>
     );
@@ -724,6 +771,18 @@ const descriptionBox: React.CSSProperties = {
   font: '13px system-ui, sans-serif',
 };
 const quietMark: React.CSSProperties = { font: '11px system-ui, sans-serif', color: '#94a3b8', fontStyle: 'italic' };
+/**
+ * What a checkout's row says about its commit (R-C2.4).
+ *
+ * Ordinary body text, not a badge: the state is carried by the words in it, and the
+ * colours that reinforce it are set per state below. Setting all three to this one
+ * colour must change nothing a reader can act on — that is what the test asserts.
+ */
+const checkoutStateLine: React.CSSProperties = {
+  font: '11px/1.5 system-ui, sans-serif',
+  color: '#64748b',
+  margin: '4px 0 0',
+};
 /**
  * The mention, quoted on the row (R-A3.7).
  *

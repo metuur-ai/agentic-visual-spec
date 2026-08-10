@@ -33,11 +33,11 @@
   - verify: panel test with two checkouts asserts both appear in the section; a test with an empty `mounted` asserts the section is absent, not present-and-empty.
   - landed: `ui/collab-pulls-panel.tsx` — `checkoutRow` / `checkoutsSection`, joined to the panel's `sections` array so the listing gains its heading below it. Tests: `ui/collab-pulls-panel.test.tsx` › "what is checked out on disk (R-C1)" — "renders every checkout the repository reports, in a section of its own" (R-C1.1, R-C1.7), "renders no section at all when nothing is checked out" (R-C1.5).
 
-- [ ] 1.2 Include a checkout whose pull request is not in the listing, and let it be removed (deps: 1.1, est: ~35m, mutex: panel-rows)
+- [x] 1.2 Include a checkout whose pull request is not in the listing, and let it be removed (deps: 1.1, est: ~35m, mutex: panel-rows)
   - why: this is the leak. `Remove checkout` lives only on a listed row, so the moment a pull request merges its working copy — a full copy of the repository — becomes invisible and unreachable from the UI, and they accumulate. The row says the pull request is not in the listing rather than guessing why, because the panel cannot tell "merged" from "filtered by the toggle".
   - acceptance: R-C1.2 — a checked-out pull request appears whether or not it is listed; R-C1.3 — where it is not listed, the section says so and offers to remove the checkout; R-C1.4 — nothing is removed without the user asking.
   - verify: panel test with a `mounted` entry having no matching listed pull request asserts the row renders, states it is not in the listing, and exposes the remove control; a test asserts no removal request is issued on render.
-  - landed:
+  - landed: `ui/collab-pulls-panel.tsx` — `checkoutRow` renders the unlisted line and a `Remove checkout` button calling the existing `unmount`; `checkoutsSection` carries the note naming the `Show` setting when a row leans on it. Tests: "includes a checkout whose pull request is not listed, and offers to remove it" (R-C1.2, R-C1.3), "removes an unlisted checkout through the same DELETE the listed row uses" (R-C1.3), "removes nothing that the user has not asked to remove" (R-C1.4).
 
 - [ ] 1.3 Keep the badge on the listed row (deps: 1.1, est: ~10m, mutex: panel-rows)
   - why: the section answers "what do I have open"; the badge answers "is this row one of them" while reading the listing. Removing the badge would make the second question cost a scroll to a different section.

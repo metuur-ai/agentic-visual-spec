@@ -8,7 +8,7 @@
  * back. R-13.9's four causes get one test each, because the whole point of keeping them
  * apart in `worktree.ts` is that they reach a human as four different instructions.
  */
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import { fireEvent } from '@testing-library/dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CollabPullsPanel, groupByOwner, shortSha } from './collab-pulls-panel';
@@ -815,5 +815,45 @@ describe('what is checked out on disk (R-C1)', () => {
     await screen.findByText(/Rework the payment rules/);
     expect(section()).toBeNull();
     expect(screen.queryByText('Checked out on disk')).toBeNull();
+  });
+
+  /*
+   * R-C1.2 / R-C1.3 — the leak, closed.
+   *
+   * `Remove checkout` lived only on a listed row, so a merged pull request's working
+   * copy — a full copy of the repository — became invisible and unreachable at the same
+   * moment. The row says the pull request is not in the listing and stops there: the
+   * panel cannot tell "merged" from "filtered by the Show setting", and a row that
+   * guessed "merged" would be wrong every time the toggle was on `Closed only`.
+   */
+  it('includes a checkout whose pull request is not listed, and offers to remove it', async () => {
+    mountPanel([OTHER_WORKTREE], [PULL]);
+
+    await waitFor(() => expect(row(7)).toBeTruthy());
+    expect(row(7)!.textContent).toContain('#7');
+    expect(row(7)!.textContent).toContain('Not in the listing');
+    // Not a guess at why. "Merged" is the tempting word and the one the panel cannot know.
+    expect(row(7)!.textContent).not.toContain('merged');
+    expect(within(row(7)!).getByRole('button', { name: 'Remove checkout' })).toBeTruthy();
+  });
+
+  it('removes an unlisted checkout through the same DELETE the listed row uses', async () => {
+    const { calls } = mountPanel([OTHER_WORKTREE], [PULL]);
+    await waitFor(() => expect(row(7)).toBeTruthy());
+
+    fireEvent.click(within(row(7)!).getByRole('button', { name: 'Remove checkout' }));
+
+    await waitFor(() => expect(calls).toContainEqual({ url: '/__vs/collab/pulls/7/mount', method: 'DELETE' }));
+  });
+
+  /*
+   * R-C1.4 — a working copy may hold uncommitted work, so the section makes it visible
+   * and reachable and nothing more. Deleting one stays a decision the user makes.
+   */
+  it('removes nothing that the user has not asked to remove', async () => {
+    const { calls } = mountPanel([WORKTREE, OTHER_WORKTREE], [PULL]);
+
+    await waitFor(() => expect(row(7)).toBeTruthy());
+    expect(calls.filter((c) => c.method === 'DELETE')).toEqual([]);
   });
 });
