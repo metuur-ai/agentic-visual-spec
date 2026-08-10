@@ -24,7 +24,7 @@ export function GenericPanel({
   kind?: FileKind;
   selection: LineSelection | null;
   content?: string;
-  width: number;
+  width: number | string;
 }) {
   const comments = useComments(path);
   const [text, setText] = useState('');

@@ -66,7 +66,8 @@ export function MarkdownDocEditor({
   onStateChange,
 }: {
   path: string; // real .md path
-  previewWidth: number;
+  /** A CSS length — the host drives this with a custom property so a drag costs no render. */
+  previewWidth: number | string;
   splitter: React.ReactNode;
   defaultEngine?: EditorEngine;
   // "Done" (and the host's save-and-view guard) return to the rendered view.

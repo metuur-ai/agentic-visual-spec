@@ -18,7 +18,8 @@ export function MarkdownEditor({
   splitter,
 }: {
   path: string; // real .md path
-  commentWidth: number;
+  /** A CSS length — the host drives this with a custom property so a drag costs no render. */
+  commentWidth: number | string;
   splitter: React.ReactNode;
 }) {
   const surfaceId = toSurfaceId(path);

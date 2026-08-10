@@ -18,6 +18,7 @@ export default defineConfig({
     // .tsx tests opt into jsdom per-file with a `// @vitest-environment jsdom`
     // docblock; the default stays `node` so the existing suite is untouched.
     include: ['core/**/*.test.ts', 'ui/**/*.test.ts', 'ui/**/*.test.tsx'],
+    setupFiles: ['./test-setup.ts'],
     server: {
       deps: {
         // Luthor ships ESM that imports `lexical` itself. Left external, Node

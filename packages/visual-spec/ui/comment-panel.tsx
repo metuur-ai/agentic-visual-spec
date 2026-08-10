@@ -112,6 +112,14 @@ export type CommentPanelSource = {
    */
   reply?: (id: string, text: string) => Promise<void>;
   /**
+   * Whether THIS row can be replied to, when only some of them can. Unset means all can.
+   *
+   * A pull request review lists two kinds of row in one panel: threads that are on GitHub
+   * and drafts still held on this machine. Only the first has somewhere for a reply to go,
+   * and a Reply button on a draft would offer to answer a comment nobody has been sent.
+   */
+  canReply?: (c: CommentRecord) => boolean;
+  /**
    * The replies already written on this comment's thread, oldest first.
    *
    * Reading a thread and adding to it are two different affordances, and the panel had
@@ -227,12 +235,12 @@ function prefersReducedMotion(): boolean {
   return typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
-export function CommentPanel({ file, width, source }: { file?: string; width: number; source?: CommentPanelSource }) {
+export function CommentPanel({ file, width, source }: { file?: string; width: number | string; source?: CommentPanelSource }) {
   return source ? <Panel width={width} source={source} /> : <LocalCommentPanel file={file ?? ''} width={width} />;
 }
 
 /** The local source: the sidecar comments for one path, keyed by line + heading. */
-function LocalCommentPanel({ file, width }: { file: string; width: number }) {
+function LocalCommentPanel({ file, width }: { file: string; width: number | string }) {
   const path = toPath(file);
   const comments = useComments(path);
   const source = useMemo<CommentPanelSource>(
@@ -285,7 +293,7 @@ function LocalCommentPanel({ file, width }: { file: string; width: number }) {
   return <Panel width={width} source={source} />;
 }
 
-function Panel({ width, source }: { width: number; source: CommentPanelSource }) {
+function Panel({ width, source }: { width: number | string; source: CommentPanelSource }) {
   const { active, selection, setSelection, setActive } = useInspector();
   const selected = selection[0] ?? null;
   const isRange = selection.length > 1;
@@ -661,7 +669,7 @@ function CommentList({ source }: { source: CommentPanelSource }) {
               >
                 <LocateIcon />
               </button>
-              {source.reply && (
+              {source.reply && (source.canReply?.(c) ?? true) && (
                 <button
                   type="button"
                   onClick={() => { setReplyId(replyId === c.id ? null : c.id); setReplyText(''); }}
@@ -737,6 +745,10 @@ function CommentList({ source }: { source: CommentPanelSource }) {
                       void source
                         .reply!(c.id, replyText.trim())
                         .then(() => { setReplyId(null); setReplyText(''); })
+                        // A refused reply leaves the composer open with the text still in
+                        // it — the source reports why, and nobody has to retype a sentence
+                        // the network lost.
+                        .catch(() => {})
                         .finally(() => setReplyBusy(false));
                     }}
                     style={confirmYes}
