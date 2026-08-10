@@ -23,7 +23,7 @@ import { createElement } from 'react';
 import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { resetAwaitingCache, useAwaitingPulls } from './use-awaiting-pulls';
+import { refreshAwaiting, resetAwaitingCache, useAwaitingPulls } from './use-awaiting-pulls';
 
 const CONFIGURED = { available: true, login: 'ana', repo: { owner: 'acme', repo: 'docs', baseBranch: 'main' }, scopes: [] };
 
@@ -192,6 +192,45 @@ describe('a read that finds nothing new (R-A4.2)', () => {
     // The steady state of a tab being switched back to. The store compared the response
     // with what it held, found it identical, and told nobody — so neither tree
     // reconciled, and the numbers on screen are the same objects they were.
+    expect(awaitingReads()).toBe(2);
+    expect(renders.n).toBe(settled);
+    expect(text('review')).toBe('3');
+  });
+});
+
+describe('a refresh asked for by hand (R-C3.4)', () => {
+  it('joins the read already in flight instead of issuing a second', async () => {
+    installFetch();
+    await readers(1);
+    expect(awaitingReads()).toBe(1);
+
+    // The press that R-C3.4 is about: a tab switch has just started a read and the user
+    // reaches for refresh before it lands. Both happen in one tick with nothing awaited
+    // between them, so the second arrives while the first is genuinely still running.
+    await act(async () => {
+      window.dispatchEvent(new Event('focus'));
+      await refreshAwaiting();
+    });
+
+    // Counted in requests, not in what was rendered. Two reads issued would agree with the
+    // first read's answer and leave the DOM identical, so a test that asserted the numbers
+    // would pass while the panel quietly spent double against a 30-a-minute search budget.
+    expect(awaitingReads()).toBe(2);
+    expect(text('review')).toBe('3');
+  });
+
+  it('re-renders neither tree when it finds what the store already held', async () => {
+    installFetch();
+    const renders = await readers(2);
+    const settled = renders.n;
+
+    await act(async () => {
+      await refreshAwaiting();
+    });
+
+    // Two roots, one shared counter: the header's chips and the panel's sections. The panel
+    // asking for a refresh must not reconcile the header, which is the coupling this store
+    // exists to prevent — and "nothing new" is the ordinary outcome of pressing refresh.
     expect(awaitingReads()).toBe(2);
     expect(renders.n).toBe(settled);
     expect(text('review')).toBe('3');

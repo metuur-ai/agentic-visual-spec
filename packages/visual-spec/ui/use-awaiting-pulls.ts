@@ -23,6 +23,10 @@
  * is the snapshot the rest of the collaboration UI already gates on, and an unconfigured
  * server answers it without touching GitHub at all.
  *
+ * A REFRESH ASKED FOR BY HAND IS THE SAME READ (R-C3.4). `refreshAwaiting` below is an
+ * export of `load` and nothing more: the panel's refresh control is just one more caller
+ * arriving at a store that already knows how to have one read serve all of them.
+ *
  * A FAILED READ WRITES NOTHING (R-A4.3). There is no error field here for the same
  * reason `use-collab-pulls.ts` has none: nothing renders one, and a field nothing renders
  * is a field somebody will render in place of the last number that was true.
@@ -156,6 +160,27 @@ export function resetAwaitingCache(): void {
   store.inflight = null;
   store.configured = null;
   store.watchers.clear();
+}
+
+/**
+ * Ask for the counts to be read again, and resolve when that read has finished (R-C3.4).
+ *
+ * This adds no behaviour. `load()` already returns the in-flight promise to every caller
+ * that arrives while a read is running, so a refresh asked for during a `focus`-triggered
+ * read is handed that same read rather than starting a second — the de-duplication R-C3.4
+ * requires is the one R-A4.2 has always had, and this is only the door onto it. Nothing new
+ * is coalesced here; if it were, there would be two rules to keep in step instead of one.
+ *
+ * IT RESOLVES, AND IT RESOLVES WITH NOTHING. A caller (the panel's refresh control, R-C3.3)
+ * needs to know when to stop saying "refreshing" and start accepting a second press, which
+ * is a question about *when*, not about what was read — the counts arrive through
+ * `useAwaitingPulls`, and a refresh that found nothing new re-renders nobody. There is no
+ * result and no rejection: a read that failed writes nothing and surfaces nothing (R-A4.3 /
+ * R-C3.5), so awaiting this needs no `catch` and a settled promise means only "the read is
+ * over" — never "the counts changed", and never "the counts are correct".
+ */
+export function refreshAwaiting(): Promise<void> {
+  return load();
 }
 
 /**
