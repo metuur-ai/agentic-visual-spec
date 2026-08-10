@@ -108,35 +108,35 @@
 
 ## Unit 3: Reviewing across repositories
 
-- [ ] 3.1 Repository-scoped route family (est: ~2h) (mutex: collab-routes)
+- [x] 3.1 Repository-scoped route family (est: ~2h) (mutex: collab-routes)
   - why: putting the repository in the path rather than a body field turns "the client forgot the repository" into a 404 instead of a plausible wrong-repository review. A header cannot carry it — `EventSource` cannot set headers, which is the same reason the request guard is not a token.
   - acceptance: R-W3.1 — THE SYSTEM SHALL require a repository to be named by each request that reviews a pull request, and SHALL refuse a request that names none rather than substituting one. R-W3.2 — WHERE a request uses the route form that predates this requirement, THE SYSTEM SHALL apply the configured repository.
   - verify: a request on the new form with no repository 404s; the legacy form still resolves the configured repository
-  - landed:
+  - landed: `GET /__vs/collab/repos/:owner/:repo/pulls/…` in front of the legacy `/pulls/…` form, stripped once at the top of `handle` (`repoScopeOf`); `core/vite/routes/collab.repo-scoped.test.ts`
 
-- [ ] 3.2 Decode then validate repository segments (deps: 3.1, est: ~45m)
+- [x] 3.2 Decode then validate repository segments (deps: 3.1, est: ~45m)
   - why: segments are matched `[^/]+`, so a bare `..` cannot appear — but `%2e%2e` can, and normalising it instead of refusing it is how a path-confusion bug gets written.
   - acceptance: R-W3.7 — THE SYSTEM SHALL decode a repository identifier supplied in a request before validating it, and SHALL refuse one that does not name a well-formed repository. R-W6.6 — a test that an identifier attempting to escape its expected form, including in encoded spelling, is refused.
   - verify: encoded and bare traversal attempts both refused, not normalised
-  - landed:
+  - landed: `repoSegment` decodes then allowlists; `.` and `..` named and refused; 400 for a malformed identifier, 404 for a path naming none
 
-- [ ] 3.3 Scope availability and authorization to the requested repository (deps: 3.1, est: ~3h) (mutex: collab-routes)
+- [x] 3.3 Scope availability and authorization to the requested repository (deps: 3.1, est: ~3h) (mutex: collab-routes)
   - why: **the largest omitted piece of the original design.** `gate()` resolves the repository from server config and seven handlers call `repoRefOf(gated.repo)`; the authorizer caches effective permission per `owner/repo` and decides author-only from it. Left alone, a credential with write access to the configured repository carries author-level decisions into a repository it can only read. Harmless while every review route is any-role, and privilege confusion the moment one is not.
   - acceptance: R-W3.3 — THE SYSTEM SHALL determine availability and authorization for a review against the repository named by the request. R-W3.4 — THE SYSTEM SHALL NOT grant, on the basis of permissions held in one repository, any operation on another. R-W3.8 — reviewing any repository is a read operation.
   - verify: a credential with write on repo A and read-only on repo B is classified reviewer for B's pull requests; preflight and availability cache per requested repository
-  - landed:
+  - landed: `availabilityFor(repo)` and `gate(op, documentId, requested)`; `REVIEW_OPERATIONS` closes the set an operation on a named repository may be
 
-- [ ] 3.4 Identify a review by repository and number (deps: 3.1, est: ~1h)
+- [x] 3.4 Identify a review by repository and number (deps: 3.1, est: ~1h)
   - why: pull request 42 exists in most repositories. Keying on the number alone was safe only while there was one repository.
   - acceptance: R-W3.5 — THE SYSTEM SHALL identify a review by repository together with pull request number.
   - verify: two repositories' pull request 42 resolve to two distinct reviews
-  - landed:
+  - landed: the held-source map was already keyed by repository and number; the requested repository now reaches it. Residual: worktrees still mount at `pr-<n>`, see the note in the test
 
-- [ ] 3.5 Identify held review comments by repository and number (deps: 3.4, est: ~1.5h) (mutex: collab-routes)
+- [x] 3.5 Identify held review comments by repository and number (deps: 3.4, est: ~1.5h) (mutex: collab-routes)
   - why: drafts live at `<servedDir>/.visual-spec/reviews/pr-<n>.json`, keyed by number alone. Under multi-repository review two repositories' drafts would share a file. Five call sites pass `baseDir()` today and all five change.
   - acceptance: R-W3.6 — THE SYSTEM SHALL identify locally held review comments by repository together with pull request number.
   - verify: hold a comment on repo A's #42 and repo B's #42; two files, neither overwriting the other; publish targets the right pull request
-  - landed:
+  - landed: `.visual-spec/reviews/<owner>/<repo>/pr-<n>.json`; `ReviewDraftScope` replaces the `baseDir` parameter at all five call sites; the pre-scoping file is adopted by the configured repository only
 
 ## Unit 4: Entry point
 
@@ -192,11 +192,11 @@
   - verify: both cases against real git repositories, not fixtures
   - landed:
 
-- [ ] 6.3 Authorization does not cross repositories (deps: 3.3, est: ~1h)
+- [x] 6.3 Authorization does not cross repositories (deps: 3.3, est: ~1h)
   - why: 3.3 is the story most likely to look finished while being wrong, because the failure is invisible until a repo-scoped write route exists.
   - acceptance: R-W6.4 — a test that a review of one repository is not authorized by permissions held in another. R-W6.5 — a test that a request naming no repository, on a route that requires one, is refused rather than defaulted.
   - verify: write-on-A read-only-on-B credential; B's review is reviewer-classified and no route substitutes a repository
-  - landed:
+  - landed: `core/collaboration/authorization.test.ts` for the classification, `collab.repo-scoped.test.ts` for the route half
 
 - [ ] 6.4 Checkout tests stay on real git (deps: 1.2, est: ~30m)
   - why: already the practice in this package, and the reason a hand-written `.git` parser was replaced once before. The extraction in 1.2 must not quietly swap real repositories for fixtures.
