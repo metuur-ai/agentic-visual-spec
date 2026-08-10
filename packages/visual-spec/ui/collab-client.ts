@@ -308,7 +308,20 @@ export type StartDocumentInput = Idempotent & {
   files?: { path: string; markdown: string }[];
 };
 
-export type OpenDocumentInput = Idempotent & { documentId: string; pullNumber: number; discardLocal?: boolean };
+export type OpenDocumentInput = Idempotent & {
+  documentId: string;
+  pullNumber: number;
+  discardLocal?: boolean;
+  /**
+   * R-W4.1 — the repository the reference named, when it named one. It travels in the
+   * PATH (`/__vs/collab/repos/:owner/:repo/open`) and never in the body: the server takes
+   * the repository from the path for every request that reviews a pull request, and a body
+   * field would be a second, quieter way to say the same thing that a forgetful caller
+   * could omit into a wrong-repository open. Absent is R-W4.2 — the legacy form, which
+   * applies the configured repository.
+   */
+  repo?: { owner: string; repo: string };
+};
 
 /**
  * R-8.9 — `markdown` is the whole payload, and the route requires it *before* it checks
@@ -322,7 +335,14 @@ export interface CollabClient {
   availability(): Promise<CollabResult<CollabAvailabilitySnapshot>>;
   /** `POST /__vs/collab/start` — R-8.5, create the branch + pull request. */
   start(input: StartDocumentInput): Promise<CollabResult<JobAccepted>>;
-  /** `POST /__vs/collab/open` — attach to a pull request that already exists. */
+  /**
+   * `POST /__vs/collab/open` — attach to a pull request that already exists.
+   *
+   * With `input.repo` it is `POST /__vs/collab/repos/:owner/:repo/open` instead (R-W4.1),
+   * which is the same route family the review reads through and is the only document route
+   * the repository-scoped form reaches. Without it the legacy path stands, and the server
+   * applies the repository it was started for (R-W4.2).
+   */
   open(input: OpenDocumentInput): Promise<CollabResult<JobAccepted>>;
   /** `GET /__vs/collab/:id` — R-8.4, what a late subscriber recovers from. */
   status(documentId: string): Promise<CollabResult<CollabDocumentStatus>>;
@@ -542,7 +562,16 @@ export function createCollabClient(fetchImpl?: typeof fetch): CollabClient {
   return {
     availability: () => call<CollabAvailabilitySnapshot>(''),
     start: (input) => send<JobAccepted>('/start', 'POST', input),
-    open: (input) => send<JobAccepted>('/open', 'POST', input),
+    // R-W4.1 — the repository goes in the path and comes back out of the body, so the
+    // request says it exactly once. `encodeURIComponent` because the server decodes the
+    // segment before validating it (R-W3.7): a repository that is not one is its refusal
+    // to make, and a raw `/` here would silently become a different route instead.
+    open: ({ repo, ...input }) =>
+      send<JobAccepted>(
+        repo ? `/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/open` : '/open',
+        'POST',
+        input,
+      ),
     status: (documentId) => call<CollabDocumentStatus>(`/${documentId}`),
     document: (documentId) => call<CollaborationRecord>(`/${documentId}/document`),
     comments: (documentId) => call<ReviewThreadRecord[]>(`/${documentId}/comments`),

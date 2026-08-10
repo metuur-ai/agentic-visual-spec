@@ -56,19 +56,88 @@ export type CollabOpenPanelProps = {
   fetchImpl?: typeof fetch;
 };
 
+/** Half a repository name, as GitHub spells one, and as the route layer re-checks it. */
+const OWNER_RE = /^[A-Za-z0-9-]{1,39}$/;
+const REPO_NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
+
+/**
+ * A pull request reference as a reviewer typed it: always a number, and a repository when
+ * whatever they pasted carried one.
+ *
+ * `repo: null` IS NOT "THE CONFIGURED REPOSITORY" (R-W4.2 / R-W4.3). It is "this reference
+ * named none", which is a different fact and is the only one a parser can know. What to
+ * apply in its place — the configured repository, or a refusal because there is none — is
+ * `repositoryForReference`'s question, one layer up, where the session is visible.
+ */
+export type PullRequestReference = {
+  pullNumber: number;
+  repo: { owner: string; repo: string } | null;
+};
+
 /**
  * Accept the shapes a reviewer actually has to hand: a pull request URL copied from the
  * browser, `#42`, or `42`. `null` when none of them parses, so the panel can say so
  * rather than posting a nonsense request.
+ *
+ * THE URL CARRIES A REPOSITORY, AND IT USED TO BE THROWN AWAY (R-W4.1). The pattern was
+ * `/\/pull\/(\d+)/` — the digits and nothing else — so a link to `facebook/react#37256`
+ * pasted into a server started for `vitejs/vite` opened `vitejs/vite#37256`. It answered
+ * "unknown document", naming a document and never a repository, which is the wrong-
+ * repository confusion this panel's own label ("a pull request in another repository")
+ * promised to solve and could not.
+ *
+ * A MALFORMED REPOSITORY IN A URL IS A REFUSAL, NOT A BARE NUMBER. Falling back to "no
+ * repository named" for `https://github.com/../react/pull/1` would apply the configured
+ * repository to a reference that plainly meant another one — the substitution R-W3.1
+ * forbids, arrived at by way of a lenient parser. The patterns above are the browser-side
+ * half of that; the route layer decodes and re-checks its own segments regardless (R-W3.7),
+ * because nothing typed here is trusted over there.
  */
-export function parsePullRequestReference(input: string): number | null {
+export function parsePullRequestReference(input: string): PullRequestReference | null {
   const text = input.trim();
   if (!text) return null;
-  const fromUrl = /\/pull\/(\d+)/.exec(text);
-  const digits = fromUrl ? fromUrl[1] : /^#?(\d+)$/.exec(text)?.[1];
-  if (!digits) return null;
-  const n = Number(digits);
-  return Number.isSafeInteger(n) && n > 0 ? n : null;
+  const number = (digits: string | undefined, repo: PullRequestReference['repo']): PullRequestReference | null => {
+    if (!digits) return null;
+    const n = Number(digits);
+    return Number.isSafeInteger(n) && n > 0 ? { pullNumber: n, repo } : null;
+  };
+  // Anything with a `/pull/<n>` in it is a link, whatever host it came from — the two
+  // segments before it are the repository. A link whose shape is right and whose
+  // repository is not is refused rather than downgraded to a bare number.
+  const fromUrl = /(?:^|\/)([^/]+)\/([^/]+)\/pull\/(\d+)/.exec(text);
+  if (fromUrl) {
+    const [, owner, repo, digits] = fromUrl as unknown as [string, string, string, string];
+    if (!OWNER_RE.test(owner) || !REPO_NAME_RE.test(repo) || repo === '.' || repo === '..') return null;
+    return number(digits, { owner, repo });
+  }
+  return number(/^#?(\d+)$/.exec(text)?.[1], null);
+}
+
+/**
+ * Which repository a parsed reference is about — the one it named, or the session's.
+ *
+ * R-W4.3 is the third arm and the reason this is a function rather than a `??`: a
+ * reference that names no repository, in a session that has none either, is not a request
+ * to be sent and guessed at. It is a thing to say out loud, before anything is attempted,
+ * naming what the reviewer can do about it.
+ */
+export function repositoryForReference(
+  reference: PullRequestReference,
+  availability: CollabAvailabilitySnapshot | null,
+): { ok: true; repo: { owner: string; repo: string } | null } | { ok: false; message: string } {
+  // Named in the link: it wins outright, including over a configured repository that
+  // differs from it. That is the whole of R-W4.1.
+  if (reference.repo) return { ok: true, repo: reference.repo };
+  // R-W4.2 — a bare number applies the configured repository, and it does so by saying
+  // nothing: `repo: null` sends the legacy route form, which is where that rule lives
+  // (R-W3.2). Restating it in the path here would be a second place for it to be wrong.
+  if (availability?.available === true) return { ok: true, repo: null };
+  return {
+    ok: false,
+    message:
+      'The repository is unknown: this reference is a bare pull request number and this session has no repository ' +
+      'to apply to it. Paste the full pull request URL instead, e.g. https://github.com/owner/repo/pull/42.',
+  };
 }
 
 type Status = { kind: 'idle' } | { kind: 'busy' } | { kind: 'error'; message: string } | { kind: 'ok'; message: string };
@@ -112,11 +181,20 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
   }, []);
 
   async function open() {
-    const pullNumber = parsePullRequestReference(reference);
-    if (pullNumber === null) {
+    const parsed = parsePullRequestReference(reference);
+    if (parsed === null) {
       setStatus({ kind: 'error', message: 'Enter a pull request URL or number, e.g. https://github.com/acme/docs/pull/42 or 42.' });
       return;
     }
+    // R-W4.3 — decided before the document id is even looked at, because "which
+    // repository" is the question that has to be answerable for any of the rest to mean
+    // anything. Nothing is posted when it is not.
+    const where = repositoryForReference(parsed, availability);
+    if (!where.ok) {
+      setStatus({ kind: 'error', message: where.message });
+      return;
+    }
+    const pullNumber = parsed.pullNumber;
     const id = documentId.trim();
     if (!id) {
       setStatus({ kind: 'error', message: 'Enter the document id — the PR body names it as `--document <id>`.' });
@@ -126,12 +204,16 @@ export function CollabOpenPanel({ onOpened, fetchImpl }: CollabOpenPanelProps) {
     // The server's own words either way — a 503 carries the availability message (R-7.8),
     // a 4xx carries `error`, and a dead server carries `fetch`'s. `failureOf` already
     // applies exactly that precedence, so nothing is flattened into "could not open".
-    const res = await client.open({ documentId: id, pullNumber });
+    const res = await client.open({ documentId: id, pullNumber, ...(where.repo ? { repo: where.repo } : {}) });
     if (!res.ok) {
       setStatus({ kind: 'error', message: res.message });
       return;
     }
-    setStatus({ kind: 'ok', message: `Opening ${id} from #${pullNumber}…` });
+    // The repository is in the sentence whenever the reference named one, so a link
+    // pasted from the wrong tab is visible in the confirmation rather than twenty minutes
+    // into reading it.
+    const from = where.repo ? `${where.repo.owner}/${where.repo.repo}#${pullNumber}` : `#${pullNumber}`;
+    setStatus({ kind: 'ok', message: `Opening ${id} from ${from}…` });
     onOpened?.(id);
   }
 

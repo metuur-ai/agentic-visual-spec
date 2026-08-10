@@ -8,16 +8,69 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import { fireEvent } from '@testing-library/dom';
 import { describe, expect, it, vi } from 'vitest';
-import { CollabOpenPanel, parsePullRequestReference } from './collab-open-panel';
+import { CollabOpenPanel, parsePullRequestReference, repositoryForReference } from './collab-open-panel';
 
 describe('the pull request references a reviewer actually has to hand', () => {
-  it('accepts a copied URL, `#42` and a bare number, and rejects the rest', () => {
-    expect(parsePullRequestReference('https://github.com/acme/docs/pull/42')).toBe(42);
-    expect(parsePullRequestReference('https://github.com/acme/docs/pull/42#issuecomment-9')).toBe(42);
-    expect(parsePullRequestReference('#42')).toBe(42);
-    expect(parsePullRequestReference(' 42 ')).toBe(42);
+  /*
+   * R-W4.1 — this used to answer `42` and nothing else, for every shape below. The number
+   * was all that survived, so a link to another repository opened this one's #42 and said
+   * so nowhere. The repository is now half the answer, and the assertions are the same
+   * six references they always were.
+   */
+  it('takes the repository from a copied URL together with the number (R-W4.1)', () => {
+    expect(parsePullRequestReference('https://github.com/acme/docs/pull/42')).toEqual({
+      pullNumber: 42,
+      repo: { owner: 'acme', repo: 'docs' },
+    });
+    expect(parsePullRequestReference('https://github.com/acme/docs/pull/42#issuecomment-9')).toEqual({
+      pullNumber: 42,
+      repo: { owner: 'acme', repo: 'docs' },
+    });
+  });
+
+  it('accepts `#42` and a bare number, naming no repository (R-W4.2)', () => {
+    expect(parsePullRequestReference('#42')).toEqual({ pullNumber: 42, repo: null });
+    expect(parsePullRequestReference(' 42 ')).toEqual({ pullNumber: 42, repo: null });
+  });
+
+  it('rejects the rest', () => {
     expect(parsePullRequestReference('acme/docs')).toBeNull();
     expect(parsePullRequestReference('')).toBeNull();
+  });
+
+  /*
+   * A link whose repository is not a repository is refused outright rather than being
+   * downgraded to a bare number — which would apply the configured repository to a
+   * reference that plainly meant a different one.
+   */
+  it('refuses a URL whose repository is not one, rather than falling back to the number', () => {
+    expect(parsePullRequestReference('https://github.com/../docs/pull/42')).toBeNull();
+    expect(parsePullRequestReference('https://github.com/acme/../pull/42')).toBeNull();
+  });
+});
+
+const SIGNED_IN = {
+  available: true as const,
+  login: 'reviewer-rita',
+  repo: { owner: 'acme', repo: 'docs', baseBranch: 'main' },
+};
+
+describe('R-W4.1 … R-W4.3 — which repository a reference is about', () => {
+  it('takes the one the reference named, even when another is configured', () => {
+    const ref = { pullNumber: 37256, repo: { owner: 'facebook', repo: 'react' } };
+    expect(repositoryForReference(ref, SIGNED_IN)).toEqual({ ok: true, repo: { owner: 'facebook', repo: 'react' } });
+  });
+
+  it('names none for a bare number, leaving the configured repository to apply (R-W4.2)', () => {
+    expect(repositoryForReference({ pullNumber: 42, repo: null }, SIGNED_IN)).toEqual({ ok: true, repo: null });
+  });
+
+  it('reports the repository is unknown when the reference names none and none is configured (R-W4.3)', () => {
+    const verdict = repositoryForReference({ pullNumber: 42, repo: null }, null);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.message).toContain('The repository is unknown');
+    // It says what to do about it, which is the difference between reporting and refusing.
+    expect(verdict.ok === false && verdict.message).toContain('https://github.com/owner/repo/pull/42');
   });
 });
 
@@ -119,7 +172,7 @@ describe('the panel creates nothing', () => {
 });
 
 describe('R-11.2 — opening by pull request reference', () => {
-  it('posts the parsed pull number and the document id', async () => {
+  it('posts the parsed pull number and the document id, to the repository the URL named', async () => {
     const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true, kind: 'sync' } });
     const onOpened = vi.fn();
     render(<CollabOpenPanel fetchImpl={impl} onOpened={onOpened} />);
@@ -131,7 +184,74 @@ describe('R-11.2 — opening by pull request reference', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Open' }));
 
     await waitFor(() => expect(onOpened).toHaveBeenCalledWith('doc-1'));
+    // R-W4.1 — the repository is in the PATH and not in the body, so there is one place
+    // for it to be and the server refuses a path that names none rather than substituting.
+    expect(calls.at(-1)).toEqual({ url: '/__vs/collab/repos/acme/docs/open', body: { documentId: 'doc-1', pullNumber: 42 } });
+  });
+
+  /*
+   * R-W4.1, the case this story exists for and the one that was reproducible in a browser:
+   * a server started for one repository, a link pasted from another. It used to post `42`
+   * and get back a sentence about an unknown document, naming no repository at all.
+   */
+  it('opens a pull request of a repository this session was not started for (R-W4.1)', async () => {
+    const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true, kind: 'open' } });
+    const onOpened = vi.fn();
+    render(<CollabOpenPanel fetchImpl={impl} onOpened={onOpened} />);
+    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
+
+    openByUrl();
+    type('Pull request', 'https://github.com/facebook/react/pull/37256');
+    type('Document id', 'doc-1');
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
+
+    await waitFor(() => expect(onOpened).toHaveBeenCalledWith('doc-1'));
+    expect(calls.at(-1)).toEqual({
+      url: '/__vs/collab/repos/facebook/react/open',
+      body: { documentId: 'doc-1', pullNumber: 37256 },
+    });
+    // And the reviewer is told which repository it went to, not just which document.
+    expect(screen.getByText(/facebook\/react#37256/)).toBeTruthy();
+  });
+
+  it('sends a bare number on the legacy form, so the configured repository applies (R-W4.2)', async () => {
+    const { impl, calls } = fakeFetch({ ok: true, status: 200, json: { ok: true, kind: 'open' } });
+    const onOpened = vi.fn();
+    render(<CollabOpenPanel fetchImpl={impl} onOpened={onOpened} />);
+    await waitFor(() => expect(screen.getByText(/Signed in as/)).toBeTruthy());
+
+    openByUrl();
+    type('Pull request', '#42');
+    type('Document id', 'doc-1');
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
+
+    await waitFor(() => expect(onOpened).toHaveBeenCalledWith('doc-1'));
     expect(calls.at(-1)).toEqual({ url: '/__vs/collab/open', body: { documentId: 'doc-1', pullNumber: 42 } });
+  });
+
+  /*
+   * R-W4.3 — the session has not answered yet, so there is no configured repository to
+   * apply and the reference named none. The reviewer is told that, and nothing is sent:
+   * a bare number posted into a session with no repository is a review of whatever the
+   * server happens to be pointed at, which is the outcome this whole unit is against.
+   */
+  it('reports the repository is unknown rather than attempting the review (R-W4.3)', async () => {
+    // A `fetch` whose availability answer never arrives, which is the only state in which
+    // this panel genuinely does not know its repository.
+    const calls: string[] = [];
+    const impl = vi.fn(async (url: string) => {
+      calls.push(url);
+      return new Promise<Response>(() => {});
+    }) as unknown as typeof fetch;
+    render(<CollabOpenPanel fetchImpl={impl} />);
+
+    openByUrl();
+    type('Pull request', '42');
+    type('Document id', 'doc-1');
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
+
+    await waitFor(() => expect(screen.getByText(/The repository is unknown/)).toBeTruthy());
+    expect(calls).toEqual(['/__vs/collab']);
   });
 
   it('refuses to post a reference it could not parse', async () => {

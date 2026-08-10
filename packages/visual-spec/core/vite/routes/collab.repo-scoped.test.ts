@@ -23,6 +23,7 @@ import { createCollabAuthorizer } from '../../collaboration/authorization';
 import type { CollaborationPreflight } from '../../collaboration/credentials';
 import type { GitHubAdapter, RepoRef } from '../../collaboration/github-adapter';
 import { createJobHubRegistry } from '../../collaboration/job-hub';
+import type { CollaborationStore } from '../../collaboration/record-store';
 import type { GitExecutor } from '../../git-context';
 import type { ResolvedVisualSpecConfig } from '../../config';
 import { type CollabAuthorizer, type CollabDeps, type CollabRouteResult, createCollabRoutes } from './collab';
@@ -344,7 +345,11 @@ describe('R-W3.8 — reviewing a pull request of any repository is a read', () =
     const text = src('core/vite/routes/collab.ts');
     const declared = /const REVIEW_OPERATIONS: ReadonlySet<CollabOperation> = new Set<CollabOperation>\(\[([^\]]*)\]\)/.exec(text);
     expect(declared, 'REVIEW_OPERATIONS is declared as a closed set').not.toBeNull();
-    expect(declared?.[1]).toBe("'read', 'comment', 'reply'");
+    // `open` joined the set under story 4.1 (R-W4.1), and the literal is pinned rather
+    // than loosened so that the next addition is as deliberate as that one was: it reads
+    // a pull request and one file off its branch, writes nothing to GitHub, and is
+    // `any-role` in `OPERATION_POLICY`. An operation that commits still cannot get in.
+    expect(declared?.[1]).toBe("'read', 'comment', 'reply', 'open'");
     expect(text).toContain('if (requested && !REVIEW_OPERATIONS.has(op))');
   });
 
@@ -699,5 +704,93 @@ describe('R-W3.2 — the route form that predates this requirement applies the c
     const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/42/files');
     expect(res.status).toBe(200);
     expect(gh.repos.every((repo) => repo.owner === 'acme' && repo.repo === 'specs')).toBe(true);
+  });
+});
+
+/* ================================================================== *
+ * R-W4.1 / R-W4.2 — the repository a pasted link named reaches `open`
+ * ================================================================== */
+/**
+ * `POST /open` is the one document route the scoped form reaches, and story 4.1 is why.
+ * The panel a reviewer pastes a link into advertises "a pull request in another
+ * repository"; with no scoped `open` the only thing it can send is a number, which the
+ * server resolves against the repository it was started for — so a link to
+ * `facebook/react#37256` served `vitejs/vite#37256`, or, more often, answered that the
+ * document was unknown while never once naming a repository.
+ *
+ * The assertions are on the repository the JOB BODY is handed, because that is the value
+ * the open actually reads GitHub with. A route that resolved the wrong repository still
+ * answers `200 { ok: true }` here — the job fails later, over SSE, with a message about a
+ * document rather than about a repository, which is exactly how this stayed invisible.
+ */
+describe('R-W4.1 — an open resolves the repository the request named', () => {
+  /** A store with nothing in it: `open` seeds the local copy, it never requires one. */
+  const emptyStore = (): CollaborationStore => ({
+    async read() {
+      return null;
+    },
+    async write() {},
+    async list() {
+      return [];
+    },
+  });
+
+  /** A router whose `open` body records what it was built with and runs nothing. */
+  function openRouter() {
+    const opened: string[] = [];
+    const r = createCollabRoutes({
+      jobs: createJobHubRegistry(),
+      config: () => ENABLED,
+      documents: emptyStore,
+      preflight: async () => OK_PREFLIGHT,
+      authorize: ALLOW_ALL,
+      baseDir: () => '/tmp/does-not-matter',
+      git: noGit,
+      repoAdapter: () => repoAdapter().adapter,
+      bodies: {
+        open: (input) => {
+          opened.push(`${input.repo.owner}/${input.repo.repo}#${input.pullNumber} as ${input.documentId}`);
+          return async () => {};
+        },
+      },
+    });
+    return { r, opened };
+  }
+
+  it('opens against the repository in the path rather than the configured one', async () => {
+    const { r, opened } = openRouter();
+    const res = await call(r, 'POST', '/repos/facebook/react/open', {}, { documentId: 'doc-1', pullNumber: 37256 });
+    expect(res.status).toBe(200);
+    expect(opened).toEqual(['facebook/react#37256 as doc-1']);
+  });
+
+  it('refuses a malformed repository rather than normalising it (R-W3.7)', async () => {
+    const { r, opened } = openRouter();
+    const res = await call(r, 'POST', '/repos/%2e%2e/react/open', {}, { documentId: 'doc-1', pullNumber: 1 });
+    expect(res.status).toBe(400);
+    expect((res.json as { error: string }).error).toMatch(/^invalid repository: /);
+    expect(opened).toEqual([]);
+  });
+
+  /*
+   * The boundary this story moved, stated as the thing it did NOT move. `open` reads a
+   * pull request and one file off its branch; `start` and `publish` commit. R-W3.4 is
+   * about the second kind, so they stay unreachable through the scoped form rather than
+   * reachable and refused.
+   */
+  it('leaves the document routes that commit unreachable through the scoped form (R-W3.4)', async () => {
+    const { r, opened } = openRouter();
+    for (const path of ['/repos/facebook/react/start', '/repos/facebook/react/doc-1/publish']) {
+      const res = await call(r, 'POST', path, {}, { documentId: 'doc-1', documentPath: 'a.md', markdown: '# x\n' });
+      expect(res.status, path).toBe(404);
+    }
+    expect(opened).toEqual([]);
+  });
+
+  it('applies the configured repository to the legacy form, unchanged (R-W4.2)', async () => {
+    const { r, opened } = openRouter();
+    const res = await call(r, 'POST', '/open', {}, { documentId: 'doc-1', pullNumber: 42 });
+    expect(res.status).toBe(200);
+    expect(opened).toEqual(['acme/specs#42 as doc-1']);
   });
 });

@@ -706,11 +706,20 @@ function repoSegment(raw: string, pattern: RegExp): string | null {
  * Strip a repository-scoped prefix off a path, or report that the path claimed to carry
  * one and did not.
  *
- * Only the review family is reachable through the scoped form. A scoped path whose tail
- * is a document route is refused rather than served, because a document route can commit
- * (`create`, `publish`) and R-W3.4 forbids one repository's permissions authorizing an
- * operation on another — making the combination unreachable is stronger than making it
+ * Only the review family and `open` are reachable through the scoped form. A scoped path
+ * whose tail is any other document route is refused rather than served, because those can
+ * commit (`create`, `publish`) and R-W3.4 forbids one repository's permissions authorizing
+ * an operation on another — making the combination unreachable is stronger than making it
  * refusable, and cheaper to keep true.
+ *
+ * `/open` IS IN, AND IT IS THE ONLY DOCUMENT ROUTE THAT IS (R-W4.1). It is the reviewer's
+ * way in from a pasted link, and the link names a repository — so a form that cannot carry
+ * one leaves the panel advertising "a pull request in another repository" and resolving
+ * against the configured one instead, which is the wrong-repository review R-W3.1 exists to
+ * end. It qualifies on the same ground the review family does: `open` reads a pull request
+ * and the file its trailer names, writes nothing to GitHub, and is `any-role` in
+ * `OPERATION_POLICY` — so no permission held on one repository decides anything about
+ * another. Everything it writes is the local copy of the document, in the served directory.
  *
  * TWO REFUSALS, NOT ONE (R-W3.7). "This path names no repository" is a route that does not
  * exist — a 404, the same answer any unrecognised path gets. "This path names something in
@@ -724,7 +733,7 @@ function repoScopeOf(pathname: string): RepoScope {
   const match = REPO_SCOPE_RE.exec(pathname);
   if (!match || !match[1] || !match[2]) return { ok: false, reason: 'no-repository' };
   const tail = match[3] ?? '';
-  if (tail !== '/pulls' && !tail.startsWith('/pulls/')) return { ok: false, reason: 'no-repository' };
+  if (tail !== '/pulls' && !tail.startsWith('/pulls/') && tail !== '/open') return { ok: false, reason: 'no-repository' };
   const owner = repoSegment(match[1], GITHUB_LOGIN_RE);
   const repo = repoSegment(match[2], REPO_NAME_RE);
   if (owner === null || repo === null) return { ok: false, reason: 'malformed', segment: `${match[1]}/${match[2]}` };
@@ -1071,8 +1080,15 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
    * only read. Naming the permitted operations at the gate means that route is refused on
    * the day it is written rather than shipped and discovered later. Adding an operation to
    * this set is then a deliberate act with this comment attached to it.
+   *
+   * `open` IS ONE OF THEM, AND IT IS THE DELIBERATE ACT (R-W4.1). Attaching to a pull
+   * request that already exists reads that pull request and one file off its branch and
+   * writes nothing to GitHub; `OPERATION_POLICY` classifies it `any-role` for exactly that
+   * reason, and it is the reviewer-onboarding path a pasted link lands on. It is here so
+   * that the repository in the link is the repository the open resolves against, rather
+   * than the configured one being substituted for it.
    */
-  const REVIEW_OPERATIONS: ReadonlySet<CollabOperation> = new Set<CollabOperation>(['read', 'comment', 'reply']);
+  const REVIEW_OPERATIONS: ReadonlySet<CollabOperation> = new Set<CollabOperation>(['read', 'comment', 'reply', 'open']);
 
   /**
    * Availability + authorization in one step, because no GitHub-touching route may skip
@@ -1335,7 +1351,15 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         if (typeof pullNumber !== 'number' || !Number.isInteger(pullNumber) || pullNumber <= 0) {
           return bad('missing pullNumber');
         }
-        const gated = await gate('open', documentId);
+        /*
+         * R-W4.1 — the repository the request named, when it named one. A pasted pull
+         * request URL carries owner and repo, and this is where they land: `gated.repo` is
+         * what the job body reads the pull request and its document from, so handing it the
+         * configured repository for a link that named another is precisely the silent
+         * wrong-repository open this requirement exists to stop. R-W4.2 is the `null` arm —
+         * the legacy form, unchanged, resolving the configured repository.
+         */
+        const gated = await gate('open', documentId, requestedRepo);
         if (!gated.ok) return gated.result;
         const idempotencyKey = optionalKey(body);
         // `open` is NOT a sync job, however much it rhymes with one. Sync pulls comments;
