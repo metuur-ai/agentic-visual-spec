@@ -195,6 +195,72 @@ describe('R-W3.1 — a request that reviews a pull request names its repository'
   });
 });
 
+/* ================================================================== *
+ * R-W3.7 / R-W6.6 — decode first, validate second, normalise never
+ * ================================================================== */
+describe('R-W3.7 — a repository identifier is decoded before it is validated', () => {
+  /*
+   * R-W6.6 is this table. Path segments are matched `[^/]+`, so `..` cannot arrive as its
+   * own segment through a host that normalises — but `%2e%2e` can, and it is the same two
+   * bytes the moment anything decodes it. Neither host decodes: `new URL(...).pathname`
+   * keeps percent-escapes, so the decode is genuinely this layer's to do, and doing it
+   * AFTER the check would leave the check answering a question about the wire format
+   * rather than about the identifier.
+   *
+   * Every one of these is REFUSED. None is repaired: stripping a `..` or collapsing a
+   * separator turns a hostile identifier into a plausible one, and the repository it then
+   * names is one nobody asked for.
+   */
+  for (const [what, path] of [
+    ['encoded traversal in the owner', '/repos/%2e%2e/specs/pulls'],
+    ['encoded traversal in the repository', '/repos/acme/%2e%2e/pulls'],
+    ['bare traversal in the owner', '/repos/../specs/pulls'],
+    ['bare traversal in the repository', '/repos/acme/../pulls'],
+    ['a bare dot for a repository', '/repos/acme/./pulls'],
+    ['an encoded separator', '/repos/acme/spe%2Fcs/pulls'],
+    ['an encoded NUL', '/repos/acme/specs%00/pulls'],
+    ['a space', '/repos/acme/spe%20cs/pulls'],
+    ['a malformed percent-escape', '/repos/acme/spe%zzcs/pulls'],
+    ['an owner GitHub could not have issued', '/repos/-acme/specs/pulls'],
+  ] as const) {
+    it(`refuses ${what}`, async () => {
+      const gh = repoAdapter();
+      const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', path);
+      expect(res.status, path).toBe(400);
+      expect(res.json).toMatchObject({ error: expect.stringContaining('invalid repository') });
+      // The decisive half: nothing was substituted and nothing was asked of GitHub, so
+      // no repository at all was reviewed on the strength of a refused identifier.
+      expect(gh.repos, path).toEqual([]);
+    });
+  }
+
+  it('refuses before consulting availability, so a malformed identifier needs no credential', async () => {
+    const r = router({
+      config: () => {
+        throw new Error('availability must not be consulted');
+      },
+    });
+    const res = await call(r, 'GET', '/repos/acme/%2e%2e/pulls');
+    expect(res.status).toBe(400);
+  });
+
+  it('accepts the punctuation a real repository name carries', async () => {
+    const gh = repoAdapter();
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/repos/acme-co/my.spec_repo/pulls');
+    expect(res.status).toBe(200);
+    expect(gh.repos).toEqual([{ owner: 'acme-co', repo: 'my.spec_repo' }]);
+  });
+
+  it('decodes an identifier that is merely encoded, rather than refusing it', async () => {
+    const gh = repoAdapter();
+    // `.` percent-encoded is still `my.spec`, and a client that encodes conservatively is
+    // not making a mistake. The decode is what makes this the same repository as above.
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/repos/acme/my%2Espec/pulls');
+    expect(res.status).toBe(200);
+    expect(gh.repos).toEqual([{ owner: 'acme', repo: 'my.spec' }]);
+  });
+});
+
 describe('R-W3.2 — the route form that predates this requirement applies the configured repository', () => {
   it('resolves the configured repository for the legacy listing', async () => {
     const gh = repoAdapter();

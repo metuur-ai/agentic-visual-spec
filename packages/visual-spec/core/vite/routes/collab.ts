@@ -664,7 +664,42 @@ const REPO_SCOPE_RE = /^\/repos(?:\/([^/]+)\/([^/]+))?(\/.*)?$/;
  * applies. It is NOT "the request named one and we could not read it": that case is
  * `ok: false`, and it is a refusal, never a fallback (R-W3.1).
  */
-type RepoScope = { ok: true; repo: RepoRef | null; pathname: string } | { ok: false };
+type RepoScope =
+  | { ok: true; repo: RepoRef | null; pathname: string }
+  /** The path named no repository this family serves. There is nothing to substitute. */
+  | { ok: false; reason: 'no-repository' }
+  /** The path named something in the repository position that is not a repository. */
+  | { ok: false; reason: 'malformed'; segment: string };
+
+/**
+ * A repository name, as GitHub spells one.
+ *
+ * `owner` reuses `GITHUB_LOGIN_RE` — the same closed character set the search qualifier is
+ * checked against, and for a related reason: this value is interpolated into an API path
+ * and, once drafts are repository-scoped, into a filesystem path. A repository name
+ * additionally admits `.` and `_`, which is why it needs a pattern of its own.
+ *
+ * `.` AND `..` ARE NAMED AND REFUSED. Both satisfy the character set and neither is a
+ * repository; they are the two spellings that mean something to a path resolver and
+ * nothing to GitHub, so they are excluded here rather than left to whatever joins them
+ * later. That is the whole of the traversal defence at this layer: refuse, never repair.
+ */
+const REPO_NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
+
+/** Decode one path segment and check it names half a repository. `null` is a refusal. */
+function repoSegment(raw: string, pattern: RegExp): string | null {
+  let decoded: string;
+  try {
+    // DECODE FIRST. `%2e%2e` is `..` and `%2f` is `/`; deciding on the encoded spelling
+    // would be answering a question about the wire format rather than the identifier.
+    decoded = decodeURIComponent(raw);
+  } catch {
+    // A malformed escape (`%zz`) throws. It is a refusal like any other, not a 500.
+    return null;
+  }
+  if (decoded === '.' || decoded === '..') return null;
+  return pattern.test(decoded) ? decoded : null;
+}
 
 /**
  * Strip a repository-scoped prefix off a path, or report that the path claimed to carry
@@ -675,14 +710,24 @@ type RepoScope = { ok: true; repo: RepoRef | null; pathname: string } | { ok: fa
  * (`create`, `publish`) and R-W3.4 forbids one repository's permissions authorizing an
  * operation on another — making the combination unreachable is stronger than making it
  * refusable, and cheaper to keep true.
+ *
+ * TWO REFUSALS, NOT ONE (R-W3.7). "This path names no repository" is a route that does not
+ * exist — a 404, the same answer any unrecognised path gets. "This path names something in
+ * the repository position that is not a repository" is a request that was understood and is
+ * malformed — a 400 carrying the segment, matching how `parsePullNumber` already answers.
+ * Collapsing them would leave someone who mistyped a repository name reading that the route
+ * does not exist.
  */
 function repoScopeOf(pathname: string): RepoScope {
   if (pathname !== '/repos' && !pathname.startsWith('/repos/')) return { ok: true, repo: null, pathname };
   const match = REPO_SCOPE_RE.exec(pathname);
-  if (!match || !match[1] || !match[2]) return { ok: false };
+  if (!match || !match[1] || !match[2]) return { ok: false, reason: 'no-repository' };
   const tail = match[3] ?? '';
-  if (tail !== '/pulls' && !tail.startsWith('/pulls/')) return { ok: false };
-  return { ok: true, repo: { owner: match[1], repo: match[2] }, pathname: tail };
+  if (tail !== '/pulls' && !tail.startsWith('/pulls/')) return { ok: false, reason: 'no-repository' };
+  const owner = repoSegment(match[1], GITHUB_LOGIN_RE);
+  const repo = repoSegment(match[2], REPO_NAME_RE);
+  if (owner === null || repo === null) return { ok: false, reason: 'malformed', segment: `${match[1]}/${match[2]}` };
+  return { ok: true, repo: { owner, repo }, pathname: tail };
 }
 
 /**
@@ -1173,7 +1218,9 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
        * be left behind resolving the configured repository on a path that named another.
        */
       const scope = repoScopeOf(req.pathname);
-      if (!scope.ok) return notFound(method, req.pathname);
+      if (!scope.ok) {
+        return scope.reason === 'malformed' ? bad(`invalid repository: ${scope.segment}`) : notFound(method, req.pathname);
+      }
       const requestedRepo = scope.repo;
       const pathname = scope.pathname;
       /* GET /__vs/collab — R-7.8, the flag the UI renders (or hides) controls on. */
