@@ -745,3 +745,75 @@ describe('what is waiting on you, as two sections of this list', () => {
     expect(calls.filter((c) => c.url.includes('awaiting'))).toEqual([]);
   });
 });
+
+/* ================================================================== *
+ * R-C1 — the checkouts on disk, gathered into a section of their own
+ * ================================================================== */
+/*
+ * `mounted` was never iterated. It was consulted only as `mountedFor(pull.number)` from
+ * inside a listed row, which is why a checkout stopped being visible the moment its pull
+ * request left the listing — and its `Remove checkout` button, which lives on that row,
+ * stopped being reachable with it. A checkout is a whole working copy of the repository,
+ * so they accumulate in silence. Iterating `mounted` is the whole of the fix.
+ *
+ * These assert on the rows the section renders, never on a style value: the states of
+ * R-C2 have to be readable without colour, and a test that reads colour would not notice
+ * if they were not.
+ */
+describe('what is checked out on disk (R-C1)', () => {
+  /** A second pull request, listed, so two checkouts can be asserted against two rows. */
+  const OTHER = { ...PULL, number: 7, title: 'Tidy the importer', headSha: 'feed123beef456' };
+  const OTHER_WORKTREE = {
+    pullNumber: 7,
+    repo: REPO,
+    path: '/repo/.visual-spec/worktrees/acme/docs/pr-7',
+    headSha: OTHER.headSha,
+  };
+
+  const section = () => document.querySelector('[data-vs-checkouts]') as HTMLElement | null;
+  const row = (n: number) => document.querySelector(`[data-vs-checkout="${n}"]`) as HTMLElement | null;
+
+  /**
+   * `worktrees` is what `GET /pulls/mounted` answers, and `pulls` what the listing does.
+   * Both are given per test, because every case here is a different join between them.
+   */
+  function mountPanel(worktrees: unknown[], pulls: unknown[] = [PULL]) {
+    const { impl, calls } = fakeFetch({
+      '/__vs/collab/pulls?state=open': { ok: true, status: 200, json: { pulls } },
+      '/__vs/collab/pulls/mounted': { ok: true, status: 200, json: { worktrees } },
+    });
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    return { calls };
+  }
+
+  /*
+   * R-C1.1 / R-C1.7 — every checkout git reports, in one place. The section is rendered
+   * from the mounted route's answer and from nothing this component remembers, which is
+   * what makes a checkout created by an earlier run of the server appear here, and one
+   * deleted from a terminal disappear.
+   */
+  it('renders every checkout the repository reports, in a section of its own', async () => {
+    mountPanel([WORKTREE, OTHER_WORKTREE], [PULL, OTHER]);
+
+    await waitFor(() => expect(section()).toBeTruthy());
+    expect(row(42)).toBeTruthy();
+    expect(row(7)).toBeTruthy();
+    // Both rows are inside the section, not scattered through the listing.
+    expect(section()!.contains(row(42)!)).toBe(true);
+    expect(section()!.contains(row(7)!)).toBe(true);
+    expect(section()!.textContent).toContain('Rework the payment rules');
+    expect(section()!.textContent).toContain('Tidy the importer');
+  });
+
+  /*
+   * R-C1.5 — a heading over no rows is a claim that something is half-done. The 99% case
+   * is nothing checked out, and it must render exactly as it always has.
+   */
+  it('renders no section at all when nothing is checked out', async () => {
+    mountPanel([]);
+
+    await screen.findByText(/Rework the payment rules/);
+    expect(section()).toBeNull();
+    expect(screen.queryByText('Checked out on disk')).toBeNull();
+  });
+});

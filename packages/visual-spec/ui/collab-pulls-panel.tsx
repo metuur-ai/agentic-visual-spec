@@ -202,6 +202,17 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
     void refreshMounted();
   }, [refreshMounted]);
 
+  /**
+   * The checkout of a pull request, if there is one.
+   *
+   * MATCHED ON THE NUMBER ALONE, AND THAT IS STILL RIGHT SINCE `MountedWorktree` GAINED A
+   * `repo` (R-W3.5). The repository is in the checkout's address because two repositories'
+   * #42 used to contend for one directory on disk — but `GET /pulls/mounted` answers only
+   * the gated repository's checkouts, and `PullRequestSummary` carries no repository at
+   * all, so there is no second key here to match on. Adding one would mean inventing the
+   * listing's repository from the availability snapshot and comparing two values that are
+   * equal by construction.
+   */
   const mountedFor = (pullNumber: number): MountedWorktree | undefined =>
     mounted.find((w) => w.pullNumber === pullNumber);
 
@@ -516,9 +527,57 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
     );
   };
 
+  /**
+   * One checkout on disk (R-C1.1).
+   *
+   * Deliberately not `listRow`. The two rows answer different questions: a listing row
+   * offers everything you can do with a pull request, and this one says what is on disk
+   * and whether it is still worth reading. Rendering `listRow` here would also give a
+   * checked-out pull request two `Review the code` buttons and two `Remove checkout`
+   * buttons on one screen, which is a worse answer to "what do I have half-done?" than
+   * the badge it replaced.
+   */
+  const checkoutRow = (worktree: MountedWorktree) => {
+    const pull = listed.get(worktree.pullNumber);
+    return (
+      <li key={worktree.pullNumber} style={card} data-vs-checkout={worktree.pullNumber}>
+        <div style={cardTitle}>
+          <span style={{ color: '#64748b' }}>#{worktree.pullNumber}</span> {pull?.title}
+        </div>
+        {/* Where it is, because the point of the section is a copy of the repository you
+            can go and look at — or delete by hand, which git's registry will then report. */}
+        <div style={meta}>{worktree.path}</div>
+      </li>
+    );
+  };
+
+  /**
+   * The checkouts, gathered (R-C1.1, R-C1.5, R-C1.7).
+   *
+   * Rendered from `mounted` — git's own worktree registry, read through
+   * `GET /pulls/mounted` — and not from anything this component remembers, so a checkout
+   * made by an earlier run of the server is here and one deleted from a terminal is not.
+   *
+   * WHY NO REPOSITORY IN THE HEADING. Every row would carry the same one: the route
+   * answers the gated repository's checkouts and nothing else. A constant repeated on
+   * every row is noise, and naming it once in the heading would be naming the repository
+   * the whole panel is already about.
+   */
+  const checkoutsSection = () => {
+    // R-C1.5 — no rows, no section. A heading over nothing claims something is half-done.
+    if (mounted.length === 0) return null;
+    return (
+      <section key="checkouts" data-vs-checkouts style={{ display: 'contents' }}>
+        <h3 style={groupHeading}>Checked out on disk</h3>
+        <ul style={listReset}>{mounted.map(checkoutRow)}</ul>
+      </section>
+    );
+  };
+
   const sections = [
     awaitingSection('review', 'Waiting on your review', awaiting?.reviewRequested),
     awaitingSection('mentions', 'You were mentioned', awaiting?.mentioned),
+    checkoutsSection(),
   ];
 
   /**

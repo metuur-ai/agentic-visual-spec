@@ -27,11 +27,11 @@
 
 ## Unit 1: The checkouts on disk
 
-- [ ] 1.1 Render the checkouts as a section of their own (deps: 3.1, est: ~40m, mutex: panel-rows)
+- [x] 1.1 Render the checkouts as a section of their own (deps: 3.1, est: ~40m, mutex: panel-rows)
   - why: `mounted` is never iterated today — it is only consulted as `mountedFor(pull.number)` from inside a listed row (`collab-pulls-panel.tsx:205`). Iterating it is what turns a scattered set of badges into an answer to "what do I have half-done?". It comes from git's own worktree registry, so a checkout made by an earlier run of the server, or removed by hand in a terminal, is reported correctly rather than remembered wrongly.
   - acceptance: R-C1.1 — every checkout on disk appears in its own section of the panel; R-C1.7 — the section is derived from the repository's record of its checkouts; R-C1.5 — with nothing checked out, no section renders.
   - verify: panel test with two checkouts asserts both appear in the section; a test with an empty `mounted` asserts the section is absent, not present-and-empty.
-  - landed:
+  - landed: `ui/collab-pulls-panel.tsx` — `checkoutRow` / `checkoutsSection`, joined to the panel's `sections` array so the listing gains its heading below it. Tests: `ui/collab-pulls-panel.test.tsx` › "what is checked out on disk (R-C1)" — "renders every checkout the repository reports, in a section of its own" (R-C1.1, R-C1.7), "renders no section at all when nothing is checked out" (R-C1.5).
 
 - [ ] 1.2 Include a checkout whose pull request is not in the listing, and let it be removed (deps: 1.1, est: ~35m, mutex: panel-rows)
   - why: this is the leak. `Remove checkout` lives only on a listed row, so the moment a pull request merges its working copy — a full copy of the repository — becomes invisible and unreachable from the UI, and they accumulate. The row says the pull request is not in the listing rather than guessing why, because the panel cannot tell "merged" from "filtered by the toggle".
