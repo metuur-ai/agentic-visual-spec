@@ -53,11 +53,11 @@
   - verify: panel test with matching shas asserts the current state and with differing shas the behind state; the injected `fetchImpl` is asserted to have issued no additional request in either case.
   - landed: `ui/collab-pulls-panel.tsx` — `checkoutRow` compares `pull.headSha` with `worktree.headSha`, both already in memory. Tests: `ui/collab-pulls-panel.test.tsx` › "whether a checkout is at the pull request's head (R-C2)" — "says a checkout at the pull request's head is up to date" and "says a checkout the branch has moved past is out of date", each asserting the injected `fetch` made only the three reads of mount (R-C2.5).
 
-- [ ] 2.2 Name both commits and the way out when a checkout is behind (deps: 2.1, est: ~20m, mutex: panel-rows)
+- [x] 2.2 Name both commits and the way out when a checkout is behind (deps: 2.1, est: ~20m, mutex: panel-rows)
   - why: "out of date" without the two commits is unverifiable, and without the remedy it is a dead end. Re-checking out is already the supported way to move a checkout to a head that has changed (R-13.12), so the row names an action that already works instead of asking for a new one.
   - acceptance: R-C2.2 — both commits are named, and the row states that checking the pull request out again moves the checkout to the current head.
   - verify: panel test asserts both short shas are present on the behind row and that the remedy is stated.
-  - landed:
+  - landed: `ui/collab-pulls-panel.tsx` — the behind line names `shortSha(worktree.headSha)` and `shortSha(pull.headSha)` and points at re-checking out from the listing below. Test: "names both commits and the way out when a checkout is behind (R-C2.2)".
 
 - [ ] 2.3 Say nothing about currency for a checkout that is not listed (deps: 2.1, 1.2, est: ~15m, mutex: panel-rows)
   - why: there is no pull request record to compare against, and a row that silently defaulted to "current" would be asserting the one thing it cannot know — about exactly the checkouts most likely to be stale.

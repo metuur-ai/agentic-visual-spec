@@ -933,4 +933,19 @@ describe('whether a checkout is at the pull request’s head (R-C2)', () => {
     expect([...new Set(calls.map((c) => c.url))].sort()).toEqual(ON_MOUNT);
   });
 
+  /*
+   * R-C2.2 — "out of date" without the two commits is unverifiable: the reviewer cannot
+   * check the claim and cannot see how far behind they are. Without the way out it is a
+   * dead end. Re-checking out is already how a checkout moves to a head that has changed
+   * (R-13.12), so the row names an action that works rather than asking for a new one.
+   */
+  it('names both commits and the way out when a checkout is behind (R-C2.2)', async () => {
+    mountPanel([STALE_WORKTREE], [MOVED]);
+
+    await waitFor(() => expect(row(42)!.textContent).toContain('Out of date'));
+    // The commit being read, and the commit that should be.
+    expect(row(42)!.textContent).toContain(shortSha(STALE_WORKTREE.headSha));
+    expect(row(42)!.textContent).toContain(shortSha(MOVED.headSha));
+    expect(row(42)!.textContent).toContain('Checking it out again');
+  });
 });

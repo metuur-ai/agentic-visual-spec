@@ -572,8 +572,17 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
               this pull request’s current head.
             </p>
           ) : (
+            /*
+             * R-C2.2 — both commits, because "out of date" without them is a claim the
+             * reviewer cannot check and cannot measure, and the way out, because without
+             * it the row is a dead end. Re-checking out already moves a checkout to a
+             * head that has changed (R-13.12), so this names an action that works rather
+             * than asking for a new one.
+             */
             <p data-vs-checkout-state="behind" style={{ ...checkoutStateLine, color: '#b45309' }}>
-              <span aria-hidden="true">!</span> Out of date — the checkout is not at this pull request’s current head.
+              <span aria-hidden="true">!</span> Out of date — the checkout is at {shortSha(worktree.headSha)} and this
+              pull request’s head is now {shortSha(pull.headSha)}. Checking it out again from the listing below moves
+              the checkout to the current head.
             </p>
           ))}
         {!pull && (
