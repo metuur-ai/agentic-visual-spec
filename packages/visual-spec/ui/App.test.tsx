@@ -73,6 +73,16 @@ const WORKTREE = {
   headSha: 'a'.repeat(40),
 };
 
+/**
+ * The pull request's tree, one directory per call — the only shape `ReviewSource` answers
+ * in, and so the only shape `/pulls/:n/tree` serves. The review surface reads the root the
+ * moment it opens, so every route through `<App />` that reaches it needs these two.
+ */
+const PR_DIRECTORIES: Record<string, { name: string; path: string; kind: 'file' | 'directory' }[]> = {
+  '': [{ name: 'docs', path: 'docs', kind: 'directory' }],
+  docs: [{ name: 'spec.md', path: 'docs/spec.md', kind: 'file' }],
+};
+
 function jsonRes(body: unknown, ok = true, status = ok ? 200 : 500) {
   return { ok, status, json: async () => body } as Response;
 }
@@ -91,6 +101,22 @@ function installFetch(availability: unknown = AVAILABILITY) {
     if (url === '/__vs/collab/pulls/42/mount' && method === 'POST') return jsonRes({ ok: true, source: 'checkout', headSha: WORKTREE.headSha, repo: { owner: 'acme', repo: 'docs' }, worktree: WORKTREE });
     if (url === '/__vs/collab/pulls/42/files') return jsonRes({ files: ['docs/spec.md'] });
     if (url === '/__vs/collab/pulls/42/drafts') return jsonRes({ drafts: [] });
+    if (url === '/__vs/collab/pulls/42/comments') return jsonRes({ threads: [] });
+    // The reads the reviewing surface makes for itself: one directory at a time, and one
+    // file when a row is clicked. Both are matched before the listing prefix below.
+    const tree = /^\/__vs\/collab\/pulls\/42\/tree\?path=(.*)$/.exec(url);
+    if (tree) {
+      const path = decodeURIComponent(tree[1] as string);
+      const entries = PR_DIRECTORIES[path];
+      if (!entries) return jsonRes({ error: 'That path could not be read at this commit.' }, false, 404);
+      return jsonRes({ pullNumber: 42, headSha: WORKTREE.headSha, path, entries });
+    }
+    const raw = /^\/__vs\/collab\/pulls\/42\/raw\?path=(.*)$/.exec(url);
+    if (raw) {
+      const path = decodeURIComponent(raw[1] as string);
+      if (path !== 'docs/spec.md') return jsonRes({ error: 'That path could not be read at this commit.' }, false, 404);
+      return jsonRes({ pullNumber: 42, headSha: WORKTREE.headSha, path, text: DOCUMENT.markdown });
+    }
     // The sidebar's collaborate item and the header chip both count these (R-7.1).
     if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: OPEN_PULLS });
     if (url === '/__vs/collab/open' && method === 'POST') return jsonRes({ ok: true });
