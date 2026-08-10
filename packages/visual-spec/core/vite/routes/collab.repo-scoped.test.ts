@@ -13,6 +13,9 @@
  *
  * No real network, no `gh` and no `git`: every executor is injected (R-4.8 / R-12.3).
  */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { CollaborationPreflight } from '../../collaboration/credentials';
 import type { GitHubAdapter, RepoRef } from '../../collaboration/github-adapter';
@@ -20,6 +23,9 @@ import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { GitExecutor } from '../../git-context';
 import type { ResolvedVisualSpecConfig } from '../../config';
 import { type CollabAuthorizer, type CollabDeps, type CollabRouteResult, createCollabRoutes } from './collab';
+
+const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+const src = (rel: string) => readFileSync(resolve(pkgRoot, rel), 'utf8');
 
 /** The repository the server was started against. Every "configured" assertion is this one. */
 const CONFIGURED = { owner: 'acme', repo: 'specs', baseBranch: 'main' } as const;
@@ -192,6 +198,164 @@ describe('R-W3.1 — a request that reviews a pull request names its repository'
       const res = await call(router(), 'GET', path);
       expect(res.status, path).toBe(404);
     }
+  });
+});
+
+/* ================================================================== *
+ * R-W3.3 / R-W3.4 / R-W3.8 — availability and authorization follow the
+ * repository the request named
+ * ================================================================== */
+describe('R-W3.3 — availability and authorization are determined against the requested repository', () => {
+  /*
+   * THIS IS THE STORY THAT LOOKS FINISHED WHILE BEING WRONG. The authorizer caches
+   * effective permission per `owner/repo` and derives its author-only verdicts from that
+   * cache. Handing it the CONFIGURED repository while the route went on to read another is
+   * how a write grant on one repository becomes an author-level decision about a second —
+   * harmless while every review route is any-role, and privilege confusion the moment one
+   * is not. The failure is invisible from the response, so the assertion has to be on what
+   * the authorizer was told.
+   */
+  it('hands the authorizer the repository the request named', async () => {
+    const seen: { owner: string; repo: string }[] = [];
+    const authorize: CollabAuthorizer = (_op, ctx) => {
+      seen.push({ owner: ctx.repo.owner, repo: ctx.repo.repo });
+      return { ok: true };
+    };
+    await call(router({ authorize }), 'GET', '/repos/other/tools/pulls/42/files');
+    expect(seen).toEqual([OTHER]);
+  });
+
+  it('hands the authorizer the configured repository on the legacy form', async () => {
+    const seen: { owner: string; repo: string }[] = [];
+    const authorize: CollabAuthorizer = (_op, ctx) => {
+      seen.push({ owner: ctx.repo.owner, repo: ctx.repo.repo });
+      return { ok: true };
+    };
+    await call(router({ authorize }), 'GET', '/pulls/42/files');
+    expect(seen).toEqual([{ owner: 'acme', repo: 'specs' }]);
+  });
+
+  /*
+   * The availability cache is keyed by `owner/repo#base` plus the credential fingerprint,
+   * so keying per requested repository comes free — but it was unreachable before, because
+   * only one repository could ever get in. These two assert both halves: a second
+   * repository is preflighted on its own rather than reading the first one's entry, and a
+   * repeat of the same repository still costs nothing.
+   */
+  it('preflights each requested repository separately rather than reusing the configured answer', async () => {
+    const asked: string[] = [];
+    const preflight = async (repo: { owner: string; repo: string }): Promise<CollaborationPreflight> => {
+      asked.push(`${repo.owner}/${repo.repo}`);
+      return { ...OK_PREFLIGHT, repo: { ...repo, baseBranch: 'main' } };
+    };
+    const r = router({ preflight });
+    await call(r, 'GET', '/pulls');
+    await call(r, 'GET', '/repos/other/tools/pulls');
+    expect(asked).toEqual(['acme/specs', 'other/tools']);
+  });
+
+  it('reuses one requested repository’s availability across its own reads and no other’s', async () => {
+    const asked: string[] = [];
+    const preflight = async (repo: { owner: string; repo: string }): Promise<CollaborationPreflight> => {
+      asked.push(`${repo.owner}/${repo.repo}`);
+      return { ...OK_PREFLIGHT, repo: { ...repo, baseBranch: 'main' } };
+    };
+    const r = router({ preflight });
+    await call(r, 'GET', '/repos/other/tools/pulls');
+    await call(r, 'GET', '/repos/other/tools/pulls/42/files');
+    await call(r, 'GET', '/repos/third/thing/pulls');
+    expect(asked).toEqual(['other/tools', 'third/thing']);
+  });
+
+  it('reports a requested repository whose preflight fails against that repository, not the configured one', async () => {
+    const preflight = async (repo: { owner: string; repo: string }): Promise<CollaborationPreflight> =>
+      repo.repo === 'tools'
+        ? { available: false, reason: 'missing_scope', message: 'no repo scope', missingScopes: ['repo'] }
+        : OK_PREFLIGHT;
+    const r = router({ preflight });
+    expect((await call(r, 'GET', '/repos/other/tools/pulls')).status).toBe(503);
+    // The configured repository is unaffected: a second repository being unavailable is
+    // not this server becoming unavailable (R-W4.4).
+    expect((await call(r, 'GET', '/pulls')).status).toBe(200);
+  });
+});
+
+describe('R-W3.8 — reviewing a pull request of any repository is a read', () => {
+  it('asks for nothing stronger than `read`, `comment` or `reply` on a named repository', async () => {
+    const seen: string[] = [];
+    const authorize: CollabAuthorizer = (op) => {
+      seen.push(op);
+      return { ok: true };
+    };
+    const r = router({ authorize });
+    for (const path of [
+      '/repos/other/tools/pulls',
+      '/repos/other/tools/pulls/42/description',
+      '/repos/other/tools/pulls/42/files',
+      '/repos/other/tools/pulls/42/comments',
+      '/repos/other/tools/pulls/42/tree',
+      '/repos/other/tools/pulls/42/raw',
+      '/repos/other/tools/pulls/42/drafts',
+    ]) {
+      await call(r, 'GET', path);
+    }
+    expect(new Set(seen)).toEqual(new Set(['read']));
+  });
+
+  /*
+   * R-W3.4, made structural. Nothing today reaches this branch — the scoped form only
+   * dispatches the review family, and every route in it is `read`, `comment` or `reply` —
+   * which is exactly why it is asserted through `gate` directly rather than through a
+   * route. The day somebody adds a repo-scoped route for an operation that commits, this
+   * is what refuses it instead of letting the configured repository's write grant answer
+   * for a repository the credential can only read.
+   */
+  it('refuses an operation that commits on a repository named by the request', async () => {
+    const authorize: CollabAuthorizer = () => ({ ok: true });
+    const r = createCollabRoutes({
+      jobs: createJobHubRegistry(),
+      config: () => ENABLED,
+      documents: () => {
+        throw new Error('unused');
+      },
+      preflight: async () => OK_PREFLIGHT,
+      authorize,
+      baseDir: () => '/tmp/does-not-matter',
+      git: noGit,
+      repoAdapter: () => repoAdapter().adapter,
+    });
+    // `/publish` is a document route, so the scoped form does not dispatch it at all —
+    // the refusal is a 404 rather than a 403, which is the stronger of the two answers.
+    const res = await call(r, 'POST', '/repos/other/tools/doc-1/publish', {}, { markdown: '# x' });
+    expect(res.status).toBe(404);
+  });
+
+  /*
+   * The second line, behind the routing. Unreachable code cannot be driven through a
+   * route, and a guard nobody can see is a guard somebody deletes — so the closed set and
+   * the refusal that reads it are asserted where they live. This is the same argument the
+   * `/pulls`-family ordering test makes in `collab.pulls.test.ts`, for the same kind of
+   * failure: silent, and only visible in the source until the day it is not.
+   */
+  it('keeps the permitted-operation set closed and consulted, in the source', () => {
+    const text = src('core/vite/routes/collab.ts');
+    const declared = /const REVIEW_OPERATIONS: ReadonlySet<CollabOperation> = new Set<CollabOperation>\(\[([^\]]*)\]\)/.exec(text);
+    expect(declared, 'REVIEW_OPERATIONS is declared as a closed set').not.toBeNull();
+    expect(declared?.[1]).toBe("'read', 'comment', 'reply'");
+    expect(text).toContain('if (requested && !REVIEW_OPERATIONS.has(op))');
+  });
+
+  it('never asks whether the credential can write to a repository it is only reviewing', async () => {
+    let probed = 0;
+    const authorize: CollabAuthorizer = () => ({ ok: true });
+    authorize.writeAccess = async () => {
+      probed += 1;
+      return { write: true };
+    };
+    const r = router({ authorize });
+    await call(r, 'GET', '/repos/other/tools/pulls');
+    await call(r, 'GET', '/repos/other/tools/pulls/42/files');
+    expect(probed).toBe(0);
   });
 });
 
