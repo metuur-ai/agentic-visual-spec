@@ -1,0 +1,212 @@
+/**
+ * collab.repo-scoped.test.ts — reviewing a pull request of a repository the server was
+ * not started against (Unit 3, R-W3.1 … R-W3.8, and the R-W6.4 … R-W6.6 tests Unit 6 asks
+ * for by name).
+ *
+ * Kept apart from `collab.pulls.test.ts` for the reason that file is kept apart from
+ * `collab.test.ts`: everything here is about the repository a request NAMES, and the
+ * doubles it needs — an adapter that records which repository it was asked about, an
+ * authorizer that records the same, a preflight that answers per repository — are shared
+ * by no test there. The legacy-form assertions live here too, deliberately: "the old form
+ * still resolves the configured repository" is only meaningful next to "the new form
+ * resolves the named one".
+ *
+ * No real network, no `gh` and no `git`: every executor is injected (R-4.8 / R-12.3).
+ */
+import { describe, expect, it } from 'vitest';
+import type { CollaborationPreflight } from '../../collaboration/credentials';
+import type { GitHubAdapter, RepoRef } from '../../collaboration/github-adapter';
+import { createJobHubRegistry } from '../../collaboration/job-hub';
+import type { GitExecutor } from '../../git-context';
+import type { ResolvedVisualSpecConfig } from '../../config';
+import { type CollabAuthorizer, type CollabDeps, type CollabRouteResult, createCollabRoutes } from './collab';
+
+/** The repository the server was started against. Every "configured" assertion is this one. */
+const CONFIGURED = { owner: 'acme', repo: 'specs', baseBranch: 'main' } as const;
+/** A repository the server was NOT started against — the one this whole unit exists for. */
+const OTHER: RepoRef = { owner: 'other', repo: 'tools' };
+
+const ENABLED: ResolvedVisualSpecConfig = {
+  surfacesDir: 'surfaces',
+  collaboration: { ...CONFIGURED },
+  git: { allowCheckout: false },
+};
+
+const OK_PREFLIGHT: CollaborationPreflight = {
+  available: true,
+  source: 'gh-auth-state',
+  login: 'octocat',
+  scopes: ['repo'],
+  repo: { ...CONFIGURED },
+};
+
+const ALLOW_ALL: CollabAuthorizer = () => ({ ok: true });
+
+/**
+ * The repo-level adapter double, recording the repository of every call.
+ *
+ * `repos` is the whole point: a route that resolved the wrong repository still answers
+ * 200 with a plausible pull request list, so the only thing that can catch it is what
+ * GitHub was asked about.
+ */
+function repoAdapter() {
+  const repos: RepoRef[] = [];
+  const adapter = {
+    async listPullRequests(repo: RepoRef) {
+      repos.push(repo);
+      return [];
+    },
+    async getPullRequest(repo: RepoRef, pullNumber: number) {
+      repos.push(repo);
+      return {
+        number: pullNumber,
+        headSha: 'a'.repeat(40),
+        baseBranch: 'main',
+        headBranch: 'patch-1',
+        state: 'open',
+        htmlUrl: `https://github.com/${repo.owner}/${repo.repo}/pull/${pullNumber}`,
+        body: '',
+        merged: false,
+        mergeable: true,
+        mergeableState: 'clean',
+      };
+    },
+    async listReviewComments(repo: RepoRef) {
+      repos.push(repo);
+      return [];
+    },
+    async listThreadResolution(repo: RepoRef) {
+      repos.push(repo);
+      return [];
+    },
+    async compareCommits(repo: RepoRef) {
+      repos.push(repo);
+      return { mergeBaseSha: 'b'.repeat(40), aheadBy: 1, behindBy: 0, files: ['docs/spec.md'] };
+    },
+    async listFiles(repo: RepoRef, path: string) {
+      repos.push(repo);
+      return [{ name: 'spec.md', path: `${path}spec.md`, type: 'file', sha: 'c'.repeat(40), size: 3 }];
+    },
+    async getFile(repo: RepoRef, path: string) {
+      repos.push(repo);
+      return { path, content: '# from the host\n', sha: 'c'.repeat(40) };
+    },
+  } as unknown as GitHubAdapter;
+  return { adapter, repos };
+}
+
+/**
+ * A served directory that is NOT a git working tree, so every review here takes the host
+ * source (R-W1.3) and no test in this file depends on a checkout it did not create. The
+ * repository under review is the subject; where its bytes come from is not.
+ */
+const noGit: GitExecutor = async () => ({ stdout: '', exitCode: 1 });
+
+function router(overrides: Partial<CollabDeps> = {}) {
+  return createCollabRoutes({
+    jobs: createJobHubRegistry(),
+    config: () => ENABLED,
+    documents: () => {
+      throw new Error('the /pulls family must not read the document store');
+    },
+    preflight: async () => OK_PREFLIGHT,
+    authorize: ALLOW_ALL,
+    baseDir: () => '/tmp/does-not-matter',
+    git: noGit,
+    repoAdapter: () => repoAdapter().adapter,
+    ...overrides,
+  });
+}
+
+const call = (
+  r: ReturnType<typeof router>,
+  method: string,
+  pathname: string,
+  query: Record<string, string> = {},
+  body: Record<string, unknown> = {},
+): Promise<CollabRouteResult> => r.handle({ method, pathname, query, body });
+
+/* ================================================================== *
+ * R-W3.1 / R-W3.2 — the repository is named in the PATH
+ * ================================================================== */
+describe('R-W3.1 — a request that reviews a pull request names its repository', () => {
+  /*
+   * The repository travels in the path and not in a body field or a header for two
+   * reasons that are both about what CANNOT go wrong. A body field is absent on every
+   * GET in this family, so "the client forgot it" would have to be answered by
+   * substituting the configured repository — the exact wrong-repository review R-W3.1
+   * forbids. A header cannot carry it at all: `GET /:id/events` is an `EventSource`, and
+   * `EventSource` has no way to set one, which is the same reason the request guard is
+   * not a bearer token.
+   */
+  it('resolves the repository named in the path, not the configured one', async () => {
+    const gh = repoAdapter();
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/repos/other/tools/pulls');
+    expect(res.status).toBe(200);
+    expect(gh.repos).toEqual([OTHER]);
+  });
+
+  it('resolves the named repository on every route in the family, not only the listing', async () => {
+    const gh = repoAdapter();
+    const r = router({ repoAdapter: () => gh.adapter });
+    for (const path of [
+      '/repos/other/tools/pulls',
+      '/repos/other/tools/pulls/42/description',
+      '/repos/other/tools/pulls/42/files',
+      '/repos/other/tools/pulls/42/comments',
+      '/repos/other/tools/pulls/42/tree',
+    ]) {
+      const res = await call(r, 'GET', path);
+      expect(res.status, path).toBe(200);
+    }
+    expect(gh.repos.every((repo) => repo.owner === 'other' && repo.repo === 'tools')).toBe(true);
+    expect(gh.repos.length).toBeGreaterThan(0);
+  });
+
+  /*
+   * R-W6.5 — the refusal, stated as the requirement states it: a request naming no
+   * repository, ON A ROUTE THAT REQUIRES ONE, is refused rather than defaulted. Each of
+   * these paths is the new form with one half of the identifier missing, and the failure
+   * they guard against is silent — substituting the configured repository would answer
+   * 200 with somebody else's pull requests under the name of the one that was asked for.
+   */
+  for (const path of ['/repos', '/repos/', '/repos/acme', '/repos/acme/', '/repos/acme/pulls', '/repos//specs/pulls']) {
+    it(`refuses ${path} rather than substituting the configured repository`, async () => {
+      const gh = repoAdapter();
+      const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', path);
+      expect(res.status).toBe(404);
+      // Nothing was asked of GitHub, so nothing could have been answered about the
+      // wrong repository — the refusal is before the network, not after it.
+      expect(gh.repos).toEqual([]);
+    });
+  }
+
+  /*
+   * The converse of R-W3.8, at the routing layer: the scoped form reaches the review
+   * family and nothing else. A scoped document route would be a repository-named request
+   * for an operation that commits, which is exactly what R-W3.4 is about — so it is not
+   * reachable rather than being reachable and refused.
+   */
+  it('refuses a repository-scoped path whose tail is not a review of a pull request', async () => {
+    for (const path of ['/repos/acme/specs', '/repos/acme/specs/', '/repos/acme/specs/doc-1', '/repos/acme/specs/start']) {
+      const res = await call(router(), 'GET', path);
+      expect(res.status, path).toBe(404);
+    }
+  });
+});
+
+describe('R-W3.2 — the route form that predates this requirement applies the configured repository', () => {
+  it('resolves the configured repository for the legacy listing', async () => {
+    const gh = repoAdapter();
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls');
+    expect(res.status).toBe(200);
+    expect(gh.repos).toEqual([{ owner: 'acme', repo: 'specs' }]);
+  });
+
+  it('resolves the configured repository for a legacy review of a pull request', async () => {
+    const gh = repoAdapter();
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/42/files');
+    expect(res.status).toBe(200);
+    expect(gh.repos.every((repo) => repo.owner === 'acme' && repo.repo === 'specs')).toBe(true);
+  });
+});

@@ -628,6 +628,63 @@ export type AwaitingSide = { ok: false } | { ok: true; total: number; items: Awa
 /** The body of `GET /__vs/collab/pulls/awaiting`. Each side fails alone (R-A4.4). */
 export type Awaiting = { reviewRequested: AwaitingSide; mentioned: AwaitingSide };
 
+/* ------------------------------------------------------------------ *
+ * Naming a repository in the path (R-W3.1, R-W3.2)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The repository-scoped form of every route that reviews a pull request:
+ * `/repos/:owner/:repo/pulls/…`, sitting in front of the legacy `/pulls/…` form.
+ *
+ * WHY THE PATH AND NOT A BODY FIELD OR A HEADER. A body field cannot carry it: every
+ * route in the review family except the draft writes is a `GET`, and there is no body to
+ * read. A header cannot either — `GET /:id/events` is an `EventSource`, and `EventSource`
+ * has no way to set one, which is the same constraint that stopped the request guard from
+ * being a bearer token. That leaves the path, and the path is the better answer anyway:
+ * a client that forgets the repository produces a path that matches nothing, so
+ * "forgotten" is a 404 rather than a plausible review of whichever repository the server
+ * happened to be started against (R-W3.1).
+ *
+ * BOTH SEGMENTS OR NEITHER. The optional group takes owner and repo together, so a path
+ * with one of them — `/repos/acme/pulls` — leaves the group unmatched and the tail
+ * `/acme/pulls`, which is not a review route and is refused. There is deliberately no
+ * spelling of this route that names half a repository and is answered.
+ *
+ * THE LEGACY FORM IS UNTOUCHED (R-W3.2). A path that does not begin `/repos/` never
+ * reaches this pattern; it is dispatched exactly as it was, against the configured
+ * repository, which is what keeps the shipped listing and local mode unaffected.
+ */
+const REPO_SCOPE_RE = /^\/repos(?:\/([^/]+)\/([^/]+))?(\/.*)?$/;
+
+/**
+ * What the scope prefix resolved to: the repository the request named, and the path that
+ * remains once it is stripped.
+ *
+ * `repo: null` is the legacy form — no repository was named, and the configured one
+ * applies. It is NOT "the request named one and we could not read it": that case is
+ * `ok: false`, and it is a refusal, never a fallback (R-W3.1).
+ */
+type RepoScope = { ok: true; repo: RepoRef | null; pathname: string } | { ok: false };
+
+/**
+ * Strip a repository-scoped prefix off a path, or report that the path claimed to carry
+ * one and did not.
+ *
+ * Only the review family is reachable through the scoped form. A scoped path whose tail
+ * is a document route is refused rather than served, because a document route can commit
+ * (`create`, `publish`) and R-W3.4 forbids one repository's permissions authorizing an
+ * operation on another — making the combination unreachable is stronger than making it
+ * refusable, and cheaper to keep true.
+ */
+function repoScopeOf(pathname: string): RepoScope {
+  if (pathname !== '/repos' && !pathname.startsWith('/repos/')) return { ok: true, repo: null, pathname };
+  const match = REPO_SCOPE_RE.exec(pathname);
+  if (!match || !match[1] || !match[2]) return { ok: false };
+  const tail = match[3] ?? '';
+  if (tail !== '/pulls' && !tail.startsWith('/pulls/')) return { ok: false };
+  return { ok: true, repo: { owner: match[1], repo: match[2] }, pathname: tail };
+}
+
 /**
  * A pull number as it arrives in a path segment.
  *
@@ -875,9 +932,27 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   // so plain throttling was enough to poison it.
   const cache = new Map<string, { snapshot: CollabAvailability; expiresAt: number }>();
 
-  async function availability(): Promise<CollabAvailability> {
-    const repo = deps.config().collaboration;
-    if (!repo) return NOT_CONFIGURED;
+  /**
+   * Availability for ONE repository — the one a request named, or the configured one.
+   *
+   * R-W3.3 — THE REPOSITORY IS A PARAMETER, NOT A CONSTANT. It used to be read from
+   * `deps.config()` here, which made every answer this function gave a statement about
+   * the configured repository whatever the request was about. The cache key already
+   * carried `owner/repo`, so keying per requested repository costs nothing extra now that
+   * the repository is passed in — but it was unreachable before, because only one
+   * repository could ever get in.
+   *
+   * WHAT THE PREFLIGHT DOES AND DOES NOT ASK. `preflightCollaboration` probes the
+   * credential and its identity (`gh api /user`); it does not touch the repository and
+   * echoes the one it was given back on the result. So preflighting a second repository
+   * is not a second question to GitHub about access — it is the same identity answer,
+   * cached under a second key. Whether the credential can actually READ the repository is
+   * GitHub's own answer to the first call that asks it for something, which is where a
+   * repository this credential cannot see surfaces as a 404 rather than as a preflight
+   * failure. That is the honest place for it: a preflight that claimed to know would be
+   * asserting an access fact it never checked.
+   */
+  async function availabilityFor(repo: ResolvedCollaborationConfig): Promise<CollabAvailability> {
     const key = `${repo.owner}/${repo.repo}#${repo.baseBranch}@${credentialFingerprint(deps.env)}`;
     const cached = cache.get(key);
     if (cached && cached.expiresAt > clock()) return cached.snapshot;
@@ -893,7 +968,13 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
     }
     const snapshot: CollabAvailability = {
       available: true,
-      repo: result.repo,
+      // The repository this snapshot is ABOUT is the one asked about, not the one the
+      // preflight echoed back. They are the same object in production — the echo is
+      // `options.repo` returned unchanged — but reading it off the echo would make the
+      // answer depend on a value the preflight has no opinion about, and a double that
+      // answers a constant would then silently report the configured repository for a
+      // request that named another (R-W3.3).
+      repo,
       login: result.login,
       scopes: result.scopes,
     };
@@ -901,21 +982,85 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
     return snapshot;
   }
 
+  /** R-7.8 — the snapshot the UI reads, which is always about the configured repository. */
+  async function availability(): Promise<CollabAvailability> {
+    const repo = deps.config().collaboration;
+    if (!repo) return NOT_CONFIGURED;
+    return availabilityFor(repo);
+  }
+
+  /**
+   * R-W3.8 — every operation a request that NAMED a repository is allowed to ask for.
+   *
+   * Reviewing a pull request of any repository is a read: the reviewer opens files, lists
+   * directories and posts review comments, none of which needs write access to it, and
+   * `OPERATION_POLICY` in `authorization.ts` already classifies all three as `any-role`.
+   *
+   * WHY IT IS A CLOSED SET HERE AND NOT ONLY A POLICY THERE. The failure R-W3.4 names is
+   * invisible today and stays invisible right up until somebody adds a repo-scoped route
+   * for an author-only operation — at which point a credential's write grant on the
+   * configured repository would decide an author-level question about a repository it can
+   * only read. Naming the permitted operations at the gate means that route is refused on
+   * the day it is written rather than shipped and discovered later. Adding an operation to
+   * this set is then a deliberate act with this comment attached to it.
+   */
+  const REVIEW_OPERATIONS: ReadonlySet<CollabOperation> = new Set<CollabOperation>(['read', 'comment', 'reply']);
+
   /**
    * Availability + authorization in one step, because no GitHub-touching route may skip
    * either. Resolves to the enabled context or to the response to send instead.
+   *
+   * `requested` is the repository the request named, or `null` for the legacy form.
+   * BOTH THE AVAILABILITY CHECK AND THE AUTHORIZER SEE IT (R-W3.3): the authorizer caches
+   * effective permission per `owner/repo` and derives its author-only verdicts from that
+   * cache, so handing it the configured repository while the route went on to read another
+   * is precisely how a write grant on one repository becomes an author-level decision
+   * about a second (R-W3.4). One repository, decided once, used by both.
    */
   async function gate(
     op: CollabOperation,
     documentId: string | null,
+    requested: RepoRef | null = null,
   ): Promise<{ ok: true; repo: ResolvedCollaborationConfig; login: string } | { ok: false; result: CollabRouteResult }> {
-    const state = await availability();
+    const configured = deps.config().collaboration;
+    // R-W5.1 — with no collaboration configured there is no credential and no session to
+    // review anything with, whatever the request named. Local mode answers exactly as it
+    // did before this feature existed.
+    if (!configured) return { ok: false, result: { status: 503, json: NOT_CONFIGURED } };
+
+    /*
+     * `baseBranch` stays the configured one for a named repository, and is never read on
+     * any path a named repository can reach: the review routes take a pull request's base
+     * from `getPullRequest`, and the two places that use the configured base — the create
+     * and publish job bodies — are document-scoped and unreachable from the scoped form.
+     * Carrying it is a shape obligation of `ResolvedCollaborationConfig`, not a claim
+     * about the reviewed repository's default branch.
+     */
+    const repo: ResolvedCollaborationConfig = requested
+      ? { owner: requested.owner, repo: requested.repo, baseBranch: configured.baseBranch }
+      : configured;
+
+    if (requested && !REVIEW_OPERATIONS.has(op)) {
+      return {
+        ok: false,
+        result: {
+          status: 403,
+          json: {
+            error:
+              `${op} is not available on a repository named by the request: reviewing ${repo.owner}/${repo.repo} is a read, ` +
+              'and an operation that commits must be run against the repository this server was started for.',
+          },
+        },
+      };
+    }
+
+    const state = await availabilityFor(repo);
     // R-7.8 — "off" is a 503 carrying the same payload the UI already understands,
     // never a 500 and never a thrown error.
     if (!state.available) return { ok: false, result: { status: 503, json: state } };
-    const verdict = await authorize(op, { documentId, login: state.login, repo: state.repo });
+    const verdict = await authorize(op, { documentId, login: state.login, repo });
     if (!verdict.ok) return { ok: false, result: { status: verdict.status, json: { error: verdict.error } } };
-    return { ok: true, repo: state.repo, login: state.login };
+    return { ok: true, repo, login: state.login };
   }
 
   /** Load a document, or the response to send when it is unknown. */
@@ -1016,8 +1161,21 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   }
 
   async function handle(req: CollabRequest): Promise<CollabRouteResult> {
-    const { method, pathname, body } = req;
+    const { method, body } = req;
     try {
+      /*
+       * R-W3.1 / R-W3.2 — which repository is this request about, before anything else is
+       * decided. The answer is one of three: a repository the request named, `null` for
+       * the legacy form (the configured repository applies), or a refusal.
+       *
+       * It is stripped here, once, rather than in each of the eleven handlers below, so
+       * that every route in the review family gains the scoped form together and none can
+       * be left behind resolving the configured repository on a path that named another.
+       */
+      const scope = repoScopeOf(req.pathname);
+      if (!scope.ok) return notFound(method, req.pathname);
+      const requestedRepo = scope.repo;
+      const pathname = scope.pathname;
       /* GET /__vs/collab — R-7.8, the flag the UI renders (or hides) controls on. */
       if (method === 'GET' && (pathname === '' || pathname === '/')) {
         const state = await availability();
@@ -1152,7 +1310,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         if (state !== 'open' && state !== 'closed' && state !== 'all') {
           return bad(`invalid state: ${state} — expected open, closed or all`);
         }
-        const gated = await gate('read', null);
+        const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
         try {
           const pulls = await repoAdapter().listPullRequests(repoRefOf(gated.repo), state as PullRequestListState);
@@ -1171,7 +1329,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
        * by hand, is reported correctly on the first request after a restart.
        */
       if (method === 'GET' && pathname === '/pulls/mounted') {
-        const gated = await gate('read', null);
+        const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
         return { status: 200, json: { worktrees: await listMountedWorktrees(baseDir(), git) } };
       }
@@ -1199,7 +1357,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
        * credential cannot search, leaves the top-level response free of an error entirely.
        */
       if (method === 'GET' && pathname === '/pulls/awaiting') {
-        const gated = await gate('read', null);
+        const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
         const { login } = gated;
         if (!GITHUB_LOGIN_RE.test(login)) {
@@ -1254,7 +1412,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
       if (mount && (method === 'POST' || method === 'DELETE')) {
         const pullNumber = parsePullNumber(mount[1]!);
         if (pullNumber === null) return bad(`invalid pullNumber: ${mount[1]!}`);
-        const gated = await gate('read', null);
+        const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
 
         /* DELETE — "already gone" is the outcome the caller wanted, so it is a 200. */
@@ -1330,7 +1488,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
       if (pullTree && method === 'GET') {
         const pullNumber = parsePullNumber(pullTree[1]!);
         if (pullNumber === null) return bad(`invalid pullNumber: ${pullTree[1]!}`);
-        const gated = await gate('read', null);
+        const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
         const resolved = await reviewSourceFor(repoRefOf(gated.repo), pullNumber);
         if (!resolved.ok) return resolved.result;
@@ -1376,7 +1534,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
       if (pullDescription && method === 'GET') {
         const pullNumber = parsePullNumber(pullDescription[1]!);
         if (pullNumber === null) return bad(`invalid pullNumber: ${pullDescription[1]!}`);
-        const gated = await gate('read', null);
+        const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
         try {
           const pull = await repoAdapter().getPullRequest(repoRefOf(gated.repo), pullNumber);
@@ -1394,7 +1552,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
       if (pullFiles && method === 'GET') {
         const pullNumber = parsePullNumber(pullFiles[1]!);
         if (pullNumber === null) return bad(`invalid pullNumber: ${pullFiles[1]!}`);
-        const gated = await gate('read', null);
+        const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
         const repoRef = repoRefOf(gated.repo);
         try {
@@ -1440,7 +1598,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
       if (pullComments && method === 'GET') {
         const pullNumber = parsePullNumber(pullComments[1]!);
         if (pullNumber === null) return bad(`invalid pullNumber: ${pullComments[1]!}`);
-        const gated = await gate('read', null);
+        const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
         const repoRef = repoRefOf(gated.repo);
         try {
@@ -1482,7 +1640,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         const rootId = reviewCommentIdFor(commentId);
         if (rootId === null) return bad(`invalid commentId: ${commentId}`);
         const text = requireString(body, 'comment');
-        const gated = await gate('reply', null);
+        const gated = await gate('reply', null, requestedRepo);
         if (!gated.ok) return gated.result;
         const repoRef = repoRefOf(gated.repo);
         try {
@@ -1531,7 +1689,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
          * what they already sent alongside what they have not). Ordering is creation
          * order, straight off the store. */
         if (method === 'GET') {
-          const gated = await gate('read', null);
+          const gated = await gate('read', null, requestedRepo);
           if (!gated.ok) return gated.result;
           return { status: 200, json: { drafts: await readReviewDrafts(baseDir(), pullNumber) } };
         }
@@ -1551,7 +1709,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         const endLine = optionalLine(body, 'endLine');
         if (startLine === undefined && endLine !== undefined) return bad('endLine without startLine');
         if (startLine !== undefined && endLine !== undefined && endLine < startLine) return bad('endLine precedes startLine');
-        const gated = await gate('read', null);
+        const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
         try {
           const draft = await addReviewDraft(baseDir(), pullNumber, {
@@ -1577,7 +1735,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         if (pullNumber === null) return bad(`invalid pullNumber: ${draftItem[1]!}`);
         const draftId = draftItem[2]!;
         if (!DRAFT_ID_RE.test(draftId)) return bad(`invalid draftId: ${draftId}`);
-        const gated = await gate('read', null);
+        const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
         try {
           // "Already gone" is the outcome the caller asked for, so it is a 200 with
@@ -1610,7 +1768,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         if (pullNumber === null) return bad(`invalid pullNumber: ${draftPublish[1]!}`);
         const draftId = draftPublish[2]!;
         if (!DRAFT_ID_RE.test(draftId)) return bad(`invalid draftId: ${draftId}`);
-        const gated = await gate('comment', null);
+        const gated = await gate('comment', null, requestedRepo);
         if (!gated.ok) return gated.result;
 
         const draft = (await readReviewDrafts(baseDir(), pullNumber)).find((d) => d.id === draftId);
@@ -1722,7 +1880,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
       // Everything below is document-scoped. One match, then a switch on the tail —
       // hand-rolled to match the rest of `/__vs`, no router library.
       const scoped = /^\/([^/]+)(\/.*)?$/.exec(pathname);
-      if (!scoped) return notFound(method, pathname);
+      if (!scoped) return notFound(method, req.pathname);
       const documentId = scoped[1]!;
       const tail = scoped[2] ?? '';
       if (!DOCUMENT_ID_RE.test(documentId)) return bad(`invalid documentId: ${documentId}`);
@@ -2019,7 +2177,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         return { status: 200, json: { ok: true, comment: updated } };
       }
 
-      return notFound(method, pathname);
+      return notFound(method, req.pathname);
     } catch (err) {
       // `hub()` throws on a documentId failing DOCUMENT_ID_RE, and `requireString`
       // throws on a missing field — both are malformed requests, so 400 (not 500).
