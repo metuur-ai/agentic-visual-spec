@@ -874,3 +874,63 @@ describe('what is checked out on disk (R-C1)', () => {
     expect(row(42)!.textContent).toContain('#42');
   });
 });
+
+/* ================================================================== *
+ * R-C2 — whether a checkout is still worth reading
+ * ================================================================== */
+/*
+ * The badge named a commit and stopped. A reviewer reading a working copy pinned to a
+ * commit the branch has moved past is reading code that no longer exists, and nothing on
+ * screen said so — everything looked normal, which is what made it undiagnosable.
+ *
+ * NOTHING HERE READS A STYLE. R-C2.4 is that each state is legible without colour, so
+ * every assertion below is on text content: set every colour in the component to the same
+ * value and these still pass, and still tell the three states apart.
+ */
+describe('whether a checkout is at the pull request’s head (R-C2)', () => {
+  /** The pull request has moved on; the checkout has not. */
+  const MOVED = { ...PULL, headSha: '9f9f9f9aaaa111' };
+  const STALE_WORKTREE = { ...WORKTREE, headSha: 'old1234cafe99' };
+  const UNLISTED_WORKTREE = {
+    pullNumber: 7,
+    repo: REPO,
+    path: '/repo/.visual-spec/worktrees/acme/docs/pr-7',
+    headSha: 'feed123beef456',
+  };
+
+  const row = (n: number) => document.querySelector(`[data-vs-checkout="${n}"]`) as HTMLElement | null;
+
+  function mountPanel(worktrees: unknown[], pulls: unknown[] = [PULL]) {
+    const { impl, calls } = fakeFetch({
+      '/__vs/collab/pulls?state=open': { ok: true, status: 200, json: { pulls } },
+      '/__vs/collab/pulls/mounted': { ok: true, status: 200, json: { worktrees } },
+    });
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    return { calls };
+  }
+
+  /**
+   * The three reads the panel makes on mount and nothing else. R-C2.5 is asserted against
+   * this set: the comparison is a `===` between two values already on screen, so a fourth
+   * URL appearing here would mean the panel had gone and asked somebody for it.
+   */
+  const ON_MOUNT = ['/__vs/collab', '/__vs/collab/pulls/mounted', '/__vs/collab/pulls?state=open'];
+
+  it('says a checkout at the pull request’s head is up to date (R-C2.1)', async () => {
+    const { calls } = mountPanel([WORKTREE], [PULL]);
+
+    await waitFor(() => expect(row(42)!.textContent).toContain('Up to date'));
+    expect(row(42)!.textContent).not.toContain('Out of date');
+    // R-C2.5 — both commits were already read, so the answer cost no request.
+    expect([...new Set(calls.map((c) => c.url))].sort()).toEqual(ON_MOUNT);
+  });
+
+  it('says a checkout the branch has moved past is out of date (R-C2.1)', async () => {
+    const { calls } = mountPanel([STALE_WORKTREE], [MOVED]);
+
+    await waitFor(() => expect(row(42)!.textContent).toContain('Out of date'));
+    // R-C2.5 again, and this is the case that would tempt a "what is the head now?" call.
+    expect([...new Set(calls.map((c) => c.url))].sort()).toEqual(ON_MOUNT);
+  });
+
+});

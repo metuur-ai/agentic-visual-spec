@@ -555,6 +555,27 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
         {/* Where it is, because the point of the section is a copy of the repository you
             can go and look at — or delete by hand, which git's registry will then report. */}
         <div style={meta}>{worktree.path}</div>
+        {/*
+          * R-C2.1 / R-C2.5 — the comparison, made from what is already on screen.
+          *
+          * `pull.headSha` came back with the listing and `worktree.headSha` with the
+          * mounted registry, so this is a `===` between two values in memory and issues
+          * no request. That matters beyond cost: a reviewer reading a checkout the branch
+          * has moved past is reading code that no longer exists, and the version of this
+          * feature that had to ask GitHub for the head would have been the version that
+          * silently did nothing whenever the quota ran out.
+          */}
+        {pull &&
+          (pull.headSha === worktree.headSha ? (
+            <p data-vs-checkout-state="current" style={{ ...checkoutStateLine, color: '#047857' }}>
+              <span aria-hidden="true">✓</span> Up to date — the checkout is at {shortSha(worktree.headSha)}, which is
+              this pull request’s current head.
+            </p>
+          ) : (
+            <p data-vs-checkout-state="behind" style={{ ...checkoutStateLine, color: '#b45309' }}>
+              <span aria-hidden="true">!</span> Out of date — the checkout is not at this pull request’s current head.
+            </p>
+          ))}
         {!pull && (
           /*
            * R-C1.3 — say what is true and nothing more.
@@ -565,7 +586,7 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
            * is the claim the panel can actually stand behind, and the note under the
            * heading says the setting is what "the listing" means.
            */
-          <p data-vs-checkout-unlisted={worktree.pullNumber} style={checkoutStateLine}>
+          <p data-vs-checkout-state="unlisted" style={checkoutStateLine}>
             <span aria-hidden="true">?</span> Not in the listing — #{worktree.pullNumber} is not among the pull
             requests listed below. Removing the checkout frees its copy of the repository on disk.
           </p>
