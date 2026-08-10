@@ -79,11 +79,11 @@
   - verify: panel test asserts a single press issues a listing read, a mounted read and an awaiting read; and that the panel renders exactly one refresh control.
   - landed: `ui/collab-pulls-panel.tsx` — `refreshAll` runs the three reads concurrently through `Promise.all` (the listing, `refreshMounted`, and the store's `refreshAwaiting`), behind one `Refresh` button in the panel header beside `Show`; a `shownState` ref drops a listing answer that outlived a change of the `Show` setting. Tests: `ui/collab-pulls-panel.test.tsx` › "asking the panel to read all of it again (R-C3)" — "re-reads the listing, the checkouts and both counts on one press" (R-C3.1), "offers exactly one refresh control, and none inside a section" (R-C3.2), "re-reads the listing at the state the “Show” setting is on".
 
-- [ ] 3.3 Say a refresh is running, and refuse a second (deps: 3.2, est: ~20m)
+- [x] 3.3 Say a refresh is running, and refuse a second (deps: 3.2, est: ~20m)
   - why: these reads are not instant and one of them crosses the network. Without a running state the button looks inert and gets pressed again; five presses in ten seconds is fifteen calls against a search limit of thirty a minute.
   - acceptance: R-C3.3 — while a refresh is in progress the system says so and does not begin a second.
   - verify: panel test with a deferred response asserts the running state is shown and that a second press during it issues no further requests.
-  - landed:
+  - landed: `ui/collab-pulls-panel.tsx` — `refreshing` state drives the button's `BusyLabel` (`Refresh` → `Refreshing…`, with the ring) and its `disabled`/`aria-busy`; a `refreshRunning` ref refuses a press at the moment it happens rather than at the moment of the last render. Tests: "says a refresh is running, on the control that was pressed (R-C3.3)", "issues nothing further when it is pressed again mid-refresh (R-C3.3)" — four further presses against a held-open listing read — and "accepts a second refresh once the first has finished (R-C3.3)".
 
 - [ ] 3.4 Keep what is on screen when a refresh fails (deps: 3.2, est: ~15m)
   - why: the same rule the counts already follow (R-A4.3) and the listing already follows (R-7.11). A refused search is an ordinary Tuesday here, and it must cost the refresh, not the panel.

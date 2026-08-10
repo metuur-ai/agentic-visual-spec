@@ -1150,4 +1150,88 @@ describe('asking the panel to read all of it again (R-C3)', () => {
     await waitFor(() => expect(calls.slice(before).map((c) => c.url)).toContain('/__vs/collab/pulls?state=closed'));
     expect(calls.slice(before).map((c) => c.url)).not.toContain('/__vs/collab/pulls?state=open');
   });
+
+  /*
+   * R-C3.3 — a control that is waiting on the network says so, and refuses to be pressed
+   * again while it does.
+   *
+   * This is the panel's existing rule (see the `BusyLabel` block above) applied to the one
+   * control that fans out to three routes, and here it is a quota question as well as a
+   * legibility one. A button that greys out and does nothing visible gets pressed again:
+   * five presses in ten seconds is fifteen calls against a *search* budget of thirty a
+   * minute, and the counts are the side that would go dark for the rest of the page.
+   *
+   * The listing is the read held open, because it is the one that reaches GitHub.
+   */
+  function hangAfterFirstListing(worktrees: unknown[] = [WORKTREE]) {
+    const { impl, calls } = fakeFetch({
+      '/__vs/collab/pulls/mounted': { ok: true, status: 200, json: { worktrees } },
+    });
+    const base = impl as unknown as (u: string, i?: RequestInit) => Promise<Response>;
+    let listings = 0;
+    const wrapped = (async (url: string, init?: RequestInit) => {
+      if (url.startsWith('/__vs/collab/pulls?')) {
+        listings += 1;
+        if (listings > 1) return new Promise<Response>(() => {});
+      }
+      return base(url, init);
+    }) as unknown as typeof fetch;
+    return { impl: wrapped, calls };
+  }
+
+  it('says a refresh is running, on the control that was pressed (R-C3.3)', async () => {
+    stubStore();
+    const { impl } = hangAfterFirstListing();
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    await waitFor(() => expect(document.querySelector('[data-vs-checkouts]')).toBeTruthy());
+
+    fireEvent.click(refreshButton());
+
+    // The word, so a reader knows *what* is happening...
+    const running = await screen.findByRole('button', { name: /Refreshing…/ });
+    // ...and the ring, which is the part that says something is still happening at all.
+    expect(running.querySelector('[data-vs-spinner]')).toBeTruthy();
+    // The rows underneath are untouched while it runs: this is a re-read, not a reload.
+    // (The title is on screen twice — the checkout's row and the listing's — which is
+    // itself the point: neither was blanked to a spinner.)
+    expect(screen.getAllByText(/Rework the payment rules/).length).toBeGreaterThan(0);
+  });
+
+  it('issues nothing further when it is pressed again mid-refresh (R-C3.3)', async () => {
+    const { urls } = stubStore();
+    const { impl, calls } = hangAfterFirstListing();
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    await waitFor(() => expect(document.querySelector('[data-vs-checkouts]')).toBeTruthy());
+
+    fireEvent.click(refreshButton());
+    await screen.findByRole('button', { name: /Refreshing…/ });
+    const panelCalls = calls.length;
+    const countReads = counted(urls);
+
+    // Four more presses, the way an unconvinced reader presses.
+    for (let i = 0; i < 4; i += 1) fireEvent.click(refreshButton());
+    await Promise.resolve();
+
+    expect(calls.length).toBe(panelCalls);
+    expect(counted(urls)).toBe(countReads);
+  });
+
+  /*
+   * And it comes back. A running state that never cleared would be the same defect wearing
+   * the fix's clothes: the panel would still have no way to be asked a second time.
+   */
+  it('accepts a second refresh once the first has finished (R-C3.3)', async () => {
+    const { calls, urls } = await mountPanel();
+
+    fireEvent.click(refreshButton());
+    await waitFor(() => expect(refreshButton().textContent).toContain('Refresh'));
+    await waitFor(() => expect(refreshButton().disabled).toBe(false));
+    const before = calls.length;
+    const countReads = counted(urls);
+
+    fireEvent.click(refreshButton());
+
+    await waitFor(() => expect(counted(urls)).toBe(countReads + 1));
+    expect(calls.slice(before).map((c) => c.url)).toContain('/__vs/collab/pulls?state=open');
+  });
 });

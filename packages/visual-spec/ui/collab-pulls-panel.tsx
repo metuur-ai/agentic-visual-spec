@@ -216,6 +216,16 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
   }, [state]);
 
   /**
+   * Whether a refresh is running: once to say so on the control (R-C3.3), and once to
+   * decide, at the moment of a press rather than at the moment of a render, whether to
+   * refuse it. Same fact, two lifetimes — the state is for the reader, the ref is for the
+   * handler, which closes over the render it was created in and would otherwise be reading
+   * a `refreshing` that is up to a commit out of date.
+   */
+  const [refreshing, setRefreshing] = useState(false);
+  const refreshRunning = useRef(false);
+
+  /**
    * Read all three sources again, because nothing here ever does it on its own (R-C3.1).
    *
    * WHY A CONTROL AT ALL. R-7.10 forbids a timer — a poll against a repository spends
@@ -242,6 +252,18 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
    * `catch`, and a settled promise means "the reads are over", never "they succeeded".
    */
   const refreshAll = useCallback(async () => {
+    /*
+     * R-C3.3 — no second refresh while one is running.
+     *
+     * The ref and not `refreshing` alone: `disabled` on the button is what a reader meets,
+     * but the state a handler closes over is the state of the render it came from, and the
+     * question here is about *now*. Refusing costs nothing and the alternative is three
+     * more requests against a search budget of thirty a minute, spent to answer a question
+     * already being answered.
+     */
+    if (refreshRunning.current) return;
+    refreshRunning.current = true;
+    setRefreshing(true);
     const asked = state;
     const listing = client.pullRequests(asked).then((res) => {
       // R-C3.5 — a refused read costs the refresh and not the panel: no rows are cleared,
@@ -252,6 +274,11 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
       if (res.ok && shownState.current === asked) setPulls(res.value);
     });
     await Promise.all([listing, refreshMounted(), refreshAwaiting()]);
+    // All three are over — which is all this says. None of them reports whether it found
+    // anything, or whether it succeeded; the screen is whatever the reads that did succeed
+    // wrote to it, and the control goes back to being pressable either way.
+    refreshRunning.current = false;
+    setRefreshing(false);
   }, [client, refreshMounted, state]);
 
   /**
@@ -791,14 +818,21 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
           * reader who does not know that this is the only refresh there is will assume the
           * screen keeps itself up to date and never press it.
           */}
+        {/*
+          * R-C3.3 — the panel's own busy idiom, on the one control that fans out to three
+          * routes: the ring says something is still happening, the word says what. Disabled
+          * with it, so the refusal is visible rather than only enforced.
+          */}
         <button
           type="button"
           data-vs-refresh
           onClick={() => void refreshAll()}
+          disabled={refreshing}
+          aria-busy={refreshing}
           style={{ ...button, marginLeft: 'auto' }}
           title="Re-read the pull request listing, the checkouts on disk, and what is waiting on you. Nothing on this panel refreshes on its own."
         >
-          <BusyLabel busy={false}>Refresh</BusyLabel>
+          <BusyLabel busy={refreshing}>{refreshing ? 'Refreshing…' : 'Refresh'}</BusyLabel>
         </button>
       </div>
 
