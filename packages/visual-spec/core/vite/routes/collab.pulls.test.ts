@@ -841,8 +841,10 @@ describe('/__vs/collab/pulls/:n/drafts', () => {
         target: { path: 'docs/spec.md', kind: 'range', startLine: 12 },
       },
     });
-    // R-13.5 — the store writes under the git-ignored directory of the served tree.
-    expect(readFileSync(join(dir, '.visual-spec/reviews/pr-7.json'), 'utf8')).toContain('needs a caveat');
+    // R-13.5 — the store writes under the git-ignored directory of the served tree, and
+    // R-W3.6 — under the repository the review resolved to, since #7 exists in more than
+    // one repository and one file cannot hold two reviews' comments.
+    expect(readFileSync(join(dir, '.visual-spec/reviews/acme/specs/pr-7.json'), 'utf8')).toContain('needs a caveat');
   });
 
   it('lists held and published comments together, in creation order', async () => {

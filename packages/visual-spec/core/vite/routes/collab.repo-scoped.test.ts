@@ -14,9 +14,11 @@
  * No real network, no `gh` and no `git`: every executor is injected (R-4.8 / R-12.3).
  */
 import { readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CollaborationPreflight } from '../../collaboration/credentials';
 import type { GitHubAdapter, RepoRef } from '../../collaboration/github-adapter';
 import { createJobHubRegistry } from '../../collaboration/job-hub';
@@ -510,6 +512,113 @@ describe('R-W3.5 — the same pull request number in two repositories denotes tw
     const res = await call(r, 'GET', '/repos/acme/specs/pulls/42/raw', { path: 'docs/spec.md' });
     expect(res.status).toBe(200);
     expect(res.json).toMatchObject({ headSha: '2'.repeat(40) });
+  });
+});
+
+/* ================================================================== *
+ * R-W3.6 — held review comments are a repository AND a number
+ * ================================================================== */
+describe('R-W3.6 — a comment held on one repository’s #42 is not a comment on another’s', () => {
+  let base: string;
+
+  beforeEach(async () => {
+    base = await mkdtemp(join(tmpdir(), 'vs-repo-scoped-'));
+  });
+
+  afterEach(async () => {
+    await rm(base, { recursive: true, force: true });
+  });
+
+  /** An adapter that records which repository each review comment was posted to. */
+  function publishing() {
+    const posted: string[] = [];
+    const adapter = {
+      async getPullRequest(repo: RepoRef, pullNumber: number) {
+        return {
+          number: pullNumber,
+          headSha: 'a'.repeat(40),
+          baseBranch: 'main',
+          headBranch: 'patch-1',
+          state: 'open',
+          htmlUrl: `https://github.com/${repo.owner}/${repo.repo}/pull/${pullNumber}`,
+          body: '',
+          merged: false,
+          mergeable: true,
+          mergeableState: 'clean',
+        };
+      },
+      async createReviewComment(repo: RepoRef, pullNumber: number, input: { path: string; body: string }) {
+        posted.push(`${repo.owner}/${repo.repo}#${pullNumber}:${input.body}`);
+        return {
+          id: 99001,
+          inReplyToId: null,
+          path: input.path,
+          line: null,
+          startLine: null,
+          originalLine: null,
+          side: 'RIGHT',
+          subjectType: 'file',
+          commitId: 'a'.repeat(40),
+          originalCommitId: 'a'.repeat(40),
+          diffHunk: '',
+          body: input.body,
+          user: 'octocat',
+          createdAt: 'T0',
+          updatedAt: 'T0',
+          htmlUrl: `https://github.com/${repo.owner}/${repo.repo}/pull/${pullNumber}#discussion_r99001`,
+        };
+      },
+    } as unknown as GitHubAdapter;
+    return { adapter, posted };
+  }
+
+  const hold = (r: ReturnType<typeof router>, path: string, comment: string) =>
+    r.handle({
+      method: 'POST',
+      pathname: path,
+      query: {},
+      body: { path: 'docs/spec.md', comment, headSha: 'a'.repeat(40) },
+    });
+
+  it('holds two files, neither overwriting the other', async () => {
+    const gh = publishing();
+    const r = router({ baseDir: () => base, repoAdapter: () => gh.adapter });
+
+    await hold(r, '/repos/acme/one/pulls/42/drafts', 'on one');
+    await hold(r, '/repos/acme/two/pulls/42/drafts', 'on two');
+
+    const one = await call(r, 'GET', '/repos/acme/one/pulls/42/drafts');
+    const two = await call(r, 'GET', '/repos/acme/two/pulls/42/drafts');
+    expect((one.json as { drafts: { comment: string }[] }).drafts.map((d) => d.comment)).toEqual(['on one']);
+    expect((two.json as { drafts: { comment: string }[] }).drafts.map((d) => d.comment)).toEqual(['on two']);
+  });
+
+  it('publishes each held comment to the pull request it was written on', async () => {
+    const gh = publishing();
+    const r = router({ baseDir: () => base, repoAdapter: () => gh.adapter });
+
+    const held = await hold(r, '/repos/acme/two/pulls/42/drafts', 'on two');
+    const { draft } = held.json as { draft: { id: string } };
+    const res = await r.handle({
+      method: 'POST',
+      pathname: `/repos/acme/two/pulls/42/drafts/${draft.id}/publish`,
+      query: {},
+      body: {},
+    });
+
+    expect(res.status).toBe(200);
+    // Not `acme/specs`, which is what a publish resolving the configured repository would
+    // have posted to — a reviewer's words landing on a pull request they never read.
+    expect(gh.posted).toEqual(['acme/two#42:on two']);
+  });
+
+  it('does not answer one repository’s held comments from another’s file', async () => {
+    const gh = publishing();
+    const r = router({ baseDir: () => base, repoAdapter: () => gh.adapter });
+    await hold(r, '/pulls/42/drafts', 'on the configured repository');
+    const res = await call(r, 'GET', '/repos/other/tools/pulls/42/drafts');
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({ drafts: [] });
   });
 });
 

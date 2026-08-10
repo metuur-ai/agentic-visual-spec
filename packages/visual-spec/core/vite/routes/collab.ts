@@ -52,6 +52,7 @@ import {
   markDraftPublished,
   readReviewDrafts,
   type ReviewDraft,
+  type ReviewDraftScope,
 } from '../../collaboration/review-drafts';
 import type { CollaborationRecord, CompanionFile, GitHubBinding } from '../../collaboration/document-record';
 import { DOCUMENT_ID_RE, newCollaborationRecord } from '../../collaboration/document-record';
@@ -877,6 +878,28 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   const git = deps.git ?? defaultExecGit;
   /** The configured repo as the adapter addresses it — `baseBranch` is not part of a ref. */
   const repoRefOf = (repo: ResolvedCollaborationConfig): RepoRef => ({ owner: repo.owner, repo: repo.repo });
+
+  /**
+   * Where one pull request's held comments live (R-W3.6) — the served directory, the
+   * repository the request resolved to, and whether that repository is entitled to the
+   * pre-scoping file.
+   *
+   * THE ENTITLEMENT IS A ROUTE FACT, NOT A STORE FACT. `.visual-spec/reviews/pr-<n>.json`
+   * was written when exactly one repository could be reviewed, so its drafts — and, more
+   * to the point, its `published` records, which are what stops a comment going to GitHub
+   * twice — belong to the CONFIGURED repository as a matter of fact. The store cannot know
+   * which repository that is; this layer can, and says so here, once, rather than at each
+   * of the five call sites. Letting whichever repository asked first claim the file would
+   * be inventing provenance and would put one project's review comments into another's.
+   */
+  const draftScopeOf = (repo: ResolvedCollaborationConfig): ReviewDraftScope => {
+    const configured = deps.config().collaboration;
+    return {
+      baseDir: baseDir(),
+      repo: repoRefOf(repo),
+      adoptLegacy: configured !== null && configured.owner === repo.owner && configured.repo === repo.repo,
+    };
+  };
 
   /* ---------------------------------------------------------------- *
    * Where a review reads from (R-W1.1)
@@ -1738,7 +1761,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         if (method === 'GET') {
           const gated = await gate('read', null, requestedRepo);
           if (!gated.ok) return gated.result;
-          return { status: 200, json: { drafts: await readReviewDrafts(baseDir(), pullNumber) } };
+          return { status: 200, json: { drafts: await readReviewDrafts(draftScopeOf(gated.repo), pullNumber) } };
         }
 
         /*
@@ -1759,7 +1782,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
         try {
-          const draft = await addReviewDraft(baseDir(), pullNumber, {
+          const draft = await addReviewDraft(draftScopeOf(gated.repo), pullNumber, {
             path,
             comment,
             headSha,
@@ -1787,7 +1810,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         try {
           // "Already gone" is the outcome the caller asked for, so it is a 200 with
           // `removed: false` — the same answer `DELETE /pulls/:n/mount` gives.
-          return { status: 200, json: { ok: true, removed: await deleteReviewDraft(baseDir(), pullNumber, draftId) } };
+          return { status: 200, json: { ok: true, removed: await deleteReviewDraft(draftScopeOf(gated.repo), pullNumber, draftId) } };
         } catch {
           /*
            * R-13.17 — the store refuses to delete a published record, and this is the
@@ -1818,7 +1841,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         const gated = await gate('comment', null, requestedRepo);
         if (!gated.ok) return gated.result;
 
-        const draft = (await readReviewDrafts(baseDir(), pullNumber)).find((d) => d.id === draftId);
+        const draft = (await readReviewDrafts(draftScopeOf(gated.repo), pullNumber)).find((d) => d.id === draftId);
         if (!draft) return { status: 404, json: { error: `unknown draft: ${draftId}` } };
 
         /*
@@ -1902,7 +1925,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
           // still come back true from a write that raced this one; the store's
           // first-write-wins means the stored link is the first publisher's, and reporting
           // it is more honest than overwriting it with ours.
-          const marked = await markDraftPublished(baseDir(), pullNumber, draftId, {
+          const marked = await markDraftPublished(draftScopeOf(gated.repo), pullNumber, draftId, {
             reviewCommentId: created.id,
             htmlUrl: created.htmlUrl,
           });
