@@ -14,25 +14,25 @@
 
 ## Unit 1: Choosing where a review reads from
 
-- [ ] 1.1 Define the `ReviewSource` interface (est: ~45m)
+- [x] 1.1 Define the `ReviewSource` interface (est: ~45m)
   - why: the seam is the reusable artifact of this whole change — one interface, two implementations — and every later story depends on its shape. Four operations: changed paths, list a directory, read a file, head sha.
   - acceptance: R-W1.4 — THE SYSTEM SHALL expose both sources through one interface, so that the reviewing surface does not vary by source.
   - verify: the interface compiles with no implementation; a type-level test asserts both future implementations must satisfy it
   - landed:
 
-- [ ] 1.2 Extract today's checkout behaviour behind `ReviewSource` (deps: 1.1, est: ~2h)
+- [x] 1.2 Extract today's checkout behaviour behind `ReviewSource` (deps: 1.1, est: ~2h)
   - why: the checkout path must be provably unchanged before a second source exists, otherwise a regression there is indistinguishable from a bug in the new one. `mountPullRequest` is not touched — only the code that reads through the resulting checkout.
   - acceptance: R-W1.2 — IF the served directory is a git working tree with an origin remote, THE SYSTEM SHALL supply the review from a checkout, irrespective of whether that origin names the pull request's repository. R-W5.2 — WHERE a checkout supplies a review, THE SYSTEM SHALL behave exactly as it does without this feature.
   - verify: the existing checkout-backed review tests pass with no edits to their assertions; `core/collaboration/worktree.ts` shows no diff
   - landed:
 
-- [ ] 1.3 `resolveReviewSource` and route wiring (deps: 1.2, 2.4, est: ~1.5h) (mutex: collab-routes)
+- [x] 1.3 `resolveReviewSource` and route wiring (deps: 1.2, 2.4, est: ~1.5h) (mutex: collab-routes)
   - why: this is the move the whole design rests on — replacing the single `baseDir` thunk with a decision. The rule keys on "is a git working tree with an origin", **not** on whether that origin matches the pull request's repository, because `fetchSource` already handles the foreign case and a match-only rule would move a working case off the checkout.
   - acceptance: R-W1.1 — WHEN a review is requested, THE SYSTEM SHALL determine which source supplies its files before any file is read. R-W1.3 — IF the served directory is not a git working tree, or has no origin remote, THE SYSTEM SHALL supply the review from the repository host rather than refusing. R-W1.6 — THE SYSTEM SHALL decide from the served directory alone.
   - verify: serve an empty directory, open a real pull request, read its changed files; serve a git repository and observe the checkout path taken
   - landed:
 
-- [ ] 1.4 Report the active source to the reviewing surface (deps: 1.3, est: ~45m)
+- [x] 1.4 Report the active source to the reviewing surface (deps: 1.3, est: ~45m)
   - why: the two sources differ in one user-visible way — the host source needs the network per file and cannot work offline. A reviewer who cannot tell which one they are on cannot account for that.
   - acceptance: R-W1.5 — THE SYSTEM SHALL report which source is supplying a review.
   - verify: the review surface names its source in both configurations
@@ -40,67 +40,67 @@
 
 ## Unit 2: Reading a pull request from its host
 
-- [ ] 2.1 Changed paths without a checkout (est: ~30m)
+- [x] 2.1 Changed paths without a checkout (est: ~30m)
   - why: cheapest story in the unit and already half-true — the changed-files pane is API-sourced today via `compareCommits`. This makes that explicit as a `ReviewSource` operation rather than a coincidence.
   - acceptance: R-W2.1 — THE SYSTEM SHALL obtain a pull request's changed paths without a checkout.
   - verify: the changed-files pane renders for a pull request with no checkout mounted
   - landed:
 
-- [ ] 2.2 File contents without a checkout (deps: 1.1, est: ~1h)
+- [x] 2.2 File contents without a checkout (deps: 1.1, est: ~1h)
   - why: this is the operation the checkout is currently kept for. `adapter.getFile(repo, path, ref)` already exists and is already called on the review path for comment anchoring, so no new GitHub access mechanism is introduced — which is what keeps the credential story unchanged.
   - acceptance: R-W2.2 — THE SYSTEM SHALL obtain the contents of any file in the pull request's tree without a checkout, including files the pull request did not change. R-W2.6 — THE SYSTEM SHALL use the same credential and access path as every other operation.
   - verify: open a changed file and an unchanged file with no checkout; assert no second executor or credential path is introduced
   - landed:
 
-- [ ] 2.3 Directory enumeration without a checkout (deps: 1.1, est: ~1h)
+- [x] 2.3 Directory enumeration without a checkout (deps: 1.1, est: ~1h)
   - why: the reviewer needs the files *around* the change, which is the second thing the checkout supplies. `adapter.listFiles(repo, path, ref)` answers one directory per call, which matches how a tree expands on click — no recursive-tree endpoint is needed or exists.
   - acceptance: R-W2.3 — THE SYSTEM SHALL enumerate the pull request's tree without a checkout, and MAY do so one directory at a time as the reviewer opens them.
   - verify: expand two levels of the tree with no checkout mounted; assert one call per directory opened, none for unopened ones
   - landed:
 
-- [ ] 2.4 Pin every read to the head commit (deps: 2.1, 2.2, 2.3, est: ~1h)
+- [x] 2.4 Pin every read to the head commit (deps: 2.1, 2.2, 2.3, est: ~1h)
   - why: a review that silently spans two heads anchors comments to bytes the reviewer never saw. A force-push mid-review is the case this exists for.
   - acceptance: R-W2.4 — THE SYSTEM SHALL pin every such read to the pull request's head commit rather than to a branch name. R-W2.5 — WHEN the head moves, THE SYSTEM SHALL refresh the changed paths and the pinned commit together.
   - verify: force-push to a pull request mid-review; the surface reports a moved head and refreshes both together, never one alone
   - landed:
 
-- [ ] 2.5 Failure taxonomy for host reads (deps: 2.2, est: ~1h)
+- [x] 2.5 Failure taxonomy for host reads (deps: 2.2, est: ~1h)
   - why: `defaultExecGit` deliberately discards stderr, and the adapter's failures are the only ones with any detail. Without a taxonomy a failed read during browsing is an error with no cause and no recovery text — the one new user-visible failure class this design introduces.
   - acceptance: R-W2.7 — IF a read cannot be completed, THE SYSTEM SHALL report which of the following occurred — no usable credential, the repository or file could not be read, or the host could not be reached — rather than a generic failure.
   - verify: three induced failures produce three distinct messages, each naming what the user must fix
   - landed:
 
-- [ ] 2.6 In-flight indication for host reads (deps: 2.2, est: ~30m)
+- [x] 2.6 In-flight indication for host reads (deps: 2.2, est: ~30m)
   - why: every file open is now a network round trip. Silence during one reads as a frozen interface.
   - acceptance: R-W2.8 — THE SYSTEM SHALL indicate when a read is in flight.
   - verify: throttled connection; opening a file shows progress rather than nothing
   - landed:
 
-- [ ] 2.7 Assert the host source writes nothing (deps: 2.2, 2.3, est: ~45m)
+- [x] 2.7 Assert the host source writes nothing (deps: 2.2, 2.3, est: ~45m)
   - why: this is the invariant the withdrawn workspace design would have broken, and the reason the request guard's "a non-browser caller has no ambient authority to borrow" rationale still holds. It needs a test, not a promise.
   - acceptance: R-W2.9 — THE SYSTEM SHALL NOT write any file outside the served directory in order to supply a review. R-W6.7 — a test that a full review supplied by the host source writes no file outside the served directory.
   - verify: run a full host-sourced review under a filesystem observer; no write outside the served directory, no directory created in the user's home
   - landed:
 
-- [ ] 2.8 Close the two source divergences (deps: 1.2, 2.3, 6.1, est: ~2h)
+- [x] 2.8 Close the two source divergences (deps: 1.2, 2.3, 6.1, est: ~2h)
   - why: story 6.1 did its job and found two places the sources answer differently for the same pull request. The symlink one is not merely cosmetic — the checkout source calls `fs.readFile`, which follows a link out of the checkout, and a fork pull request's tree is attacker-controlled, so a committed link to `~/.ssh/id_rsa` renders its contents in the review surface. The exposure predates this feature (worktrees already mount inside the served directory and `/__vs/tree` already walks them) but this is the first requirement that names it.
   - acceptance: R-W2.10 — THE SYSTEM SHALL NOT read the contents of any file outside the pull request's tree, including by way of a committed symbolic link. R-W2.11 — a symbolic link reports its own target path as its contents, identically from both sources. R-W2.12 — a missing directory is reported as unreadable, not as an empty directory.
   - verify: R-W6.9 and R-W6.10 added to the parity suite; a link pointing outside the checkout yields its target path, never the pointed-at file's bytes, from either source
   - landed:
 
-- [ ] 2.9 Resolve in-tree symlinks, refuse escaping ones (deps: 2.8, est: ~1.5h)
+- [x] 2.9 Resolve in-tree symlinks, refuse escaping ones (deps: 2.8, est: ~1.5h)
   - why: 2.8 closed the security hole but overshot. GitHub resolves a link whose target is inside the repository and returns that file's contents; it answers with the link's target path only when it cannot resolve — which is the out-of-tree case. Returning the target path for an in-repo link is a fresh divergence in the opposite direction, and the parity fixture cannot see it because it models every link as unresolvable.
   - acceptance: R-W2.11 — a link targeting inside the tree reports the target's contents. R-W2.11a — a link targeting outside reports its own target path and does not read the target. R-W2.11b — both sources answer alike, and the fixture models both cases.
   - verify: parity suite covers an in-repo link and an escaping link; the escaping case still never yields the target file's bytes
   - landed:
 
-- [ ] 2.10 Record the tree and raw review routes (deps: 1.3, est: ~0m — already built)
+- [x] 2.10 Record the tree and raw review routes (deps: 1.3, est: ~0m — already built)
   - why: story 1.3 had to add `GET /pulls/:n/tree` and `GET /pulls/:n/raw` because without them the host source is unreachable from either host and R-W1.1's "before any file is read" has no read to precede. No story asked for them; the plan was incomplete, not the agent overstepping. Recorded here so the work is attributed rather than landing unaccounted for.
   - acceptance: R-W1.3 — the host source supplies a review rather than the request being refused.
   - verify: covered by 1.3's route tests — listing, file read, root default, not-readable → 404, one resolution across three reads
   - landed: (built under 1.3)
 
-- [ ] 2.11 Wire the reviewing surface to the host source's reads (deps: 1.3, 1.4, est: ~4h)
+- [x] 2.11 Wire the reviewing surface to the host source's reads (deps: 1.3, 1.4, est: ~4h)
   - why: **SC-1 is not met without this.** A host-sourced review currently opens, names its source, lists its changed files and holds comments, but opening a file still reads through `/__vs/tree/file` under the worktree prefix — so with no checkout on disk the reader sees "No preview for this file." Story 1.3 built `/pulls/:n/tree` and `/pulls/:n/raw`; nothing consumes them. The honest blocker is that `useTree`'s contract is a flat full walk of a directory, and the host source can only answer one directory per call, so the surface needs lazy per-directory expansion before it can read from either source uniformly. Branching the read path on the source kind would satisfy the symptom and destroy the seam, so it is explicitly not the fix.
   - acceptance: R-W1.3 — the host source supplies a review rather than the request being refused. R-W1.4 — both sources are exposed through one interface, so that the reviewing surface does not vary by source. R-W2.2 — the contents of any file in the tree, including files the pull request did not change.
   - verify: serve an empty directory, open a real pull request, open a changed file and an unchanged file, and read both — the SC-1 check, end to end, with nothing cloned
@@ -154,7 +154,7 @@
 
 ## Unit 5: What must not change
 
-- [ ] 5.1 Local mode and configured-repository listing untouched (est: ~45m)
+- [x] 5.1 Local mode and configured-repository listing untouched (est: ~45m)
   - why: local mode is the shipped product, and a regression there is worse than this feature not shipping. The existing pull request listing — including the shipped "awaiting you" sections — must be unaffected.
   - acceptance: R-W5.1 — WHERE no collaboration is configured, THE SYSTEM SHALL behave exactly as it does without this feature. R-W4.4 — THE SYSTEM SHALL continue to present the pull requests of the configured repository.
   - verify: the local-mode and `pull-requests-awaiting-you` suites pass with no assertion edits
@@ -180,13 +180,13 @@
 
 ## Unit 6: Testability
 
-- [ ] 6.1 Both sources answer alike (deps: 1.3, est: ~2h)
+- [x] 6.1 Both sources answer alike (deps: 1.3, est: ~2h)
   - why: the whole design rests on the two sources being substitutable. If they disagree about a directory listing or a file's bytes, the reviewing surface silently means two different things depending on where the user happened to be sitting.
   - acceptance: R-W6.1 — THE SYSTEM SHALL include tests that drive both sources through the same interface and assert they answer alike for the same pull request.
   - verify: one test body, two sources, identical assertions on changed paths, a directory listing, and a file's bytes
   - landed:
 
-- [ ] 6.2 Source selection is correct at both boundaries (deps: 1.3, est: ~1h)
+- [x] 6.2 Source selection is correct at both boundaries (deps: 1.3, est: ~1h)
   - why: 6.2's first case is the regression the corrected resolution rule exists to prevent — a served repository whose origin names a *different* repository must still take the checkout, because `fetchSource` already handles it.
   - acceptance: R-W6.2 — a test that a served directory which is a git working tree selects the checkout source even when its origin names a different repository. R-W6.3 — a test that a served directory which is not a git working tree yields a review rather than a refusal.
   - verify: both cases against real git repositories, not fixtures
@@ -203,3 +203,27 @@
   - acceptance: R-W6.8 — THE SYSTEM SHALL include tests that drive the checkout source against real git repositories.
   - verify: the checkout suite still creates real repositories; no fixture `.git` directories introduced
   - landed:
+
+## Verified against real repositories
+
+Units 1-4 were driven end to end in a browser on 2026-08-10, from a served directory that
+is not a git working tree, against `vitejs/vite` and `facebook/react`:
+
+- the pull request listing, the tree walked one directory per click, and a changed file —
+  all pinned to `a283f82` (R-W2.4)
+- `CONTRIBUTING.md`, a file the pull request never touched, read with nothing cloned. This
+  is SC-1, and it is the check the whole change exists to pass (R-W2.2)
+- the surface named its source: "Files come from GitHub - each one you open needs the
+  network" (R-W1.5)
+- `facebook/react#37256` served while the server was configured for `vitejs/vite`, through
+  `/repos/:owner/:repo/...` (R-W3.1). A path naming no repository answered 404, a malformed
+  one 400, a well-formed one 200 (R-W3.7)
+- pull request **#23000 exists in both repositories** and resolved to two distinct reviews -
+  head `2e4f1c4c92ab` on `perf/native-config-compat-skip-on-ignore` with 1 file, against
+  head `55eae0b94470` on `issue-21094` with 4. Keyed by number alone these would have been
+  one review (R-W3.5)
+- the header read `vitejs/vite#23219 ...` (R-W4.5), and a pasted `facebook/react` URL posted
+  to `/repos/facebook/react/open` rather than being resolved against the configured
+  repository (R-W4.1)
+- across all of it the served directory kept only the two files placed in it, and no
+  `~/.visual-spec` was ever created (R-W2.9, R-W5.3)
