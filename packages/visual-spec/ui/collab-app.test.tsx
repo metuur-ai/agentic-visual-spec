@@ -117,6 +117,11 @@ describe('CollabApp opens where the caller asked (R-7.7 / R-7.8)', () => {
           return jsonRes({ pullNumber: 43, headSha: 'ccccccc3', baseBranch: 'main', headBranch: 'chore/lint', mergeBaseSha: 'ddddddd4', files: [] });
         }
         if (url.startsWith('/__vs/collab/pulls/43/drafts')) return jsonRes({ drafts: [] });
+        // The reviewing surface reads the pull request's root directory as it opens; this
+        // suite is about the header, so the tree it reads is empty rather than absent.
+        if (url.startsWith('/__vs/collab/pulls/43/tree')) {
+          return jsonRes({ pullNumber: 43, headSha: WORKTREE_43.headSha, path: '', entries: [] });
+        }
         if (url.startsWith('/__vs/collab/pulls')) {
           return jsonRes({ pulls: [{ number: 43, title: 'Bump the linter', state: 'open', draft: false, headBranch: 'chore/lint', baseBranch: 'main', headSha: 'ccccccc3', htmlUrl: 'https://github.com/acme/docs/pull/43', author: 'cy', updatedAt: '2026-08-03T00:00:00.000Z' }] });
         }
@@ -199,6 +204,11 @@ describe('one header row while a pull request is under review (P5)', () => {
           return jsonRes({ pullNumber: 43, headSha: 'ccccccc3', baseBranch: 'main', headBranch: 'chore/lint', mergeBaseSha: 'ddddddd4', files: [] });
         }
         if (url.startsWith('/__vs/collab/pulls/43/drafts')) return jsonRes({ drafts: [] });
+        // The reviewing surface reads the pull request's root directory as it opens; this
+        // suite is about the header, so the tree it reads is empty rather than absent.
+        if (url.startsWith('/__vs/collab/pulls/43/tree')) {
+          return jsonRes({ pullNumber: 43, headSha: WORKTREE_43.headSha, path: '', entries: [] });
+        }
         if (url.startsWith('/__vs/collab/pulls')) {
           return jsonRes({ pulls: [{ number: 43, title: 'Bump the linter', state: 'open', draft: false, headBranch: 'chore/lint', baseBranch: 'main', headSha: 'ccccccc3', htmlUrl: 'https://github.com/acme/docs/pull/43', author: 'cy', updatedAt: '2026-08-03T00:00:00.000Z' }] });
         }

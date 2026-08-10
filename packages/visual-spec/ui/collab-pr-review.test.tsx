@@ -181,9 +181,11 @@ describe('R-W1.3 / R-W1.4 — the files open from either source, through one rea
 
   it('reads a file the pull request did not change, by expanding into the tree (R-W2.2)', async () => {
     openReview(HOST);
-    fireEvent.click(await screen.findByRole('button', { name: /Rest of the files/ }));
-    fireEvent.click(await screen.findByRole('button', { name: /src$/ }));
-    fireEvent.click(await screen.findByRole('button', { name: /util\.ts/ }));
+    // The changed-files pane holds a `src` folder too — it is the parent of `src/pay.ts` —
+    // so the folder is opened in the rest-of-the-tree pane, which is the one this is about.
+    await openTheRest();
+    await expandFolder(/src$/, /util\.ts/);
+    fireEvent.click(restPane().getByRole('button', { name: /util\.ts/ }));
 
     expect(await screen.findByText(/export const util/)).toBeTruthy();
   });
@@ -203,14 +205,12 @@ describe('R-W1.3 / R-W1.4 — the files open from either source, through one rea
    */
   it('reads one directory per folder opened, and nothing for the folders left shut', async () => {
     const calls = openReview(HOST);
-    fireEvent.click(await screen.findByRole('button', { name: /Rest of the files/ }));
     // The root, and only the root, until someone opens something.
-    await screen.findByRole('button', { name: /vendor$/ });
+    await openTheRest();
     const listings = () => calls.filter((c) => c.includes('/tree?path='));
     expect(listings()).toEqual(['/__vs/collab/pulls/42/tree?path=']);
 
-    fireEvent.click(screen.getByRole('button', { name: /src$/ }));
-    await screen.findByRole('button', { name: /util\.ts/ });
+    await expandFolder(/src$/, /util\.ts/);
 
     // One more listing, for the folder that was opened. `vendor` sat beside it and was
     // never read.
@@ -1188,6 +1188,10 @@ describe('sending a review comment shows that it is sending', () => {
  * Opening a checkout showed the heading "Changed files", the sentence under it, and then
  * blank space — for as long as GitHub took to answer. It read as a pull request that
  * changed nothing, on a surface where that is a real state with its own sentence.
+ *
+ * The pane says "Opening the pull request…" and not "Opening the checkout…": a review
+ * supplied by the host has no checkout to open (R-W1.3), so the older sentence was false
+ * for exactly the case this feature exists to serve.
  */
 describe('the checkout says it is loading rather than looking empty', () => {
   /** A `fetch` where `/files` never settles; everything else answers normally. */
@@ -1195,6 +1199,9 @@ describe('the checkout says it is loading rather than looking empty', () => {
     const drafts = { ok: true, status: 200, json: async () => ({ drafts: [] }) } as unknown as Response;
     return (async (url: string) => {
       if (url.endsWith('/files')) return new Promise<Response>(() => {});
+      // The tree still answers: only the changed-file list is what this is waiting on.
+      const read = reviewRead(url);
+      if (read) return read;
       return drafts;
     }) as unknown as typeof fetch;
   };
@@ -1204,7 +1211,7 @@ describe('the checkout says it is loading rather than looking empty', () => {
 
     const line = await screen.findByText('Reading what changed…');
     expect(line.querySelector('[data-vs-spinner]')).toBeTruthy();
-    expect(screen.getByText('Opening the checkout…')).toBeTruthy();
+    expect(screen.getByText('Opening the pull request…')).toBeTruthy();
 
     // `null` is "not answered yet"; the empty array is a different claim with its own words.
     expect(screen.queryByText('This pull request changes no files.')).toBeNull();
@@ -1216,7 +1223,7 @@ describe('the checkout says it is loading rather than looking empty', () => {
     mount();
     await waitFor(() => expect(screen.getByRole('button', { name: /pay\.ts/ })).toBeTruthy());
     expect(screen.queryByText('Reading what changed…')).toBeNull();
-    expect(screen.queryByText('Opening the checkout…')).toBeNull();
+    expect(screen.queryByText('Opening the pull request…')).toBeNull();
   });
 
   /* A folder that is still being read looks exactly like an empty one, and the two are
@@ -1232,7 +1239,9 @@ describe('the checkout says it is loading rather than looking empty', () => {
     render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={impl as unknown as typeof fetch} />);
 
     await openTheRest();
-    fireEvent.click(screen.getByRole('button', { name: /src$/ }));
+    // Scoped to the rest-of-the-tree pane: `src` is also the parent of the changed
+    // `src/pay.ts`, so it has a row in the changed-files pane above as well.
+    fireEvent.click(restPane().getByRole('button', { name: /src$/ }));
 
     const line = await screen.findByText('Reading src…');
     expect(line.querySelector('[data-vs-spinner]')).toBeTruthy();
@@ -1328,6 +1337,9 @@ describe('the review shows the pull request’s comments and replies', () => {
     const impl = (async (url: string) => {
       if (url.endsWith('/comments')) return { ok: false, status: 502, json: async () => ({ error: 'gh is unreachable' }) } as unknown as Response;
       if (url.endsWith('/files')) return { ok: true, status: 200, json: async () => changedFiles(['spec.md']).json } as unknown as Response;
+      // Only the conversation is broken here; the file reads answer as they always do.
+      const read = reviewRead(url);
+      if (read) return read;
       return { ok: true, status: 200, json: async () => ({ drafts: [] }) } as unknown as Response;
     }) as unknown as typeof fetch;
     render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={impl} />);
