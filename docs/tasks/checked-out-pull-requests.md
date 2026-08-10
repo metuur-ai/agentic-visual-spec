@@ -65,11 +65,11 @@
   - verify: panel test asserts the unlisted row carries neither the current nor the behind wording.
   - landed: `ui/collab-pulls-panel.tsx` — the currency line is rendered only where `listed` has the pull request, recorded in the code as the requirement it is rather than as a null guard. Test: "asserts nothing about the currency of a checkout that is not listed (R-C2.3)", which pins it against a later edit adding a fallback.
 
-- [ ] 2.4 Carry each state in a word and a mark, not in colour (deps: 2.1, est: ~20m, mutex: panel-rows)
+- [x] 2.4 Carry each state in a word and a mark, not in colour (deps: 2.1, est: ~20m, mutex: panel-rows)
   - why: this codebase already settled the question when it chose a count over a coloured dot for per-file comments — a mark says "something is here" only to a reader who already knows what the colour means. Three states separated only by hue are unreadable to a reviewer who cannot distinguish them and ambiguous to everyone else on first sight.
   - acceptance: R-C2.4 — each state is conveyed by a word and a mark as well as by colour, and colour alone never distinguishes one state from another.
   - verify: test asserts each state is identifiable from text content alone, with no reference to a style value — a test that passes with every colour in the component set to the same value.
-  - landed:
+  - landed: `ui/collab-pulls-panel.tsx` — each state line is a word plus an `aria-hidden` mark (`✓` up to date, `!` out of date, `?` not in the listing), with colour set on top. Test: "carries each state in a word and a mark, so colour alone never distinguishes them (R-C2.4)", written entirely against `textContent` — it names no colour, class or style, and was checked by mutation (deleting one mark fails it).
 
 ## Unit 3: Refreshing — the control
 

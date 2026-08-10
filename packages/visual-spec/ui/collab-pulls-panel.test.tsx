@@ -897,6 +897,14 @@ describe('whether a checkout is at the pull request’s head (R-C2)', () => {
     path: '/repo/.visual-spec/worktrees/acme/docs/pr-7',
     headSha: 'feed123beef456',
   };
+  /** A third pull request, so all three states can be on screen at once for R-C2.4. */
+  const MOVED_9 = { ...PULL, number: 9, title: 'Split the ledger', headSha: 'aaa111bbb222' };
+  const BEHIND_WORKTREE_9 = {
+    pullNumber: 9,
+    repo: REPO,
+    path: '/repo/.visual-spec/worktrees/acme/docs/pr-9',
+    headSha: 'ccc333ddd444',
+  };
 
   const row = (n: number) => document.querySelector(`[data-vs-checkout="${n}"]`) as HTMLElement | null;
 
@@ -965,5 +973,41 @@ describe('whether a checkout is at the pull request’s head (R-C2)', () => {
     expect(row(7)!.textContent).not.toContain('Up to date');
     expect(row(7)!.textContent).not.toContain('Out of date');
     expect(row(7)!.textContent).toContain('Not in the listing');
+  });
+
+  /*
+   * R-C2.4 — the accessibility requirement, tested the only way that proves it.
+   *
+   * Everything below is read off `textContent`. There is no reference to a colour, a
+   * class or a style value anywhere in it, so the test would pass unchanged with every
+   * colour in the component set to the same one — and it would still tell the three
+   * states apart, which is the whole claim. Anything weaker (asserting the green, or that
+   * three colours differ) proves the colours exist, not that the states are legible
+   * without them.
+   *
+   * This codebase settled the question once already, when it chose a count over a
+   * coloured dot for per-file comments: a mark says "something is here" only to a reader
+   * who already knows what the colour means.
+   */
+  it('carries each state in a word and a mark, so colour alone never distinguishes them (R-C2.4)', async () => {
+    // One of each state on screen at once, which is also the case a reader has to read.
+    mountPanel([WORKTREE, BEHIND_WORKTREE_9, UNLISTED_WORKTREE], [PULL, MOVED_9]);
+
+    await waitFor(() => expect(row(9)).toBeTruthy());
+    const words = { current: 'Up to date', behind: 'Out of date', unlisted: 'Not in the listing' };
+    const marks = { current: '✓', behind: '!', unlisted: '?' };
+    const text = { current: row(42)!.textContent!, behind: row(9)!.textContent!, unlisted: row(7)!.textContent! };
+
+    for (const state of ['current', 'behind', 'unlisted'] as const) {
+      expect(text[state]).toContain(words[state]);
+      expect(text[state]).toContain(marks[state]);
+    }
+    // And the words are what separate them: no state's word appears on another's row.
+    expect(text.current).not.toContain(words.behind);
+    expect(text.current).not.toContain(words.unlisted);
+    expect(text.behind).not.toContain(words.current);
+    expect(text.behind).not.toContain(words.unlisted);
+    expect(text.unlisted).not.toContain(words.current);
+    expect(text.unlisted).not.toContain(words.behind);
   });
 });
