@@ -391,6 +391,12 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
         <div style={cardTitle}>
           <span style={{ color: '#64748b' }}>#{pull.number}</span> {pull.title}
           {pull.draft && <span style={badge}>draft</span>}
+          {/*
+            * R-C1.6 — the badge stays, and the section above does not replace it. They
+            * answer different questions: the section is "what do I have half-done", the
+            * badge is "is this row one of them" while you are reading the listing. Losing
+            * the badge would make the second question cost a scroll to another section.
+            */}
           {worktree && <span style={mountedBadge}>checked out · {shortSha(worktree.headSha)}</span>}
         </div>
         <div style={meta}>

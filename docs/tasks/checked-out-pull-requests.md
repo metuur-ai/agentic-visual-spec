@@ -39,11 +39,11 @@
   - verify: panel test with a `mounted` entry having no matching listed pull request asserts the row renders, states it is not in the listing, and exposes the remove control; a test asserts no removal request is issued on render.
   - landed: `ui/collab-pulls-panel.tsx` — `checkoutRow` renders the unlisted line and a `Remove checkout` button calling the existing `unmount`; `checkoutsSection` carries the note naming the `Show` setting when a row leans on it. Tests: "includes a checkout whose pull request is not listed, and offers to remove it" (R-C1.2, R-C1.3), "removes an unlisted checkout through the same DELETE the listed row uses" (R-C1.3), "removes nothing that the user has not asked to remove" (R-C1.4).
 
-- [ ] 1.3 Keep the badge on the listed row (deps: 1.1, est: ~10m, mutex: panel-rows)
+- [x] 1.3 Keep the badge on the listed row (deps: 1.1, est: ~10m, mutex: panel-rows)
   - why: the section answers "what do I have open"; the badge answers "is this row one of them" while reading the listing. Removing the badge would make the second question cost a scroll to a different section.
   - acceptance: R-C1.6 — a checked-out pull request is still marked on its row in the listing, and the section does not replace that marking.
   - verify: existing badge assertions still pass, plus a test asserting a checked-out pull request appears both in the section and marked on its listing row.
-  - landed:
+  - landed: `ui/collab-pulls-panel.tsx` — the badge in `listRow` is unchanged, now with the reason recorded beside it. Test: "still marks a checked-out pull request on its own row in the listing" (R-C1.6), alongside the untouched "marks a pull request that is already checked out, and names the commit".
 
 ## Unit 2: Whether a checkout is still current
 

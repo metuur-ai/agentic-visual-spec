@@ -856,4 +856,21 @@ describe('what is checked out on disk (R-C1)', () => {
     await waitFor(() => expect(row(7)).toBeTruthy());
     expect(calls.filter((c) => c.method === 'DELETE')).toEqual([]);
   });
+
+  /*
+   * R-C1.6 — the two answer different questions and neither replaces the other. The
+   * section answers "what do I have half-done"; the badge answers "is this row one of
+   * them" while you are reading the listing. Dropping the badge would make the second
+   * question cost a scroll to a different part of the panel.
+   */
+  it('still marks a checked-out pull request on its own row in the listing', async () => {
+    mountPanel([WORKTREE], [PULL]);
+
+    await waitFor(() => expect(row(42)).toBeTruthy());
+    const listedRow = document.querySelector('[data-vs-pull-group="all"] [data-vs-pull="42"]') as HTMLElement;
+    expect(listedRow.textContent).toContain('checked out · abc1234');
+    // Both, at once: the section did not take the marking away from the listing.
+    expect(section()!.contains(listedRow)).toBe(false);
+    expect(row(42)!.textContent).toContain('#42');
+  });
 });
