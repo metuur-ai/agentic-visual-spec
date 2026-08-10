@@ -33,7 +33,7 @@ import { deriveReadiness, type ReadinessVerdict } from '../core/collaboration/re
 import { buildApplyPrompt } from '../core/editing/apply-prompt';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { collabCommentPanelSource, collabIndicatorTargets } from './collab-comment-source';
-import type { MountedWorktree, PullRequestSummary } from './collab-client';
+import type { OpenedReview, PullRequestSummary } from './collab-client';
 import { CollabEditor, type CollabEditorHandle } from './collab-editor';
 import { CollabOpenPanel } from './collab-open-panel';
 import { CollabPrReview } from './collab-pr-review';
@@ -144,7 +144,7 @@ export function intentFromUrl(): CollabIntent | null {
  * a checkout carries none — it is a detached copy of a commit, and remounting it is one
  * click and no loss. So the cheaper state is the honest one.
  */
-type PullReview = { pull: PullRequestSummary; worktree: MountedWorktree };
+type PullReview = { pull: PullRequestSummary; review: OpenedReview };
 
 /**
  * The surface's own header, and — R-9.1 — which pull request is on screen.
@@ -179,7 +179,7 @@ export function CollabHeader({ onExit, review }: { onExit: () => void; review: P
       <span style={title}>Collaboration review</span>
       {review && (
         <span data-testid="vs-review-pull" data-vs-review-pull={review.pull.number} style={reviewChip}>
-          #{review.pull.number} · at {shortSha(review.worktree.headSha)} · read-only
+          #{review.pull.number} · at {shortSha(review.review.headSha)} · read-only
         </span>
       )}
     </header>
@@ -204,7 +204,7 @@ export function CollabHeader({ onExit, review }: { onExit: () => void; review: P
 export type CollabIntent = {
   documentId?: string;
   reviewPull?: number;
-  review?: { pull: PullRequestSummary; worktree: MountedWorktree };
+  review?: { pull: PullRequestSummary; review: OpenedReview };
 };
 
 export function CollabApp({ onExit, initial }: { onExit: () => void; initial?: CollabIntent }) {
@@ -248,7 +248,7 @@ export function CollabApp({ onExit, initial }: { onExit: () => void; initial?: C
         <CollabPrReview
           key={pullReview.pull.number}
           pull={pullReview.pull}
-          worktree={pullReview.worktree}
+          review={pullReview.review}
           /*
            * Where "back" goes depends on where the reviewer came from, and the button says
            * `← Pull requests` either way — so both arms have to land on a list. A checkout
@@ -274,7 +274,7 @@ export function CollabApp({ onExit, initial }: { onExit: () => void; initial?: C
             * button the reviewer would have pressed, pressed for them.
             */}
           <CollabPullsPanel
-            onReview={(pull, worktree) => setPullReview({ pull, worktree })}
+            onReview={(pull, review) => setPullReview({ pull, review })}
             onResume={setDocumentId}
             {...(initial?.reviewPull !== undefined ? { autoReview: initial.reviewPull } : {})}
             onAutoReviewFailed={() => setDeepLinkPending(false)}

@@ -83,7 +83,7 @@ function installFetch(availability: unknown = AVAILABILITY) {
     // before the listing below, whose prefix would otherwise swallow it.
     if (url === '/__vs/collab/pulls/mounted') return jsonRes({ worktrees: [] });
     // R-13.3 — the checkout git produced, plus the two reads `CollabPrReview` opens with.
-    if (url === '/__vs/collab/pulls/42/mount' && method === 'POST') return jsonRes({ worktree: WORKTREE });
+    if (url === '/__vs/collab/pulls/42/mount' && method === 'POST') return jsonRes({ ok: true, source: 'checkout', headSha: WORKTREE.headSha, worktree: WORKTREE });
     if (url === '/__vs/collab/pulls/42/files') return jsonRes({ files: ['docs/spec.md'] });
     if (url === '/__vs/collab/pulls/42/drafts') return jsonRes({ drafts: [] });
     // The sidebar's collaborate item and the header chip both count these (R-7.1).
@@ -306,7 +306,7 @@ describe('a reload comes back to what was open', () => {
     unmount();
     render(<App />);
     await waitFor(() => expect(screen.queryByText(/Select a file or folder/)).toBeNull());
-    await screen.findByText(/Read-only checkout/);
+    await screen.findByText(/Read-only —/);
   });
 
   /*

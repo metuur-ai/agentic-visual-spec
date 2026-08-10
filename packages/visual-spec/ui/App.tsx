@@ -270,9 +270,9 @@ export function App() {
             setPicker(false);
             setCollab({ documentId });
           }}
-          onReview={(pull, worktree) => {
+          onReview={(pull, review) => {
             setPicker(false);
-            setCollab({ review: { pull, worktree } });
+            setCollab({ review: { pull, review } });
           }}
         />
       )}

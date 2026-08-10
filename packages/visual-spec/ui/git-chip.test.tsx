@@ -123,13 +123,16 @@ describe('the chip is in both headers, beside the served path (R-3.1)', () => {
     await waitFor(() => expect(chip.textContent).toContain('acme/docs'));
   });
 
-  it('sits next to the path button, not somewhere else in the bar', async () => {
+  it('sits next to the wordmark, on the row the eye lands on first', async () => {
     const chip = await mountChip(REMOTE_GITHUB);
-    // The path button and the chip share one row: the directory and the branch
-    // checked out in it are the same fact. The chip's immediate parent is the
-    // positioned wrapper its popovers hang off, so the row is one step further out.
+    // The repository, the branch and what is open are read constantly; the served path
+    // is read once a session. So the chips take the lead row and the path keeps the
+    // quieter line below it. The chip's immediate parent is the positioned wrapper its
+    // popovers hang off, so the row is one step further out.
     const row = (chip.closest('[data-testid="git-chip-area"]') as HTMLElement).parentElement as HTMLElement;
-    expect(within(row).getByText('/repo/docs')).toBeTruthy();
+    expect(within(row).getByText('Visual Specs')).toBeTruthy();
+    // ...and no longer beside the path, which is on its own line now.
+    expect(within(row).queryByText('/repo/docs')).toBeNull();
   });
 });
 
@@ -691,13 +694,16 @@ describe('the brand row yields the served path before the git chips', () => {
     expect(area.style.minWidth).toBe('0');
   });
 
-  it('makes the path yield faster than the chips', async () => {
+  it('makes the chips the only thing on the wordmark row that yields', async () => {
     await mountChip(REMOTE_GITHUB);
     const area = screen.getByTestId('git-chip-area');
     const row = area.parentElement as HTMLElement;
-    const [path] = [...row.children] as HTMLElement[];
+    const [name, byline] = [...row.children] as HTMLElement[];
 
-    expect(Number(path.style.flexShrink)).toBeGreaterThan(Number(area.style.flexShrink || 1));
+    // The product's own name does not truncate to make room for a branch label.
+    expect(name.style.flexShrink).toBe('0');
+    expect(byline.style.flexShrink).toBe('0');
+    expect(area.style.flexShrink).not.toBe('0');
   });
 
   /*

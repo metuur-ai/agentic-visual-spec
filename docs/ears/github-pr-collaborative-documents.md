@@ -362,17 +362,24 @@ outside the directory the user is currently serving so that unsaved local work i
 disturbed. The checkout is a review surface, not a workspace: nothing here commits,
 pushes, or merges, and Unit 7's "merging is not part of visual-spec" is unchanged.
 
+**Scope.** Every requirement in this unit that names a checkout describes the
+checkout-backed review source, which is used wherever the served directory is a git working
+tree with an origin. Where it is not, no checkout exists and `collaboration-workspace.md`
+supplies the review instead; the requirements below that presuppose one do not apply to it.
+R-13.1, R-13.2, R-13.11, R-13.12 and R-13.13–R-13.20 hold for both sources.
+
 | ID | EARS statement |
 | --- | --- |
 | R-13.1 | THE SYSTEM SHALL list the pull requests of the configured repository, carrying at least number, title, state, author, head branch and head commit, so that a reviewer can choose one without leaving the application. |
 | R-13.2 | THE SYSTEM SHALL treat listing pull requests as a read, requiring no write access to the repository. |
 | R-13.3 | WHEN a reviewer selects a pull request, THE SYSTEM SHALL materialise that pull request's tree on the local filesystem at a path derived from its number, without changing the commit or the working copy of the directory being served. |
 | R-13.4 | THE SYSTEM SHALL fetch the pull request head through a reference that GitHub serves for pull requests opened from forks, so that a fork-based pull request is reviewable on the same path as a same-repository one. |
-| R-13.5 | THE SYSTEM SHALL place every such checkout under a single directory inside the served directory, and SHALL ensure that directory is ignored by git before creating the first checkout, so that a checkout never appears as untracked content of the repository under review. |
+| R-13.5 | THE SYSTEM SHALL place every such checkout under a single directory inside the git working tree hosting it, and SHALL ensure that directory is ignored by git before creating the first checkout, so that a checkout never appears as untracked content of the repository hosting it. |
 | R-13.6 | THE SYSTEM SHALL check out the pull request head in a detached state, so that no edit made inside the checkout can be committed to a branch by accident. |
 | R-13.7 | WHEN a pull request that is already checked out is selected again, THE SYSTEM SHALL move the existing checkout to the current head rather than recreating it, so that the path stays stable across a force-push. |
 | R-13.8 | THE SYSTEM SHALL report the same filesystem path for a given checkout from every operation that names one, so that a caller can determine whether a pull request is already checked out by comparing paths. |
-| R-13.9 | IF a checkout cannot be created, THE SYSTEM SHALL report which of the following occurred — the served directory is not a git repository, it has no origin remote, the pull request reference could not be fetched, or git refused the checkout — rather than a generic failure. |
+| R-13.9 | IF a checkout cannot be created because the pull request reference could not be fetched, or because git refused the checkout, THE SYSTEM SHALL report which of the two occurred rather than a generic failure. |
+| R-13.9a | WHERE the served directory is not a git working tree, or has no origin remote, THE SYSTEM SHALL NOT attempt a checkout and SHALL supply the review from the source named in `collaboration-workspace.md` Unit 1, so that neither condition is a failure. |
 | R-13.10 | THE SYSTEM SHALL reject a pull request identifier that is not a positive integer before it reaches a filesystem path or a git reference. |
 | R-13.11 | THE SYSTEM SHALL present the pull request's changed files as the entry point to a review, and SHALL allow opening any other file in the checkout, so that a reviewer can read the context surrounding a change. |
 | R-13.12 | WHEN the pull request head moves while a checkout is mounted, THE SYSTEM SHALL refresh the set of changed files together with the checkout, so that the two cannot disagree about which commit is under review. |

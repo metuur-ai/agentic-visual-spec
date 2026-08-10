@@ -109,6 +109,9 @@ function repoAdapter(
 ) {
   const states: (string | undefined)[] = [];
   const compares: { base: string; head: string }[] = [];
+  const reads: string[] = [];
+  /** Every `getPullRequest` — one per source resolution, and no more. */
+  const details: number[] = [];
   const adapter = {
     async listPullRequests(_repo: unknown, state?: string) {
       states.push(state);
@@ -116,6 +119,7 @@ function repoAdapter(
       return options.pulls ?? [summary()];
     },
     async getPullRequest(_repo: unknown, pullNumber: number) {
+      details.push(pullNumber);
       if (options.pullFails) throw options.pullFails;
       return {
         number: pullNumber,
@@ -144,20 +148,49 @@ function repoAdapter(
       compares.push({ base, head });
       return { mergeBaseSha: 'b'.repeat(40), aheadBy: 2, behindBy: 0, files: options.files ?? ['docs/spec.md'] };
     },
+    /* The two reads a host-sourced review makes. Recorded with their ref, because the
+     * whole point of the pin is that it is a commit and never a branch name (R-W2.4). */
+    async listFiles(_repo: unknown, path: string, ref?: string) {
+      reads.push(`listFiles:${path}@${ref ?? ''}`);
+      return [{ name: 'spec.md', path: 'docs/spec.md', type: 'file', sha: 'c'.repeat(40), size: 3 }];
+    },
+    async getFile(_repo: unknown, path: string, ref?: string) {
+      reads.push(`getFile:${path}@${ref ?? ''}`);
+      return { path, content: '# from the host\n', sha: 'c'.repeat(40) };
+    },
   } as unknown as GitHubAdapter;
-  return { adapter, states, compares };
+  return { adapter, states, compares, reads, details };
+}
+
+/**
+ * The two reads `readGitContext` makes, answered as an ordinary clone would.
+ *
+ * `resolveReviewSource` asks them before deciding whether a review takes the checkout, so
+ * a stub that stayed silent here would report "not a git working tree" and every mount
+ * test would quietly measure the host path instead of the one it names. A test that is
+ * about one of these two answers overrides it; the rest inherit a working tree with an
+ * origin, which is the state they were all written in.
+ *
+ * The origin is the configured repository's own URL, so `fetchSource` resolves to
+ * `origin` exactly as it did when this stub answered nothing at all.
+ */
+function gitContextDefault(args: string[]): { stdout?: string; exitCode: number | null } | undefined {
+  if (args[2] === 'rev-parse' && args[3] === '--abbrev-ref') return { stdout: 'main\n', exitCode: 0 };
+  if (args[2] === 'remote' && args[3] === 'get-url') return { stdout: 'https://github.com/acme/specs.git\n', exitCode: 0 };
+  return undefined;
 }
 
 /**
  * A `GitExecutor` that answers per command, recording every call. `answer` returns
- * `undefined` for anything it does not care about, which then succeeds silently — so a
- * test names only the command it is about.
+ * `undefined` for anything it does not care about, which then falls to
+ * `gitContextDefault` and otherwise succeeds silently — so a test names only the command
+ * it is about.
  */
 function stubGit(answer: (args: string[]) => { stdout?: string; exitCode: number | null } | undefined = () => undefined) {
   const calls: string[][] = [];
   const exec: GitExecutor = async (args) => {
     calls.push(args);
-    const { stdout = '', exitCode = 0 } = answer(args) ?? {};
+    const { stdout = '', exitCode = 0 } = answer(args) ?? gitContextDefault(args) ?? {};
     return { stdout, exitCode };
   };
   return { exec, calls };
@@ -362,16 +395,31 @@ describe('POST /__vs/collab/pulls/:n/mount', () => {
   const mount = (git: GitExecutor, baseDir = dir) =>
     router({ git, baseDir: () => baseDir }).handle({ method: 'POST', pathname: '/pulls/7/mount', query: {}, body: {} });
 
-  it('reports a served directory that is not a repository as a 409 naming the directory', async () => {
-    const res = await mount(stubGit((args) => (isCommand(args, 'rev-parse') ? { exitCode: 1 } : undefined)).exec);
-    expect(res.status).toBe(409);
-    expect(res.json).toMatchObject({ reason: 'not-a-repo', error: expect.stringContaining('not a git working tree') });
+  /*
+   * R-W1.3 / R-13.9a — the two refusals this feature deletes. Both used to be a 409
+   * telling the reviewer to go and clone something; both are now a review supplied by the
+   * host. `source: 'host'` is how the answer says so (R-W1.5), and "no fetch was
+   * attempted" is the other half: R-13.9a says neither condition may attempt a checkout at
+   * all, not merely that its failure is tolerated.
+   *
+   * `headSha` rides on both answers, checkout or not. It is the commit the whole review is
+   * pinned to and what every held comment is stamped with, and reading it off `worktree`
+   * made it conditional on there being a path on disk.
+   */
+  it('supplies the review from the host when the served directory is not a git working tree', async () => {
+    const git = stubGit((args) => (isCommand(args, 'rev-parse') ? { exitCode: 1 } : undefined));
+    const res = await mount(git.exec);
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({ ok: true, source: 'host', headSha: 'a'.repeat(40) });
+    expect(git.calls.some((c) => isCommand(c, 'fetch'))).toBe(false);
   });
 
-  it('reports a missing origin as a 409 naming the remote', async () => {
-    const res = await mount(stubGit((args) => (isCommand(args, 'remote') ? { exitCode: 1 } : undefined)).exec);
-    expect(res.status).toBe(409);
-    expect(res.json).toMatchObject({ reason: 'no-origin', error: expect.stringContaining('`origin`') });
+  it('supplies the review from the host when the served directory has no origin', async () => {
+    const git = stubGit((args) => (isCommand(args, 'remote') ? { exitCode: 1 } : undefined));
+    const res = await mount(git.exec);
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({ ok: true, source: 'host', headSha: 'a'.repeat(40) });
+    expect(git.calls.some((c) => isCommand(c, 'fetch'))).toBe(false);
   });
 
   it('reports a failed fetch as a 502, because the refusal came from upstream', async () => {
@@ -408,6 +456,10 @@ describe('POST /__vs/collab/pulls/:n/mount', () => {
     expect(res.status).toBe(200);
     expect(res.json).toEqual({
       ok: true,
+      // R-W1.5 — the other half of the pair the host tests above assert. The reviewer is
+      // told which source is live in *both* configurations, or being told is worthless.
+      source: 'checkout',
+      headSha: head,
       worktree: { pullNumber: 7, path: `${dir}/.visual-spec/worktrees/pr-7`, headSha: head },
     });
     // The fetch uses the fork-safe refspec, not the head branch by name.
@@ -452,6 +504,101 @@ describe('POST /__vs/collab/pulls/:n/mount', () => {
     expect(error).toContain('ddddddd');
     expect(error).toContain('aaaaaaa');
     expect(error).toContain('VS_COLLAB_REPO');
+  });
+
+  /*
+   * R-W1.2 at the route — the regression the corrected resolution rule exists to prevent.
+   * The served directory's `origin` is a clone of `someone/served` and the review is of
+   * `acme/specs`, and the answer still carries a worktree: the checkout was chosen, not
+   * the host. The test above already proves the fetch went to the derived URL; this one
+   * proves which source the reviewer ended up on.
+   */
+  it('still takes the checkout when `origin` names a different repository', async () => {
+    const head = 'a'.repeat(40);
+    const git = stubGit((args) => {
+      if (isCommand(args, 'remote')) return { stdout: 'https://github.com/someone/served.git\n', exitCode: 0 };
+      if (isCommand(args, 'rev-parse') && args[3] === 'HEAD') return { stdout: `${head}\n`, exitCode: 0 };
+      if (isCommand(args, 'rev-parse') && args[1] !== dir) return { exitCode: 1 };
+      return undefined;
+    });
+    const res = await mount(git.exec);
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({ ok: true, source: 'checkout', worktree: { pullNumber: 7 } });
+  });
+});
+
+/* ================================================================== *
+ * Reading a review through whichever source supplies it
+ * ================================================================== */
+describe('GET /__vs/collab/pulls/:n/{tree,raw}', () => {
+  /* No git working tree, so the resolution lands on the host source (R-W1.3) and every
+   * read below is one the reviewer could not have made at all before this change. */
+  const noRepo = () => stubGit((args) => (isCommand(args, 'rev-parse') ? { exitCode: 1 } : undefined)).exec;
+
+  const read = (path: string, query: Record<string, string> = {}, gh = repoAdapter()) =>
+    router({ git: noRepo(), repoAdapter: () => gh.adapter }).handle({ method: 'GET', pathname: path, query, body: {} });
+
+  it('lists one directory of the pull request’s tree at the pinned commit', async () => {
+    const gh = repoAdapter();
+    const res = await read('/pulls/7/tree', { path: 'docs' }, gh);
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({
+      pullNumber: 7,
+      headSha: 'a'.repeat(40),
+      path: 'docs',
+      entries: [{ name: 'spec.md', path: 'docs/spec.md', kind: 'file' }],
+    });
+    // The ref is the head COMMIT, never the head branch (R-W2.4).
+    expect(gh.reads).toEqual([`listFiles:docs@${'a'.repeat(40)}`]);
+  });
+
+  it('reads a file at the pinned commit', async () => {
+    const gh = repoAdapter();
+    const res = await read('/pulls/7/raw', { path: 'docs/spec.md' }, gh);
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({ pullNumber: 7, path: 'docs/spec.md', text: '# from the host\n' });
+    expect(gh.reads).toEqual([`getFile:docs/spec.md@${'a'.repeat(40)}`]);
+  });
+
+  it('defaults to the repository root when no path is given', async () => {
+    const gh = repoAdapter();
+    await read('/pulls/7/tree', {}, gh);
+    expect(gh.reads).toEqual([`listFiles:@${'a'.repeat(40)}`]);
+  });
+
+  it('reports a failed read as its own kind of failure, not a generic one', async () => {
+    // `getFile` answering `null` is "not at this commit", which the host source reports as
+    // `not-readable` — the one of the four whose advice is "check the path or your access".
+    const gh = repoAdapter();
+    const missing = { ...gh.adapter, getFile: async () => null } as unknown as GitHubAdapter;
+    const res = await router({ git: noRepo(), repoAdapter: () => missing }).handle({
+      method: 'GET',
+      pathname: '/pulls/7/raw',
+      query: { path: 'nope.md' },
+      body: {},
+    });
+    expect(res.status).toBe(404);
+    expect(res.json).toMatchObject({ reason: 'not-readable' });
+  });
+
+  it('resolves the source once and reads through it, rather than per file', async () => {
+    const gh = repoAdapter();
+    const r = router({ git: noRepo(), repoAdapter: () => gh.adapter });
+    const request = (pathname: string, query: Record<string, string>) => r.handle({ method: 'GET', pathname, query, body: {} });
+    await request('/pulls/7/tree', {});
+    await request('/pulls/7/raw', { path: 'docs/spec.md' });
+    await request('/pulls/7/raw', { path: 'docs/spec.md' });
+    // Three reads, one resolution: the head is not re-read per file, which is what keeps
+    // an open review pinned to the commit it opened on (R-W2.4).
+    expect(gh.reads).toHaveLength(3);
+    expect(gh.details).toEqual([7]);
+  });
+
+  it('refuses a pull number that is not one', async () => {
+    for (const pathname of ['/pulls/0/tree', '/pulls/abc/raw']) {
+      const res = await read(pathname);
+      expect(res.status, pathname).toBe(400);
+    }
   });
 });
 

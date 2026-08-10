@@ -33,6 +33,7 @@ import type { Awaiting, AwaitingSide } from '../core/vite/routes/collab';
 import type { JobEvent, JobKind, JobSnapshot, JobSync } from '../core/collaboration/job-hub';
 import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import type { ReviewDraft } from '../core/collaboration/review-drafts';
+import type { ReviewEntry, ReviewSourceKind } from '../core/collaboration/review-source';
 import type { MountedWorktree } from '../core/collaboration/worktree';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import type { CommentPatch } from '../core/vite/routes/comments';
@@ -41,7 +42,7 @@ import type { CollaborationRecord, GitHubBinding } from '../core/collaboration/d
 // Re-exported so a component can name what it renders without reaching into `core/`
 // itself — the same courtesy `collab-open-panel.tsx` already takes with the
 // availability snapshot. These are the server's shapes, declared once, over there.
-export type { MountedWorktree, PullRequestListState, PullRequestSummary, ReviewDraft };
+export type { MountedWorktree, PullRequestListState, PullRequestSummary, ReviewDraft, ReviewEntry, ReviewSourceKind };
 // The `/pulls/awaiting` shapes travel the same way. A chip that renders a count and a
 // panel section that renders its rows are both browser modules; neither should have to
 // name `core/vite/routes/` to type what it was handed.
@@ -153,8 +154,57 @@ export type PullRequestChangedFiles = {
   files: string[];
 };
 
-/** `POST /__vs/collab/pulls/:n/mount` — R-13.3, the checkout git actually produced. */
-export type WorktreeMounted = { ok: true; worktree: MountedWorktree };
+/**
+ * `GET /__vs/collab/pulls/:n/tree?path=` — the entries directly inside one directory of
+ * the pull request's tree, at the commit the review is pinned to.
+ *
+ * ONE DIRECTORY, NEVER A WALK. `ReviewSource.listDirectory` answers one directory per
+ * call on both sides, and the route is that call. The reviewing surface asks for a
+ * directory when the reviewer opens it and at no other time, so a repository with fifty
+ * thousand files costs one listing to browse into rather than a full walk to display.
+ */
+export type PullRequestTree = {
+  pullNumber: number;
+  headSha: string;
+  /** The directory that was listed. `''` is the repository root. */
+  path: string;
+  entries: readonly ReviewEntry[];
+};
+
+/**
+ * `GET /__vs/collab/pulls/:n/raw?path=` — one file's contents at the pinned commit,
+ * including a file the pull request did not change (R-W2.2).
+ */
+export type PullRequestFile = { pullNumber: number; headSha: string; path: string; text: string };
+
+/**
+ * A review that has been opened: where its files come from, the commit they are read at,
+ * and — only where there is one — the checkout on this disk.
+ *
+ * `source` IS FOR SAYING, NOT FOR SWITCHING (R-W1.5). The two sources differ in one thing
+ * a reviewer can feel: a `'host'` review fetches every file it opens over the network and
+ * cannot be read offline, while a `'checkout'` one, once mounted, can. That is why the
+ * kind travels to the browser at all. Nothing on the reviewing surface may read, order or
+ * render differently because of it — the seam exists precisely so it does not have to.
+ *
+ * `headSha` is the commit the whole review is pinned to (R-W2.4), and it is here rather
+ * than only on `worktree` because it is what a held comment is stamped with: a review
+ * with no checkout still has a commit, and still holds comments against it.
+ */
+export type OpenedReview = {
+  source: ReviewSourceKind;
+  headSha: string;
+  /**
+   * Absent when the review is supplied by the repository host rather than by a checkout
+   * (R-W1.3): the served directory is not a git working tree, or has no origin, so there
+   * is no path on this disk to report. Its absence is not a failure and never was — it is
+   * simply a review with no working copy.
+   */
+  worktree?: MountedWorktree;
+};
+
+/** `POST /__vs/collab/pulls/:n/mount` — R-13.3 / R-W1.5, the review the server opened. */
+export type WorktreeMounted = { ok: true } & OpenedReview;
 
 /**
  * `DELETE /__vs/collab/pulls/:n/mount`. `removed: false` is not a failure — it is
@@ -354,6 +404,21 @@ export interface CollabClient {
   /** `GET /__vs/collab/pulls/:n/files` — R-13.11, the review's entry point. */
   pullRequestFiles(pullNumber: number): Promise<CollabResult<PullRequestChangedFiles>>;
   /**
+   * `GET /__vs/collab/pulls/:n/tree?path=` — one directory of the review's tree (R-W2.3).
+   *
+   * `''` is the repository root. Called once per directory the reviewer opens, which is
+   * the only shape both sources can answer cheaply — see `ReviewSource.listDirectory`.
+   */
+  pullRequestTree(pullNumber: number, path: string): Promise<CollabResult<PullRequestTree>>;
+  /**
+   * `GET /__vs/collab/pulls/:n/raw?path=` — one file of the review (R-W2.2).
+   *
+   * The pair above is the whole read path of a review, and it is the same pair whichever
+   * source is live: the route reads through the resolved `ReviewSource`, so a reviewer
+   * with no checkout on disk reads exactly what a reviewer with one reads (R-W1.4).
+   */
+  pullRequestFile(pullNumber: number, path: string): Promise<CollabResult<PullRequestFile>>;
+  /**
    * `GET /__vs/collab/pulls/:n/description` — what the pull request says it is.
    *
    * Its own call rather than a field on the listing: bodies are unbounded prose, and most
@@ -497,6 +562,10 @@ export function createCollabClient(fetchImpl?: typeof fetch): CollabClient {
     mountPullRequest: (pullNumber) => send<WorktreeMounted>(`/pulls/${pullNumber}/mount`, 'POST', {}),
     unmountPullRequest: (pullNumber) => call<WorktreeRemoved>(`/pulls/${pullNumber}/mount`, { method: 'DELETE' }),
     pullRequestFiles: (pullNumber) => call<PullRequestChangedFiles>(`/pulls/${pullNumber}/files`),
+    pullRequestTree: (pullNumber, path) =>
+      call<PullRequestTree>(`/pulls/${pullNumber}/tree?path=${encodeURIComponent(path)}`),
+    pullRequestFile: (pullNumber, path) =>
+      call<PullRequestFile>(`/pulls/${pullNumber}/raw?path=${encodeURIComponent(path)}`),
     pullRequestDescription: (pullNumber) =>
       projected(call<{ body: string }>(`/pulls/${pullNumber}/description`), (b) => b.body),
     reviewDrafts: (pullNumber) =>

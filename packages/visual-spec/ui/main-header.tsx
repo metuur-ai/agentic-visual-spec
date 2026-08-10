@@ -945,6 +945,12 @@ function Brand({
         <div style={wordmarkRow}>
           <span style={wordmark}>Visual Specs</span>
           <span style={byline}>by Uncle&#8209;Dev</span>
+          {/* R-3.1 — the repository, the branch and what is open sit beside the wordmark
+              rather than under it. They are read constantly and the served path is not, so
+              they take the row the eye lands on first; the path keeps the quieter line
+              below. `Brand` is what `MainHeader` and `BrandHeader` share, so one placement
+              covers both. */}
+          <GitChip actions={actions} />
         </div>
         {/*
           NOWRAP, AND THE PATH IS WHAT GIVES. With a document open the toolbar is wide and
@@ -978,9 +984,6 @@ function Brand({
               {pathCopied ? '✓' : <CopyIcon />}
             </span>
           </button>
-          {/* R-3.1 — adjacent to the served path, in both headers: `Brand` is what
-              `MainHeader` and `BrandHeader` share, so one placement covers both. */}
-          <GitChip actions={actions} />
           {/*
             R-1.x — "Change…" only where the row has room for it.
 
@@ -2276,8 +2279,14 @@ const bar: React.CSSProperties = {
   position: 'relative',
   zIndex: 60,
 };
-const wordmarkRow: React.CSSProperties = { display: 'flex', alignItems: 'baseline', gap: 8, lineHeight: 1 };
+/*
+ * `center`, not `baseline`, since the chips joined it: a pill has no text baseline worth
+ * aligning to, and baseline-aligning it against 18px display type dropped it below the row.
+ * `minWidth: 0` is what lets the chips give width back — the wordmark and byline do not.
+ */
+const wordmarkRow: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, lineHeight: 1, minWidth: 0 };
 const wordmark: React.CSSProperties = {
+  flexShrink: 0,
   font: `700 18px ${DISPLAY}`,
   letterSpacing: '-0.02em',
   background: 'linear-gradient(92deg, #4f46e5 0%, #8b5cf6 70%)',
@@ -2287,6 +2296,7 @@ const wordmark: React.CSSProperties = {
   color: '#4f46e5',
 };
 const byline: React.CSSProperties = {
+  flexShrink: 0,
   fontSize: 9.5,
   fontWeight: 700,
   letterSpacing: '0.16em',

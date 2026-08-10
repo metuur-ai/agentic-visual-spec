@@ -28,6 +28,11 @@ const PULL = {
 
 const WORKTREE = { pullNumber: 42, path: '/repo/.visual-spec/worktrees/pr-42', headSha: 'abc1234def5678' };
 
+/** What the mount route answers where a checkout supplies the review (R-W1.5). */
+const CHECKOUT_MOUNT = { ok: true, source: 'checkout', headSha: WORKTREE.headSha, worktree: WORKTREE };
+/** And where the repository host does: same shape, same success, no path on this disk. */
+const HOST_MOUNT = { ok: true, source: 'host', headSha: WORKTREE.headSha };
+
 type Reply = { ok: boolean; status: number; json: unknown };
 
 /**
@@ -40,7 +45,7 @@ function fakeFetch(overrides: Record<string, Reply> = {}) {
   const routes: Record<string, Reply> = {
     '/__vs/collab/pulls?state=open': { ok: true, status: 200, json: { pulls: [PULL] } },
     '/__vs/collab/pulls/mounted': { ok: true, status: 200, json: { worktrees: [] } },
-    '/__vs/collab/pulls/42/mount': { ok: true, status: 200, json: { ok: true, worktree: WORKTREE } },
+    '/__vs/collab/pulls/42/mount': { ok: true, status: 200, json: CHECKOUT_MOUNT },
     ...overrides,
   };
   const impl = vi.fn(async (url: string, init?: RequestInit) => {
@@ -103,10 +108,38 @@ describe('R-13.3 — checking a pull request out', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Review the code' }));
 
-    await waitFor(() => expect(onReview).toHaveBeenCalledWith(PULL, WORKTREE));
+    await waitFor(() =>
+      expect(onReview).toHaveBeenCalledWith(PULL, { source: 'checkout', headSha: WORKTREE.headSha, worktree: WORKTREE }),
+    );
     expect(calls.filter((c) => c.url === '/__vs/collab/pulls/42/mount')).toEqual([
       { url: '/__vs/collab/pulls/42/mount', method: 'POST' },
     ]);
+  });
+
+  /*
+   * R-W1.3 / R-W1.5 — a review the host supplies is a review.
+   *
+   * This is the case the whole change exists for: the reviewer serving a directory that is
+   * not a git working tree. The response carries no `worktree` because there is no path on
+   * this disk, and the panel used to read that absence as a failure and print a sentence
+   * telling the reviewer to go and clone something. Nothing failed. The panel opens the
+   * review, and passes on which source is supplying it so the surface can say so.
+   */
+  it('opens a host-supplied review, which has no worktree and is not a failure', async () => {
+    const { impl } = fakeFetch({
+      '/__vs/collab/pulls/42/mount': { ok: true, status: 200, json: HOST_MOUNT },
+    });
+    const onReview = vi.fn();
+    render(<CollabPullsPanel onReview={onReview} fetchImpl={impl} />);
+    await waitFor(() => expect(screen.getByText(/Rework the payment rules/)).toBeTruthy());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Review the code' }));
+
+    await waitFor(() => expect(onReview).toHaveBeenCalledWith(PULL, { source: 'host', headSha: WORKTREE.headSha }));
+    // Nothing is said about cloning, serving a git directory, or an `origin` remote — the
+    // exact sentences the refusal used to print.
+    expect(screen.queryByText(/origin/i)).toBeNull();
+    expect(screen.queryByText(/needs a checkout/i)).toBeNull();
   });
 
   /*
@@ -308,7 +341,7 @@ describe('your own pull requests are their own section', () => {
 
 /*
  * Every button here runs git or GitHub, and none of them showed it: `Resume writing` and
- * `Remove checkout` only greyed out, and the row-wide busy flag put "Checking out…" on
+ * `Remove checkout` only greyed out, and the row-wide busy flag put "Opening the review…" on
  * the *mount* button when `Resume` was the one pressed. Reported as "it looks like nothing
  * happened".
  */
@@ -338,7 +371,7 @@ describe('a control that is waiting on the network says so, and it is the right 
     await waitFor(() => expect(screen.getByRole('button', { name: /Opening…/ })).toBeTruthy());
     expect(screen.getByRole('button', { name: /Opening…/ }).querySelector('[data-vs-spinner]')).toBeTruthy();
     // ...and the neighbour is not claiming the wait it is not doing.
-    expect(screen.queryByText('Checking out…')).toBeNull();
+    expect(screen.queryByText('Opening the review…')).toBeNull();
     expect(screen.getByRole('button', { name: /Review the code/ })).toBeTruthy();
   });
 
@@ -348,7 +381,7 @@ describe('a control that is waiting on the network says so, and it is the right 
     render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /Review the code/ }));
 
-    const btn = await screen.findByRole('button', { name: /Checking out…/ });
+    const btn = await screen.findByRole('button', { name: /Opening the review…/ });
     expect(btn.querySelector('[data-vs-spinner]')).toBeTruthy();
   });
 

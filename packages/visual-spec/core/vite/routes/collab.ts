@@ -42,7 +42,9 @@ import {
   type RepoRef,
 } from '../../collaboration/github-adapter';
 import { defaultExecGit, type GitExecutor } from '../../git-context';
-import { listMountedWorktrees, mountPullRequest, unmountPullRequest, type WorktreeFailure } from '../../collaboration/worktree';
+import { listMountedWorktrees, unmountPullRequest } from '../../collaboration/worktree';
+import type { ReviewSource, ReviewSourceFailure } from '../../collaboration/review-source';
+import { resolveReviewSource, type ReviewResolveFailure } from '../../collaboration/review-source-resolve';
 import {
   addReviewDraft,
   deleteReviewDraft,
@@ -641,28 +643,26 @@ function parsePullNumber(raw: string): number | null {
 }
 
 /**
- * Why a mount did not happen, said in the words of the thing the user has to fix.
+ * Why a review's checkout did not happen, said in the words of the thing the user has to
+ * fix.
  *
- * Each reason gets its own status because each is a different actor's problem: the first
- * two are the served directory's (nothing to do with GitHub, so `409` — the request was
- * fine, the state it addresses is not), `fetch-failed` is the network or the credential
- * (`502` — an upstream we depend on refused), and `worktree-failed` is git on this
- * machine (`500` — ours). Collapsing them into one "mount failed" would leave a user
- * with an unconfigured `origin` reading a message about GitHub being unreachable.
+ * Each reason gets its own status because each is a different actor's problem:
+ * `fetch-failed` is the network or the credential (`502` — an upstream we depend on
+ * refused), `worktree-failed` is git on this machine (`500` — ours), and `head-mismatch`
+ * is the served directory addressing a different repository (`409` — the request was
+ * fine, the state it addresses is not). Collapsing them into one "mount failed" would
+ * leave a user with a broken worktree registration reading about GitHub being unreachable.
+ *
+ * IT IS KEYED BY `ReviewResolveFailure`, NOT `WorktreeFailure` (R-13.9a). `not-a-repo` and
+ * `no-origin` used to live here as two 409s, and they were the refusal this whole change
+ * exists to delete: a served directory that is not a git working tree, or has no origin to
+ * fetch from, now takes the host source instead of being told to go and clone something.
+ * `resolveReviewSource` never returns either, so an entry for them here would be dead code
+ * that reads like a live refusal. The other three stay exactly as they were — a directory
+ * that *is* a clone with an origin and still could not produce a checkout has a problem
+ * the reviewer must see, and falling through to the host would hide it.
  */
-const MOUNT_FAILURE: Record<WorktreeFailure, { status: number; message: string }> = {
-  'not-a-repo': {
-    status: 409,
-    message:
-      'The served directory is not a git working tree, so a pull request cannot be checked out next to it. ' +
-      'Serve a directory inside the repository this pull request belongs to.',
-  },
-  'no-origin': {
-    status: 409,
-    message:
-      'The served directory has no `origin` remote, so there is nowhere to fetch the pull request from. ' +
-      'Add one with `git remote add origin <url>`.',
-  },
+const MOUNT_FAILURE: Record<ReviewResolveFailure, { status: number; message: string }> = {
   'fetch-failed': {
     status: 502,
     message:
@@ -683,6 +683,50 @@ const MOUNT_FAILURE: Record<WorktreeFailure, { status: number; message: string }
       '`VS_COLLAB_REPO` and the directory’s `origin`.',
   },
 };
+
+/**
+ * A failed read through a `ReviewSource`, as a status (R-W2.7).
+ *
+ * Four outcomes, four statuses, because each is a different actor's problem and the
+ * reviewer's next move differs for every one: authenticate (`401`), check the path or the
+ * access (`404`), retry (`502` — the upstream, not us), re-open the review at the new head
+ * (`409` — the request was fine, the commit it names has moved). The source's own `detail`
+ * is appended to the message the same way `MOUNT_FAILURE`'s is, so the reader sees the
+ * evidence as well as the advice.
+ *
+ * Deliberately shared by both sources: the seam exists so that a review does not vary by
+ * where its bytes came from, and a per-source status table would be exactly that variance
+ * (R-W1.4).
+ */
+const READ_FAILURE: Record<ReviewSourceFailure, { status: number; message: string }> = {
+  'no-credential': {
+    status: 401,
+    message: 'There is no usable credential for this repository. Run `gh auth login` — retrying will not help.',
+  },
+  'not-readable': {
+    status: 404,
+    message: 'That path could not be read at this commit. Check the path, and that your credential can see this repository.',
+  },
+  unreachable: {
+    status: 502,
+    message: 'The source of this review could not be reached. Check that you are online, then try again.',
+  },
+  'head-moved': {
+    status: 409,
+    message:
+      'The pull request head has moved, so this review is pinned to a commit that is no longer current. ' +
+      'Re-open the pull request to read it at the new head.',
+  },
+};
+
+/** One failed `ReviewSource` read, as the response to send. */
+function readFailure(failure: { reason: ReviewSourceFailure; detail?: string }): CollabRouteResult {
+  const { status, message } = READ_FAILURE[failure.reason];
+  return {
+    status,
+    json: { error: failure.detail ? `${message} (${failure.detail})` : message, reason: failure.reason },
+  };
+}
 
 /* ------------------------------------------------------------------ *
  * Held review comments on a checked-out Pull Request (Unit 13, R-13.13 … R-13.18)
@@ -731,6 +775,72 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   const git = deps.git ?? defaultExecGit;
   /** The configured repo as the adapter addresses it — `baseBranch` is not part of a ref. */
   const repoRefOf = (repo: ResolvedCollaborationConfig): RepoRef => ({ owner: repo.owner, repo: repo.repo });
+
+  /* ---------------------------------------------------------------- *
+   * Where a review reads from (R-W1.1)
+   * ---------------------------------------------------------------- */
+
+  /**
+   * The source each open review reads through, one per pull request.
+   *
+   * WHY IT IS HELD AT ALL. Resolving is not free — on the checkout side it is a fetch and
+   * a `checkout --detach` — and a review issues one read per file the reviewer opens. Re-
+   * resolving per read would fetch once per click, and worse, it would re-pin the review
+   * to whatever the head is *now*, silently, which is the swap R-W2.4 exists to forbid.
+   *
+   * WHY IT CANNOT GO STALE UNNOTICED. A `ReviewSource` is immutable and bound to one
+   * commit, so a held one cannot drift — it can only become wrong about the world, and it
+   * says so: the checkout source re-checks `rev-parse HEAD` on every read and the host
+   * source gets GitHub's own answer, and both report `head-moved` rather than serving
+   * other bytes. The recovery is to open the review again, which resolves afresh and
+   * replaces this entry — the changed paths and the pinned commit move together because
+   * they come out of one `resolveReviewSource` (R-W2.5), and there is no other way to get
+   * a source.
+   *
+   * Keyed by repository as well as number because pull request 42 exists in most
+   * repositories.
+   */
+  const reviews = new Map<string, ReviewSource>();
+  const reviewKey = (repo: RepoRef, pullNumber: number): string => `${repo.owner}/${repo.repo}#${pullNumber}`;
+
+  /**
+   * Decide where a review reads from, build it, and remember it — the move this whole
+   * change rests on, replacing the served directory as the one place a review could come
+   * from with a decision made per review (R-W1.1 / R-W1.3).
+   *
+   * `refresh` is what an open request passes: it discards any held source and resolves at
+   * the head as it is now. Every other caller reuses the held one, so browsing a review
+   * never re-pins it.
+   */
+  async function reviewSourceFor(
+    repo: RepoRef,
+    pullNumber: number,
+    options: { refresh?: boolean } = {},
+  ): Promise<
+    | { ok: true; source: ReviewSource; worktree?: { pullNumber: number; path: string; headSha: string } }
+    | { ok: false; result: CollabRouteResult }
+  > {
+    const key = reviewKey(repo, pullNumber);
+    if (!options.refresh) {
+      const held = reviews.get(key);
+      if (held) return { ok: true, source: held };
+    }
+    const resolved = await resolveReviewSource({ baseDir: baseDir(), repo, pullNumber, adapter: repoAdapter(), exec: git });
+    if (!resolved.ok) {
+      // The pull request itself could not be read, so neither source could have been
+      // built. Answered exactly as every sibling route answers an adapter failure —
+      // GitHub's own status, or a rethrow for anything that is not GitHub's.
+      if (resolved.reason === 'pull-unreadable') {
+        if (resolved.error instanceof GitHubError) return { ok: false, result: githubFailure(resolved.error) };
+        throw resolved.error;
+      }
+      const { status, message } = MOUNT_FAILURE[resolved.reason];
+      const detailed = resolved.detail ? `${message} (${resolved.detail})` : message;
+      return { ok: false, result: { status, json: { error: detailed, reason: resolved.reason } } };
+    }
+    reviews.set(key, resolved.source);
+    return { ok: true, source: resolved.source, ...(resolved.worktree ? { worktree: resolved.worktree } : {}) };
+  }
 
   /**
    * ONE PER SERVER, ON PURPOSE. `createMentionsReader` is stateful: it remembers the
@@ -1154,33 +1264,90 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         }
 
         /*
-         * The head is read from the API before the fetch, not derived from it, and both
-         * the repository and that commit are handed to the mount.
+         * POST — open the review, which is now "decide where it reads from" rather than
+         * "check it out" (R-W1.1). `resolveReviewSource` makes that decision from the
+         * served directory alone and builds the source; on the checkout side it is the
+         * same `mountPullRequest` call this route always made, with the same repository
+         * and the same expected head, so every checkout behaviour and every checkout
+         * failure is unchanged (R-W5.2).
          *
-         * The pull number alone does not identify a pull request — it identifies one
-         * *within a repository*. Everything else on this route addresses `gated.repo`,
-         * while the mount used to address the served directory's `origin`, so the moment
-         * those two differ (`VS_COLLAB_REPO`, or a served directory that is a clone of
-         * something else) the number resolved twice, in two repositories, and the reviewer
-         * was shown one pull request's file list over another's tree.
+         * The head is still read from the API before the fetch and handed to the mount —
+         * it just happens inside the resolution now, together with the source, because a
+         * head read apart from the source it pins is a pair that can disagree (R-W2.5).
+         * The pull number alone does not identify a pull request; it identifies one
+         * *within a repository*, and the moment `gated.repo` and the served directory's
+         * `origin` differ, the number would otherwise resolve twice, in two repositories.
+         *
+         * `refresh` because this IS the refresh: a re-open after a force-push must drop
+         * the source pinned to the old head rather than keep answering from it.
+         *
+         * WHAT THE RESPONSE SAYS, AND WHY EACH FIELD IS THERE (R-W1.5).
+         *
+         * `source` names which of the two supplied the review, because the browser cannot
+         * work it out and the difference is one the reviewer has to be able to account for:
+         * a host-sourced review needs the network for every file it opens and a checkout-
+         * backed one does not. It is a label to report, never a discriminant — the surface
+         * that receives it says it out loud and reads exactly the same way either way.
+         *
+         * `headSha` is the commit every read of this review lands on, and it is reported
+         * unconditionally because it is what a held comment is stamped with (R-13.13) and
+         * what R-13.14's staleness check compares against. It used to be reachable only
+         * through `worktree.headSha`, which made the one fact a review cannot do without
+         * conditional on there being a path on disk.
+         *
+         * `worktree` stays present exactly when the checkout supplies the review — it is
+         * the path on this machine, and a host-sourced review has none. Its absence is no
+         * longer how a caller learns the source; `source` says so directly.
          */
-        let expectedHeadSha: string;
-        try {
-          expectedHeadSha = (await repoAdapter().getPullRequest(repoRefOf(gated.repo), pullNumber)).headSha;
-        } catch (err) {
-          if (err instanceof GitHubError) return githubFailure(err);
-          throw err;
+        const resolved = await reviewSourceFor(repoRefOf(gated.repo), pullNumber, { refresh: true });
+        if (!resolved.ok) return resolved.result;
+        return {
+          status: 200,
+          json: {
+            ok: true,
+            source: resolved.source.kind,
+            headSha: resolved.source.headSha,
+            ...(resolved.worktree ? { worktree: resolved.worktree } : {}),
+          },
+        };
+      }
+
+      /*
+       * GET /__vs/collab/pulls/:n/tree?path= — one directory of the pull request's tree at
+       * the pinned commit, and GET …/raw?path= — one file's bytes at it (R-W2.2 / R-W2.3).
+       *
+       * WHY THESE ARE HERE AND NOT ON `/__vs/tree` AND `/__vs/raw`. Those two serve the
+       * *served directory*, and a review supplied by the host has nothing on that disk to
+       * serve. Both read through the `ReviewSource` the open resolved, so a review reads
+       * the same way from either side and the reviewing surface does not vary by source
+       * (R-W1.4). A read arriving before an open resolves one rather than refusing — the
+       * decision is still made before any file is read, which is all R-W1.1 asks.
+       *
+       * `read`-gated like every sibling in this family: reading a pull request writes
+       * nothing to it.
+       */
+      const pullTree = /^\/pulls\/([^/]+)\/(tree|raw)$/.exec(pathname);
+      if (pullTree && method === 'GET') {
+        const pullNumber = parsePullNumber(pullTree[1]!);
+        if (pullNumber === null) return bad(`invalid pullNumber: ${pullTree[1]!}`);
+        const gated = await gate('read', null);
+        if (!gated.ok) return gated.result;
+        const resolved = await reviewSourceFor(repoRefOf(gated.repo), pullNumber);
+        if (!resolved.ok) return resolved.result;
+        const { source } = resolved;
+        // `''` is the repository root for a listing, and is never a file — `readFile`
+        // refuses it on both sides rather than leaving it to whichever error the platform
+        // happens to raise.
+        const path = req.query.path ?? '';
+
+        if (pullTree[2] === 'tree') {
+          const listed = await source.listDirectory(path);
+          if (!listed.ok) return readFailure(listed);
+          return { status: 200, json: { pullNumber, headSha: source.headSha, path, entries: listed.value } };
         }
-        const result = await mountPullRequest(baseDir(), pullNumber, git, {
-          repo: repoRefOf(gated.repo),
-          expectedHeadSha,
-        });
-        if (!result.ok) {
-          const { status, message } = MOUNT_FAILURE[result.reason];
-          const detailed = result.detail ? `${message} (${result.detail})` : message;
-          return { status, json: { error: detailed, reason: result.reason } };
-        }
-        return { status: 200, json: { ok: true, worktree: result.worktree } };
+        const file = await source.readFile(path);
+        if (!file.ok) return readFailure(file);
+        return { status: 200, json: { pullNumber, headSha: source.headSha, path: file.value.path, text: file.value.text } };
       }
 
       /*

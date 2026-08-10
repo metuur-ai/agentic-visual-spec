@@ -33,8 +33,17 @@ export type RepoRef = { owner: string; repo: string };
 /** A git ref and the commit it points at. */
 export type GitRef = { ref: string; sha: string };
 
-/** A file read back from the Contents API, already decoded to utf-8. */
-export type FileContent = { path: string; sha: string; content: string };
+/**
+ * A file read back from the Contents API, already decoded to utf-8.
+ *
+ * `target` is present only when the endpoint answered with a *symlink object* rather than
+ * a file: GitHub does that for a symbolic link it did not resolve, and such a response
+ * carries the link's own target path and no `content` at all. The field is optional and
+ * purely additive — every existing caller reads `path`, `sha` and `content` and receives
+ * exactly what it did before — and it is the only thing that tells an unresolved link
+ * apart from a file whose bytes were withheld, since both arrive with `content: ''`.
+ */
+export type FileContent = { path: string; sha: string; content: string; target?: string };
 
 /**
  * One entry of a Contents API *directory* listing. `type` is GitHub's own
@@ -752,7 +761,16 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
         const raw = await get('getFile', `/repos/${repo.owner}/${repo.repo}/contents/${path}?ref=${ref}`);
         // GitHub wraps base64 at 60 columns; strip whitespace before decoding.
         const encoded = str(raw.content).replace(/\s+/g, '');
-        return { path: str(raw.path, path), sha: str(raw.sha), content: Buffer.from(encoded, 'base64').toString('utf8') };
+        // A symlink object carries `target` and no content. Passed through when it is
+        // there and omitted when it is not, so a file response is byte-identical to what
+        // this method has always returned.
+        const target = str(raw.target);
+        return {
+          path: str(raw.path, path),
+          sha: str(raw.sha),
+          content: Buffer.from(encoded, 'base64').toString('utf8'),
+          ...(target === '' ? {} : { target }),
+        };
       } catch (err) {
         if (err instanceof GitHubError && err.status === 404) return null;
         throw err;

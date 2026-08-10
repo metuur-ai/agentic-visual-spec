@@ -52,6 +52,7 @@ import {
   type AwaitingMention,
   type AwaitingSide,
   type MountedWorktree,
+  type OpenedReview,
   type PullRequestListState,
   type PullRequestSummary,
   createCollabClient,
@@ -60,11 +61,13 @@ import { useAwaitingPulls } from './use-awaiting-pulls';
 
 export type CollabPullsPanelProps = {
   /**
-   * Called once a Pull Request is checked out and ready to read. Both halves are
-   * handed over: the summary is what the header names, the worktree is where the files
-   * are — and it is git's own path (R-13.8), never one recomputed here.
+   * Called once a Pull Request is open and ready to read. Both halves are handed over:
+   * the summary is what the header names, and the review says where its files come from
+   * (R-W1.5) and at which commit. Where a checkout supplies it, `worktree.path` is git's
+   * own (R-13.8), never one recomputed here; where the host does, there is no path and
+   * that is an ordinary review, not a lesser one.
    */
-  onReview: (pull: PullRequestSummary, worktree: MountedWorktree) => void;
+  onReview: (pull: PullRequestSummary, review: OpenedReview) => void;
   /**
    * R-7.7 — called with the document id once `POST /__vs/collab/open` has accepted, for a
    * row whose pull request carries one. The id is the server's (R-7.4/R-7.5); nothing here
@@ -123,7 +126,7 @@ export function shortSha(sha: string): string {
 /**
  * `action` as well as `pullNumber`, so the spinner lands on the button that was pressed.
  *
- * A row-wide busy flag put "Checking out…" on the mount button when the reviewer had
+ * A row-wide busy flag put "Opening the review…" on the mount button when the reviewer had
  * pressed `Resume writing` next to it — the wrong control claiming the wait, and the
  * pressed one showing nothing at all. Every button on the row still disables together,
  * because they all act on the same checkout; only the signal is narrowed.
@@ -254,9 +257,23 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
         setStatus({ kind: 'error', message: res.message });
         return false;
       }
+      /*
+       * A REVIEW WITH NO WORKTREE IS A REVIEW, NOT A REFUSAL (R-W1.3).
+       *
+       * The server answered, so the pull request is open and readable; `worktree` is
+       * simply absent because the served directory is not a working tree it could check
+       * out into, and the repository host is supplying the files instead. That used to be
+       * reported here as an error — the honest placeholder while the surface knew only
+       * about checkouts — and it is not one: nothing failed, and there is nothing for the
+       * reviewer to go and fix.
+       *
+       * So the whole response is handed on as it stands. Which source it is goes with it
+       * (R-W1.5), for the surface to say out loud; the path goes only when there is one.
+       */
+      const { source, headSha, worktree } = res.value;
       setStatus({ kind: 'idle' });
       await refreshMounted();
-      onReview(pull, res.value.worktree);
+      onReview(pull, { source, headSha, ...(worktree ? { worktree } : {}) });
       return true;
     },
     [client, onReview, refreshMounted],
@@ -388,7 +405,7 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
             disabled={busy}
             style={pull.documentId ? button : primaryButton}
           >
-            <BusyLabel busy={running('mount')}>{running('mount') ? 'Checking out…' : 'Review the code'}</BusyLabel>
+            <BusyLabel busy={running('mount')}>{running('mount') ? 'Opening the review…' : 'Review the code'}</BusyLabel>
           </button>
           {worktree && (
             <button type="button" onClick={() => void unmount(pull.number)} disabled={busy} style={button}>

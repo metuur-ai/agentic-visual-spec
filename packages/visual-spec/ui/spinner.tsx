@@ -19,7 +19,7 @@
  * opacity breathes instead. It still says "waiting" without anything travelling.
  */
 
-import { useLayoutEffect } from 'react';
+import { useEffect, useLayoutEffect, useState } from 'react';
 
 const CSS =
   '@keyframes vs-spin{to{transform:rotate(360deg)}}' +
@@ -100,6 +100,41 @@ export function BusyLabel({ busy, children, size = 12 }: { busy: boolean; childr
  * exactly the complaint the spinner exists to answer: on a slow route the screen looked
  * static and finished. This pairs the word with the one thing that says it is still going.
  */
+/**
+ * How long a read may take before it is worth saying so.
+ *
+ * The same 320ms the header's chip tooltips already wait, and for the same reason: a
+ * signal that appears and disappears faster than the eye can settle on it is not a
+ * signal, it is a flash. A file read that lands in single-digit milliseconds — which is
+ * every read from a checkout on this machine — has nothing to report, and reporting it
+ * anyway strobes the pane on every click. A read that is still outstanding after this
+ * long is a wait the reader is already noticing, and that one gets said out loud.
+ *
+ * One number for both sources, not a rule per source: the surface must not read or render
+ * differently because of where its bytes come from (R-W1.4). It is the *duration* that
+ * decides, and the host source is simply the one that usually exceeds it.
+ */
+export const BUSY_DELAY_MS = 320;
+
+/**
+ * `busy`, but only once it has been true for longer than a glance (R-W2.8).
+ *
+ * Falls to `false` the instant `busy` does — a finished read must clear immediately, and
+ * holding the indicator open for symmetry would invent a wait that is over.
+ */
+export function useSettledBusy(busy: boolean, delayMs = BUSY_DELAY_MS): boolean {
+  const [settled, setSettled] = useState(false);
+  useEffect(() => {
+    if (!busy) {
+      setSettled(false);
+      return;
+    }
+    const timer = setTimeout(() => setSettled(true), delayMs);
+    return () => clearTimeout(timer);
+  }, [busy, delayMs]);
+  return settled;
+}
+
 export function LoadingLine({ children = 'Loading…', style }: { children?: React.ReactNode; style?: React.CSSProperties }) {
   return (
     <p style={{ display: 'flex', alignItems: 'center', gap: 7, opacity: 0.65, margin: 0, ...style }}>

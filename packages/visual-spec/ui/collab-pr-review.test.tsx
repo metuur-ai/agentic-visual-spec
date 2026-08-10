@@ -1,25 +1,27 @@
 // @vitest-environment jsdom
 /**
- * collab-pr-review.test.tsx — reading a checked-out pull request (R-13.11, R-13.19).
+ * collab-pr-review.test.tsx — reading a pull request (R-13.11, R-13.19, R-W1.3, R-W1.4).
  *
- * Two fakes, for two boundaries. `/__vs/collab/pulls/:n/files` is injected into the
- * component (`fetchImpl`); `/__vs/tree` and `/__vs/tree/file` are stubbed on the global,
- * because `useTree`/`useFile` are the shared browsing hooks and take no injection. Either
- * way nothing here reaches a server, a git repository or a disk.
+ * ONE FAKE, FOR ONE BOUNDARY. Every read this surface makes is a `/__vs/collab/pulls/:n/*`
+ * call, and all of them are injected into the component (`fetchImpl`). The global `fetch`
+ * is stubbed to *throw*: the surface used to browse the served directory through
+ * `/__vs/tree`, and a review that still reached for it would be a review that only works
+ * where a checkout happens to be on disk. Nothing here touches a server, a git repository
+ * or a disk.
  *
- * The read-only suite at the bottom is the one that matters most: R-13.19 is a promise
- * about what the interface does *not* offer, and the only way to keep such a promise
- * under refactoring is to assert the absence.
+ * The read-only suite matters most: R-13.19 is a promise about what the interface does
+ * *not* offer, and the only way to keep such a promise under refactoring is to assert the
+ * absence.
  */
 import { render, screen, waitFor, within } from '@testing-library/react';
 import { fireEvent } from '@testing-library/dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ReviewDraft } from '../core/collaboration/review-drafts';
 import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
-import { worktreeRelPath } from '../core/collaboration/worktree';
-import { CollabPrReview, changedTreeEntries, entriesUnder, worktreePrefix } from './collab-pr-review';
+import type { ReviewEntry } from '../core/collaboration/review-source';
+import { CollabPrReview, changedTreeEntries } from './collab-pr-review';
 import { reviewCommentPanelSource } from './review-comment-source';
-import { invalidateTree, type TreeEntry } from './use-tree';
+import type { TreeEntry } from './use-tree';
 
 const PULL = {
   number: 42,
@@ -36,52 +38,75 @@ const PULL = {
 
 const WORKTREE = { pullNumber: 42, path: '/repo/.visual-spec/worktrees/pr-42', headSha: 'abc1234def5678' };
 
-const PREFIX = '.visual-spec/worktrees/pr-42/';
+/**
+ * The review as `CollabPullsPanel` hands it over. `source` is the label R-W1.5 requires the
+ * surface to report; the host-sourced counterpart is built inline where it is asserted on.
+ */
+const REVIEW = { source: 'checkout' as const, headSha: WORKTREE.headSha, worktree: WORKTREE };
 
-/** The whole served tree: the checkout, plus a file outside it that must not appear. */
-const TREE: TreeEntry[] = [
-  { path: '.visual-spec', name: '.visual-spec', type: 'dir' },
-  { path: '.visual-spec/worktrees', name: 'worktrees', type: 'dir' },
-  { path: '.visual-spec/worktrees/pr-42', name: 'pr-42', type: 'dir' },
-  { path: `${PREFIX}src`, name: 'src', type: 'dir' },
-  { path: `${PREFIX}src/pay.ts`, name: 'pay.ts', type: 'file', kind: 'code' },
-  { path: `${PREFIX}src/util.ts`, name: 'util.ts', type: 'file', kind: 'code' },
-  { path: `${PREFIX}spec.md`, name: 'spec.md', type: 'file', kind: 'markdown' },
-  { path: 'notes.md', name: 'notes.md', type: 'file', kind: 'markdown' },
-];
-
-const CONTENT: Record<string, string> = {
-  [`${PREFIX}src/pay.ts`]: 'export const pay = () => 1;\n',
-  [`${PREFIX}src/util.ts`]: 'export const util = () => 2;\n',
-  [`${PREFIX}spec.md`]: '# Refunds\n\nWithin five business days.\n',
+/**
+ * The pull request's tree, one directory at a time — which is the only shape a
+ * `ReviewSource` answers in, and therefore the only shape `/pulls/:n/tree` serves. A
+ * directory that is not a key here is one the review cannot read.
+ */
+const DIRECTORIES: Record<string, ReviewEntry[]> = {
+  '': [
+    { name: 'src', path: 'src', kind: 'directory' },
+    { name: 'vendor', path: 'vendor', kind: 'directory' },
+    { name: 'spec.md', path: 'spec.md', kind: 'file' },
+  ],
+  src: [
+    { name: 'pay.ts', path: 'src/pay.ts', kind: 'file' },
+    { name: 'util.ts', path: 'src/util.ts', kind: 'file' },
+  ],
+  vendor: [{ name: 'huge.ts', path: 'vendor/huge.ts', kind: 'file' }],
 };
 
-/** Stub `/__vs/tree` and `/__vs/tree/file` on the global — the hooks take no injection. */
-function stubTreeFetch() {
-  const impl = vi.fn(async (url: string) => {
-    if (url === '/__vs/tree') return { ok: true, status: 200, json: async () => TREE } as unknown as Response;
-    const file = /^\/__vs\/tree\/file\?path=(.+)$/.exec(url);
-    if (file) {
-      const path = decodeURIComponent(file[1] as string);
-      const content = CONTENT[path];
-      if (content === undefined) return { ok: false, status: 404, text: async () => 'not found' } as unknown as Response;
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ path, kind: 'code', content, size: content.length }),
-      } as unknown as Response;
+/** The bytes at the pinned commit, repo-relative — no worktree prefix on any of them. */
+const CONTENT: Record<string, string> = {
+  'src/pay.ts': 'export const pay = () => 1;\n',
+  'src/util.ts': 'export const util = () => 2;\n',
+  'spec.md': '# Refunds\n\nWithin five business days.\n',
+  'vendor/huge.ts': 'export const huge = 3;\n',
+};
+
+const reply = (status: number, json: unknown) =>
+  ({ ok: status < 400, status, json: async () => json }) as unknown as Response;
+
+/**
+ * The two review reads, answered as the routes answer them. Shared by every fake below,
+ * because they are the surface's whole read path now and no test can avoid them.
+ *
+ * Returns `undefined` for a URL that is not one of the two, so a caller can add its own
+ * routes in front of it.
+ */
+function reviewRead(url: string): Response | undefined {
+  const tree = /^\/__vs\/collab\/pulls\/42\/tree\?path=(.*)$/.exec(url);
+  if (tree) {
+    const path = decodeURIComponent(tree[1] as string);
+    const entries = DIRECTORIES[path];
+    if (!entries) return reply(404, { error: 'That path could not be read at this commit.', reason: 'not-readable' });
+    return reply(200, { pullNumber: 42, headSha: PULL.headSha, path, entries });
+  }
+  const raw = /^\/__vs\/collab\/pulls\/42\/raw\?path=(.*)$/.exec(url);
+  if (raw) {
+    const path = decodeURIComponent(raw[1] as string);
+    const text = CONTENT[path];
+    if (text === undefined) {
+      return reply(404, { error: 'That path could not be read at this commit.', reason: 'not-readable' });
     }
-    throw new Error(`unexpected global fetch: ${url}`);
-  });
-  vi.stubGlobal('fetch', impl);
-  return impl;
+    return reply(200, { pullNumber: 42, headSha: PULL.headSha, path, text });
+  }
+  return undefined;
 }
 
-/** The one collaboration route this surface calls. */
+/** The collaboration routes this surface calls, with `reply` standing in for `/files`. */
 function fakeCollabFetch(reply: { ok: boolean; status: number; json: unknown }) {
   const calls: string[] = [];
   const impl = vi.fn(async (url: string) => {
     calls.push(url);
+    const read = reviewRead(url);
+    if (read) return read;
     return { ok: reply.ok, status: reply.status, json: async () => reply.json } as unknown as Response;
   });
   return { impl: impl as unknown as typeof fetch, calls };
@@ -100,11 +125,19 @@ const changedFiles = (files: string[]): { ok: boolean; status: number; json: unk
   },
 });
 
+/**
+ * R-W1.4, asserted as an absence. The served directory's routes are not this surface's to
+ * call: a review that reached for `/__vs/tree` would read files only where a checkout is
+ * on disk, which is precisely the failure this feature exists to end. Anything that goes
+ * to the global `fetch` fails the test that made it.
+ */
 beforeEach(() => {
-  // The tree walk is cached for seconds at module scope, so without this the second
-  // test in the file would render the first one's tree.
-  invalidateTree();
-  stubTreeFetch();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      throw new Error(`the review surface must read through the pull request routes, not: ${url}`);
+    }),
+  );
 });
 
 afterEach(() => {
@@ -113,18 +146,90 @@ afterEach(() => {
 
 const mount = (reply = changedFiles(['src/pay.ts'])) => {
   const { impl, calls } = fakeCollabFetch(reply);
-  render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+  render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={impl} />);
   return calls;
 };
 
-describe('the checkout path convention is the one core writes', () => {
-  it('matches `worktreeRelPath`, which is what git was told to create', () => {
-    expect(worktreePrefix(42)).toBe(`${worktreeRelPath(42)}/`);
-    expect(WORKTREE.path.endsWith(worktreeRelPath(42))).toBe(true);
+/*
+ * R-W1.3 / R-W1.4 — THE STORY'S OWN CHECK, and the assertion that failed before it.
+ *
+ * A review supplied by the host has nothing on this disk: no worktree, no path, no served
+ * subtree to walk. It opened, named its source and listed its changed files, and then said
+ * "No preview for this file." for every one of them, which is SC-1 unmet. Nothing below
+ * mentions a source — the reads are the same reads — and that is the point: the two cases
+ * are the same test run twice with a different label on the review.
+ */
+describe('R-W1.3 / R-W1.4 — the files open from either source, through one read path', () => {
+  const HOST = { source: 'host' as const, headSha: PULL.headSha };
+
+  const openReview = (review: { source: 'host' | 'checkout'; headSha: string }) => {
+    const { impl, calls } = fakeCollabFetch(changedFiles(['src/pay.ts']));
+    render(<CollabPrReview pull={PULL} review={review} onExit={vi.fn()} fetchImpl={impl} />);
+    return calls;
+  };
+
+  it('reads a changed file with no checkout on disk', async () => {
+    const calls = openReview(HOST);
+    fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
+
+    expect(await screen.findByText(/export const pay/)).toBeTruthy();
+    // Through the pull request's own route, at the pinned commit — not through the served
+    // directory, and not under a worktree prefix.
+    expect(calls).toContain('/__vs/collab/pulls/42/raw?path=src%2Fpay.ts');
+    expect(calls.some((c) => c.includes('worktrees'))).toBe(false);
   });
 
-  it('re-roots the checkout and leaves everything outside it alone', () => {
-    expect(entriesUnder(TREE, PREFIX).map((e) => e.path)).toEqual(['src', 'src/pay.ts', 'src/util.ts', 'spec.md']);
+  it('reads a file the pull request did not change, by expanding into the tree (R-W2.2)', async () => {
+    openReview(HOST);
+    fireEvent.click(await screen.findByRole('button', { name: /Rest of the files/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /src$/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /util\.ts/ }));
+
+    expect(await screen.findByText(/export const util/)).toBeTruthy();
+  });
+
+  it('reads the same way from a checkout, with the same result', async () => {
+    const calls = openReview({ source: 'checkout', headSha: PULL.headSha });
+    fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
+
+    expect(await screen.findByText(/export const pay/)).toBeTruthy();
+    expect(calls).toContain('/__vs/collab/pulls/42/raw?path=src%2Fpay.ts');
+  });
+
+  /*
+   * THE REASON THE TREE IS NOT WALKED. `listDirectory` answers one directory per call, so
+   * a full walk is one round trip per directory in the repository — and on the host source
+   * each of those is a round trip to GitHub. A folder nobody opened must cost nothing.
+   */
+  it('reads one directory per folder opened, and nothing for the folders left shut', async () => {
+    const calls = openReview(HOST);
+    fireEvent.click(await screen.findByRole('button', { name: /Rest of the files/ }));
+    // The root, and only the root, until someone opens something.
+    await screen.findByRole('button', { name: /vendor$/ });
+    const listings = () => calls.filter((c) => c.includes('/tree?path='));
+    expect(listings()).toEqual(['/__vs/collab/pulls/42/tree?path=']);
+
+    fireEvent.click(screen.getByRole('button', { name: /src$/ }));
+    await screen.findByRole('button', { name: /util\.ts/ });
+
+    // One more listing, for the folder that was opened. `vendor` sat beside it and was
+    // never read.
+    expect(listings()).toEqual(['/__vs/collab/pulls/42/tree?path=', '/__vs/collab/pulls/42/tree?path=src']);
+    expect(calls.some((c) => c.includes('vendor'))).toBe(false);
+  });
+
+  /*
+   * R-13.12 / R-W2.7 — a changed path that is not in the tree at this commit is a file the
+   * pull request deleted. The read says what to do about it; "No preview for this file"
+   * said nothing at all, and used to be the answer for every file on a host-sourced review.
+   */
+  it('gives the route’s own sentence when a changed path cannot be read', async () => {
+    const { impl } = fakeCollabFetch(changedFiles(['src/gone.ts']));
+    render(<CollabPrReview pull={PULL} review={HOST} onExit={vi.fn()} fetchImpl={impl} />);
+    fireEvent.click(await screen.findByRole('button', { name: /gone\.ts/ }));
+
+    expect(await screen.findByText(/could not be read at this commit/)).toBeTruthy();
+    expect(screen.queryByText('No preview for this file.')).toBeNull();
   });
 });
 
@@ -155,42 +260,45 @@ describe('R-13.11 — the changed files are the entry point', () => {
 });
 
 /**
- * The rest of the checkout is behind a disclosure now, so every test that reaches a file
- * the pull request did not touch has to open it first — which is the point: the changed
- * files are what a reviewer lands on.
+ * The rest of the tree is behind a disclosure, so every test that reaches a file the pull
+ * request did not touch has to open it first — which is the point: the changed files are
+ * what a reviewer lands on.
  */
+/**
+ * The rest-of-the-tree pane, queried on its own. The changed-files tree above it holds a
+ * `src` folder too — they are two views of one tree — so a bare query would find both.
+ */
+const restPane = () => within(document.getElementById('vs-checkout-rest') as HTMLElement);
+
 async function openTheRest(): Promise<void> {
-  fireEvent.click(await screen.findByRole('button', { name: /Rest of the checkout/ }));
-  await waitFor(() => expect(screen.getByPlaceholderText('filter…')).toBeTruthy());
+  fireEvent.click(await screen.findByRole('button', { name: /Rest of the files/ }));
+  await waitFor(() => expect(restPane().getByRole('button', { name: /vendor$/ })).toBeTruthy());
 }
 
-describe('R-13.11 — any other file in the checkout can be opened', () => {
-  it('browses the whole checkout, not only the changed subset', async () => {
-    mount();
-    // The filter force-opens the tree, which is how a reviewer reaches a file the pull
-    // request did not touch without clicking through every folder.
-    await openTheRest();
-    fireEvent.change(screen.getByPlaceholderText('filter…'), { target: { value: 'util' } });
+/** Open a folder in that pane and wait for the directory it holds to arrive. */
+async function expandFolder(name: RegExp, until: RegExp): Promise<void> {
+  fireEvent.click(restPane().getByRole('button', { name }));
+  await restPane().findByRole('button', { name: until });
+}
 
-    const row = await screen.findByRole('button', { name: /util\.ts/ });
-    fireEvent.click(row);
+describe('R-13.11 — any other file in the tree can be opened', () => {
+  it('browses the whole tree, not only the changed subset', async () => {
+    mount();
+    await openTheRest();
+    // Folders open one at a time, because that is what the source can answer.
+    await expandFolder(/src$/, /util\.ts/);
+
+    fireEvent.click(screen.getByRole('button', { name: /util\.ts/ }));
 
     await waitFor(() => expect(screen.getByText(/export const util/)).toBeTruthy());
-  });
-
-  it('shows nothing from outside the checkout', async () => {
-    mount();
-    await openTheRest();
-    fireEvent.change(screen.getByPlaceholderText('filter…'), { target: { value: 'notes' } });
-    await waitFor(() => expect(screen.queryByRole('button', { name: /notes\.md/ })).toBeNull());
   });
 });
 
 describe('R-13.19 — a checkout is a review surface, not a workspace', () => {
   it('states that it is read-only, and names the commit being read', async () => {
     mount();
-    await waitFor(() => expect(screen.getByText(/Read-only checkout/)).toBeTruthy());
-    expect(screen.getByText(/Read-only checkout/).textContent).toContain('no commit, push or merge');
+    await waitFor(() => expect(screen.getByText(/Read-only —/)).toBeTruthy());
+    expect(screen.getByText(/Read-only —/).textContent).toContain('no commit, push or merge');
     expect(screen.getByText(/at abc1234/)).toBeTruthy();
     expect(screen.getByText(/#42 Rework the payment rules/)).toBeTruthy();
   });
@@ -205,7 +313,7 @@ describe('R-13.19 — a checkout is a review surface, not a workspace', () => {
   it('offers no way to rename a file, even on the row under the cursor', async () => {
     mount();
     await openTheRest();
-    fireEvent.change(screen.getByPlaceholderText('filter…'), { target: { value: 'util' } });
+    await expandFolder(/src$/, /util\.ts/);
 
     const row = await screen.findByRole('button', { name: /util\.ts/ });
     fireEvent.mouseEnter(row.parentElement as HTMLElement);
@@ -288,6 +396,10 @@ function fakeDraftServer(opts: {
     const body = init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : undefined;
     calls.push({ url, method, ...(body ? { body } : {}) });
 
+    // The two reads every review makes, whichever source supplies it.
+    const read = reviewRead(url);
+    if (read) return read;
+
     // `spec.md` is changed too, so the Markdown path is reachable from the entry point
     // a reviewer actually starts at rather than only by walking the tree.
     if (url.endsWith('/files')) return reply({ status: 200, json: changedFiles(['src/pay.ts', 'spec.md']).json });
@@ -352,7 +464,7 @@ async function openAndSelectLine1(): Promise<void> {
 describe('R-13.13 — a Markdown file under review is commented on where it is read', () => {
   it('keeps the reader in the rendered document, with the shared comment panel beside it', async () => {
     const server = fakeDraftServer();
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
 
     fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
     await waitFor(() => expect(screen.getByRole('heading', { name: 'Refunds' })).toBeTruthy());
@@ -372,7 +484,7 @@ describe('R-13.13 — a Markdown file under review is commented on where it is r
    */
   it('stamps the rendered blocks with the positions a comment anchors to', async () => {
     const server = fakeDraftServer();
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
 
     fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
     const heading = await screen.findByRole('heading', { name: 'Refunds' });
@@ -387,7 +499,7 @@ describe('R-13.13 — a Markdown file under review is commented on where it is r
    */
   it('leaves the line composer in place for files that have no rendered form', async () => {
     const server = fakeDraftServer();
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
 
     await openAndSelectLine1();
     expect(await screen.findByLabelText('Review comment')).toBeTruthy();
@@ -404,7 +516,7 @@ describe('a document’s review comments are worked from the panel', () => {
   const alsoHeld = draftRecord({ id: 'd-held0002', comment: 'Second thought.', target: { path: 'spec.md', kind: 'range', startLine: 5 } });
 
   const openSpec = async (server: ReturnType<typeof fakeDraftServer>) => {
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
     await waitFor(() => expect(screen.getByRole('heading', { name: 'Refunds' })).toBeTruthy());
   };
@@ -513,7 +625,7 @@ describe('a document’s review comments are worked from the panel', () => {
 describe('R-13.13 — a comment is held locally, and never sent by typing it', () => {
   it('anchors it to the selected line, at the checked-out head, and lists it as a draft', async () => {
     const server = fakeDraftServer();
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
 
     await openAndSelectLine1();
     fireEvent.change(await screen.findByLabelText('Review comment'), {
@@ -540,7 +652,7 @@ describe('R-13.13 — a comment is held locally, and never sent by typing it', (
 
   it('offers no composer until a line is picked — a viewer has no idle buffer', async () => {
     const server = fakeDraftServer();
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
     await waitFor(() => expect(screen.getByText(/export const pay/)).toBeTruthy());
     expect(screen.queryByLabelText('Review comment')).toBeNull();
@@ -557,7 +669,7 @@ describe('R-13.15 / R-13.16 — publishing is a second, explicit act', () => {
         json: { ok: true, alreadyPublished: false, draft: publishInState(state, id, 'https://github.com/acme/docs/pull/42#discussion_r700123') },
       }),
     });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
 
     fireEvent.click(await screen.findByRole('button', { name: 'Send' }));
@@ -583,7 +695,7 @@ describe('R-13.15 / R-13.16 — publishing is a second, explicit act', () => {
         json: { ok: true, alreadyPublished: true, draft: publishInState(state, id, 'https://github.com/x#1') },
       }),
     });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
     fireEvent.click(await screen.findByRole('button', { name: 'Send' }));
 
@@ -612,7 +724,7 @@ describe('R-13.14 — a stale draft is refused with both shas, and forced only o
 
   it('shows the sha it was written against and the one the pull request is at now', async () => {
     const server = staleServer();
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
     fireEvent.click(await screen.findByRole('button', { name: 'Send' }));
 
@@ -631,7 +743,7 @@ describe('R-13.14 — a stale draft is refused with both shas, and forced only o
 
   it('retries with force only when the reviewer asks for it', async () => {
     const server = staleServer();
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
     fireEvent.click(await screen.findByRole('button', { name: 'Send' }));
 
@@ -658,7 +770,7 @@ describe('R-13.17 — discarding a comment that already went out is not the revi
         };
       },
     });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
 
     fireEvent.click(await screen.findByRole('button', { name: 'Discard' }));
@@ -681,7 +793,7 @@ describe('R-13.17 — discarding a comment that already went out is not the revi
         return { status: 200, json: { ok: true, removed: true } };
       },
     });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
     fireEvent.click(await screen.findByRole('button', { name: 'Discard' }));
 
@@ -710,7 +822,7 @@ describe('R-13.18 — a held comment and a published one are told apart by a lab
         }),
       ],
     });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
 
     await waitFor(() => expect(screen.getByText('already sent')).toBeTruthy());
@@ -738,7 +850,7 @@ describe('R-13.18 — a held comment and a published one are told apart by a lab
         }),
       ],
     });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
 
     await waitFor(() => expect(screen.getByText('already sent')).toBeTruthy());
@@ -765,7 +877,7 @@ describe('the review row carries the whole identity, once', () => {
   it('names the number, the mounted tree’s commit and read-only, from props alone', async () => {
     const moved = { pullNumber: 42, path: WORKTREE.path, headSha: 'f00dbee9999' };
     const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
-    render(<CollabPrReview pull={PULL} worktree={moved} onExit={vi.fn()} fetchImpl={impl} />);
+    render(<CollabPrReview pull={PULL} review={{ source: 'checkout' as const, headSha: moved.headSha, worktree: moved }} onExit={vi.fn()} fetchImpl={impl} />);
 
     const row = await screen.findByTestId('vs-review-pull');
     expect(row.textContent).toContain('#42');
@@ -782,7 +894,7 @@ describe('the review row carries the whole identity, once', () => {
    */
   it('names the author and links out to the pull request', async () => {
     const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={impl} />);
 
     const row = await screen.findByTestId('vs-review-pull');
     expect(row.textContent).toContain('reviewer-rita');
@@ -800,7 +912,7 @@ describe('the review row carries the whole identity, once', () => {
    */
   it('says so when there is no author, rather than showing a gap', async () => {
     const { impl } = fakeCollabFetch(changedFiles([]));
-    render(<CollabPrReview pull={{ ...PULL, author: '' }} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+    render(<CollabPrReview pull={{ ...PULL, author: '' }} review={REVIEW} onExit={vi.fn()} fetchImpl={impl} />);
 
     const row = await screen.findByTestId('vs-review-pull');
     expect(row.textContent).toContain('unknown author');
@@ -808,7 +920,7 @@ describe('the review row carries the whole identity, once', () => {
 
   it('says read-only exactly once on the surface', async () => {
     const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
-    const { container } = render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+    const { container } = render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={impl} />);
 
     await screen.findByTestId('vs-review-pull');
     expect((container.textContent ?? '').match(/read-only/gi) ?? []).toHaveLength(1);
@@ -817,7 +929,7 @@ describe('the review row carries the whole identity, once', () => {
   it('keeps a way back', async () => {
     const onExit = vi.fn();
     const { impl } = fakeCollabFetch(changedFiles([]));
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={onExit} fetchImpl={impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={onExit} fetchImpl={impl} />);
 
     fireEvent.click(await screen.findByRole('button', { name: '← Pull requests' }));
     expect(onExit).toHaveBeenCalled();
@@ -832,7 +944,7 @@ describe('the review row carries the whole identity, once', () => {
 describe('the review title truncates instead of running under the controls', () => {
   it('shrinks the title and never the number', async () => {
     const { impl } = fakeCollabFetch(changedFiles([]));
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={impl} />);
 
     const heading = await screen.findByText(/#42 Rework the payment rules/);
     // The permission to shrink sits on the identity block — a flex child defaults to
@@ -854,7 +966,7 @@ describe('the review title truncates instead of running under the controls', () 
 describe('starting a comment does not take the document off the screen', () => {
   it('arms the panel and leaves the reader looking at the rendered document', async () => {
     const server = fakeDraftServer();
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
 
     fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
     await waitFor(() => expect(screen.getByRole('heading', { name: 'Refunds' })).toBeTruthy());
@@ -874,21 +986,26 @@ describe('starting a comment does not take the document off the screen', () => {
  * reviewer's eye landed on files the pull request never touched. The changed files lead
  * and stay open; the checkout collapses into one line that says what it is for.
  */
-describe('the changed files lead and the rest of the checkout stands down', () => {
-  it('collapses the checkout behind one summary line, expandable in one click', async () => {
+describe('the changed files lead and the rest of the tree stands down', () => {
+  it('collapses the tree behind one summary line, expandable in one click', async () => {
     mount();
 
-    const toggle = await screen.findByRole('button', { name: /Rest of the checkout/ });
+    const toggle = await screen.findByRole('button', { name: /Rest of the files/ });
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    expect(toggle.textContent).toContain('3 files');
     expect(toggle.textContent).toContain('read for context, not under review');
+    /*
+     * NO FILE COUNT. The line used to say `3 files`, from the full walk. A tree read one
+     * directory at a time has not counted anything, and a number of the rows that happen
+     * to be loaded would be a count of what the reviewer has already clicked.
+     */
+    expect(toggle.textContent).not.toMatch(/\d+ files/);
     // Nothing of the tree is on screen while it is closed.
-    expect(screen.queryByPlaceholderText('filter…')).toBeNull();
+    expect(screen.queryByRole('button', { name: /vendor$/ })).toBeNull();
 
     fireEvent.click(toggle);
 
-    await waitFor(() => expect(screen.getByPlaceholderText('filter…')).toBeTruthy());
-    expect(screen.getByRole('button', { name: /Rest of the checkout/ }).getAttribute('aria-expanded')).toBe('true');
+    expect(await screen.findByRole('button', { name: /vendor$/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Rest of the files/ }).getAttribute('aria-expanded')).toBe('true');
   });
 
   it('keeps the changed files expanded and named as the review', async () => {
@@ -901,7 +1018,7 @@ describe('the changed files lead and the rest of the checkout stands down', () =
     const server = fakeDraftServer({
       drafts: [draftRecord({ id: 'd-aaaa1111' }), draftRecord({ id: 'd-bbbb2222', comment: 'and this' })],
     });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
 
     const badge = await waitFor(() => {
       const el = document.querySelector('[data-vs-file-comments="src/pay.ts"]') as HTMLElement | null;
@@ -924,7 +1041,7 @@ describe('the changed files lead and the rest of the checkout stands down', () =
 describe('the panel says true things about a review comment', () => {
   it('offers no "Apply via" workflow, because nothing applies a review comment locally', async () => {
     const server = fakeDraftServer();
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
 
     fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
     fireEvent.click(await screen.findByRole('button', { name: 'Start commenting' }));
@@ -988,7 +1105,7 @@ describe('the panel says true things about a review comment', () => {
 describe('the changed files are a tree, not a column of truncated paths', () => {
   it('nests the paths under the folders that hold them, already open', async () => {
     const server = fakeDraftServer();
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
 
     const tree = await waitFor(() => {
       const el = document.querySelector('[data-vs-changed-tree]') as HTMLElement | null;
@@ -1052,7 +1169,7 @@ describe('sending a review comment shows that it is sending', () => {
       return (server.impl as unknown as (u: string, i?: RequestInit) => Promise<Response>)(url, init);
     }) as unknown as typeof fetch;
 
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
 
     const send = await screen.findByRole('button', { name: 'Send' });
@@ -1083,7 +1200,7 @@ describe('the checkout says it is loading rather than looking empty', () => {
   };
 
   it('says what it is waiting for, in the column and in the pane', async () => {
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={hangingFiles()} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={hangingFiles()} />);
 
     const line = await screen.findByText('Reading what changed…');
     expect(line.querySelector('[data-vs-spinner]')).toBeTruthy();
@@ -1102,17 +1219,23 @@ describe('the checkout says it is loading rather than looking empty', () => {
     expect(screen.queryByText('Opening the checkout…')).toBeNull();
   });
 
-  /* `0 files` while the walk runs is a number the walk has not produced. */
-  it('counts the checkout out loud rather than claiming zero', async () => {
-    invalidateTree();
-    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})));
-    const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+  /* A folder that is still being read looks exactly like an empty one, and the two are
+   * opposite things to a reviewer — so an open folder with nothing in it yet says so. */
+  it('says a directory is being read rather than showing it as empty', async () => {
+    const impl = vi.fn(async (url: string) => {
+      if (url.includes('/tree?path=src')) return new Promise<Response>(() => {});
+      const read = reviewRead(url);
+      if (read) return read;
+      const files = changedFiles(['src/pay.ts']);
+      return { ok: files.ok, status: files.status, json: async () => files.json } as unknown as Response;
+    });
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={impl as unknown as typeof fetch} />);
 
-    const toggle = await screen.findByRole('button', { name: /Rest of the checkout/ });
-    expect(toggle.textContent).toContain('counting files…');
-    expect(toggle.textContent).not.toContain('0 files');
-    expect(toggle.querySelector('[data-vs-spinner]')).toBeTruthy();
+    await openTheRest();
+    fireEvent.click(screen.getByRole('button', { name: /src$/ }));
+
+    const line = await screen.findByText('Reading src…');
+    expect(line.querySelector('[data-vs-spinner]')).toBeTruthy();
   });
 });
 
@@ -1133,7 +1256,7 @@ describe('the review shows the pull request’s comments and replies', () => {
 
   it('reads them when the checkout opens, without being asked', async () => {
     const server = fakeDraftServer({ threads: [withReplies] });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
 
     expect(await screen.findByText('test comments 003')).toBeTruthy();
@@ -1144,7 +1267,7 @@ describe('the review shows the pull request’s comments and replies', () => {
 
   it('says who wrote a reply and when, so a thread reads as a conversation', async () => {
     const server = fakeDraftServer({ threads: [withReplies] });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
 
     const reply = await screen.findByText('reply comment 003 -A');
@@ -1156,7 +1279,7 @@ describe('the review shows the pull request’s comments and replies', () => {
 
   it('picks up a new reply when the reviewer presses Refresh comments', async () => {
     const server = fakeDraftServer({ threads: [threadRecord()] });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
     await screen.findByText('test comments 003');
     expect(screen.queryByText('answered while you were reading')).toBeNull();
@@ -1174,7 +1297,7 @@ describe('the review shows the pull request’s comments and replies', () => {
 
   it('counts what is on the pull request, not what this machine happened to send', async () => {
     const server = fakeDraftServer({ threads: [withReplies, threadRecord({ id: 'c-0000002d', github: { ...threadRecord().github, reviewCommentId: 45 } })] });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
 
     const tally = await waitFor(() => {
       const el = document.querySelector('[data-vs-draft-tally]');
@@ -1194,7 +1317,7 @@ describe('the review shows the pull request’s comments and replies', () => {
       published: { reviewCommentId: 43, htmlUrl: 'https://github.com/acme/docs/pull/42#discussion_r43', ts: '2026-02-01T09:00:00Z' },
     });
     const server = fakeDraftServer({ drafts: [published], threads: [withReplies] });
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={server.impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={server.impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
 
     await screen.findByText('reply comment 003 -A');
@@ -1207,9 +1330,101 @@ describe('the review shows the pull request’s comments and replies', () => {
       if (url.endsWith('/files')) return { ok: true, status: 200, json: async () => changedFiles(['spec.md']).json } as unknown as Response;
       return { ok: true, status: 200, json: async () => ({ drafts: [] }) } as unknown as Response;
     }) as unknown as typeof fetch;
-    render(<CollabPrReview pull={PULL} worktree={WORKTREE} onExit={vi.fn()} fetchImpl={impl} />);
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={impl} />);
     fireEvent.click(await screen.findByRole('button', { name: /spec\.md/ }));
 
     await waitFor(() => expect(document.querySelector('[data-vs-threads-error]')?.textContent).toContain('gh is unreachable'));
+  });
+});
+
+/* ================================================================== *
+ * Which source is supplying the review, and what that costs the reader
+ * ================================================================== */
+
+describe('R-W1.5 — the review says where its files come from', () => {
+  /*
+   * Both configurations, because a label that only ever appears on one of them tells the
+   * reviewer nothing: "no chip" would have to be read as the other case, which is exactly
+   * the inference the requirement exists to remove.
+   *
+   * The assertions are on the sentence, not only on the attribute. The word `checkout` in
+   * a data attribute is for tests; what the reviewer needs is the consequence — whether
+   * opening a file will cost them a round trip — and that is what is asserted.
+   */
+  it('says the files are already here when a checkout supplies them', async () => {
+    mount();
+    const chip = await waitFor(() => document.querySelector('[data-vs-review-source]')!);
+    expect(chip.getAttribute('data-vs-review-source')).toBe('checkout');
+    expect(chip.textContent).toMatch(/on this machine/i);
+    expect(chip.textContent).toMatch(/without the network/i);
+  });
+
+  it('says every file costs a request when the host supplies them', async () => {
+    const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
+    render(
+      <CollabPrReview
+        pull={PULL}
+        review={{ source: 'host', headSha: PULL.headSha }}
+        onExit={vi.fn()}
+        fetchImpl={impl}
+      />,
+    );
+    const chip = await waitFor(() => document.querySelector('[data-vs-review-source]')!);
+    expect(chip.getAttribute('data-vs-review-source')).toBe('host');
+    expect(chip.textContent).toMatch(/from GitHub/i);
+    expect(chip.textContent).toMatch(/needs the network/i);
+  });
+
+  /*
+   * The commit is the review's, not the checkout's. It used to be read off `worktree`,
+   * which made the one fact every held comment is stamped with unavailable to a review
+   * that has no working copy.
+   */
+  it('names the pinned commit whether or not there is a checkout', async () => {
+    const { impl } = fakeCollabFetch(changedFiles([]));
+    render(
+      <CollabPrReview pull={PULL} review={{ source: 'host', headSha: PULL.headSha }} onExit={vi.fn()} fetchImpl={impl} />,
+    );
+    expect(await screen.findByText(/at abc1234/)).toBeTruthy();
+  });
+});
+
+describe('R-W2.8 — a read that outlasts a glance says so', () => {
+  it('shows progress while a file read is in flight, and clears it when the bytes land', async () => {
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const impl = vi.fn(async (url: string) => {
+      if (url.includes('/raw?path=')) await held;
+      const read = reviewRead(url);
+      if (read) return read;
+      const files = changedFiles(['src/pay.ts']);
+      return { ok: files.ok, status: files.status, json: async () => files.json } as unknown as Response;
+    });
+    render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={impl as unknown as typeof fetch} />);
+    fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
+
+    // Not immediately: a read that returns in a few milliseconds — every read from a
+    // checkout on this disk — must not paint an indicator and take it away again.
+    expect(document.querySelector('[data-vs-reading]')).toBeNull();
+
+    await waitFor(() => expect(document.querySelector('[data-vs-reading]')).toBeTruthy(), { timeout: 2000 });
+    expect(screen.getByText(/Reading pay\.ts…/)).toBeTruthy();
+    // The ring, not only the word — the whole point of the shared component.
+    expect(document.querySelector('[data-vs-reading] [data-vs-spinner]')).toBeTruthy();
+    // And nothing claims the file is unreadable while it is still being read.
+    expect(screen.queryByText('No preview for this file.')).toBeNull();
+
+    release();
+    await waitFor(() => expect(document.querySelector('[data-vs-reading]')).toBeNull());
+    expect(screen.getByText(/export const pay/)).toBeTruthy();
+  });
+
+  it('says nothing at all for a read that answers straight away', async () => {
+    mount();
+    fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
+    await screen.findByText(/export const pay/);
+    expect(document.querySelector('[data-vs-reading]')).toBeNull();
   });
 });

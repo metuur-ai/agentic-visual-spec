@@ -2,10 +2,16 @@
  * file-tree.tsx — the directory browser sidebar. Driven by the flat TreeEntry[]
  * from /__vs/tree (dirs + files). Folders expand/collapse and are themselves
  * selectable (so you can comment on a folder); files are selectable.
+ *
+ * THE ENTRIES MAY ARRIVE ALL AT ONCE OR A DIRECTORY AT A TIME. The local sidebar hands
+ * over a full walk and this component never asks for more. A review has no full walk to
+ * hand over — its source answers one directory per call — so it passes `onExpand`, which
+ * is told each time a folder opens and pushes that directory's entries into the same flat
+ * list. Nothing about the rendering differs; the second caller simply keeps appending.
  */
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FileKind, TreeEntry } from './use-tree';
-import { BusyLabel } from './spinner';
+import { BusyLabel, LoadingLine } from './spinner';
 
 type TreeNode = {
   name: string;
@@ -89,6 +95,8 @@ export function FileTree({
   onRenamed,
   readOnly = false,
   defaultOpen = false,
+  onExpand,
+  pending,
 }: {
   entries: TreeEntry[];
   current: string;
@@ -97,6 +105,17 @@ export function FileTree({
   commentCounts?: Map<string, number>;
   onCreated?: (path: string) => void;
   onRenamed?: (from: string, to: string) => void;
+  /**
+   * Told the path of every folder that is open, as it opens. A caller whose entries are
+   * already complete omits it; a caller that reads one directory per call uses it to
+   * fetch that directory and append what comes back.
+   *
+   * It fires per folder and only for folders that are actually open, which is what keeps
+   * an unopened sibling free: nothing is read on its behalf.
+   */
+  onExpand?: (path: string) => void;
+  /** Folders whose entries are still being read, so the row can say so rather than look empty. */
+  pending?: Set<string>;
   /**
    * R-13.19 — browse without any way to write. A Pull Request checkout is a review
    * surface, not a workspace: the tree still expands and still opens files, but "+ New
@@ -201,7 +220,7 @@ export function FileTree({
       )}
       <ul style={listReset}>
         {tree.children.map((node) => (
-          <TreeItem key={node.path} node={node} depth={0} current={current} onPick={onPick} expanded={expanded} toggle={toggle} forceOpen={defaultOpen || q.length > 0} commentCounts={commentCounts} write={write} readOnly={readOnly} />
+          <TreeItem key={node.path} node={node} depth={0} current={current} onPick={onPick} expanded={expanded} toggle={toggle} forceOpen={defaultOpen || q.length > 0} commentCounts={commentCounts} write={write} readOnly={readOnly} onExpand={onExpand} pending={pending} />
         ))}
       </ul>
     </div>
@@ -258,6 +277,8 @@ function TreeItem({
   commentCounts,
   write,
   readOnly = false,
+  onExpand,
+  pending,
 }: {
   node: TreeNode;
   depth: number;
@@ -269,11 +290,22 @@ function TreeItem({
   commentCounts?: Map<string, number>;
   write: WriteState;
   readOnly?: boolean;
+  onExpand?: (path: string) => void;
+  pending?: Set<string>;
 }) {
   const pad = 8 + depth * 13;
   const active = node.path === current;
   const count = commentCounts?.get(node.path) ?? 0;
   const [hover, setHover] = useState(false);
+  // Computed above the file branch because the effect below it must run on every render,
+  // and a file's row returns early.
+  const open = node.type === 'dir' && (forceOpen || expanded.has(node.path) || current.startsWith(`${node.path}/`));
+  // The one place a directory is asked for. It fires when the folder opens and not when
+  // it is merely rendered, so the siblings a reviewer never opens are never read; asking
+  // twice for the same folder is the caller's to ignore, and `useReviewTree` does.
+  useEffect(() => {
+    if (open) onExpand?.(node.path);
+  }, [open, node.path, onExpand]);
 
   if (node.type === 'file') {
     // R-5.2 — the rename input replaces the row it belongs to, prefilled with that
@@ -321,7 +353,6 @@ function TreeItem({
   }
 
   const hasDescendantComments = !!commentCounts && [...commentCounts.keys()].some((p) => p.startsWith(`${node.path}/`));
-  const open = forceOpen || expanded.has(node.path) || current.startsWith(`${node.path}/`);
   return (
     <li>
       {/* Folder row: clicking anywhere on it only expands/collapses — browsing the
@@ -364,8 +395,15 @@ function TreeItem({
       {open && (
         <ul style={listReset}>
           {node.children.map((child) => (
-            <TreeItem key={child.path} node={child} depth={depth + 1} current={current} onPick={onPick} expanded={expanded} toggle={toggle} forceOpen={forceOpen} commentCounts={commentCounts} write={write} readOnly={readOnly} />
+            <TreeItem key={child.path} node={child} depth={depth + 1} current={current} onPick={onPick} expanded={expanded} toggle={toggle} forceOpen={forceOpen} commentCounts={commentCounts} write={write} readOnly={readOnly} onExpand={onExpand} pending={pending} />
           ))}
+          {/* An open folder that is still being read looks exactly like an empty one, and
+              the two are opposite things to a reviewer. */}
+          {pending?.has(node.path) && (
+            <li>
+              <LoadingLine style={{ paddingLeft: pad + 16, fontSize: 12 }}>Reading {node.name}…</LoadingLine>
+            </li>
+          )}
         </ul>
       )}
     </li>

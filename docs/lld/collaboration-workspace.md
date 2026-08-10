@@ -1,244 +1,198 @@
-# Collaboration Workspace — Low-Level Design
+# Reviewing a Pull Request Without a Clone — Low-Level Design
+
+> **Revision.** The managed root, provisioning, registry and eviction lifecycle described
+> in the first draft are withdrawn. What survives is the one idea that review found sound:
+> replacing the single `baseDir` thunk with a resolver. The resolver's other branch is now
+> an API-backed source rather than a provisioned clone.
 
 ## Architecture
 
-### The shape of the change
+### The seam
 
-Today `mountPullRequest(baseDir, n)` is handed one `baseDir` — the served directory,
-supplied by a thunk (`baseDir: () => contentDir`). Everything downstream of that argument
-already works. This change replaces the thunk with a **resolver** that answers a different
-question:
-
-> Given the repository this pull request belongs to, which directory should host its
-> checkout?
-
-`mountPullRequest` itself is unchanged. It gains no knowledge of workspaces, homes, or
-provisioning; it keeps taking a `baseDir` that is a git working tree with an `origin`, and
-the resolver's whole job is to guarantee it gets one.
+`ui/collab-pr-review.tsx` reads the pull request through `/__vs/tree`, `/__vs/raw` and the
+`/files` route. Its own header says it browses through `/__vs/tree` *because the checkout
+happens to already be there* — a convenience, not a requirement. That makes the data source
+substitutable, which is the whole change.
 
 ```mermaid
 flowchart TD
-  REQ["POST /collab/pulls/:n/mount<br/>{ host, owner, repo, pull }"]
-  REQ --> RES["resolveWorkspace(repoRef)"]
+  REQ["review of PR n in repo R"]
+  REQ --> RES["resolveReviewSource(R)"]
 
-  RES --> Q{"served dir is a working tree<br/>whose origin is repoRef?"}
-  Q -->|yes| L["kind: local<br/>path = servedDir"]
-  Q -->|no| M{"managed clone exists?"}
-  M -->|yes| E["kind: managed<br/>path = ~/.visualspec/workspaces/host/owner/repo"]
-  M -->|no| P["provision:<br/>git clone --filter=blob:none"]
-  P --> E
+  RES --> Q{"served dir is a git working tree<br/>with a usable origin?"}
+  Q -->|yes| W["WorktreeSource<br/>mountPullRequest(servedDir, n)<br/>UNCHANGED"]
+  Q -->|no| A["ApiSource<br/>adapter.getFile / listFiles / compareCommits"]
 
-  L --> MT["mountPullRequest(path, n)<br/>UNCHANGED"]
-  E --> MT
-  MT --> REG["registry: record workspace + last opened"]
-  REG --> UI["review surface owns the window"]
+  W --> UI["review surface<br/>(one interface, two implementations)"]
+  A --> UI
 
-  style MT fill:#14532d,stroke:#22c55e,color:#fff
-  style P fill:#78350f,stroke:#f59e0b,color:#fff
+  style W fill:#14532d,stroke:#22c55e,color:#fff
+  style A fill:#1e3a5f,stroke:#60a5fa,color:#fff
 ```
 
-### Layout on disk
+`ReviewSource` is the reusable artifact — one interface, two implementations. Four
+operations, all of which both sides can answer:
+
+| Operation | WorktreeSource | ApiSource |
+| --- | --- | --- |
+| changed paths | `/files` route (already API-backed on both) | same |
+| list a directory | walk the checkout | `adapter.listFiles(repo, path, headSha)` |
+| read a file | read from the checkout | `adapter.getFile(repo, path, headSha)` |
+| head sha | `rev-parse HEAD` in the checkout | the pull request's head |
+
+Every read is pinned to the head sha, not a branch name, so a force-push during a review
+cannot silently swap the bytes under a comment being written.
+
+### The resolution rule — corrected
+
+The first draft said the served directory is used only when its origin *matches* the pull
+request's repository. That is wrong, and would have broken a working case.
+`fetchSource(originUrl, repo)` derives an explicit fetch URL on `origin`'s host when the
+configured repository differs from `origin`, so today a reviewer serving repository **A**
+can already mount a pull request of repository **B**. A match-only rule would have moved
+that case from a checkout to the API, changing behaviour nobody asked to change.
 
 ```
-~/.visualspec/                          VISUAL_SPEC_HOME overrides the root
-├── registry.json                       every workspace opened or provisioned
-└── workspaces/
-    └── github.com/
-        ├── acme/docs/                  blobless clone
-        │   ├── .git/
-        │   └── .visual-spec/
-        │       └── worktrees/pr-42/    existing worktree.ts, unchanged
-        └── other-org/service/
-            └── .visual-spec/worktrees/pr-7/
-```
-
-Keyed `host/owner/repo` so a second forge is not designed out, and so two repositories
-with the same name under different owners cannot collide. The per-clone interior is
-identical to what a served directory gets today, which is what lets `worktree.ts` stay as
-it is: `WORKTREE_DIR`, `ensureIgnored`, `refs/visual-spec/pr/<n>` all apply unchanged.
-
-### Registry
-
-`registry.json` holds one entry per workspace, of two kinds:
-
-| Field | Meaning |
-| --- | --- |
-| `kind` | `managed` — provisioned by `visual-spec`, removable. `local` — a directory the user served, recorded for reopening only. |
-| `host`, `owner`, `repo` | The repository, when known. A `local` entry with no parsable origin has none. |
-| `path` | Absolute path. For `managed`, always inside the workspace root. |
-| `lastOpenedAt` | Sort key for the recents list. |
-| `pulls` | Pull request numbers with a checkout currently mounted, for display and for cleanup. |
-
-The registry is a **cache of facts about the filesystem, never the authority**. Every read
-reconciles against disk: an entry whose path is gone is dropped, and mounted checkouts are
-re-derived from `git worktree list --porcelain` rather than trusted from `pulls`. This is
-the same discipline `listMountedWorktrees` already applies for exactly the same reason —
-a directory removed with `rm -rf` must not be reported as available.
-
-### Resolution rule
-
-```
-resolveWorkspace(repoRef):
+resolveReviewSource(repoRef):
   ctx = readGitContext(servedDir)
-  if ctx.state == 'remote' and (ctx.host, ctx.owner, ctx.repo) == repoRef:
-      return { kind: 'local', path: servedDir }
-  return { kind: 'managed', path: ensureManagedClone(repoRef) }
+  if ctx.state is 'remote' or 'local':          # a git working tree with an origin
+      return WorktreeSource(servedDir)          # fetchSource handles the foreign case
+  return ApiSource(repoRef)
 ```
 
-`readGitContext` and its comparison inputs already exist and are already used to infer
-`owner/repo` from the served directory. The rule adds no new detection: it reuses the one
-signal the system already trusts, and treats every other outcome as "provision".
+So the API source is reached only in the case that refuses today: no git working tree, or
+no origin to fetch from. `not-a-repo` and `no-origin` stop being terminal; the other two
+mount failures are unchanged.
 
-Deliberately **not** in the rule: any search of the registry's `local` entries, any
-filesystem scan, any prompt. Reuse is decided from the served directory alone. A user with
-five clones of the same repository gets a predictable answer instead of a guess.
+`fetchSource`'s explicit-URL branch stays live — it is the mechanism that keeps the
+foreign-repo-in-a-local-clone case on the checkout path.
 
-### Provisioning
+### Repository scoping — the omitted layer
 
-`ensureManagedClone(repoRef)` is idempotent and concurrency-safe:
+Accepting a repository per request is not a routing change. `gate()` resolves
+`gated.repo` from server configuration and every `/pulls/*` handler calls
+`repoRefOf(gated.repo)` — seven call sites. Behind it, `availability()` caches per
+`owner/repo#baseBranch@credential`, and the authorizer caches effective permission per
+`owner/repo` and decides author-only versus any-role from it. Left alone, a foreign-repo
+request is authorized against the *configured* repository's permissions.
 
-1. If the target path is already a working tree with a matching `origin`, return it.
-2. Otherwise clone into a temporary sibling directory, then `rename()` into place — so a
-   half-finished clone is never observable at the real path, and a crash leaves garbage
-   that the next reconcile can drop rather than a broken workspace.
-3. Concurrent requests for the same repository coalesce onto one in-flight clone.
+Blast radius is small today because every `/pulls/*` operation is `read`/any-role, but it
+is privilege confusion waiting for the first repo-scoped write. So:
 
-`--filter=blob:none` is the clone form: full history and full tree structure, blobs
-fetched on demand. A reviewer wants one commit's worth of file contents, and paying for
-every blob in history to get it is the cost that makes "just clone it for them" feel
-wrong. The trade is that browsing a file in the checkout can hit the network.
+- `gate(op, documentId, repoRef?)` takes the repository being acted on; absent, it means
+  the configured one.
+- `availability()` and preflight run per requested repository, keyed as they already are.
+- The authorizer's permission cache is already keyed by `owner/repo` and needs no change —
+  only its *input* was wrong.
+- Review routes take `RepoRef` (host/owner/repo), not `ResolvedCollaborationConfig`, whose
+  `baseBranch` is meaningless for a repository being reviewed rather than published to.
 
-Clone URL comes from the same credential path as everything else — `gh` supplies
-authentication, so a private repository the user can read is a repository they can
-provision.
+### Route shape
 
-### Multi-repository requests
+The repository goes in the path, not the body, and the old family keeps its meaning:
 
-Every route that reaches a workspace must name its repository. Today `/pulls/:n/mount`
-carries only a number because the repository is server-wide configuration. The route
-family gains an explicit repository reference, and the server-wide `collaboration.owner` /
-`.repo` becomes the **default** used when a request omits one — which is what keeps every
-existing single-repository call working unchanged.
+```
+GET  /__vs/collab/repos/:host/:owner/:repo/pulls/:n/{files,description,…}   repo REQUIRED
+POST /__vs/collab/repos/:host/:owner/:repo/pulls/:n/mount
+GET  /__vs/collab/pulls/*                                  legacy — the configured repo
+```
 
-The client-side consequence: `parsePullRequestReference` currently extracts only the digits
-from a pasted URL and discards the `owner/repo` in it. It must return the repository too,
-which is what makes SC-5 possible and closes the gap where the panel already advertises
-"for a pull request in another repository".
+Four reasons for the path over a body field or header:
 
-### Discovery
+1. A client that omits the repository gets a 404, not a plausible wrong-repository review.
+   The default stops being a fallback inside a new route and becomes a different, older
+   route.
+2. It is versionable — the legacy family can be deprecated and deleted independently. There
+   is no API version scheme in this package, and a parallel family is the cheapest one.
+3. `EventSource` cannot set headers — the same reason the request guard is not a token — so
+   any header-borne parameter would break the SSE routes.
+4. Segments are matched `[^/]+`, so a bare `..` cannot appear. `%2e%2e` can, so segments are
+   **decoded, then validated**, and an invalid segment is refused rather than normalised.
 
-Two entry points, no repository configuration required for either:
+Two shipped routes need care:
 
-- **Involving me** — one search query for open pull requests where the user is author,
-  reviewer, assignee or mentioned. Returns rows carrying their own repository, so a
-  reviewer invited to a repository they have never heard of sees it. Rate limits and the
-  search API's eventual consistency are its known costs; the list is a discovery aid, not
-  a source of truth about a pull request's state.
-- **Pasted URL** — the fallback, now carrying its repository.
+- `GET /pulls/mounted` answers from the served directory. It stays exactly that. Nothing
+  else can be mounted, because nothing else is ever cloned.
+- `DELETE /pulls/:n/mount` unmounts from the served directory. With no managed checkouts it
+  cannot silently no-op against one, so the bug the first draft's "already absent is a
+  completed release" would have masked does not arise.
 
-The existing per-repository listing stays for the configured repository.
+Review drafts stay at `<servedDir>/.visual-spec/reviews/pr-<n>.json`, keyed by pull number.
+Under multi-repository review that key is no longer unique, so the draft file gains the
+repository in its identity. Five call sites pass `baseDir()` today and all five are in
+scope.
 
-### The review surface
+### Amending Unit 13
 
-Reviewing takes the window and hands it back. The served directory is never re-rooted:
-`setRoot` is not called, `contentDir` does not move, the comments sidecar does not follow,
-and the file tree returns to the user's project when the review closes. The review's own
-tree is rooted at its checkout path, which is how the existing PR review surface already
-works — it simply now sometimes points into the managed root.
-
-Reopening a workspace from the recents list is the one case that *does* re-root, and only
-for `local` entries. That is a new capability with a security consequence, handled below.
-
-### Removal
-
-Two triggers, both explicit about what they touch:
-
-- **User removes a managed workspace** — unmount every checkout, delete its private
-  references, then delete the clone directory. Only `managed` entries are removable.
-  Removing a `local` entry drops the registry row and touches no files.
-- **A pull request ends** — when a mounted pull request is observed merged or closed, its
-  checkout is unmounted and its reference deleted. The clone stays. This extends the
-  existing merge-time cleanup rather than inventing a second lifecycle.
+R-13.9 is a closed enumeration of four causes, mirrored 1:1 by `WorktreeFailure`,
+`MOUNT_FAILURE`, and a test asserting fourness. R-13.5 states flatly that a checkout lives
+inside the served directory, and a UI comment cites it by number. Enumerated taxonomies and
+flat factual claims cannot be amended from a second document without leaving the original
+saying the opposite. **Both are edited in place**, and this document owns only what is new.
 
 ## Constraints
 
-- **One `git` seam, one `gh` seam.** Every git subprocess goes through the existing
-  `GitExecutor`; every GitHub call through the existing `gh` executor. `clone` becomes the
-  second network-touching git command after `fetch`, and must not acquire a second spawn
-  site.
-- **All GitHub access is server-side.** The credential lives in the node process and never
-  reaches the browser. Unchanged by this design.
-- **Failures are values.** No new throw-based path. Provisioning reports a distinct reason
-  per fixable cause, the way mount failures already do.
-- **No absolute path leaks where one is not asked for.** `readGitContext` deliberately
-  keeps `dir` out of its return value because git writes absolute paths into stderr. The
-  workspace list is the one place paths are surfaced, because the user asked to see their
-  workspaces; error messages must keep the existing discipline.
-- **Path containment.** Managed paths are derived from `host/owner/repo` segments that
-  arrive from a request. They must be validated before reaching `join()` — the same
-  argument `assertPullNumber` makes for pull numbers, extended to repository components.
-  An `owner` of `..` must be refused, not normalised.
-- **Re-rooting from a path is not a free capability.** `/__vs/dir/pick` today requires a
-  human at an OS folder picker; the server never accepts a caller-supplied directory to
-  serve. Reopening from the recents list must accept only paths that are already registry
-  entries, so the route cannot be turned into "serve any directory on this machine".
-- **`.visual-spec/` must be ignored before a checkout exists** inside a managed clone, as
-  it is inside a served one.
-- **Two hosts, one route layer.** Resolution and provisioning live in shared code; neither
-  host branches.
-- **Node builtins and sibling core modules only** in anything the CLI reaches, per the
-  existing bundle guard.
-- **Local mode stays inert.** With no collaboration configured, nothing here constructs a
-  workspace root, reads a registry, or creates `~/.visualspec/`.
+- **One `gh` seam, one `git` seam.** The API source adds no executor — it uses the adapter
+  that already serves every other GitHub call. No new authentication path, which is what
+  removes the `gh auth setup-git` trap the first draft would have introduced.
+- **All GitHub access is server-side.** Unchanged.
+- **Failures are values.** The API source reports network, credential and permission
+  failures as values, in the same shape mount failures already use.
+- **Reads are pinned to the head sha**, never a branch name.
+- **Nothing is written outside the served directory.** Restored as an invariant. There is
+  no home directory, no cache, no registry.
+- **The request guard's rationale is preserved.** It allows an absent `Sec-Fetch-Site`
+  because a non-browser caller "has no ambient authority to borrow". That reasoning holds
+  only while routes act on the directory the user already chose. No route added here clones,
+  writes outside, or changes what is served — so the rationale stays true. It would not have
+  under the first draft.
+- **Two hosts, one route layer.** Source selection lives in shared code. The bundle guard
+  mechanically enforces this by failing any host source containing `writeFile(`, `mkdir(`
+  or `readGitContext(`.
+- **The bundle guard's `FORBIDDEN` list is three specifiers**, not a general dependency
+  policy. Nothing here adds a dependency; if that changes, the list must be extended rather
+  than the constraint asserted in prose.
+- **Local mode stays inert** with no collaboration configured.
 
 ## Key Decisions
 
-**The resolver replaces the thunk; `mountPullRequest` is untouched.** The alternative —
-teaching the worktree module about workspaces — would put provisioning behind the same
-function that must stay a thin wrapper over four git commands. Keeping the decision above
-it means the clone-free and clone-backed paths converge on one already-tested function.
+**API source rather than a provisioned clone.** The worktree design rejects the API on the
+grounds that a reviewer wants the whole tree without N round trips. A `blob:none` clone
+fetches blobs on demand — N round trips — after paying a full history clone for the
+privilege, and `git worktree add` materialises every blob at the head commit regardless, so
+the deferral only skips history. The argument does not survive its own implementation. The
+API path costs one call per directory expanded and one per file opened, which is what the
+surface already does, and adds no disk, no auth seam, no lifecycle.
 
-**Blobless clone rather than bare, full, or API-materialised.** Bare would make `baseDir`
-something `readGitContext`, the file tree and the branch chip have never seen. Full pays
-for every blob in history to read one commit. Materialising trees through the API
-re-introduces the per-file round trips that the worktree design exists to avoid. Blobless
-keeps one code path and pays only for what is read, at the cost of network access during
-browsing.
+**The worktree is kept, not replaced.** Where the user is already in a repository, objects
+are local and they get real files. That is where the rationale is true. The mistake was
+making it the only way.
 
-**Reuse is decided from the served directory alone.** A registry-driven or filesystem-scan
-rule reuses more clones and makes the answer unpredictable — which of the user's copies,
-in what state, on what branch. The served directory is the one clone the user has already
-pointed at.
+**No managed root.** Provisioning would have required a root, an env override, lazy
+creation, a path scheme, escape validation on request-supplied segments, atomic
+provisioning, in-flight coalescing that is still wrong across processes, a failure
+taxonomy, progress reporting, removal with reference cleanup, and reconcile-on-read. That
+is a package manager's cache, and nothing else in this tool needs one.
 
-**Discovery is search-based, not registry-based.** The reviewer this feature exists for
-has never opened the repository, so a registry-driven list would be empty exactly when it
-is needed. The registry serves reopening; search serves discovery.
+**No registry.** It recorded served directories — a different feature — and introduced a
+route that serves a caller-named path whose allowlist is a file in the user's home. The
+tool has never read application state from outside the served directory, and that is worth
+more than skipping the OS folder picker.
 
-**The registry is a cache, not a source of truth.** Anything it claims about disk is
-re-derived from git and the filesystem on read. The failure mode of trusting it — offering
-a workspace that is not there — is worse than the cost of reconciling.
+**No search discovery.** The reviewer holding a link has the repository in the link; the
+code simply throws it away. Fixing that is a function returning three fields instead of
+one. Search brings a different rate limit, eventual consistency, an empty-list-looks-broken
+failure mode, and a listing of every repository the credential can read.
 
-**Reviewing does not re-root.** Re-rooting would reuse existing machinery, and would make
-the user's project vanish from the sidebar as a side effect of reading someone else's pull
-request. The review surface already owns the window; it keeps doing so.
-
-**Removal is explicit, plus end-of-pull-request release.** Staleness timers and disk
-budgets need accounting, a clock, and a policy the user did not ask for, and they delete
-things while nobody is watching. Not shipping them keeps the rule "your disk changes when
-you or a merge says so".
-
-**Temp-then-rename for provisioning.** A partially cloned directory at the real path is
-indistinguishable from a usable workspace, and would be found by the "already exists"
-check on the next attempt. Renaming in makes the path atomic.
+**Repository in the path, required.** Makes the omitted-parameter case a 404 instead of a
+wrong-repository review.
 
 ## Out of Scope
 
-- Automatic eviction by staleness or disk budget.
-- Any forge other than GitHub, though the layout is keyed by host.
-- Filesystem scanning for existing clones, and reuse of registry `local` entries.
-- Two workspaces open simultaneously; a split or tabbed file tree.
-- Commit, push, branch or merge against a managed clone.
-- Migrating checkouts already mounted under a served directory.
-- A background process, daemon, or scheduled cleanup.
-- Sharing a workspace root between users or machines.
-- Making the recents list a general "open any directory" control.
+- A managed repository root, provisioning, or any clone performed for the user.
+- A workspace registry, recents list, or reopening a directory by path.
+- Cross-repository pull request discovery.
+- Offline review of a repository not on disk.
+- Automatic eviction of anything, since nothing is provisioned.
+- Any forge other than GitHub.
+- Two projects open at once.

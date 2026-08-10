@@ -31,11 +31,13 @@ const PULL = {
 };
 
 const WORKTREE = { pullNumber: 42, path: '/repo/.visual-spec/worktrees/pr-42', headSha: 'fedcba9876543' };
+/** The review as `CollabPullsPanel` hands it over: the source, the pinned commit, the checkout. */
+const REVIEW = { source: 'checkout' as const, headSha: WORKTREE.headSha, worktree: WORKTREE };
 
 describe('CollabHeader', () => {
   it('names the pull request and the commit of the mounted tree, from props alone (R-9.1, R-9.4)', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch');
-    render(<CollabHeader onExit={() => {}} review={{ pull: PULL, worktree: WORKTREE }} />);
+    render(<CollabHeader onExit={() => {}} review={{ pull: PULL, review: REVIEW }} />);
 
     const chip = screen.getByTestId('vs-review-pull');
     expect(chip.textContent).toContain('#42');
@@ -46,13 +48,13 @@ describe('CollabHeader', () => {
   });
 
   it('presents the mounted tree as read-only (R-9.3)', () => {
-    render(<CollabHeader onExit={() => {}} review={{ pull: PULL, worktree: WORKTREE }} />);
+    render(<CollabHeader onExit={() => {}} review={{ pull: PULL, review: REVIEW }} />);
 
     expect(screen.getByTestId('vs-review-pull').textContent).toMatch(/read-only/i);
   });
 
   it('names no branch for a mounted tree (R-9.2)', () => {
-    const { container } = render(<CollabHeader onExit={() => {}} review={{ pull: PULL, worktree: WORKTREE }} />);
+    const { container } = render(<CollabHeader onExit={() => {}} review={{ pull: PULL, review: REVIEW }} />);
 
     const text = container.textContent ?? '';
     expect(text).not.toContain('feat/payments');
@@ -110,7 +112,7 @@ describe('CollabApp opens where the caller asked (R-7.7 / R-7.8)', () => {
         if (url === '/__vs/collab/doc-c/comments') return jsonRes([]);
         if (url === '/__vs/tree') return jsonRes([]);
         if (url === '/__vs/collab/pulls/mounted') return jsonRes({ worktrees: [] });
-        if (url.startsWith('/__vs/collab/pulls/43/mount')) return jsonRes({ worktree: WORKTREE_43 });
+        if (url.startsWith('/__vs/collab/pulls/43/mount')) return jsonRes({ ok: true, source: 'checkout', headSha: WORKTREE_43.headSha, worktree: WORKTREE_43 });
         if (url.startsWith('/__vs/collab/pulls/43/files')) {
           return jsonRes({ pullNumber: 43, headSha: 'ccccccc3', baseBranch: 'main', headBranch: 'chore/lint', mergeBaseSha: 'ddddddd4', files: [] });
         }
@@ -156,7 +158,7 @@ describe('CollabApp opens where the caller asked (R-7.7 / R-7.8)', () => {
  * P5 — the surface said the same three things twice.
  *
  * `← Files | Collaboration review | #10 · at bd4a496 · read-only` sat directly above
- * `← Pull requests | #10 Guia de estilo | … at bd4a496 | Read-only checkout …`. Two rows,
+ * `← Pull requests | #10 Guia de estilo | … at bd4a496 | Read-only …`. Two rows,
  * one subject, and "read-only" printed twice. The review surface's own row is the one that
  * survives — it is the row that can also say what the pull request is — so this header
  * stands down while a pull request is on screen. The R-9 obligations it used to carry are
@@ -192,7 +194,7 @@ describe('one header row while a pull request is under review (P5)', () => {
         if (url === '/__vs/collab/doc-c/comments') return jsonRes([]);
         if (url === '/__vs/tree') return jsonRes([]);
         if (url === '/__vs/collab/pulls/mounted') return jsonRes({ worktrees: [] });
-        if (url.startsWith('/__vs/collab/pulls/43/mount')) return jsonRes({ worktree: WORKTREE_43 });
+        if (url.startsWith('/__vs/collab/pulls/43/mount')) return jsonRes({ ok: true, source: 'checkout', headSha: WORKTREE_43.headSha, worktree: WORKTREE_43 });
         if (url.startsWith('/__vs/collab/pulls/43/files')) {
           return jsonRes({ pullNumber: 43, headSha: 'ccccccc3', baseBranch: 'main', headBranch: 'chore/lint', mergeBaseSha: 'ddddddd4', files: [] });
         }

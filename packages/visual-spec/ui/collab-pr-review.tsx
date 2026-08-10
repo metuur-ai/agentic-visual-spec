@@ -1,18 +1,30 @@
 /**
- * collab-pr-review.tsx — reading a checked-out Pull Request (R-13.11, R-13.19).
+ * collab-pr-review.tsx — reading a Pull Request (R-13.11, R-13.19, R-W1.3, R-W1.4).
  *
- * WHAT IT IS. The surface a reviewer lands on once `CollabPullsPanel` has mounted a
+ * WHAT IT IS. The surface a reviewer lands on once `CollabPullsPanel` has opened a
  * Pull Request. The changed files are the entry point, because that is what a review is
- * *about*; the whole checkout sits underneath them, because a change is rarely readable
+ * *about*; the rest of the tree sits underneath them, because a change is rarely readable
  * without the files around it. Both halves are R-13.11, and it is one requirement rather
  * than two on purpose: a list of changed paths with no way out of it is a diff, not a
  * review.
  *
- * WHY IT BROWSES THROUGH `/__vs/tree` RATHER THAN A ROUTE OF ITS OWN. The checkout lives
- * at `<served>/.visual-spec/worktrees/pr-<n>` (R-13.5) — inside the directory the tree
- * walk already covers, and not ignored by it. So the files are already enumerable and
- * already readable, and the whole job here is to show that subtree under its own root.
- * A second listing route would be a second answer to a question `TreeStore` answers.
+ * WHY IT READS THROUGH `/__vs/collab/pulls/:n/{tree,raw}` AND NOT `/__vs/tree`. It used to
+ * browse the served directory, on the reasoning that a checkout lives inside it at
+ * `<served>/.visual-spec/worktrees/pr-<n>` (R-13.5) and is therefore already enumerable.
+ * True, and it made the whole surface conditional on there being a checkout at all: a
+ * reviewer serving a directory that is not a git working tree got a review that opened,
+ * named its source and listed its changed files, and then said "No preview for this file."
+ * for every one of them. The two routes above read through the `ReviewSource` the open
+ * resolved, so the same reads answer from a checkout on this disk and from the repository
+ * host, and this file never learns which (R-W1.4). `review.source` reaches it to be said
+ * out loud in the banner and for nothing else.
+ *
+ * WHY THE TREE EXPANDS INSTEAD OF ARRIVING. `useTree`'s contract is a flat full walk, and
+ * a `ReviewSource` answers one directory per call and is never recursive — turning one
+ * into the other means a round trip per directory in the repository before the first file
+ * can be read. So the sidebar reads the root when the review opens and one more directory
+ * each time a reviewer opens a folder; a folder nobody opens costs nothing. See
+ * `ui/use-review-source.ts`, which owns both reads.
  *
  * READ-ONLY, AND NOT BY DISABLING THINGS (R-13.19). Three writes exist in the local file
  * surface — create, rename, and the editor's save — and none of them is rendered here.
@@ -45,9 +57,8 @@
  * has got there yet. "Local" is the sidecar panel's word for a different kind of comment
  * entirely — the reader's own notes, which are going nowhere.
  *
- * IT IMPORTS ONLY TYPES FROM `core/`. `worktree.ts` reads `node:fs/promises`; the one
- * thing needed from it here is the shape of a mounted worktree and the shape of its
- * path, and the path convention is re-declared below rather than imported.
+ * IT IMPORTS ONLY TYPES FROM `core/`. Every module this surface would otherwise want
+ * reaches `node:fs/promises`; the shapes travel as types through `collab-client.ts`.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
@@ -56,10 +67,11 @@ import { ActiveCommentProvider } from './active-comment';
 import { CodeView, type LineSelection } from './code-view';
 import { CommentPanel } from './comment-panel';
 import { IndicatorLayer } from './indicator-layer';
-import { BusyLabel, LoadingLine, Spinner } from './spinner';
+import { BusyLabel, LoadingLine, useSettledBusy } from './spinner';
 import { reviewCommentPanelSource, reviewIndicatorTargets } from './review-comment-source';
 import {
-  type MountedWorktree,
+  type CollabClient,
+  type OpenedReview,
   type PullRequestSummary,
   type ReviewDraft,
   type ReviewDraftInput,
@@ -69,39 +81,25 @@ import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import { shortSha } from './collab-pulls-panel';
 import { FileTree } from './file-tree';
 import { MarkdownSurface } from './markdown-surface';
-import { type TreeEntry, invalidateTree, rawUrl, useFile, useTree } from './use-tree';
+import { reviewFileKind, useReviewFile, useReviewTree } from './use-review-source';
+import type { TreeEntry } from './use-tree';
 
 export type CollabPrReviewProps = {
   pull: PullRequestSummary;
-  worktree: MountedWorktree;
+  /**
+   * Where this review's files come from, and the commit they are read at (R-W1.5).
+   *
+   * IT IS REPORTED, NOT BRANCHED ON. Everything below reads, orders and renders the same
+   * way whichever source is live — that is the whole point of there being one interface
+   * behind them. The kind reaches this component for one reason: to be said out loud, in
+   * the banner, because the reviewer is the one who has to account for the difference.
+   */
+  review: OpenedReview;
   /** Back to the list. The checkout is left mounted — leaving a review is not unmounting. */
   onExit: () => void;
   /** Injectable for tests; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
 };
-
-/**
- * Where the checkout sits, relative to the served directory (R-13.5).
- *
- * `core/collaboration/worktree.ts` owns this convention and computes the same string
- * from `WORKTREE_DIR`; it cannot be imported here because that module reaches
- * `node:fs/promises`. The two are pinned to each other by
- * `ui/collab-pr-review.test.tsx`, which asserts this against the path git reports.
- */
-export function worktreePrefix(pullNumber: number): string {
-  return `.visual-spec/worktrees/pr-${pullNumber}/`;
-}
-
-/**
- * The checkout's own tree: everything under the mount point, re-rooted so a reviewer
- * reads `src/auth.ts` rather than `.visual-spec/worktrees/pr-42/src/auth.ts`. The full
- * path is put back on before any read — see `checkoutPath`.
- */
-export function entriesUnder(entries: TreeEntry[], prefix: string): TreeEntry[] {
-  return entries
-    .filter((e) => e.path.startsWith(prefix) && e.path.length > prefix.length)
-    .map((e) => ({ ...e, path: e.path.slice(prefix.length) }));
-}
 
 /**
  * The changed paths as a tree, with the folders that hold them.
@@ -113,11 +111,12 @@ export function entriesUnder(entries: TreeEntry[], prefix: string): TreeEntry[] 
  * the leaves instead, and the shape of the change becomes readable at a glance: four docs,
  * then a run of `core/vite/routes`, then the UI.
  *
- * THE ENTRIES ARE THE CHECKOUT'S OWN where the checkout has them, so a row opens exactly
- * the file the flat list opened and carries the `kind` the server detected. A path the
- * checkout does not have is a file the pull request deleted (R-13.12); it still gets a row,
- * because "this was removed" is part of the change, and clicking it reports that rather
- * than opening nothing.
+ * THE ENTRIES ARE THE TREE'S OWN where the tree has been read that far, so a row opens
+ * exactly the file the sidebar below opens. Most of them will not be: the tree expands on
+ * demand and a changed path usually sits in a folder nobody has opened yet, so the row is
+ * synthesised from the path and its kind read off the name. A path the pull request
+ * deleted (R-13.12) is the same case and gets the same row; clicking it reports that the
+ * file cannot be read at this commit rather than opening nothing.
  *
  * `buildTree` resolves each node's parent by path and needs the parent to exist, so the
  * directories are synthesised here rather than left to it.
@@ -130,7 +129,8 @@ export function changedTreeEntries(paths: readonly string[], byPath: Map<string,
       const dir = segments.slice(0, i).join('/');
       if (!out.has(dir)) out.set(dir, { path: dir, name: segments[i - 1]!, type: 'dir' });
     }
-    out.set(path, byPath.get(path) ?? { path, name: segments[segments.length - 1]!, type: 'file', kind: 'text' });
+    const name = segments[segments.length - 1]!;
+    out.set(path, byPath.get(path) ?? { path, name, type: 'file', kind: reviewFileKind(name) });
   }
   // Sorted by path so parents precede children, which is what `buildTree` relies on.
   return [...out.values()].sort((a, b) => a.path.localeCompare(b.path));
@@ -149,15 +149,13 @@ type DraftNotice =
   | { kind: 'error'; message: string }
   | { kind: 'note'; message: string };
 
-export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrReviewProps) {
+export function CollabPrReview({ pull, review, onExit, fetchImpl }: CollabPrReviewProps) {
   const client = useMemo(() => createCollabClient(fetchImpl), [fetchImpl]);
-  const prefix = worktreePrefix(pull.number);
 
   const [changed, setChanged] = useState<string[] | null>(null);
   const [changedError, setChangedError] = useState<string | null>(null);
   const [selected, setSelected] = useState<TreeEntry | null>(null);
-  const [filter, setFilter] = useState('');
-  /** P7 — the rest of the checkout is context, so it starts out of the way. */
+  /** P7 — the rest of the tree is context, so it starts out of the way. */
   const [restOpen, setRestOpen] = useState(false);
   const [drafts, setDrafts] = useState<ReviewDraft[]>([]);
   const [draftsError, setDraftsError] = useState<string | null>(null);
@@ -167,13 +165,11 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
   const [threadsError, setThreadsError] = useState<string | null>(null);
   const [threadsBusy, setThreadsBusy] = useState(false);
 
-  // The mount just wrote thousands of files into a directory whose walk is cached for
-  // seconds on both sides. Without this the checkout is invisible until the TTL lapses,
-  // which reads as an empty pull request.
-  useEffect(() => {
-    invalidateTree();
-  }, [worktree.path]);
-  const { entries, loading, reload } = useTree();
+  /*
+   * The review's own tree, read one directory at a time through the routes that go via
+   * the resolved source. The root arrives on mount; everything else waits to be opened.
+   */
+  const tree = useReviewTree(client, pull.number);
 
   useEffect(() => {
     let live = true;
@@ -344,9 +340,7 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
   }, [threads, drafts]);
   const replyCount = (threads ?? []).reduce((n, t) => n + t.replies.length, 0);
 
-  const checkout = useMemo(() => entriesUnder(entries, prefix), [entries, prefix]);
-  const byPath = useMemo(() => new Map(checkout.map((e) => [e.path, e])), [checkout]);
-  const checkoutFiles = useMemo(() => checkout.filter((e) => e.type === 'file').length, [checkout]);
+  const byPath = useMemo(() => new Map(tree.entries.map((e) => [e.path, e])), [tree.entries]);
   const changedEntries = useMemo(() => changedTreeEntries(changed ?? [], byPath), [changed, byPath]);
 
   /**
@@ -372,12 +366,14 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
   }, [drafts, threads]);
 
   /**
-   * R-13.12 — the changed paths and the checkout must name the same commit. Both were
-   * taken at the mount, and the head is re-read on every reload, so a changed file that
-   * the checkout does not have is reported as such instead of opening nothing.
+   * R-13.12 — every read lands on the one commit the review is pinned to, so a changed
+   * path that is not in the tree at that commit (the pull request deleted it) is reported
+   * by the read that fails rather than by opening nothing.
    */
-  const open = (path: string) =>
-    setSelected(byPath.get(path) ?? { path, name: path.slice(path.lastIndexOf('/') + 1), type: 'file', kind: 'text' });
+  const open = (path: string) => {
+    const name = path.slice(path.lastIndexOf('/') + 1);
+    setSelected(byPath.get(path) ?? { path, name, type: 'file', kind: reviewFileKind(name) });
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
@@ -424,10 +420,34 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
           </strong>
           <span style={identityMeta}>
             {pull.author || 'unknown author'} · {pull.headBranch} → {pull.baseBranch} · at{' '}
-            {shortSha(worktree.headSha)}
+            {shortSha(review.headSha)}
           </span>
         </span>
-        <span style={readOnlyChip}>Read-only checkout — no commit, push or merge</span>
+        {/*
+          * "checkout" left this chip when a review stopped needing one. The promise it
+          * makes is about what the interface will not do to the code, and that promise is
+          * the same whether the bytes came off this disk or off the wire.
+          */}
+        <span style={readOnlyChip}>Read-only — no commit, push or merge</span>
+        {/*
+          * WHERE THE FILES COME FROM (R-W1.5), SAID AS WHAT IT MEANS.
+          *
+          * The two sources differ in one thing the reviewer will feel: a host-sourced
+          * review fetches every file it opens, so it is as fast as the connection and
+          * impossible on a plane; a checkout-backed one has the files already. A reviewer
+          * who is not told which one they are on cannot tell a slow network from a stuck
+          * interface, and cannot plan to read offline.
+          *
+          * So the chip does not print the word "host" or "checkout" and leave the reader
+          * to work out the consequence — it states the consequence, which is the only part
+          * that changes what they do. The word is still in the DOM (`data-vs-review-source`)
+          * for anything that needs to assert on it.
+          */}
+        <span data-vs-review-source={review.source} style={sourceChip}>
+          {review.source === 'checkout'
+            ? 'Files are on this machine — they open without the network'
+            : 'Files come from GitHub — each one you open needs the network'}
+        </span>
         {(drafts.length > 0 || threadCount > 0) && (
           <span data-vs-draft-tally style={tallyChip}>
             {heldCount} held locally · {threadCount} on GitHub
@@ -446,10 +466,10 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
           On GitHub ↗
         </a>
         {/*
-          * `reload()` re-walks the checkout — thousands of files on a real repository —
-          * and the button gave no sign of it, so a reviewer waiting for a pushed commit to
-          * appear pressed it repeatedly. `useTree`'s own `loading` is the truth here; this
-          * button does not need a flag of its own.
+          * `reload()` re-reads the directories that are currently open, and nothing else —
+          * the ones nobody expanded were never read and do not need re-reading. It says it
+          * is working, because a reviewer waiting for a pushed commit to appear otherwise
+          * presses it repeatedly.
           */}
         {/*
           * The conversation is read from GitHub, so it goes stale the moment somebody
@@ -467,16 +487,8 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
         >
           <BusyLabel busy={threadsBusy}>{threadsBusy ? 'Reading…' : 'Refresh comments'}</BusyLabel>
         </button>
-        <button
-          type="button"
-          onClick={() => {
-            invalidateTree();
-            void reload();
-          }}
-          disabled={loading}
-          style={backBtn}
-        >
-          <BusyLabel busy={loading}>{loading ? 'Refreshing…' : 'Refresh files'}</BusyLabel>
+        <button type="button" onClick={() => tree.reload()} disabled={tree.loading} style={backBtn}>
+          <BusyLabel busy={tree.loading}>{tree.loading ? 'Refreshing…' : 'Refresh files'}</BusyLabel>
         </button>
       </div>
 
@@ -546,41 +558,54 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
             aria-controls="vs-checkout-rest"
             style={restToggle}
           >
-            <span aria-hidden="true">{restOpen ? '▾' : '▸'}</span> Rest of the checkout ·{' '}
             {/*
-              * The tree walk covers the whole checkout and is slow on a real repository.
-              * `0 files` while it runs is a number the walk has not produced — a claim, not
-              * a placeholder — so it waits and says it is counting.
+              * NO FILE COUNT ANY MORE, BECAUSE NOTHING HAS COUNTED THEM. The line used to
+              * say `1,204 files`, which was the full walk's answer; a tree that is read a
+              * directory at a time has no such number, and printing the number of rows
+              * that happen to be loaded would be a count of what the reviewer has already
+              * clicked. The sentence says what the pane is for instead.
               */}
-            {loading ? (
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, verticalAlign: 'middle' }}>
-                <Spinner size={10} /> counting files…
-              </span>
-            ) : (
-              `${checkoutFiles} files`
-            )}{' '}
-            — read for context, not under review
+            <span aria-hidden="true">{restOpen ? '▾' : '▸'}</span> Rest of the files — read for context, not under
+            review
           </button>
           {restOpen && (
             <div id="vs-checkout-rest" style={restBody}>
-              <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="filter…" style={filterInput} />
+              {/*
+                * THE FILTER BOX IS GONE WITH THE WALK. It matched paths in the flat list,
+                * and the flat list is now whatever has been opened — so it would search
+                * the folders the reviewer had already been through and silently miss the
+                * rest, which is worse than not offering it. Folders open on click.
+                */}
               <div style={{ flex: 1, overflow: 'auto', padding: 6 }}>
-                {loading ? (
+                {tree.loading ? (
                   <LoadingLine style={{ padding: '4px 12px', fontSize: 12 }} />
                 ) : (
-                  <FileTree entries={checkout} current={selected?.path ?? ''} filter={filter} onPick={setSelected} readOnly />
+                  <FileTree
+                    entries={tree.entries}
+                    current={selected?.path ?? ''}
+                    filter=""
+                    onPick={setSelected}
+                    onExpand={tree.expand}
+                    pending={tree.pending}
+                    readOnly
+                  />
                 )}
               </div>
+            </div>
+          )}
+          {tree.error && (
+            <div data-vs-tree-error style={errorLine}>
+              {tree.error}
             </div>
           )}
         </nav>
 
         {selected ? (
-          <CheckoutFileView
+          <ReviewFileView
             key={selected.path}
             entry={selected}
-            prefix={prefix}
-            headSha={worktree.headSha}
+            client={client}
+            headSha={review.headSha}
             drafts={drafts.filter((d) => d.target.path === selected.path)}
             threads={(threads ?? []).filter((t) => t.target.path === selected.path)}
             pullNumber={pull.number}
@@ -600,9 +625,9 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
               * already arrived.
               */}
             {changed === null && !changedError ? (
-              <LoadingLine>Opening the checkout…</LoadingLine>
+              <LoadingLine>Opening the pull request…</LoadingLine>
             ) : (
-              'Pick a changed file to start reading, or open any file in the checkout.'
+              'Pick a changed file to start reading, or open any other file in the tree.'
             )}
           </main>
         )}
@@ -611,15 +636,11 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
   );
 }
 
-/** The path `/__vs/tree/file` and `/__vs/raw` want: the checkout path, re-prefixed. */
-export function checkoutPath(prefix: string, path: string): string {
-  return `${prefix}${path}`;
-}
-
-type CheckoutFileViewProps = {
+type ReviewFileViewProps = {
   entry: TreeEntry;
-  prefix: string;
-  /** The commit the checkout is at — stamped on every comment held from this file. */
+  /** How this file is read — the same client, and the same routes, for either source. */
+  client: CollabClient;
+  /** The commit the review is pinned to — stamped on every comment held from this file. */
   headSha: string;
   /** This file's held and published comments, in creation order. */
   drafts: ReviewDraft[];
@@ -643,11 +664,24 @@ type CheckoutFileViewProps = {
  * viewer already reports, and it is what a held comment anchors to (R-13.13): picking a
  * line is reading, and the composer below writes a comment, never the file.
  */
-function CheckoutFileView({ entry, prefix, headSha, drafts, threads, pullNumber, notices, error, threadsError, onHold, onPublish, onDiscard, onReply }: CheckoutFileViewProps) {
-  const path = checkoutPath(prefix, entry.path);
-  const { file, loading } = useFile(entry.type === 'dir' ? '' : path, entry.kind);
+function ReviewFileView({ entry, client, headSha, drafts, threads, pullNumber, notices, error, threadsError, onHold, onPublish, onDiscard, onReply }: ReviewFileViewProps) {
+  const { text, loading, error: readError } = useReviewFile(client, pullNumber, entry);
+  /*
+   * R-W2.8 — a read that is taking long enough to notice says so.
+   *
+   * Opening a file is a round trip now, and on the host source it is a round trip to
+   * GitHub: a pane that shows the file's name, "read-only", and then nothing for two
+   * seconds is indistinguishable from a pane that has finished and found nothing to show.
+   *
+   * `useSettledBusy` and not `loading` directly, because the same read against a checkout
+   * on this disk returns in a few milliseconds — long enough to paint an indicator and
+   * remove it, which is a flash rather than a signal, on every single click. The wait is
+   * what is reported; the source is not consulted, and the checkout case simply never
+   * waits long enough to say anything.
+   */
+  const reading = useSettledBusy(loading);
   const [selection, setSelection] = useState<LineSelection | null>(null);
-  const content = file && 'content' in file ? file.content : undefined;
+  const content = text ?? undefined;
   /*
    * MARKDOWN IS READ RENDERED, AND COMMENTED ON RENDERED.
    *
@@ -728,9 +762,34 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, threads, pullNumber,
         {entry.type === 'dir' ? (
           <div style={placeholder}>Folder — pick a file inside it.</div>
         ) : loading ? (
-          <LoadingLine />
+          /*
+           * Nothing at all until the read has outlasted a glance, and then the sentence.
+           * The empty branch matters: falling through to the "no preview" placeholder for
+           * those few milliseconds would tell the reviewer the file is unreadable and then
+           * take it back, which is worse than a moment of blank.
+           */
+          reading ? (
+            <div data-vs-reading={entry.path}>
+              <LoadingLine style={{ padding: '8px 0' }}>Reading {entry.name}…</LoadingLine>
+            </div>
+          ) : null
         ) : entry.kind === 'image' ? (
-          <img src={rawUrl(path)} alt={entry.name} style={{ maxWidth: '100%', borderRadius: 8, border: '1px solid #e2e8f0' }} />
+          /*
+           * A review reads text — that is the whole of `ReviewSource.readFile`, on both
+           * sides — so there is no image to show and no route that would serve one. Said
+           * plainly, with the way to see it, rather than rendered as a broken picture.
+           */
+          <div data-vs-no-image style={placeholder}>This is an image. A review reads text, so open it on GitHub to look at it.</div>
+        ) : readError ? (
+          /*
+           * The route's own sentence (R-11.4 / R-W2.7): each of the four read failures
+           * names a different thing for the reviewer to do, and "No preview for this file"
+           * names none of them. A changed path that is not in the tree — the file the pull
+           * request deleted (R-13.12) — lands here too, which is where it belongs.
+           */
+          <div data-vs-read-error={entry.path} style={{ ...placeholder, color: '#b91c1c', borderColor: '#fecaca' }}>
+            {readError}
+          </div>
         ) : content == null ? (
           <div style={placeholder}>No preview for this file.</div>
         ) : rendered ? (
@@ -852,13 +911,13 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, threads, pullNumber,
   if (!rendered) return body;
 
   /*
-   * `surfaceId` namespaces the inspector's selection, and a checkout's file is not the
+   * `surfaceId` namespaces the inspector's selection, and a review's file is not the
    * local file of the same name — the reviewer may well have both open across a session.
    * The pull request number is what keeps the two apart.
    */
   return (
     <ActiveCommentProvider>
-      <InspectorProvider key={`${prefix}:${entry.path}`} surfaceId={`review:${prefix}:${entry.path}`} pageIndex={0}>
+      <InspectorProvider key={`pr-${pullNumber}:${entry.path}`} surfaceId={`review:pr-${pullNumber}:${entry.path}`} pageIndex={0}>
         {body}
         <CommentPanel width={340} source={panelSource} />
       </InspectorProvider>
@@ -1037,6 +1096,12 @@ const identityMeta: React.CSSProperties = { font: '11px ui-monospace, monospace'
 /** A link, dressed as one: the two neighbours are buttons and this must not read as a third. */
 const ghLink: React.CSSProperties = { flexShrink: 0, font: '12px system-ui, sans-serif', color: '#92400e', textDecoration: 'underline' };
 const readOnlyChip: React.CSSProperties = { flexShrink: 0, font: '600 10px system-ui', padding: '2px 8px', borderRadius: 99, border: '1px solid #fcd34d', background: '#fef3c7', color: '#92400e' };
+/**
+ * A statement of fact, not a warning: quieter than the read-only chip beside it, and the
+ * same shape so the two read as one row of things that are true about this review rather
+ * than as an alert. One style for both sources — only the sentence differs (R-W1.4).
+ */
+const sourceChip: React.CSSProperties = { flexShrink: 0, font: '10px system-ui', padding: '2px 8px', borderRadius: 99, border: '1px solid #e2e8f0', background: 'white', color: '#475569' };
 const backBtn: React.CSSProperties = { flexShrink: 0, font: '12px system-ui, sans-serif', padding: '4px 10px', border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#334155', cursor: 'pointer' };
 const sidebar: React.CSSProperties = { width: 300, flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid #e5e7eb', background: 'white', overflow: 'hidden' };
 const sectionHead: React.CSSProperties = { padding: '10px 12px 6px', font: '700 11px system-ui', color: '#64748b', textTransform: 'uppercase', letterSpacing: 0.4 };
@@ -1047,7 +1112,6 @@ const leadNote: React.CSSProperties = { padding: '0 12px 6px', font: '11px syste
 /** The whole second half of R-13.11, folded into the line that says what it is for. */
 const restToggle: React.CSSProperties = { flexShrink: 0, display: 'block', width: 'calc(100% - 12px)', margin: '10px 6px 0', textAlign: 'left', padding: '8px 8px', border: '1px solid #e2e8f0', borderRadius: 6, background: '#f8fafc', color: '#64748b', font: '11px system-ui', lineHeight: 1.45, cursor: 'pointer' };
 const restBody: React.CSSProperties = { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, paddingTop: 8 };
-const filterInput: React.CSSProperties = { margin: '0 12px 6px', padding: '4px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: '12px system-ui' };
 const emptyLine: React.CSSProperties = { padding: '4px 12px', font: '12px system-ui', color: '#94a3b8' };
 const errorLine: React.CSSProperties = { padding: '4px 12px', font: '12px system-ui', color: '#b91c1c' };
 const pane: React.CSSProperties = { flex: 1, minWidth: 0, overflow: 'auto', background: '#f8fafc' };

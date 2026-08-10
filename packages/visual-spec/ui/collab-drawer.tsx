@@ -23,7 +23,7 @@
  */
 import { useEffect, useRef } from 'react';
 
-import type { MountedWorktree, PullRequestSummary } from './collab-client';
+import type { OpenedReview, PullRequestSummary } from './collab-client';
 import { CollabOpenPanel } from './collab-open-panel';
 import { CollabPullsPanel } from './collab-pulls-panel';
 
@@ -32,8 +32,8 @@ export type CollabDrawerProps = {
   onClose: () => void;
   /** R-7.7 — a pull request that carries a document, opened for writing. */
   onResume: (documentId: string) => void;
-  /** R-7.8 — a pull request checked out for reading, with git's own worktree path. */
-  onReview: (pull: PullRequestSummary, worktree: MountedWorktree) => void;
+  /** R-7.8 — a pull request opened for reading, with the source supplying its files. */
+  onReview: (pull: PullRequestSummary, review: OpenedReview) => void;
 };
 
 /**
