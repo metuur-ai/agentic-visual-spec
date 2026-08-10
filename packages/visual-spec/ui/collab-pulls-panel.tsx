@@ -57,7 +57,7 @@ import {
   type PullRequestSummary,
   createCollabClient,
 } from './collab-client';
-import { useAwaitingPulls } from './use-awaiting-pulls';
+import { refreshAwaiting, useAwaitingPulls } from './use-awaiting-pulls';
 
 export type CollabPullsPanelProps = {
   /**
@@ -201,6 +201,58 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
   useEffect(() => {
     void refreshMounted();
   }, [refreshMounted]);
+
+  /**
+   * Which listing is on screen, for a refresh that lands after the reader moved on.
+   *
+   * The `Show` control stays live while a refresh runs, so its answer can outlive the
+   * question: press refresh on `Open only`, switch to `Closed only`, and the open listing
+   * arrives last and wins. The effect above already guards its own reads with `live`; this
+   * is the same guard for a read that does not belong to an effect.
+   */
+  const shownState = useRef(state);
+  useEffect(() => {
+    shownState.current = state;
+  }, [state]);
+
+  /**
+   * Read all three sources again, because nothing here ever does it on its own (R-C3.1).
+   *
+   * WHY A CONTROL AT ALL. R-7.10 forbids a timer — a poll against a repository spends
+   * somebody's API quota, and this panel is mounted for as long as the drawer is open — so
+   * a reviewer who has just merged in another window, checked something out from a
+   * terminal, or been added as a reviewer has nothing to ask with. Everything here
+   * refreshes on some occasion of its own (the listing when `Show` changes, the checkouts
+   * when one is mounted or removed, the counts on a tab switch) and never on the reader's.
+   *
+   * WHY ALL THREE, FROM ONE PRESS (R-C3.2). They are three reads but one screen, and two
+   * of them are joined: `checkoutRow` decides "not in the listing" by looking the checkout
+   * up in `pulls`. A control that moved the checkouts alone could only restate a join made
+   * from a stale half. One that moved fewer than all three would be pressed, believed, and
+   * wrong.
+   *
+   * CONCURRENTLY, NOT ONE AFTER THE OTHER. They share no data and no order — the join is
+   * recomputed at render from whatever has arrived — so sequencing them would only add the
+   * two faster reads' latency to the slowest one, and hold the running state open for the
+   * sum instead of the maximum. They also land in three separate commits either way.
+   *
+   * NOTHING HERE REJECTS. `client.*` return results rather than throwing (`call` in
+   * `collab-client.ts` catches), and `refreshAwaiting` resolves on failure by contract — a
+   * failed read of the counts writes nothing and surfaces nothing. So this needs no
+   * `catch`, and a settled promise means "the reads are over", never "they succeeded".
+   */
+  const refreshAll = useCallback(async () => {
+    const asked = state;
+    const listing = client.pullRequests(asked).then((res) => {
+      // R-C3.5 — a refused read costs the refresh and not the panel: no rows are cleared,
+      // no error line appears, and what is on screen stays the last thing that was true.
+      // This is deliberately not the mount effect's path, which blanks the list to a
+      // spinner and reports — right for a first read, wrong for a re-read of a list the
+      // reader is looking at.
+      if (res.ok && shownState.current === asked) setPulls(res.value);
+    });
+    await Promise.all([listing, refreshMounted(), refreshAwaiting()]);
+  }, [client, refreshMounted, state]);
 
   /**
    * The checkout of a pull request, if there is one.
@@ -710,24 +762,45 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
         commits, pushes or merges.
       </p>
 
-      <label style={row}>
-        <span style={label}>Show</span>
-        <select
-          aria-label="Pull request state"
-          value={state}
-          onChange={(e) => setState(e.target.value as PullRequestListState)}
-          style={select}
+      <div style={row}>
+        <label style={row}>
+          <span style={label}>Show</span>
+          <select
+            aria-label="Pull request state"
+            value={state}
+            onChange={(e) => setState(e.target.value as PullRequestListState)}
+            style={select}
+          >
+            {/*
+              * "Open only" rather than "Open": `App.test.tsx` reaches the reviewer's
+              * Open *button* by its text, and a one-word option beside it makes that
+              * query ambiguous. The longer label is also the more accurate one.
+              */}
+            <option value="open">Open only</option>
+            <option value="closed">Closed only</option>
+            <option value="all">All states</option>
+          </select>
+        </label>
+        {/*
+          * R-C3.2 — one control, in the panel's own header, beside the other control that
+          * decides what the whole panel shows. Not in a section: a refresh per section
+          * would be three answers to one question, and it would put the same button on
+          * screen three times for a reader whose question was "is any of this current?".
+          *
+          * The title says what it re-reads *and* that nothing does it unasked, because a
+          * reader who does not know that this is the only refresh there is will assume the
+          * screen keeps itself up to date and never press it.
+          */}
+        <button
+          type="button"
+          data-vs-refresh
+          onClick={() => void refreshAll()}
+          style={{ ...button, marginLeft: 'auto' }}
+          title="Re-read the pull request listing, the checkouts on disk, and what is waiting on you. Nothing on this panel refreshes on its own."
         >
-          {/*
-            * "Open only" rather than "Open": `App.test.tsx` reaches the reviewer's
-            * Open *button* by its text, and a one-word option beside it makes that
-            * query ambiguous. The longer label is also the more accurate one.
-            */}
-          <option value="open">Open only</option>
-          <option value="closed">Closed only</option>
-          <option value="all">All states</option>
-        </select>
-      </label>
+          <BusyLabel busy={false}>Refresh</BusyLabel>
+        </button>
+      </div>
 
       {status.kind === 'error' && (
         <p data-vs-collab-pulls-status style={error}>

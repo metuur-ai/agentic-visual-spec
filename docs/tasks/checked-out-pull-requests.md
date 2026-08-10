@@ -73,11 +73,11 @@
 
 ## Unit 3: Refreshing — the control
 
-- [ ] 3.2 Put one refresh in the panel header, re-reading all three sources (deps: 3.1, 1.1, est: ~35m)
+- [x] 3.2 Put one refresh in the panel header, re-reading all three sources (deps: 3.1, 1.1, est: ~35m)
   - why: nothing polls, by design — R-7.10 forbids a timer because a poll against a repository spends somebody's API quota — so a user who has just merged, checked out, or been added as a reviewer in another window has no way to ask. The listing, the checkouts and the counts refresh on different occasions today and never together, so refresh has to mean all three or it will be pressed and disbelieved.
   - acceptance: R-C3.1 — one control re-reads the listing, the checkouts and both counts; R-C3.2 — it is presented once for the panel, with no per-section control.
   - verify: panel test asserts a single press issues a listing read, a mounted read and an awaiting read; and that the panel renders exactly one refresh control.
-  - landed:
+  - landed: `ui/collab-pulls-panel.tsx` — `refreshAll` runs the three reads concurrently through `Promise.all` (the listing, `refreshMounted`, and the store's `refreshAwaiting`), behind one `Refresh` button in the panel header beside `Show`; a `shownState` ref drops a listing answer that outlived a change of the `Show` setting. Tests: `ui/collab-pulls-panel.test.tsx` › "asking the panel to read all of it again (R-C3)" — "re-reads the listing, the checkouts and both counts on one press" (R-C3.1), "offers exactly one refresh control, and none inside a section" (R-C3.2), "re-reads the listing at the state the “Show” setting is on".
 
 - [ ] 3.3 Say a refresh is running, and refuse a second (deps: 3.2, est: ~20m)
   - why: these reads are not instant and one of them crosses the network. Without a running state the button looks inert and gets pressed again; five presses in ten seconds is fifteen calls against a search limit of thirty a minute.

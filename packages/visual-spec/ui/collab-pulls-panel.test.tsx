@@ -1011,3 +1011,143 @@ describe('whether a checkout is at the pull request’s head (R-C2)', () => {
     expect(text.unlisted).not.toContain(words.behind);
   });
 });
+
+/* ================================================================== *
+ * R-C3 — asking for all of this to be read again
+ * ================================================================== */
+/*
+ * NOTHING POLLS, BY DESIGN, WHICH IS WHY A CONTROL HAS TO EXIST. R-7.10 forbids a timer
+ * because a poll against a repository spends somebody's API quota — so a reviewer who has
+ * just merged in another window, checked something out from a terminal, or been added as a
+ * reviewer has no way to ask this panel to look again.
+ *
+ * THE THREE SOURCES ARE ASSERTED SEPARATELY BECAUSE THEY REFRESH SEPARATELY TODAY. The
+ * listing re-reads when the `Show` setting changes, the checkouts when one is mounted or
+ * removed, the counts on a tab switch — and never together. A refresh that moved two of
+ * the three would be pressed and disbelieved, so every test here names all three.
+ *
+ * TWO FETCHES AGAIN, for the reason given above the R-A3 block: the panel's own reads go
+ * through the injected `fetchImpl`, and the counts through the *global* one, because their
+ * store is shared with the header and has no props to be injected through.
+ */
+describe('asking the panel to read all of it again (R-C3)', () => {
+  /** One side answering keeps the fixture small; the other has simply never answered. */
+  const AWAITING = {
+    reviewRequested: {
+      ok: true,
+      complete: true,
+      total: 1,
+      items: [{ number: 42, title: PULL.title, htmlUrl: PULL.htmlUrl }],
+    },
+    mentioned: { ok: false },
+  };
+
+  /**
+   * The store's server, recording every URL and able to start failing on command.
+   *
+   * `failing` is a box rather than a boolean so a test can flip it *after* a good render —
+   * which is the whole shape of R-C3.5: what is on screen was read successfully, and then
+   * the next read is refused.
+   */
+  function stubStore() {
+    const urls: string[] = [];
+    const state = { failing: false };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        urls.push(url);
+        if (url === '/__vs/collab') {
+          const json = { available: true, login: 'reviewer-rita', repo: REPO, scopes: [] };
+          return { ok: true, status: 200, json: async () => json } as Response;
+        }
+        if (url === '/__vs/collab/pulls/awaiting') {
+          if (state.failing) {
+            return { ok: false, status: 403, json: async () => ({ error: 'API rate limit exceeded' }) } as Response;
+          }
+          return { ok: true, status: 200, json: async () => AWAITING } as Response;
+        }
+        throw new Error(`unexpected global fetch: ${url}`);
+      }),
+    );
+    return { urls, state };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const refreshButton = () => document.querySelector('[data-vs-refresh]') as HTMLButtonElement;
+  const counted = (urls: string[]) => urls.filter((u) => u === '/__vs/collab/pulls/awaiting').length;
+
+  /** Panel with a listed pull request, a checkout of it, and one counted section. */
+  async function mountPanel(over: Parameters<typeof fakeFetch>[0] = {}) {
+    const store = stubStore();
+    const { impl, calls } = fakeFetch({
+      '/__vs/collab/pulls/mounted': { ok: true, status: 200, json: { worktrees: [WORKTREE] } },
+      ...over,
+    });
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    // Every source has landed before anything is pressed. Pressing while the store's first
+    // read is still in flight would be joined rather than issued (R-C3.4), which is correct
+    // and would make these tests measure the wrong thing.
+    await waitFor(() => expect(document.querySelector('[data-vs-awaiting="review"]')).toBeTruthy());
+    await waitFor(() => expect(document.querySelector('[data-vs-checkouts]')).toBeTruthy());
+    return { calls, ...store };
+  }
+
+  /*
+   * R-C3.1 — one press, all three sources.
+   *
+   * Asserted as requests issued after the press and not as rows on screen, because the
+   * fixture answers the same thing twice: a refresh that re-rendered nothing looks
+   * identical to one that never asked. The requests are the behaviour.
+   */
+  it('re-reads the listing, the checkouts and both counts on one press', async () => {
+    const { calls, urls } = await mountPanel();
+    const panelBefore = calls.length;
+    const countsBefore = counted(urls);
+
+    fireEvent.click(refreshButton());
+
+    await waitFor(() => expect(counted(urls)).toBe(countsBefore + 1));
+    const after = calls.slice(panelBefore).map((c) => c.url);
+    expect(after).toContain('/__vs/collab/pulls?state=open');
+    expect(after).toContain('/__vs/collab/pulls/mounted');
+  });
+
+  /*
+   * R-C3.2 — one control for the panel.
+   *
+   * A control per section would be three answers to one question, and two of them would be
+   * wrong the moment they were used: the checkouts join against the listing, so refreshing
+   * them alone can only restate a join made from a stale half.
+   */
+  it('offers exactly one refresh control, and none inside a section', async () => {
+    await mountPanel();
+
+    expect(document.querySelectorAll('[data-vs-refresh]')).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: /Refresh/ })).toHaveLength(1);
+    expect(document.querySelector('[data-vs-awaiting="review"] [data-vs-refresh]')).toBeNull();
+    expect(document.querySelector('[data-vs-checkouts] [data-vs-refresh]')).toBeNull();
+    expect(document.querySelector('[data-vs-pull-group="all"] [data-vs-refresh]')).toBeNull();
+  });
+
+  /*
+   * The listing is re-read at the setting the reader is looking at, not at the default.
+   * A refresh that quietly reverted `Show` to `open` would answer a question nobody asked.
+   */
+  it('re-reads the listing at the state the “Show” setting is on', async () => {
+    const { calls } = await mountPanel({
+      '/__vs/collab/pulls?state=closed': { ok: true, status: 200, json: { pulls: [] } },
+    });
+    fireEvent.change(screen.getByLabelText('Pull request state'), { target: { value: 'closed' } });
+    await waitFor(() => expect(calls.map((c) => c.url)).toContain('/__vs/collab/pulls?state=closed'));
+    const before = calls.length;
+
+    fireEvent.click(refreshButton());
+
+    await waitFor(() => expect(calls.slice(before).map((c) => c.url)).toContain('/__vs/collab/pulls?state=closed'));
+    expect(calls.slice(before).map((c) => c.url)).not.toContain('/__vs/collab/pulls?state=open');
+  });
+});
