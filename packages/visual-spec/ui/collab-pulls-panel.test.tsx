@@ -29,9 +29,10 @@ const PULL = {
 const WORKTREE = { pullNumber: 42, path: '/repo/.visual-spec/worktrees/pr-42', headSha: 'abc1234def5678' };
 
 /** What the mount route answers where a checkout supplies the review (R-W1.5). */
-const CHECKOUT_MOUNT = { ok: true, source: 'checkout', headSha: WORKTREE.headSha, worktree: WORKTREE };
+const REPO = { owner: 'acme', repo: 'docs' };
+const CHECKOUT_MOUNT = { ok: true, source: 'checkout', headSha: WORKTREE.headSha, repo: REPO, worktree: WORKTREE };
 /** And where the repository host does: same shape, same success, no path on this disk. */
-const HOST_MOUNT = { ok: true, source: 'host', headSha: WORKTREE.headSha };
+const HOST_MOUNT = { ok: true, source: 'host', headSha: WORKTREE.headSha, repo: REPO };
 
 type Reply = { ok: boolean; status: number; json: unknown };
 
@@ -109,7 +110,7 @@ describe('R-13.3 — checking a pull request out', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Review the code' }));
 
     await waitFor(() =>
-      expect(onReview).toHaveBeenCalledWith(PULL, { source: 'checkout', headSha: WORKTREE.headSha, worktree: WORKTREE }),
+      expect(onReview).toHaveBeenCalledWith(PULL, { source: 'checkout', headSha: WORKTREE.headSha, repo: REPO, worktree: WORKTREE }),
     );
     expect(calls.filter((c) => c.url === '/__vs/collab/pulls/42/mount')).toEqual([
       { url: '/__vs/collab/pulls/42/mount', method: 'POST' },
@@ -135,7 +136,7 @@ describe('R-13.3 — checking a pull request out', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Review the code' }));
 
-    await waitFor(() => expect(onReview).toHaveBeenCalledWith(PULL, { source: 'host', headSha: WORKTREE.headSha }));
+    await waitFor(() => expect(onReview).toHaveBeenCalledWith(PULL, { source: 'host', headSha: WORKTREE.headSha, repo: REPO }));
     // Nothing is said about cloning, serving a git directory, or an `origin` remote — the
     // exact sentences the refusal used to print.
     expect(screen.queryByText(/origin/i)).toBeNull();

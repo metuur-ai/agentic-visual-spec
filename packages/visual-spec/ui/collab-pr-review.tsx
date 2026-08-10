@@ -414,8 +414,31 @@ export function CollabPrReview({ pull, review, onExit, fetchImpl }: CollabPrRevi
           * to `min-width: auto` and refuses to go below its own content. The number leads
           * line one so an ellipsis on the tail can only ever take the title.
           */}
+        {/*
+          * WHICH REPOSITORY THIS IS (R-W4.5).
+          *
+          * The row said `#23219 <title>`, and with one repository reachable that was the
+          * whole identity. It is not any more: a pasted link opens any repository the
+          * credential can read, and `#23219` exists in most of them. A wrong-repository
+          * review is a plausible diff — the reviewer notices after twenty minutes of
+          * reading, or does not notice at all.
+          *
+          * So it leads the identity line, in GitHub's own spelling of a cross-repository
+          * reference (`owner/repo#n`), joined to the number rather than floated into a chip
+          * of its own: R-W4.5 says "at all times", and the header is the one part of this
+          * surface that never scrolls. Leading also means the ellipsis on this line can only
+          * ever take the title, which is what P4 established for the number and is the same
+          * argument one place further left.
+          *
+          * It is `review.repo` and NOT `pull.htmlUrl`. The pull request record came from a
+          * listing; the review's files came from whatever repository the server resolved.
+          * Naming the first would make this row agree with itself while showing the second.
+        */}
         <span data-testid="vs-review-pull" data-vs-review-pull={pull.number} style={pullIdentity}>
-          <strong style={identityLine} title={pull.title}>
+          <strong style={identityLine} title={`${review.repo.owner}/${review.repo.repo}#${pull.number} ${pull.title}`}>
+            <span data-vs-review-repo={`${review.repo.owner}/${review.repo.repo}`} style={repoName}>
+              {review.repo.owner}/{review.repo.repo}
+            </span>
             #{pull.number} {pull.title}
           </strong>
           <span style={identityMeta}>
@@ -1091,6 +1114,13 @@ const banner: React.CSSProperties = { display: 'flex', alignItems: 'center', gap
 /** P4 — the one element that may shrink, and the ellipsis can only reach the title. */
 const pullIdentity: React.CSSProperties = { flex: '1 1 auto', minWidth: 0, display: 'flex', flexDirection: 'column', gap: 1 };
 const identityLine: React.CSSProperties = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+/**
+ * R-W4.5 — the repository, quieter than the number it precedes but never smaller than it
+ * is readable at. `flexShrink` is irrelevant here (this is inline inside the line, not a
+ * flex child); what matters is that it comes first, so the line's own ellipsis reaches it
+ * last.
+ */
+const repoName: React.CSSProperties = { color: '#92766a', fontWeight: 500 };
 /** Provenance, in the row's own monospace so the author and the sha line up as facts. */
 const identityMeta: React.CSSProperties = { font: '11px ui-monospace, monospace', color: '#92766a', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
 /** A link, dressed as one: the two neighbours are buttons and this must not read as a third. */

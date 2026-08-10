@@ -794,3 +794,29 @@ describe('R-W4.1 — an open resolves the repository the request named', () => {
     expect(opened).toEqual(['acme/specs#42 as doc-1']);
   });
 });
+
+/* ================================================================== *
+ * R-W4.5 — the review says which repository it is of
+ * ================================================================== */
+/**
+ * The browser cannot work this out and must not try. A pull request record carries an
+ * `htmlUrl` naming the repository its *listing* came from, and a surface that read the
+ * repository off that would agree with itself for as long as the two matched — which is
+ * every case except the one worth catching. So the open reports the repository it actually
+ * resolved, and these assert that it is the requested one on both route forms.
+ */
+describe('R-W4.5 — an opened review names the repository it reads from', () => {
+  it('reports the repository the request named', async () => {
+    const gh = repoAdapter();
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'POST', '/repos/other/tools/pulls/42/mount');
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({ ok: true, repo: { owner: 'other', repo: 'tools' } });
+  });
+
+  it('reports the configured repository on the legacy form (R-W3.2)', async () => {
+    const gh = repoAdapter();
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'POST', '/pulls/42/mount');
+    expect(res.status).toBe(200);
+    expect(res.json).toMatchObject({ ok: true, repo: { owner: 'acme', repo: 'specs' } });
+  });
+});

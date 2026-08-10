@@ -1550,6 +1550,13 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
          * `worktree` stays present exactly when the checkout supplies the review — it is
          * the path on this machine, and a host-sourced review has none. Its absence is no
          * longer how a caller learns the source; `source` says so directly.
+         *
+         * `repo` is the repository this review READS FROM (R-W4.5), and it is reported for
+         * the browser to keep on screen for as long as the review is open. It is taken from
+         * `gated.repo` — the repository the request named, or the configured one — and not
+         * echoed back from anything the caller sent, because the point of showing it is that
+         * it is the server's answer: a surface that displayed the repository it had asked
+         * about would agree with itself while reading somebody else's diff.
          */
         const resolved = await reviewSourceFor(repoRefOf(gated.repo), pullNumber, { refresh: true });
         if (!resolved.ok) return resolved.result;
@@ -1559,6 +1566,7 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
             ok: true,
             source: resolved.source.kind,
             headSha: resolved.source.headSha,
+            repo: { owner: gated.repo.owner, repo: gated.repo.repo },
             ...(resolved.worktree ? { worktree: resolved.worktree } : {}),
           },
         };

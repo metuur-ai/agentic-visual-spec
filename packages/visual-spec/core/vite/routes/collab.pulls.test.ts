@@ -410,7 +410,7 @@ describe('POST /__vs/collab/pulls/:n/mount', () => {
     const git = stubGit((args) => (isCommand(args, 'rev-parse') ? { exitCode: 1 } : undefined));
     const res = await mount(git.exec);
     expect(res.status).toBe(200);
-    expect(res.json).toEqual({ ok: true, source: 'host', headSha: 'a'.repeat(40) });
+    expect(res.json).toEqual({ ok: true, source: 'host', headSha: 'a'.repeat(40), repo: { owner: 'acme', repo: 'specs' } });
     expect(git.calls.some((c) => isCommand(c, 'fetch'))).toBe(false);
   });
 
@@ -418,7 +418,7 @@ describe('POST /__vs/collab/pulls/:n/mount', () => {
     const git = stubGit((args) => (isCommand(args, 'remote') ? { exitCode: 1 } : undefined));
     const res = await mount(git.exec);
     expect(res.status).toBe(200);
-    expect(res.json).toEqual({ ok: true, source: 'host', headSha: 'a'.repeat(40) });
+    expect(res.json).toEqual({ ok: true, source: 'host', headSha: 'a'.repeat(40), repo: { owner: 'acme', repo: 'specs' } });
     expect(git.calls.some((c) => isCommand(c, 'fetch'))).toBe(false);
   });
 
@@ -460,6 +460,9 @@ describe('POST /__vs/collab/pulls/:n/mount', () => {
       // told which source is live in *both* configurations, or being told is worthless.
       source: 'checkout',
       headSha: head,
+      // R-W4.5 — and which repository it is of, on every answer, so the surface can keep
+      // it on screen without inferring it from the row that was clicked.
+      repo: { owner: 'acme', repo: 'specs' },
       worktree: { pullNumber: 7, path: `${dir}/.visual-spec/worktrees/pr-7`, headSha: head },
     });
     // The fetch uses the fork-safe refspec, not the head branch by name.

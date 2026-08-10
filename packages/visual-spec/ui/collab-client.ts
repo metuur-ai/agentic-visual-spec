@@ -195,6 +195,19 @@ export type OpenedReview = {
   source: ReviewSourceKind;
   headSha: string;
   /**
+   * R-W4.5 — the repository this review reads from, as the SERVER resolved it.
+   *
+   * Not derivable on this side and deliberately not derived: `pull.htmlUrl` names the
+   * repository the *listing* came from, so a surface that read the repository off it would
+   * agree with itself no matter which repository the server went on to serve. This field is
+   * the one the review's files actually came out of, which is the only one worth showing.
+   *
+   * Required, because R-W4.5 says "at all times while a review is open" — an optional field
+   * is a review that sometimes cannot say where it is from, and that review is exactly the
+   * one somebody spends twenty minutes reading before noticing.
+   */
+  repo: { owner: string; repo: string };
+  /**
    * Absent when the review is supplied by the repository host rather than by a checkout
    * (R-W1.3): the served directory is not a git working tree, or has no origin, so there
    * is no path on this disk to report. Its absence is not a failure and never was — it is

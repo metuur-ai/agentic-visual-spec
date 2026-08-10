@@ -32,7 +32,9 @@ const PULL = {
 
 const WORKTREE = { pullNumber: 42, path: '/repo/.visual-spec/worktrees/pr-42', headSha: 'fedcba9876543' };
 /** The review as `CollabPullsPanel` hands it over: the source, the pinned commit, the checkout. */
-const REVIEW = { source: 'checkout' as const, headSha: WORKTREE.headSha, worktree: WORKTREE };
+/** R-W4.5 — the repository the review reads from travels with it. */
+const REPO = { owner: 'acme', repo: 'docs' };
+const REVIEW = { source: 'checkout' as const, headSha: WORKTREE.headSha, repo: REPO, worktree: WORKTREE };
 
 describe('CollabHeader', () => {
   it('names the pull request and the commit of the mounted tree, from props alone (R-9.1, R-9.4)', () => {
@@ -112,7 +114,7 @@ describe('CollabApp opens where the caller asked (R-7.7 / R-7.8)', () => {
         if (url === '/__vs/collab/doc-c/comments') return jsonRes([]);
         if (url === '/__vs/tree') return jsonRes([]);
         if (url === '/__vs/collab/pulls/mounted') return jsonRes({ worktrees: [] });
-        if (url.startsWith('/__vs/collab/pulls/43/mount')) return jsonRes({ ok: true, source: 'checkout', headSha: WORKTREE_43.headSha, worktree: WORKTREE_43 });
+        if (url.startsWith('/__vs/collab/pulls/43/mount')) return jsonRes({ ok: true, source: 'checkout', headSha: WORKTREE_43.headSha, repo: REPO, worktree: WORKTREE_43 });
         if (url.startsWith('/__vs/collab/pulls/43/files')) {
           return jsonRes({ pullNumber: 43, headSha: 'ccccccc3', baseBranch: 'main', headBranch: 'chore/lint', mergeBaseSha: 'ddddddd4', files: [] });
         }
@@ -194,7 +196,7 @@ describe('one header row while a pull request is under review (P5)', () => {
         if (url === '/__vs/collab/doc-c/comments') return jsonRes([]);
         if (url === '/__vs/tree') return jsonRes([]);
         if (url === '/__vs/collab/pulls/mounted') return jsonRes({ worktrees: [] });
-        if (url.startsWith('/__vs/collab/pulls/43/mount')) return jsonRes({ ok: true, source: 'checkout', headSha: WORKTREE_43.headSha, worktree: WORKTREE_43 });
+        if (url.startsWith('/__vs/collab/pulls/43/mount')) return jsonRes({ ok: true, source: 'checkout', headSha: WORKTREE_43.headSha, repo: REPO, worktree: WORKTREE_43 });
         if (url.startsWith('/__vs/collab/pulls/43/files')) {
           return jsonRes({ pullNumber: 43, headSha: 'ccccccc3', baseBranch: 'main', headBranch: 'chore/lint', mergeBaseSha: 'ddddddd4', files: [] });
         }

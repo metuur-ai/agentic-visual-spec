@@ -42,7 +42,9 @@ const WORKTREE = { pullNumber: 42, path: '/repo/.visual-spec/worktrees/pr-42', h
  * The review as `CollabPullsPanel` hands it over. `source` is the label R-W1.5 requires the
  * surface to report; the host-sourced counterpart is built inline where it is asserted on.
  */
-const REVIEW = { source: 'checkout' as const, headSha: WORKTREE.headSha, worktree: WORKTREE };
+/** R-W4.5 — the repository the review reads from, which the server resolves and reports. */
+const REPO = { owner: 'acme', repo: 'docs' };
+const REVIEW = { source: 'checkout' as const, headSha: WORKTREE.headSha, repo: REPO, worktree: WORKTREE };
 
 /**
  * The pull request's tree, one directory at a time — which is the only shape a
@@ -160,9 +162,9 @@ const mount = (reply = changedFiles(['src/pay.ts'])) => {
  * are the same test run twice with a different label on the review.
  */
 describe('R-W1.3 / R-W1.4 — the files open from either source, through one read path', () => {
-  const HOST = { source: 'host' as const, headSha: PULL.headSha };
+  const HOST = { source: 'host' as const, headSha: PULL.headSha, repo: REPO };
 
-  const openReview = (review: { source: 'host' | 'checkout'; headSha: string }) => {
+  const openReview = (review: { source: 'host' | 'checkout'; headSha: string; repo: { owner: string; repo: string } }) => {
     const { impl, calls } = fakeCollabFetch(changedFiles(['src/pay.ts']));
     render(<CollabPrReview pull={PULL} review={review} onExit={vi.fn()} fetchImpl={impl} />);
     return calls;
@@ -189,7 +191,7 @@ describe('R-W1.3 / R-W1.4 — the files open from either source, through one rea
   });
 
   it('reads the same way from a checkout, with the same result', async () => {
-    const calls = openReview({ source: 'checkout', headSha: PULL.headSha });
+    const calls = openReview({ source: 'checkout', headSha: PULL.headSha, repo: REPO });
     fireEvent.click(await screen.findByRole('button', { name: /pay\.ts/ }));
 
     expect(await screen.findByText(/export const pay/)).toBeTruthy();
@@ -877,7 +879,7 @@ describe('the review row carries the whole identity, once', () => {
   it('names the number, the mounted tree’s commit and read-only, from props alone', async () => {
     const moved = { pullNumber: 42, path: WORKTREE.path, headSha: 'f00dbee9999' };
     const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
-    render(<CollabPrReview pull={PULL} review={{ source: 'checkout' as const, headSha: moved.headSha, worktree: moved }} onExit={vi.fn()} fetchImpl={impl} />);
+    render(<CollabPrReview pull={PULL} review={{ source: 'checkout' as const, headSha: moved.headSha, repo: REPO, worktree: moved }} onExit={vi.fn()} fetchImpl={impl} />);
 
     const row = await screen.findByTestId('vs-review-pull');
     expect(row.textContent).toContain('#42');
@@ -918,6 +920,69 @@ describe('the review row carries the whole identity, once', () => {
     expect(row.textContent).toContain('unknown author');
   });
 
+  /*
+   * R-W4.5 — the repository, on screen for as long as the review is.
+   *
+   * Until stories 3.1 and 4.1 there was one repository a review could possibly be of, so
+   * `#42` was the whole identity and naming the repository would have been noise. Now a
+   * pasted link reaches any repository the credential can read, and #42 exists in most of
+   * them — so a review of the wrong one is a plausible diff that reads correctly for
+   * twenty minutes. The repository leads the identity line for that reason: it is the
+   * first thing on the row and the row never scrolls.
+   */
+  it('names the repository the review reads from, ahead of the number (R-W4.5)', async () => {
+    const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
+    render(
+      <CollabPrReview
+        pull={PULL}
+        review={{ ...REVIEW, repo: { owner: 'facebook', repo: 'react' } }}
+        onExit={vi.fn()}
+        fetchImpl={impl}
+      />,
+    );
+
+    const row = await screen.findByTestId('vs-review-pull');
+    expect(row.textContent).toContain('facebook/react#42');
+    expect(row.querySelector('[data-vs-review-repo]')?.getAttribute('data-vs-review-repo')).toBe('facebook/react');
+  });
+
+  /*
+   * The half that makes it a defence rather than a decoration. `pull.htmlUrl` is where the
+   * repository is *also* written down, and it is the listing's answer — so a row that read
+   * it from there would agree with itself while the review served somebody else's bytes.
+   * The fixture below is exactly that disagreement, and the row must side with the review.
+   */
+  it('names the repository the review came from, not the one the listing named', async () => {
+    const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
+    render(
+      <CollabPrReview
+        pull={{ ...PULL, htmlUrl: 'https://github.com/acme/docs/pull/42' }}
+        review={{ ...REVIEW, repo: { owner: 'other', repo: 'tools' } }}
+        onExit={vi.fn()}
+        fetchImpl={impl}
+      />,
+    );
+
+    const row = await screen.findByTestId('vs-review-pull');
+    expect(row.textContent).toContain('other/tools#42');
+    expect(row.textContent).not.toContain('acme/docs');
+  });
+
+  /*
+   * "At all times" is the requirement, and the two sources are the two ways a review can
+   * exist. A host-sourced review has no checkout to read a repository off, which is
+   * precisely why the server reports it rather than the browser deriving it.
+   */
+  it('names it from either source (R-W4.5)', async () => {
+    for (const review of [REVIEW, { source: 'host' as const, headSha: PULL.headSha, repo: REPO }]) {
+      const { impl } = fakeCollabFetch(changedFiles([]));
+      const { unmount } = render(<CollabPrReview pull={PULL} review={review} onExit={vi.fn()} fetchImpl={impl} />);
+      const row = await screen.findByTestId('vs-review-pull');
+      expect(row.textContent, review.source).toContain('acme/docs#42');
+      unmount();
+    }
+  });
+
   it('says read-only exactly once on the surface', async () => {
     const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
     const { container } = render(<CollabPrReview pull={PULL} review={REVIEW} onExit={vi.fn()} fetchImpl={impl} />);
@@ -952,8 +1017,10 @@ describe('the review title truncates instead of running under the controls', () 
     expect(screen.getByTestId('vs-review-pull').style.minWidth).toMatch(/^0(px)?$/);
     expect(heading.style.textOverflow).toBe('ellipsis');
     expect(heading.style.overflow).toBe('hidden');
-    // The number is the first thing in the string, so the ellipsis takes the title.
-    expect((heading.textContent ?? '').startsWith('#42')).toBe(true);
+    // The identity is the first thing in the string, so the ellipsis takes the title.
+    // R-W4.5 put the repository at the head of it — same argument, one place further
+    // left: what leads cannot be the thing an ellipsis eats.
+    expect((heading.textContent ?? '').startsWith('acme/docs#42')).toBe(true);
     // And the controls beside it hold their size rather than being squeezed.
     expect((screen.getByRole('button', { name: 'Refresh files' }) as HTMLElement).style.flexShrink).toBe('0');
   });
@@ -1364,7 +1431,7 @@ describe('R-W1.5 — the review says where its files come from', () => {
     render(
       <CollabPrReview
         pull={PULL}
-        review={{ source: 'host', headSha: PULL.headSha }}
+        review={{ source: 'host', headSha: PULL.headSha, repo: REPO }}
         onExit={vi.fn()}
         fetchImpl={impl}
       />,
@@ -1383,7 +1450,7 @@ describe('R-W1.5 — the review says where its files come from', () => {
   it('names the pinned commit whether or not there is a checkout', async () => {
     const { impl } = fakeCollabFetch(changedFiles([]));
     render(
-      <CollabPrReview pull={PULL} review={{ source: 'host', headSha: PULL.headSha }} onExit={vi.fn()} fetchImpl={impl} />,
+      <CollabPrReview pull={PULL} review={{ source: 'host', headSha: PULL.headSha, repo: REPO }} onExit={vi.fn()} fetchImpl={impl} />,
     );
     expect(await screen.findByText(/at abc1234/)).toBeTruthy();
   });

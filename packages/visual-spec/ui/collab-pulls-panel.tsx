@@ -270,10 +270,13 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
        * So the whole response is handed on as it stands. Which source it is goes with it
        * (R-W1.5), for the surface to say out loud; the path goes only when there is one.
        */
-      const { source, headSha, worktree } = res.value;
+      // R-W4.5 — the repository comes back with the review and travels on with it, so the
+      // surface can name where the bytes are from rather than inferring it from the row
+      // that was clicked.
+      const { source, headSha, repo, worktree } = res.value;
       setStatus({ kind: 'idle' });
       await refreshMounted();
-      onReview(pull, { source, headSha, ...(worktree ? { worktree } : {}) });
+      onReview(pull, { source, headSha, repo, ...(worktree ? { worktree } : {}) });
       return true;
     },
     [client, onReview, refreshMounted],
