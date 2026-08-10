@@ -235,6 +235,13 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
    * refreshes on some occasion of its own (the listing when `Show` changes, the checkouts
    * when one is mounted or removed, the counts on a tab switch) and never on the reader's.
    *
+   * AND IT IS STILL ONLY EVER PRESSED (R-C3.6). Nothing calls this on an interval, and
+   * nothing may: the counts spend a search budget of thirty requests a minute against a
+   * token belonging to whoever the server is holding one for, and this panel stays mounted
+   * for as long as the drawer is open. The R-C3.6 test advances ten minutes of fake time
+   * with the panel mounted and asserts not one request — so wrapping this in a
+   * `setInterval` fails the suite rather than quietly working.
+   *
    * WHY ALL THREE, FROM ONE PRESS (R-C3.2). They are three reads but one screen, and two
    * of them are joined: `checkoutRow` decides "not in the listing" by looking the checkout
    * up in `pulls`. A control that moved the checkouts alone could only restate a join made

@@ -91,8 +91,8 @@
   - verify: panel test — a good render, then a refresh whose reads all fail, leaves the rows and counts unchanged and renders no error node.
   - landed: `ui/collab-pulls-panel.tsx` — `refreshAll`'s listing read writes only on success and never sets `status`, so it is deliberately not the mount effect's path (which blanks to a spinner and reports); the checkouts already retained (`refreshMounted`) and the counts already retain by R-A4.3. Tests: "keeps every row and count on screen when the refresh fails (R-C3.5)" — all three sources refused at once, asserting the three sections' text is byte-identical and no `[data-vs-collab-pulls-status]` node exists — and "offers the refresh again after one has failed (R-C3.5)". Checked by mutation: making the refresh report like the mount effect fails the first test.
 
-- [ ] 3.5 Guard that none of this runs on a timer (deps: 3.2, est: ~10m)
+- [x] 3.5 Guard that none of this runs on a timer (deps: 3.2, est: ~10m)
   - why: R-7.10 exists because a poll against a repository spends someone else's quota, and this change adds a control whose obvious next step is "just refresh it every 30 seconds". A guard is what makes that a deliberate decision later rather than an accident.
   - acceptance: R-C3.6 — none of the listing, the checkouts or the counts is re-read on a timer.
   - verify: panel test advances fake timers several minutes with the panel mounted and asserts zero requests.
-  - landed:
+  - landed: `ui/collab-pulls-panel.test.tsx` › "re-reads nothing on a timer, however long the panel is left open (R-C3.6)" — fake timers installed *before* the render (so an interval registered on mount is one the test owns), ten minutes advanced, zero requests on the injected `fetch` and zero on the store's global one, with the panel asserted still mounted so the check is not vacuous. `waitFor` is replaced by a microtask drain there, because it polls on `setInterval` and detects only jest's fake clock. The reason is recorded beside `refreshAll` in `ui/collab-pulls-panel.tsx`. Checked by mutation: a 30s `setInterval` calling `refreshMounted` fails this test and only this test.

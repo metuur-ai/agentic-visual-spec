@@ -8,7 +8,7 @@
  * back. R-13.9's four causes get one test each, because the whole point of keeping them
  * apart in `worktree.ts` is that they reach a human as four different instructions.
  */
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import { fireEvent } from '@testing-library/dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CollabPullsPanel, groupByOwner, shortSha } from './collab-pulls-panel';
@@ -1306,5 +1306,64 @@ describe('asking the panel to read all of it again (R-C3)', () => {
 
     await waitFor(() => expect(refreshButton().textContent).toContain('Refresh'));
     expect(refreshButton().disabled).toBe(false);
+  });
+
+  /*
+   * R-C3.6 / R-7.10 — none of this runs on a timer, and this is the test that keeps it
+   * that way.
+   *
+   * THE GUARD IS THE POINT, NOT THE ASSERTION. Adding a refresh control makes "…and just
+   * run it every thirty seconds" the obvious next commit, and it is the wrong one: this
+   * panel is mounted for as long as the drawer is open, the counts come from a *search*
+   * budget of thirty requests a minute, and the quota being spent belongs to whoever's
+   * token the server is holding — a cost paid by someone who is not in the room. A poll
+   * would also be indistinguishable from working correctly, which is what makes it a
+   * decision somebody should have to argue for rather than one that arrives by accident.
+   *
+   * Fake timers are installed *before* the render, not after, so a `setInterval` registered
+   * on mount is one this test owns. Installed after, a real interval would keep its own
+   * clock and `advanceTimersByTime` would sail straight past it.
+   */
+  it('re-reads nothing on a timer, however long the panel is left open (R-C3.6)', async () => {
+    vi.useFakeTimers();
+    try {
+      const { urls } = stubStore();
+      const { impl, calls } = fakeFetch({
+        '/__vs/collab/pulls/mounted': { ok: true, status: 200, json: { worktrees: [WORKTREE] } },
+      });
+      /*
+       * `waitFor` is unusable here and that is not this panel's fault: it polls on
+       * `setInterval`, and it detects *jest's* fake clock only — under vitest's it would
+       * wait on an interval this test has stopped. The mount reads settle on promises and
+       * nothing else, so draining the microtask queue is the whole of the wait.
+       */
+      const settle = async () => {
+        for (let i = 0; i < 20; i += 1) await act(async () => { await Promise.resolve(); });
+      };
+      render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+      await settle();
+      expect(document.querySelector('[data-vs-checkouts]')).toBeTruthy();
+      expect(document.querySelector('[data-vs-awaiting="review"]')).toBeTruthy();
+
+      const panelCalls = calls.length;
+      const countReads = counted(urls);
+
+      // Ten minutes of a reviewer reading the diff in another tab. Twenty polls at the
+      // usual thirty seconds; sixty reads across the three sources.
+      await act(async () => {
+        vi.advanceTimersByTime(10 * 60 * 1000);
+      });
+      // …and whatever a fired timer might have started is given every chance to land.
+      await settle();
+
+      expect(calls.length).toBe(panelCalls);
+      expect(counted(urls)).toBe(countReads);
+      // Not vacuous: the panel is still mounted, still rendered, and still has the one
+      // control that *is* allowed to read again.
+      expect(document.querySelector('[data-vs-checkouts]')).toBeTruthy();
+      expect(refreshButton()).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
