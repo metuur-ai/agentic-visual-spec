@@ -948,4 +948,22 @@ describe('whether a checkout is at the pull request’s head (R-C2)', () => {
     expect(row(42)!.textContent).toContain(shortSha(MOVED.headSha));
     expect(row(42)!.textContent).toContain('Checking it out again');
   });
+
+  /*
+   * R-C2.3 — there is no `PullRequestSummary` to compare against, so there is nothing to
+   * say. A row that quietly defaulted to "up to date" would be asserting the one thing it
+   * cannot know, about exactly the checkouts most likely to be stale: the ones whose pull
+   * request has left the listing.
+   */
+  it('asserts nothing about the currency of a checkout that is not listed (R-C2.3)', async () => {
+    mountPanel([UNLISTED_WORKTREE], [PULL]);
+
+    await waitFor(() => expect(row(7)).toBeTruthy());
+    expect(row(7)!.querySelector('[data-vs-checkout-state="current"]')).toBeNull();
+    expect(row(7)!.querySelector('[data-vs-checkout-state="behind"]')).toBeNull();
+    // Read as a human would read it, not just as a selector: neither word is on the row.
+    expect(row(7)!.textContent).not.toContain('Up to date');
+    expect(row(7)!.textContent).not.toContain('Out of date');
+    expect(row(7)!.textContent).toContain('Not in the listing');
+  });
 });

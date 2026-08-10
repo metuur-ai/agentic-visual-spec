@@ -565,6 +565,12 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
           * feature that had to ask GitHub for the head would have been the version that
           * silently did nothing whenever the quota ran out.
           */}
+        {/*
+          * R-C2.3 — the `pull &&` is the requirement, not a null guard. With no summary
+          * there is no head to compare against, and a row that fell through to "up to
+          * date" would assert the one thing it cannot know about exactly the checkouts
+          * most likely to be stale.
+          */}
         {pull &&
           (pull.headSha === worktree.headSha ? (
             <p data-vs-checkout-state="current" style={{ ...checkoutStateLine, color: '#047857' }}>

@@ -59,11 +59,11 @@
   - verify: panel test asserts both short shas are present on the behind row and that the remedy is stated.
   - landed: `ui/collab-pulls-panel.tsx` — the behind line names `shortSha(worktree.headSha)` and `shortSha(pull.headSha)` and points at re-checking out from the listing below. Test: "names both commits and the way out when a checkout is behind (R-C2.2)".
 
-- [ ] 2.3 Say nothing about currency for a checkout that is not listed (deps: 2.1, 1.2, est: ~15m, mutex: panel-rows)
+- [x] 2.3 Say nothing about currency for a checkout that is not listed (deps: 2.1, 1.2, est: ~15m, mutex: panel-rows)
   - why: there is no pull request record to compare against, and a row that silently defaulted to "current" would be asserting the one thing it cannot know — about exactly the checkouts most likely to be stale.
   - acceptance: R-C2.3 — an unlisted checkout does not assert whether it is current.
   - verify: panel test asserts the unlisted row carries neither the current nor the behind wording.
-  - landed:
+  - landed: `ui/collab-pulls-panel.tsx` — the currency line is rendered only where `listed` has the pull request, recorded in the code as the requirement it is rather than as a null guard. Test: "asserts nothing about the currency of a checkout that is not listed (R-C2.3)", which pins it against a later edit adding a fallback.
 
 - [ ] 2.4 Carry each state in a word and a mark, not in colour (deps: 2.1, est: ~20m, mutex: panel-rows)
   - why: this codebase already settled the question when it chose a count over a coloured dot for per-file comments — a mark says "something is here" only to a reader who already knows what the colour means. Three states separated only by hue are unreadable to a reviewer who cannot distinguish them and ambiguous to everyone else on first sight.
