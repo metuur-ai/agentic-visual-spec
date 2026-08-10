@@ -1234,4 +1234,77 @@ describe('asking the panel to read all of it again (R-C3)', () => {
     await waitFor(() => expect(counted(urls)).toBe(countReads + 1));
     expect(calls.slice(before).map((c) => c.url)).toContain('/__vs/collab/pulls?state=open');
   });
+
+  /*
+   * R-C3.5 — a refused refresh costs the refresh, not the panel.
+   *
+   * The same rule the counts already follow (R-A4.3) and the listing already follows
+   * (R-7.11): what is on screen was read successfully once, and a later read that failed
+   * is not new information about it. A rate-limited search is an ordinary Tuesday against
+   * a budget of thirty a minute, and a panel that answered it by clearing three sections
+   * and printing a banner would punish the reader for asking.
+   *
+   * Every source fails at once, which is the worst case and also the realistic one: all
+   * three are the same credential against the same host.
+   */
+  it('keeps every row and count on screen when the refresh fails (R-C3.5)', async () => {
+    const store = stubStore();
+    const failing = { now: false };
+    const { impl, calls } = fakeFetch({
+      '/__vs/collab/pulls/mounted': { ok: true, status: 200, json: { worktrees: [WORKTREE] } },
+    });
+    const base = impl as unknown as (u: string, i?: RequestInit) => Promise<Response>;
+    const wrapped = (async (url: string, init?: RequestInit) => {
+      if (failing.now) {
+        calls.push({ url, method: init?.method ?? 'GET' });
+        return { ok: false, status: 403, json: async () => ({ error: 'API rate limit exceeded' }) } as Response;
+      }
+      return base(url, init);
+    }) as unknown as typeof fetch;
+
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={wrapped} />);
+    await waitFor(() => expect(document.querySelector('[data-vs-awaiting="review"]')).toBeTruthy());
+    await waitFor(() => expect(document.querySelector('[data-vs-checkouts]')).toBeTruthy());
+
+    // What a reader can see, recorded before anything is asked to fail.
+    const listedBefore = document.querySelector('[data-vs-pull-group="all"]')!.textContent;
+    const checkoutsBefore = document.querySelector('[data-vs-checkouts]')!.textContent;
+    const countedBefore = document.querySelector('[data-vs-awaiting="review"]')!.textContent;
+    const panelCalls = calls.length;
+
+    failing.now = true;
+    store.state.failing = true;
+    fireEvent.click(refreshButton());
+    await waitFor(() => expect(refreshButton().disabled).toBe(false));
+
+    // The reads really were attempted — otherwise this asserts nothing at all.
+    expect(calls.length).toBeGreaterThan(panelCalls);
+    // …and every one of the three sources is exactly as it was.
+    expect(document.querySelector('[data-vs-pull-group="all"]')!.textContent).toBe(listedBefore);
+    expect(document.querySelector('[data-vs-checkouts]')!.textContent).toBe(checkoutsBefore);
+    expect(document.querySelector('[data-vs-awaiting="review"]')!.textContent).toBe(countedBefore);
+    // R-C3.5's second half: no error takes their place, and none appears beside them.
+    expect(document.querySelector('[data-vs-collab-pulls-status]')).toBeNull();
+    expect(screen.queryByText(/API rate limit exceeded/)).toBeNull();
+  });
+
+  /*
+   * And the panel is still usable afterwards: a failed refresh must not leave the control
+   * spinning forever, or the reader has lost the only way to ask.
+   */
+  it('offers the refresh again after one has failed (R-C3.5)', async () => {
+    const store = stubStore();
+    store.state.failing = true;
+    // Nothing this panel asks for succeeds, from the first read onwards.
+    const refused = (async () =>
+      ({ ok: false, status: 403, json: async () => ({ error: 'API rate limit exceeded' }) }) as Response) as unknown as typeof fetch;
+
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={refused} />);
+    await waitFor(() => expect(refreshButton()).toBeTruthy());
+
+    fireEvent.click(refreshButton());
+
+    await waitFor(() => expect(refreshButton().textContent).toContain('Refresh'));
+    expect(refreshButton().disabled).toBe(false);
+  });
 });

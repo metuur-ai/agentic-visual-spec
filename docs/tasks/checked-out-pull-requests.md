@@ -85,11 +85,11 @@
   - verify: panel test with a deferred response asserts the running state is shown and that a second press during it issues no further requests.
   - landed: `ui/collab-pulls-panel.tsx` — `refreshing` state drives the button's `BusyLabel` (`Refresh` → `Refreshing…`, with the ring) and its `disabled`/`aria-busy`; a `refreshRunning` ref refuses a press at the moment it happens rather than at the moment of the last render. Tests: "says a refresh is running, on the control that was pressed (R-C3.3)", "issues nothing further when it is pressed again mid-refresh (R-C3.3)" — four further presses against a held-open listing read — and "accepts a second refresh once the first has finished (R-C3.3)".
 
-- [ ] 3.4 Keep what is on screen when a refresh fails (deps: 3.2, est: ~15m)
+- [x] 3.4 Keep what is on screen when a refresh fails (deps: 3.2, est: ~15m)
   - why: the same rule the counts already follow (R-A4.3) and the listing already follows (R-7.11). A refused search is an ordinary Tuesday here, and it must cost the refresh, not the panel.
   - acceptance: R-C3.5 — a failed refresh retains what is displayed and does not replace it with an error.
   - verify: panel test — a good render, then a refresh whose reads all fail, leaves the rows and counts unchanged and renders no error node.
-  - landed:
+  - landed: `ui/collab-pulls-panel.tsx` — `refreshAll`'s listing read writes only on success and never sets `status`, so it is deliberately not the mount effect's path (which blanks to a spinner and reports); the checkouts already retained (`refreshMounted`) and the counts already retain by R-A4.3. Tests: "keeps every row and count on screen when the refresh fails (R-C3.5)" — all three sources refused at once, asserting the three sections' text is byte-identical and no `[data-vs-collab-pulls-status]` node exists — and "offers the refresh again after one has failed (R-C3.5)". Checked by mutation: making the refresh report like the mount effect fails the first test.
 
 - [ ] 3.5 Guard that none of this runs on a timer (deps: 3.2, est: ~10m)
   - why: R-7.10 exists because a poll against a repository spends someone else's quota, and this change adds a control whose obvious next step is "just refresh it every 30 seconds". A guard is what makes that a deliberate decision later rather than an accident.
