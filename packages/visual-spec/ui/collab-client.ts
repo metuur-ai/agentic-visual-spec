@@ -28,7 +28,8 @@
  * `node:fs` reaches the browser bundle through `job-hub.ts`; the shapes are still the
  * server's, declared once.
  */
-import type { PullRequestListState, PullRequestSummary } from '../core/collaboration/github-adapter';
+import type { AwaitingItem, AwaitingMention, PullRequestListState, PullRequestSummary } from '../core/collaboration/github-adapter';
+import type { Awaiting, AwaitingSide } from '../core/vite/routes/collab';
 import type { JobEvent, JobKind, JobSnapshot, JobSync } from '../core/collaboration/job-hub';
 import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import type { ReviewDraft } from '../core/collaboration/review-drafts';
@@ -41,6 +42,10 @@ import type { CollaborationRecord, GitHubBinding } from '../core/collaboration/d
 // itself — the same courtesy `collab-open-panel.tsx` already takes with the
 // availability snapshot. These are the server's shapes, declared once, over there.
 export type { MountedWorktree, PullRequestListState, PullRequestSummary, ReviewDraft };
+// The `/pulls/awaiting` shapes travel the same way. A chip that renders a count and a
+// panel section that renders its rows are both browser modules; neither should have to
+// name `core/vite/routes/` to type what it was handed.
+export type { Awaiting, AwaitingItem, AwaitingMention, AwaitingSide };
 
 /** Root of the route family. Not configurable — the server mounts it at one path. */
 const BASE = '/__vs/collab';
@@ -319,6 +324,22 @@ export interface CollabClient {
    */
   mountedPullRequests(): Promise<CollabResult<MountedWorktree[]>>;
   /**
+   * `GET /__vs/collab/pulls/awaiting` — the two counts of pull requests waiting on *me*
+   * (R-A1.1 / R-A1.2), and the pull requests behind them (R-A3.1).
+   *
+   * TAKES NO ARGUMENTS, AND A LOGIN LEAST OF ALL (R-A2.4). The availability snapshot is
+   * visible to this process, so an identity sent from here would be spoofable and would
+   * be a qualifier-injection vector into the search `q`. The server counts whoever its
+   * own session is; there is nothing for a caller to choose.
+   *
+   * The body is not an envelope, so nothing is projected off it: each side of it is a
+   * separate answer that can be `{ ok: false }` while the other succeeded (R-A4.4), and
+   * `total` is the query's own total rather than `items.length` (R-A2.10). A caller
+   * retains its last known value for a side that failed — which is why a failed side is
+   * a 200 carrying `ok: false` and not an error the whole read has to be judged by.
+   */
+  awaitingPullRequests(): Promise<CollabResult<Awaiting>>;
+  /**
    * `POST /__vs/collab/pulls/:n/mount` — R-13.3 … R-13.7, materialise the Pull Request's
    * tree locally, detached, without touching the served directory's working copy.
    *
@@ -356,6 +377,16 @@ export interface CollabClient {
    * first shows a reviewer their own words and calls it the conversation.
    */
   reviewComments(pullNumber: number): Promise<CollabResult<ReviewThreadRecord[]>>;
+  /**
+   * `POST /__vs/collab/pulls/:n/comments/:commentId/reply` — R-7.15 from the pull request
+   * surface, where the thread came from `reviewComments` and there is no document id to
+   * route by. `commentId` is the thread root's record id, as listed.
+   */
+  replyToReviewComment(
+    pullNumber: number,
+    commentId: string,
+    input: { comment: string },
+  ): Promise<CollabResult<CommentSaved>>;
   /** `POST /__vs/collab/pulls/:n/drafts` — R-13.13, hold a comment locally. No GitHub call. */
   holdReviewDraft(pullNumber: number, input: ReviewDraftInput): Promise<CollabResult<ReviewDraftSaved>>;
   /** `DELETE /__vs/collab/pulls/:n/drafts/:id` — drop a held comment. 409 once published. */
@@ -461,6 +492,7 @@ export function createCollabClient(fetchImpl?: typeof fetch): CollabClient {
       projected(call<{ pulls: PullRequestSummary[] }>(state ? `/pulls?state=${state}` : '/pulls'), (b) => b.pulls),
     mountedPullRequests: () =>
       projected(call<{ worktrees: MountedWorktree[] }>('/pulls/mounted'), (b) => b.worktrees),
+    awaitingPullRequests: () => call<Awaiting>('/pulls/awaiting'),
     // No body: the pull number is the whole request, and it is in the path.
     mountPullRequest: (pullNumber) => send<WorktreeMounted>(`/pulls/${pullNumber}/mount`, 'POST', {}),
     unmountPullRequest: (pullNumber) => call<WorktreeRemoved>(`/pulls/${pullNumber}/mount`, { method: 'DELETE' }),
@@ -471,6 +503,8 @@ export function createCollabClient(fetchImpl?: typeof fetch): CollabClient {
       projected(call<{ drafts: ReviewDraft[] }>(`/pulls/${pullNumber}/drafts`), (b) => b.drafts),
     reviewComments: (pullNumber) =>
       projected(call<{ threads: ReviewThreadRecord[] }>(`/pulls/${pullNumber}/comments`), (b) => b.threads),
+    replyToReviewComment: (pullNumber, commentId, input) =>
+      send<CommentSaved>(`/pulls/${pullNumber}/comments/${commentId}/reply`, 'POST', input),
     holdReviewDraft: (pullNumber, input) => send<ReviewDraftSaved>(`/pulls/${pullNumber}/drafts`, 'POST', input),
     discardReviewDraft: (pullNumber, draftId) =>
       call<ReviewDraftRemoved>(`/pulls/${pullNumber}/drafts/${draftId}`, { method: 'DELETE' }),

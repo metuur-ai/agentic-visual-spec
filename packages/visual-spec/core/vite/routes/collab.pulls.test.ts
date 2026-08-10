@@ -17,12 +17,20 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { CollaborationPreflight } from '../../collaboration/credentials';
-import { GitHubError, type GitHubAdapter, type PullRequestSummary } from '../../collaboration/github-adapter';
+import {
+  GitHubError,
+  type GitHubAdapter,
+  type PullRequestSearchQualifier,
+  type PullRequestSearchResult,
+  type PullRequestSummary,
+} from '../../collaboration/github-adapter';
 import type { ReviewComment, ThreadResolution } from '../../collaboration/review-comments';
 import { createJobHubRegistry } from '../../collaboration/job-hub';
 import type { GitExecutor } from '../../git-context';
 import type { ResolvedVisualSpecConfig } from '../../config';
 import {
+  GITHUB_LOGIN_RE,
+  type Awaiting,
   type CollabAuthorizer,
   type CollabDeps,
   type CollabOperation,
@@ -201,7 +209,7 @@ describe('/pulls is matched before the document-scoped route', () => {
     const text = src('core/vite/routes/collab.ts');
     const scoped = text.indexOf('const scoped = /^\\/([^/]+)(\\/.*)?$/.exec(pathname)');
     expect(scoped).toBeGreaterThan(-1);
-    for (const marker of ["pathname === '/pulls'", "pathname === '/pulls/mounted'", '/^\\/pulls\\/([^/]+)\\/mount$/', '/^\\/pulls\\/([^/]+)\\/files$/', '/^\\/pulls\\/([^/]+)\\/description$/', '/^\\/pulls\\/([^/]+)\\/comments$/']) {
+    for (const marker of ["pathname === '/pulls'", "pathname === '/pulls/mounted'", "pathname === '/pulls/awaiting'", '/^\\/pulls\\/([^/]+)\\/mount$/', '/^\\/pulls\\/([^/]+)\\/files$/', '/^\\/pulls\\/([^/]+)\\/description$/', '/^\\/pulls\\/([^/]+)\\/comments$/']) {
       const at = text.indexOf(marker);
       expect(at, marker).toBeGreaterThan(-1);
       expect(at, marker).toBeLessThan(scoped);
@@ -994,4 +1002,234 @@ describe('GET /__vs/collab/pulls/:n/description', () => {
     const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/7/description');
     expect(res).toEqual({ status: 404, json: { error: 'Not Found' } });
   });
+});
+
+/* ================================================================== *
+ * GET /pulls/awaiting — the two counts that are waiting on *me*
+ * ================================================================== */
+
+/**
+ * The repo-level adapter as the `awaiting` route drives it, counting every call.
+ *
+ * The counting is the assertion, not a convenience: R-A2.9 is a statement about queries
+ * *issued*, and an empty response body is no evidence that none were.
+ */
+function awaitingAdapter(
+  options: {
+    pulls?: PullRequestSummary[];
+    /** Per qualifier: the result, or the error that query answers with. */
+    search?: Partial<Record<PullRequestSearchQualifier, PullRequestSearchResult | Error>>;
+    listFails?: Error;
+    reviewComments?: ReviewComment[];
+  } = {},
+) {
+  const searches: { qualifier: string; login: string }[] = [];
+  const lists: string[] = [];
+  const adapter = {
+    async searchPullRequests(_repo: unknown, qualifier: PullRequestSearchQualifier, login: string) {
+      searches.push({ qualifier, login });
+      const answer = options.search?.[qualifier] ?? { total: 0, items: [] };
+      if (answer instanceof Error) throw answer;
+      return answer;
+    },
+    async listPullRequests(_repo: unknown, state?: string) {
+      lists.push(state ?? 'open');
+      if (options.listFails) throw options.listFails;
+      return options.pulls ?? [];
+    },
+    async listReviewComments(_repo: unknown, _pullNumber: number) {
+      return options.reviewComments ?? [];
+    },
+  } as unknown as GitHubAdapter;
+  return { adapter, searches, lists, calls: () => searches.length + lists.length };
+}
+
+const awaiting = (res: CollabRouteResult): Awaiting => res.json as Awaiting;
+
+/* ------------------------------------------------------------------ *
+ * R-A2.4 / R-A2.5 — the login is the server's, and it is checked
+ * ------------------------------------------------------------------ */
+describe('the login the counts are taken for', () => {
+  /*
+   * The login is interpolated into the search `q`, which is space-separated free text —
+   * so `me repo:other/repo` is not a malformed login, it is a *second qualifier*, and the
+   * chip would then count another repository under this repository's name.
+   */
+  it('rejects anything outside GitHub’s login character set', () => {
+    for (const bad of ['me repo:other/repo', 'a b', 'x"y', '', '-ana', 'ana-', 'a/b', 'ana@b']) {
+      expect(GITHUB_LOGIN_RE.test(bad), bad).toBe(false);
+    }
+    for (const good of ['ana-b', 'Bob99', 'octocat', 'a']) {
+      expect(GITHUB_LOGIN_RE.test(good), good).toBe(true);
+    }
+  });
+
+  it('refuses to build a query at all when the session reports an unusable login', async () => {
+    const gh = awaitingAdapter();
+    const res = await call(
+      router({
+        repoAdapter: () => gh.adapter,
+        preflight: async () => ({ ...OK_PREFLIGHT, login: 'me repo:other/repo' }),
+      }),
+      'GET',
+      '/pulls/awaiting',
+    );
+    expect(res.status).toBe(500);
+    // The point of R-A2.5: rejected *before* it reaches a query, not filtered afterwards.
+    expect(gh.calls()).toBe(0);
+  });
+
+  /*
+   * R-A2.4 — the availability snapshot is visible to the browser, so a login it could
+   * supply would be spoofable. The route reads neither the query string nor the body.
+   */
+  it('ignores a login supplied by the client, in the query string or in the body', async () => {
+    const gh = awaitingAdapter();
+    const r = router({ repoAdapter: () => gh.adapter });
+    await r.handle({ method: 'GET', pathname: '/pulls/awaiting', query: { login: 'someone-else' }, body: {} });
+    await r.handle({ method: 'GET', pathname: '/pulls/awaiting', query: {}, body: { login: 'someone-else' } });
+    // Two queries per request — the review side and the mention side — and every one of
+    // the four carries the session's login, never the one the client offered.
+    expect(gh.searches).toHaveLength(4);
+    expect(new Set(gh.searches.map((s) => s.login))).toEqual(new Set(['octocat']));
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * R-A2.9 — an unconfigured server issues nothing
+ * ------------------------------------------------------------------ */
+describe('with collaboration unconfigured', () => {
+  it('issues zero calls to the adapter, not merely an empty answer', async () => {
+    const gh = awaitingAdapter();
+    const res = await call(router({ config: () => DISABLED, repoAdapter: () => gh.adapter }), 'GET', '/pulls/awaiting');
+    expect(res.status).toBe(503);
+    expect(gh.calls()).toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * R-A4.4 / R-A4.5 / R-A4.6 — the payload, one side at a time
+ * ------------------------------------------------------------------ */
+describe('GET /__vs/collab/pulls/awaiting', () => {
+  const REVIEWED: PullRequestSearchResult = {
+    // GitHub's own total, deliberately larger than the page it returned (R-A2.10).
+    total: 40,
+    items: [{ number: 7, title: 'Tighten the onboarding guide', htmlUrl: 'https://github.com/acme/specs/pull/7' }],
+  };
+  const MENTIONED: PullRequestSearchResult = {
+    total: 1,
+    items: [{ number: 9, title: 'Rewrite the glossary', htmlUrl: 'https://github.com/acme/specs/pull/9' }],
+  };
+  /** A 422 is what `search/issues` answers for a repository this credential cannot search. */
+  const UNSEARCHABLE = new GitHubError('searchPullRequests', 'Validation Failed', 422, 'unprocessable');
+
+  it('answers both sides when both queries land', async () => {
+    const gh = awaitingAdapter({
+      search: { 'review-requested': REVIEWED, mentions: MENTIONED },
+      pulls: [summary({ number: 11, updatedAt: 'T1' })],
+      reviewComments: [reviewComment({ id: 3, user: 'ana', body: 'ping @octocat — this paragraph contradicts the one above' })],
+    });
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/awaiting');
+
+    expect(res.status).toBe(200);
+    const body = awaiting(res);
+    // `total` is GitHub's, not `items.length`: the panel states the shortfall (R-A3.8).
+    expect(body.reviewRequested).toEqual({ ok: true, total: 40, items: REVIEWED.items, complete: true });
+    expect(body.mentioned.ok).toBe(true);
+    if (!body.mentioned.ok) throw new Error('unreachable');
+    // The union of both sources: #9 from search, #11 from a review comment (R-A2.6).
+    expect(body.mentioned.items.map((i) => i.number)).toEqual([11, 9]);
+    expect(body.mentioned.total).toBe(2);
+    expect(body.mentioned.complete).toBe(true);
+    // R-A3.7 — who wrote it and what it said, already in hand at the moment it matched.
+    expect(body.mentioned.items[0]!.mention).toMatchObject({ author: 'ana' });
+    expect(body.mentioned.items[0]!.mention!.excerpt).toContain('@octocat');
+  });
+
+  /*
+   * R-A4.6 — the repository being unsearchable is a failure of *this* read. The pull
+   * request listing has its own route and its own error field, and neither is touched.
+   */
+  it('reports a failed review side alone, leaving the listing’s error field untouched', async () => {
+    const gh = awaitingAdapter({ search: { 'review-requested': UNSEARCHABLE, mentions: MENTIONED } });
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/awaiting');
+
+    expect(res.status).toBe(200);
+    expect(awaiting(res).reviewRequested).toEqual({ ok: false });
+    expect(awaiting(res).mentioned).toMatchObject({ ok: true, total: 1 });
+    expect(res.json).not.toHaveProperty('error');
+  });
+
+  it('reports a failed mention side alone', async () => {
+    const gh = awaitingAdapter({
+      search: { 'review-requested': REVIEWED },
+      listFails: new GitHubError('listPullRequests', 'Not Found', 404, 'not_found'),
+    });
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/awaiting');
+
+    expect(res.status).toBe(200);
+    expect(awaiting(res).reviewRequested).toMatchObject({ ok: true, total: 40 });
+    expect(awaiting(res).mentioned).toEqual({ ok: false });
+  });
+
+  /*
+   * R-A4.5 — one of the *two mention sources* failed. The number that comes back is real
+   * but low, and saying so is the difference between a reduced count and a wrong one.
+   */
+  it('marks the mention union incomplete when only one of its two sources answered', async () => {
+    const gh = awaitingAdapter({
+      search: { 'review-requested': REVIEWED, mentions: UNSEARCHABLE },
+      pulls: [summary({ number: 11, updatedAt: 'T1' })],
+      reviewComments: [reviewComment({ id: 3, user: 'ana', body: 'over to you @octocat' })],
+    });
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/awaiting');
+
+    expect(res.status).toBe(200);
+    const { mentioned } = awaiting(res);
+    expect(mentioned).toMatchObject({ ok: true, total: 1, complete: false });
+    expect(awaiting(res).reviewRequested).toMatchObject({ ok: true });
+  });
+
+  it('answers with the family’s own failure shape when neither side could be read', async () => {
+    const gh = awaitingAdapter({
+      search: { 'review-requested': UNSEARCHABLE, mentions: UNSEARCHABLE },
+      listFails: new GitHubError('listPullRequests', 'Not Found', 404, 'not_found'),
+    });
+    const res = await call(router({ repoAdapter: () => gh.adapter }), 'GET', '/pulls/awaiting');
+    expect(res).toEqual({ status: 422, json: { error: 'Validation Failed' } });
+  });
+
+  it('gates on `read` with no document, like the rest of the family', async () => {
+    const seen: CollabOperation[] = [];
+    const authorize: CollabAuthorizer = (op) => {
+      seen.push(op);
+      return { ok: true };
+    };
+    await call(router({ authorize, repoAdapter: () => awaitingAdapter().adapter }), 'GET', '/pulls/awaiting');
+    expect(seen).toEqual(['read']);
+  });
+});
+
+/* ================================================================== *
+ * R-A2.2 — GUARD. The notification inbox is not a source, ever.
+ * ================================================================== */
+describe('R-A2.2 — no count derives from the notification inbox', () => {
+  /*
+   * DO NOT RELAX. This is the decision a future implementer is most likely to reverse for
+   * looking cheaper — one endpoint instead of several — and it is wrong for three
+   * independent reasons, any one of them sufficient. Checked against the live account:
+   * the inbox held 26 items, **zero** of them a mention or a review request, while
+   * `review-requested:@me` returned two real pull requests. It also only ever contains
+   * subscribed threads, and it is emptied by reading a notification anywhere else —
+   * including on a phone — so the count would fall while the obligation stayed.
+   *
+   * A prose requirement leaves no mark when someone tries, so this is a source-level guard
+   * in the style of `core/editing/local-mode.regression.test.ts`: no module on the path
+   * that answers `/pulls/awaiting` may so much as name the endpoint.
+   */
+  for (const path of ['core/vite/routes/collab.ts', 'core/collaboration/github-adapter.ts']) {
+    it(`${path} does not reference notifications`, () => {
+      expect(src(path)).not.toMatch(/notification/i);
+    });
+  }
 });

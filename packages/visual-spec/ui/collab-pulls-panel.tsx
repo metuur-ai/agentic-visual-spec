@@ -29,17 +29,34 @@
  * code. A row that has none offers only the read, AND SAYS SO: the listing is every open
  * pull request (R-7.3), so a row with fewer buttons than the one above it has to explain
  * itself or it reads as broken.
+ *
+ * WHAT IS WAITING ON *YOU* IS TWO SECTIONS OF THIS LIST, NOT A SECOND LIST (R-A3.2). The
+ * actions already here — resume, review the code, remove the checkout — are the ones a
+ * counted pull request needs, and a parallel list would own its own copy of them and
+ * drift. So the sections render above the groups, from the same `listRow` the groups
+ * render, and the listing underneath stays whole and unfiltered (R-A3.6).
+ *
+ * THE JOIN ONTO THE LISTING CAN MISS, AND THAT IS NOT A BUG (R-A3.4 / R-A3.5). The counts
+ * come from search, which pages at 30, and R-7.9 bounds the listing while deliberately not
+ * bounding the count — so the two sets genuinely diverge. A search item carries a number, a
+ * title and a URL and no branch or head commit, so a row the listing does not have is
+ * rendered from those three fields with no checkout offered: a button built on a head
+ * nobody fetched could only fail.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { MarkdownSurface } from './markdown-surface';
 import { BusyLabel, LoadingLine } from './spinner';
 import {
+  type AwaitingItem,
+  type AwaitingMention,
+  type AwaitingSide,
   type MountedWorktree,
   type PullRequestListState,
   type PullRequestSummary,
   createCollabClient,
 } from './collab-client';
+import { useAwaitingPulls } from './use-awaiting-pulls';
 
 export type CollabPullsPanelProps = {
   /**
@@ -206,6 +223,24 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
   const groups = useMemo(() => groupByOwner(pulls ?? [], login), [pulls, login]);
 
   /**
+   * What is waiting on this reader, read from the store the header chips already read
+   * (R-A3.1). Subscribed, not fetched: a second caller of `/pulls/awaiting` would double
+   * the cost of every refresh of a route that spends a search budget of 30 a minute, and
+   * the whole reason that value lives in a module store is that this panel and the header
+   * are in different trees with nothing to prop-drill from.
+   */
+  const awaiting = useAwaitingPulls();
+
+  /**
+   * The listing, by number, so a section row can be the listing's own row (R-A3.3).
+   *
+   * Derived and never stored. `pulls` is state here and `awaiting` is state in the store;
+   * a third copy synchronised by an effect would render one pass behind both of them, and
+   * there is nothing in this join a render cannot recompute.
+   */
+  const listed = useMemo(() => new Map((pulls ?? []).map((p) => [p.number, p] as const)), [pulls]);
+
+  /**
    * R-13.3 / R-13.7 — mount, then read. Re-mounting an already-checked-out PR is the
    * supported way to move it to a head that has since changed (R-13.12), so the button
    * is offered on a mounted row too; git moves the existing checkout rather than
@@ -293,6 +328,200 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
     [client, refreshMounted],
   );
 
+  /**
+   * Who wrote the mention and what it said (R-A3.7).
+   *
+   * This is the row's reason to exist. The ask was "not only on github.com", and a row
+   * that says "you were mentioned" and links out has moved the trip rather than saved it —
+   * the scan already held the comment body at the moment it matched, so the passage is
+   * here for free. Absent on a mention found by search, which does not say who wrote it.
+   */
+  const mentionNote = (pullNumber: number, mention: AwaitingMention) => (
+    <div data-vs-awaiting-mention={pullNumber} style={mentionBox}>
+      <span style={mentionAuthor}>@{mention.author}</span> {mention.excerpt}
+    </div>
+  );
+
+  /**
+   * One row of the listing. `scope` distinguishes the copies: the same pull request can be
+   * both in a section and in the groups below, and two elements cannot share the `id` the
+   * description disclosure is addressed by.
+   *
+   * Called from the sections as well as from the groups, because R-A3.3 is precisely that a
+   * counted pull request is not downgraded for having arrived through a different door.
+   */
+  const listRow = (pull: PullRequestSummary, scope: string, mention?: AwaitingMention) => {
+    const worktree = mountedFor(pull.number);
+    const busy = status.kind === 'busy' && status.pullNumber === pull.number;
+    const running = (a: PullAction) => busy && status.kind === 'busy' && status.action === a;
+    const descId = `vs-pr-desc-${scope}-${pull.number}`;
+    return (
+      <li key={pull.number} style={card} data-vs-pull={pull.number}>
+        <div style={cardTitle}>
+          <span style={{ color: '#64748b' }}>#{pull.number}</span> {pull.title}
+          {pull.draft && <span style={badge}>draft</span>}
+          {worktree && <span style={mountedBadge}>checked out · {shortSha(worktree.headSha)}</span>}
+        </div>
+        <div style={meta}>
+          {pull.author || 'unknown author'} · {pull.headBranch} → {pull.baseBranch} · {shortSha(pull.headSha)} ·{' '}
+          {pull.state}
+        </div>
+        {mention && mentionNote(pull.number, mention)}
+        <div style={actions}>
+          {pull.documentId ? (
+            <button type="button" onClick={() => void resume(pull)} disabled={busy} style={primaryButton}>
+              <BusyLabel busy={running('resume')}>{running('resume') ? 'Opening…' : 'Resume writing'}</BusyLabel>
+            </button>
+          ) : (
+            /*
+              * The listing is unfiltered (R-7.3), so most rows will not carry a
+              * document. Saying which ones do not is what keeps a row with one
+              * button from reading as a row whose other button failed to render.
+              */
+            <span data-vs-pull-nodoc style={quietMark} title="No visual-spec document is named in this pull request’s body, so there is nothing to resume writing.">
+              no document
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => void mount(pull)}
+            disabled={busy}
+            style={pull.documentId ? button : primaryButton}
+          >
+            <BusyLabel busy={running('mount')}>{running('mount') ? 'Checking out…' : 'Review the code'}</BusyLabel>
+          </button>
+          {worktree && (
+            <button type="button" onClick={() => void unmount(pull.number)} disabled={busy} style={button}>
+              <BusyLabel busy={running('unmount')}>{running('unmount') ? 'Removing…' : 'Remove checkout'}</BusyLabel>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => void toggleDescription(pull.number)}
+            aria-expanded={descriptions[pull.number] !== undefined}
+            aria-controls={descId}
+            style={button}
+          >
+            <BusyLabel busy={descriptions[pull.number] === null}>
+              {descriptions[pull.number] !== undefined ? 'Hide description' : 'View description'}
+            </BusyLabel>
+          </button>
+          <a href={pull.htmlUrl} target="_blank" rel="noreferrer" style={link}>
+            On GitHub ↗
+          </a>
+        </div>
+        {descriptions[pull.number] !== undefined && descriptions[pull.number] !== null && (
+          <div id={descId} data-vs-pull-description={pull.number} style={descriptionBox}>
+            {descriptions[pull.number] ? (
+              /*
+               * Rendered, not printed raw. A pull request body is Markdown, and this
+               * product renders Markdown everywhere else — showing the source here
+               * would make the one place a reviewer reads prose the one place it is
+               * not readable.
+               */
+              <MarkdownSurface source={descriptions[pull.number] as string} />
+            ) : (
+              <span style={quietMark}>No description on this pull request.</span>
+            )}
+          </div>
+        )}
+      </li>
+    );
+  };
+
+  /**
+   * A pull request the listing does not have (R-A3.4 / R-A3.5).
+   *
+   * Number, title and a link out is everything search gave us, so it is everything shown.
+   * No checkout: there is no branch and no head commit behind this row, and the sentence
+   * beside it is there because a row with fewer controls than the one above it reads as
+   * broken unless it says why.
+   */
+  const unlistedRow = (item: AwaitingItem) => (
+    <li key={item.number} style={card} data-vs-awaiting-unlisted={item.number}>
+      <div style={cardTitle}>
+        <span style={{ color: '#64748b' }}>#{item.number}</span> {item.title}
+      </div>
+      {item.mention && mentionNote(item.number, item.mention)}
+      <div style={actions}>
+        <span style={quietMark}>
+          Not among the pull requests listed below, so it cannot be checked out from here.
+        </span>
+        <a href={item.htmlUrl} target="_blank" rel="noreferrer" style={link}>
+          On GitHub ↗
+        </a>
+      </div>
+    </li>
+  );
+
+  /**
+   * One titled section of the list (R-A3.1 / R-A3.2).
+   *
+   * A side that has never answered is `{ ok: false }` and renders nothing — the same rule
+   * the chips follow, where an unknown count is absent rather than zero. An empty section
+   * is dropped too: a heading over no rows is a claim that something is waiting.
+   */
+  const awaitingSection = (key: string, title: string, side: AwaitingSide | undefined) => {
+    if (!side?.ok || side.items.length === 0) return null;
+    return (
+      <section key={key} data-vs-awaiting={key} style={{ display: 'contents' }}>
+        <h3 style={groupHeading}>{title}</h3>
+        {/*
+          * R-A3.9 — the `Show` control above re-queries the *listing*; both counts are of
+          * open pull requests by R-A1.7 and these sections never move. Said out loud only
+          * when the two disagree, because a section that silently stayed put while the list
+          * changed underneath it would look filtered by a control that never touched it.
+          */}
+        {state !== 'open' && (
+          <p data-vs-awaiting-open-only={key} style={quietMark}>
+            Open pull requests only — the “Show” setting above applies to the listing, not to this section.
+          </p>
+        )}
+        {/*
+          * R-A3.8 — the count is GitHub's own total (R-A2.10) and one search page is what
+          * was retrieved. The gap is legitimate; unexplained it turns a bound into a lie.
+          */}
+        {side.items.length < side.total && (
+          <p data-vs-awaiting-shortfall={key} style={quietMark}>
+            Showing {side.items.length} of {side.total} — GitHub answers this query one page at a time.
+          </p>
+        )}
+        <ul style={listReset}>
+          {side.items.map((item) => {
+            const pull = listed.get(item.number);
+            return pull ? listRow(pull, `awaiting-${key}`, item.mention) : unlistedRow(item);
+          })}
+        </ul>
+      </section>
+    );
+  };
+
+  const sections = [
+    awaitingSection('review', 'Waiting on your review', awaiting?.reviewRequested),
+    awaitingSection('mentions', 'You were mentioned', awaiting?.mentioned),
+  ];
+
+  /**
+   * The listing's own heading, and only once something is stacked above it.
+   *
+   * `groupByOwner` answers `title: null` for the undivided list, and that was right while
+   * nothing preceded it — a heading over the only block is a label, not a division. With a
+   * section above, the absence stops being neutral: found in the browser, the listing's
+   * rows read as three more rows of "You were mentioned", because nothing on screen said
+   * the mention section had ended. So the fallback appears exactly when a section did, and
+   * the common case — nothing waiting on you, no sections — renders as it always has.
+   *
+   * Only the untitled group takes it. "Yours" and "From others" already divide, and a
+   * heading above their heading would divide the same rows twice.
+   */
+  const listHeading = sections.some(Boolean)
+    ? state === 'open'
+      ? 'All open pull requests'
+      : state === 'closed'
+        ? 'All closed pull requests'
+        : 'All pull requests'
+    : null;
+
   if (autoPending) {
     return (
       <section data-vs-collab-pulls data-vs-opening={autoReview} style={wrap}>
@@ -338,6 +567,13 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
         </p>
       )}
 
+      {/*
+        * R-A3.1 / R-A3.2 — the two sections, at the top of this list and not beside it.
+        * Above the listing's own states on purpose: they are the answer to "what is waiting
+        * on me", and they are still the answer while the listing is loading or empty.
+        */}
+      {sections}
+
       {pulls === null ? (
         <LoadingLine style={{ ...note, opacity: 1 }}>Loading pull requests…</LoadingLine>
       ) : pulls.length === 0 ? (
@@ -356,88 +592,14 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
          * known (collaboration unconfigured, or the snapshot has not landed) or every row
          * falls on one side of the line, the list renders exactly as it did — flat, with no
          * heading. A section header over the only group is a label, not a division.
+         *
+         * R-A3.6 — unchanged by the sections above: every pull request the listing holds is
+         * still here, in its group, with nothing removed for having been shown twice.
          */
         groups.map(({ key, title, rows }) => (
           <section key={key} data-vs-pull-group={key} style={{ display: 'contents' }}>
-            {title && <h3 style={groupHeading}>{title}</h3>}
-            <ul style={listReset}>
-              {rows.map((pull) => {
-            const worktree = mountedFor(pull.number);
-            const busy = status.kind === 'busy' && status.pullNumber === pull.number;
-            const running = (a: PullAction) => busy && status.kind === 'busy' && status.action === a;
-            return (
-              <li key={pull.number} style={card} data-vs-pull={pull.number}>
-                <div style={cardTitle}>
-                  <span style={{ color: '#64748b' }}>#{pull.number}</span> {pull.title}
-                  {pull.draft && <span style={badge}>draft</span>}
-                  {worktree && <span style={mountedBadge}>checked out · {shortSha(worktree.headSha)}</span>}
-                </div>
-                <div style={meta}>
-                  {pull.author || 'unknown author'} · {pull.headBranch} → {pull.baseBranch} · {shortSha(pull.headSha)} ·{' '}
-                  {pull.state}
-                </div>
-                <div style={actions}>
-                  {pull.documentId ? (
-                    <button type="button" onClick={() => void resume(pull)} disabled={busy} style={primaryButton}>
-                      <BusyLabel busy={running('resume')}>{running('resume') ? 'Opening…' : 'Resume writing'}</BusyLabel>
-                    </button>
-                  ) : (
-                    /*
-                      * The listing is unfiltered (R-7.3), so most rows will not carry a
-                      * document. Saying which ones do not is what keeps a row with one
-                      * button from reading as a row whose other button failed to render.
-                      */
-                    <span data-vs-pull-nodoc style={quietMark} title="No visual-spec document is named in this pull request’s body, so there is nothing to resume writing.">
-                      no document
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => void mount(pull)}
-                    disabled={busy}
-                    style={pull.documentId ? button : primaryButton}
-                  >
-                    <BusyLabel busy={running('mount')}>{running('mount') ? 'Checking out…' : 'Review the code'}</BusyLabel>
-                  </button>
-                  {worktree && (
-                    <button type="button" onClick={() => void unmount(pull.number)} disabled={busy} style={button}>
-                      <BusyLabel busy={running('unmount')}>{running('unmount') ? 'Removing…' : 'Remove checkout'}</BusyLabel>
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => void toggleDescription(pull.number)}
-                    aria-expanded={descriptions[pull.number] !== undefined}
-                    aria-controls={`vs-pr-desc-${pull.number}`}
-                    style={button}
-                  >
-                    <BusyLabel busy={descriptions[pull.number] === null}>
-                      {descriptions[pull.number] !== undefined ? 'Hide description' : 'View description'}
-                    </BusyLabel>
-                  </button>
-                  <a href={pull.htmlUrl} target="_blank" rel="noreferrer" style={link}>
-                    On GitHub ↗
-                  </a>
-                </div>
-                {descriptions[pull.number] !== undefined && descriptions[pull.number] !== null && (
-                  <div id={`vs-pr-desc-${pull.number}`} data-vs-pull-description={pull.number} style={descriptionBox}>
-                    {descriptions[pull.number] ? (
-                      /*
-                       * Rendered, not printed raw. A pull request body is Markdown, and this
-                       * product renders Markdown everywhere else — showing the source here
-                       * would make the one place a reviewer reads prose the one place it is
-                       * not readable.
-                       */
-                      <MarkdownSurface source={descriptions[pull.number] as string} />
-                    ) : (
-                      <span style={quietMark}>No description on this pull request.</span>
-                    )}
-                  </div>
-                )}
-              </li>
-            );
-              })}
-            </ul>
+            {(title ?? listHeading) && <h3 style={groupHeading}>{title ?? listHeading}</h3>}
+            <ul style={listReset}>{rows.map((pull) => listRow(pull, 'list'))}</ul>
           </section>
         ))
       )}
@@ -483,3 +645,21 @@ const descriptionBox: React.CSSProperties = {
   font: '13px system-ui, sans-serif',
 };
 const quietMark: React.CSSProperties = { font: '11px system-ui, sans-serif', color: '#94a3b8', fontStyle: 'italic' };
+/**
+ * The mention, quoted on the row (R-A3.7).
+ *
+ * Set apart with a rule down the side the way a quotation is, because it is somebody
+ * else's words inside the row and not the row's own metadata. The excerpt is a passage
+ * and can be long, so it wraps rather than being clipped — the point is to read it here.
+ */
+const mentionBox: React.CSSProperties = {
+  marginTop: 6,
+  padding: '4px 8px',
+  borderLeft: '2px solid #ddd6fe',
+  background: '#faf5ff',
+  borderRadius: 3,
+  font: '12px/1.5 system-ui, sans-serif',
+  color: '#475569',
+  whiteSpace: 'pre-wrap',
+};
+const mentionAuthor: React.CSSProperties = { font: '600 12px system-ui, sans-serif', color: '#6d28d9' };

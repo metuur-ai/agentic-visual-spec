@@ -34,7 +34,9 @@ import { type CollaborationPreflight, credentialFingerprint, preflightCollaborat
 import { githubCommentStore } from '../../collaboration/comment-projection';
 import {
   createGitHubAdapter,
+  createMentionsReader,
   GitHubError,
+  type AwaitingItem,
   type GitHubAdapter,
   type PullRequestListState,
   type RepoRef,
@@ -589,6 +591,42 @@ function githubFailure(err: GitHubError): CollabRouteResult {
  * ------------------------------------------------------------------ */
 
 /**
+ * R-A2.5 — GitHub's own login character set: alphanumerics and hyphens, never leading or
+ * trailing, at most 39 characters.
+ *
+ * This is checked because the login is the one value on this path that gets interpolated
+ * into the search `q`, which is space-separated free text. A login carrying a space would
+ * not be rejected by GitHub — it would be read as a *second qualifier*, so
+ * `review-requested:me repo:other/repo` silently counts somebody else's repository under
+ * this repository's name. The qualifier itself is a closed union in the adapter for the
+ * same reason; this closes the other half.
+ *
+ * Deliberately stricter than "no spaces or quotes": an allowlist cannot be outflanked by a
+ * separator nobody thought of. The cost is that a login GitHub would accept but this
+ * pattern would not (a `…[bot]` app identity, say) is refused rather than queried — which
+ * is the safe direction, and no such identity reaches here from `gh auth`.
+ */
+export const GITHUB_LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+
+/**
+ * R-A4.4 / R-A4.5 — one side of `GET /pulls/awaiting`.
+ *
+ * `ok: false` carries no number at all rather than a zero: the client retains its last
+ * known count on a failed read (R-7.11 / R-A4.3), and a zero here would be
+ * indistinguishable from "nothing is waiting on you", which is the one thing a failed read
+ * must not be allowed to say.
+ *
+ * `total` is kept apart from `items.length` because the review side reports GitHub's own
+ * `total_count` over a single search page (R-A2.10) while R-7.9 bounds what is listed.
+ * `complete` is `false` when one of the two mention sources failed — the number is then
+ * real but low, and R-A4.5 forbids presenting it as if it were whole.
+ */
+export type AwaitingSide = { ok: false } | { ok: true; total: number; items: AwaitingItem[]; complete: boolean };
+
+/** The body of `GET /__vs/collab/pulls/awaiting`. Each side fails alone (R-A4.4). */
+export type Awaiting = { reviewRequested: AwaitingSide; mentioned: AwaitingSide };
+
+/**
  * A pull number as it arrives in a path segment.
  *
  * Validated **here**, at the edge, and not left to `worktree.ts`'s own
@@ -693,6 +731,23 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   const git = deps.git ?? defaultExecGit;
   /** The configured repo as the adapter addresses it — `baseBranch` is not part of a ref. */
   const repoRefOf = (repo: ResolvedCollaborationConfig): RepoRef => ({ owner: repo.owner, repo: repo.repo });
+
+  /**
+   * ONE PER SERVER, ON PURPOSE. `createMentionsReader` is stateful: it remembers the
+   * `updatedAt` each open pull request carried when its review comments were last read, and
+   * R-A2.7 is that memory — a later read re-reads only the pull requests whose last update
+   * moved, which in the steady state of a tab being switched back to is usually none.
+   * Built per request instead, the cache would start empty every time and every read would
+   * cost one API call per open pull request, for ever.
+   *
+   * It is given a facade rather than `repoAdapter()`'s result because `repoAdapter` is a
+   * thunk read per request (a runtime re-root or a token swap must be honoured), while the
+   * reader outlives any one request. The reader touches exactly these two methods.
+   */
+  const mentions = createMentionsReader({
+    searchPullRequests: (repo, qualifier, login) => repoAdapter().searchPullRequests(repo, qualifier, login),
+    listReviewComments: (repo, pullNumber) => repoAdapter().listReviewComments(repo, pullNumber),
+  } as GitHubAdapter);
 
   // Memoized per repo *and* credential identity: the preflight shells out to `gh`, and
   // every mutating route consults it. Keyed by owner/repo/base plus
@@ -1011,6 +1066,80 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         return { status: 200, json: { worktrees: await listMountedWorktrees(baseDir(), git) } };
       }
 
+      /*
+       * GET /__vs/collab/pulls/awaiting — which open pull requests are waiting on *me*.
+       *
+       * TAKES NO PARAMETERS, AND IN PARTICULAR NO LOGIN (R-A2.4). The availability snapshot
+       * is visible to the browser (`collab-client.ts:51`), so a client-supplied identity
+       * would be spoofable — and worse, it would be a qualifier-injection vector into the
+       * search `q`. The login is `gate`'s, resolved from the preflight's identity probe, and
+       * it is checked against GitHub's login character set before it can reach a query
+       * (R-A2.5). Anything arriving in the query string or the body is simply never read.
+       *
+       * `gate` runs first and nothing before it touches the network, so an unconfigured
+       * server answers 503 having issued no GitHub call at all (R-A2.9 / R-7.2). That is a
+       * statement about calls, not about the response body, and is asserted as one.
+       *
+       * EACH SIDE FAILS ALONE (R-A4.4). The two counts are separate obligations with
+       * separate failure modes — the search rate limit is 30/minute and separate from the
+       * core limit the review-comment scan spends — so a flat 200 could not say "review
+       * requests failed, mentions did not" and a shared throw would let either one erase the
+       * other. Neither may be reported as a fault of the pull request listing (R-A4.6): a
+       * 422 from `search/issues`, which is what GitHub answers for a repository this
+       * credential cannot search, leaves the top-level response free of an error entirely.
+       */
+      if (method === 'GET' && pathname === '/pulls/awaiting') {
+        const gated = await gate('read', null);
+        if (!gated.ok) return gated.result;
+        const { login } = gated;
+        if (!GITHUB_LOGIN_RE.test(login)) {
+          // Not a 400: no part of the request caused this. The session handed us something
+          // that cannot be a GitHub login, and the refusal happens before any query is built.
+          return { status: 500, json: { error: 'the authenticated session reported a login GitHub could not have issued' } };
+        }
+        const repo = repoRefOf(gated.repo);
+
+        /** Kept so a route that answered nothing at all can still say why. */
+        let firstFailure: GitHubError | null = null;
+
+        let reviewRequested: AwaitingSide = { ok: false };
+        try {
+          const search = await repoAdapter().searchPullRequests(repo, 'review-requested', login);
+          // `complete: true` — this side has one source, so it is whole whenever it answers.
+          reviewRequested = { ok: true, total: search.total, items: search.items, complete: true };
+        } catch (err) {
+          /* R-A4.3 — the client keeps its last known number; this side just says nothing. */
+          if (err instanceof GitHubError) firstFailure = err;
+        }
+
+        let mentioned: AwaitingSide = { ok: false };
+        try {
+          /*
+           * The listing is read here rather than taken from the browser: R-A2.6 scopes the
+           * review-comment scan to the open pull requests of the configured repository, and
+           * a client-supplied set would be a client-supplied scope. A failure here fails the
+           * mention side only — the review side has already answered.
+           */
+          const openPulls = await repoAdapter().listPullRequests(repo, 'open');
+          const union = await mentions.read(repo, login, openPulls);
+          mentioned = { ok: true, total: union.total, items: union.items, complete: union.complete };
+        } catch (err) {
+          /* Same as above. `mentions.read` swallows a per-source failure into `complete`. */
+          if (err instanceof GitHubError && firstFailure === null) firstFailure = err;
+        }
+
+        /*
+         * Both sides gone is not a partial answer, it is the route having failed, so it is
+         * reported the way every sibling in this family reports one — the panel's existing
+         * error path already handles that shape. A 200 whose every field said `ok: false`
+         * would be a success response describing a total outage.
+         */
+        if (!reviewRequested.ok && !mentioned.ok && firstFailure) return githubFailure(firstFailure);
+
+        const body: Awaiting = { reviewRequested, mentioned };
+        return { status: 200, json: body };
+      }
+
       const mount = /^\/pulls\/([^/]+)\/mount$/.exec(pathname);
       if (mount && (method === 'POST' || method === 'DELETE')) {
         const pullNumber = parsePullNumber(mount[1]!);
@@ -1160,6 +1289,42 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
           });
           return { status: 200, json: { pullNumber, threads } };
         } catch (err) {
+          if (err instanceof GitHubError) return githubFailure(err);
+          throw err;
+        }
+      }
+
+      /*
+       * POST /__vs/collab/pulls/:n/comments/:commentId/reply — the pull-scoped twin of
+       * the document route below (R-7.15).
+       *
+       * WHY A SECOND ONE. The threads the panel lists on a checked-out Pull Request come
+       * from `/pulls/:n/comments`, which is repo-scoped precisely because the file being
+       * reviewed may have no collaboration document at all. Sending their replies through
+       * `/:documentId/comments/:id/reply` would demand the one thing that surface does not
+       * have. Same GitHub call, same `c-<8hex>` decode; only the gate's subject differs —
+       * `null`, because there is no document to resolve a per-document role against, which
+       * is exactly what the sibling `/pulls` routes already do.
+       */
+      const pullReply = /^\/pulls\/([^/]+)\/comments\/([^/]+)\/reply$/.exec(pathname);
+      if (pullReply && method === 'POST') {
+        const pullNumber = parsePullNumber(pullReply[1]!);
+        if (pullNumber === null) return bad(`invalid pullNumber: ${pullReply[1]!}`);
+        const commentId = pullReply[2]!;
+        if (!COMMENT_ID_RE.test(commentId)) return bad(`invalid commentId: ${commentId}`);
+        const rootId = reviewCommentIdFor(commentId);
+        if (rootId === null) return bad(`invalid commentId: ${commentId}`);
+        const text = requireString(body, 'comment');
+        const gated = await gate('reply', null);
+        if (!gated.ok) return gated.result;
+        const repoRef = repoRefOf(gated.repo);
+        try {
+          const created = await repoAdapter().replyToReviewComment(repoRef, pullNumber, rootId, text);
+          const record = projectCreated(created);
+          return { status: 200, json: { ok: true, id: record.id, comment: record } };
+        } catch (err) {
+          // R-7.14 — the cause is reported and the text is never consumed by a failed
+          // create, so the panel can re-submit exactly what the reviewer typed.
           if (err instanceof GitHubError) return githubFailure(err);
           throw err;
         }

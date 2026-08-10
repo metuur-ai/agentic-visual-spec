@@ -9,7 +9,8 @@ import { toPath } from './md-path';
 // the browser as a value without dragging `node:*` behind it.
 import { DOCUMENT_ID_RE } from '../core/collaboration/document-record';
 import { type CollabAvailabilitySnapshot, createCollabClient } from './collab-client';
-import type { PullRequestSummary } from './collab-client';
+import type { AwaitingSide, PullRequestSummary } from './collab-client';
+import { useAwaitingPulls } from './use-awaiting-pulls';
 import { type CollabPulls, type ConfiguredRepo, useCollabPulls } from './use-collab-pulls';
 import { type BranchListing, useGitBranches } from './use-git-branches';
 import { type GitContext, useGitContext } from './use-git-context';
@@ -35,6 +36,16 @@ export type HeaderActions = {
   onResumeCollab?: (documentId: string) => void;
   /** R-7.8 — open the collaboration surface on a pull request to be checked out. */
   onReviewPull?: (pullNumber: number) => void;
+  /**
+   * R-A3.1 — open the pull request panel, where the "waiting on you" sections live.
+   *
+   * The open count's chip opens `PullMenu`, a popover local to this header, and that is
+   * unchanged. The two awaiting chips need the *panel* instead, because R-A3.2 puts their
+   * sections inside the listing it already renders — and the panel is not a descendant of
+   * the header, so the header cannot mount it. `App` owns that surface; this is the header
+   * asking for it, the same request the sidebar's "Collaborate on pull requests" makes.
+   */
+  onOpenPulls?: () => void;
 };
 
 function CommentIcon({ size = 14 }: { size?: number }) {
@@ -408,11 +419,15 @@ function GitChip({ actions }: { actions?: HeaderActions }) {
     else run();
   };
 
-  const toggle = (which: Exclude<ChipMenu, 'closed'>) => {
+  // Stable, because it is now the identity behind a prop three chips receive rather than
+  // a handler read once on click. Every dependency is a setter, so `[]` is the real list.
+  const toggle = useCallback((which: Exclude<ChipMenu, 'closed'>) => {
     setRefusal(null);
     setFailure(null);
     setMenu((current) => (current === which ? 'closed' : which));
-  };
+  }, []);
+
+  const openPullMenu = useCallback(() => toggle('pulls'), [toggle]);
 
   /*
    * R-6.1 / R-6.2 — a control only where configuration has enabled one. `enabled` is
@@ -481,7 +496,7 @@ function GitChip({ actions }: { actions?: HeaderActions }) {
               <span>not a git repo</span>
             </span>
           </Tooltip>
-          <PullCount ctx={ctx} pulls={pulls} onOpen={() => toggle('pulls')} />
+          <PullCounts ctx={ctx} pulls={pulls} onOpenMenu={openPullMenu} onOpenPanel={actions?.onOpenPulls} />
         </span>
       );
     }
@@ -501,7 +516,7 @@ function GitChip({ actions }: { actions?: HeaderActions }) {
             </span>
           </Tooltip>
           {branchChip(ctx.branch, ctx.detached, gitToneLocal)}
-          <PullCount ctx={ctx} pulls={pulls} onOpen={() => toggle('pulls')} />
+          <PullCounts ctx={ctx} pulls={pulls} onOpenMenu={openPullMenu} onOpenPanel={actions?.onOpenPulls} />
         </span>
       );
     }
@@ -534,7 +549,7 @@ function GitChip({ actions }: { actions?: HeaderActions }) {
           </span>
         </Tooltip>
         {branchChip(ctx.branch, ctx.detached, gitToneRemote)}
-        <PullCount ctx={ctx} pulls={pulls} onOpen={() => toggle('pulls')} />
+        <PullCounts ctx={ctx} pulls={pulls} onOpenMenu={openPullMenu} onOpenPanel={actions?.onOpenPulls} />
       </span>
     );
   })();
@@ -577,40 +592,115 @@ function GitChip({ actions }: { actions?: HeaderActions }) {
 }
 
 /**
- * The open pull request count (R-7.1 … R-7.3) and, where they differ, the name of the
- * repository it belongs to (R-8.1).
+ * What a side of `/pulls/awaiting` is worth rendering as, or `null` for nothing (R-A1.5).
  *
- * Renders nothing at all where collaboration is not configured (R-7.2) or before the
- * first listing lands — and `useCollabPulls` has issued no request in the first case,
- * which is the half of R-7.2 an absent element cannot demonstrate on its own.
+ * Three different situations collapse here and all three render the same absence: the
+ * first read has not landed (`undefined`), the side has never answered (`ok: false`), and
+ * the side answered zero. A permanent `0 to review` is noise on almost every day, and a
+ * zero shown before anything was read would be a number the server never said.
+ *
+ * `total` is GitHub's own count and not `items.length` (R-A2.10), so the chip and the
+ * section it opens can legitimately disagree — that gap is R-A3.8's to explain, not the
+ * chip's to hide by counting rows instead.
  */
-function PullCount({ ctx, pulls, onOpen }: { ctx: GitContext; pulls: CollabPulls; onOpen: () => void }) {
-  if (pulls.configured !== true || pulls.pulls === null) return null;
-  const count = pulls.pulls.length;
-  const named = namesCountRepo(ctx, pulls.repo);
-  const plural = `${count} open pull request${count === 1 ? '' : 's'}`;
+function awaitingCount(side: AwaitingSide | undefined): number | null {
+  if (!side?.ok) return null;
+  return side.total > 0 ? side.total : null;
+}
+
+/**
+ * The group of counts: open pull requests (R-7.1 … R-7.3), review requests (R-A1.1) and
+ * mentions (R-A1.2) — and, once for the three of them, the repository they are of
+ * (R-8.1 / R-A1.11).
+ *
+ * THE REPOSITORY IS NAMED BY THE GROUP, NOT BY A CHIP. R-8.1 was written when there was
+ * one count and the naming lived inside its pill. Three pills each carrying
+ * `on owner/repo` is the same sentence three times in a row that is already short of
+ * width; dropping it instead reopens the hole Unit 8 exists to close, because in the
+ * `local` and `none` states nothing else on screen names a repository at all. So it moves
+ * out of the button and sits after the counts, where it reads as the caption of all of
+ * them — which is what it always meant.
+ *
+ * THREE INDEPENDENT ABSENCES, NOT ONE. The open count needs its listing, the two awaiting
+ * counts need a route that spends a different budget and can fail on its own (R-A4.4).
+ * Each chip is decided separately, and nothing renders at all when none of them has
+ * anything to say — including the caption, which would otherwise name a repository for a
+ * group of no counts.
+ *
+ * `useAwaitingPulls` is read *here* rather than in `GitChip` so that a refresh of the
+ * counts reconciles these pills and not the repository chip, the branch switcher and the
+ * two popovers beside them.
+ */
+function PullCounts({
+  ctx,
+  pulls,
+  onOpenMenu,
+  onOpenPanel,
+}: {
+  ctx: GitContext;
+  pulls: CollabPulls;
+  /** The open count's own popover, local to the header — unchanged by any of this. */
+  onOpenMenu: () => void;
+  /** R-A3.1 — the panel, which is where the two awaiting chips lead. */
+  onOpenPanel?: () => void;
+}) {
+  const awaiting = useAwaitingPulls();
+  // Nothing derived is stored: these are read off the store on the way through.
+  const review = awaitingCount(awaiting?.reviewRequested);
+  const mentioned = awaitingCount(awaiting?.mentioned);
   /*
-   * R-8.1's disclosure rides in the tooltip AND stays on screen, because the two say
-   * different things: the visible `on owner/repo` is what stops an unlabelled number
-   * being read as this directory's, and the tooltip is where the *reason* fits without
-   * spending a header row on it.
+   * R-7.2 — no count where collaboration is not configured, and `useCollabPulls` issued
+   * no request for one either, which is the half an absent element cannot demonstrate.
    */
-  const disclosure =
-    named && pulls.repo
-      ? ` — in ${pulls.repo.owner}/${pulls.repo.repo}, the configured collaboration repository, which is not this directory's origin`
-      : '';
+  const open = pulls.configured === true && pulls.pulls !== null ? pulls.pulls.length : null;
+  if (open === null && review === null && mentioned === null) return null;
+
+  const repo = pulls.repo;
+  const named = namesCountRepo(ctx, repo) && repo !== null;
   return (
-    <Tooltip label={`${plural}${disclosure} — click to list them`} shrink={false}>
-      <button type="button" onClick={onOpen} data-testid="git-pull-count" style={{ ...gitChip, ...gitTonePulls, ...pullCountBtn }}>
-        <PullRequestChipIcon />
-        {count} open
-        {named && pulls.repo && (
+    <>
+      {open !== null && (
+        <Tooltip label={`${open} open pull request${open === 1 ? '' : 's'} — click to list them`} shrink={false}>
+          <button type="button" onClick={onOpenMenu} data-testid="git-pull-count" style={{ ...gitChip, ...gitTonePulls, ...pullCountBtn }}>
+            <PullRequestChipIcon />
+            {open} open
+          </button>
+        </Tooltip>
+      )}
+      {/*
+        Two chips, never one number (R-A1.4). Being asked to review blocks someone else's
+        work; being mentioned asks you to read something. And they are not a partition —
+        a pull request that is both is counted by both (R-A1.8), which the server already
+        does and which nothing here may tidy away.
+      */}
+      {review !== null && (
+        <Tooltip label={`${review} open pull request${review === 1 ? '' : 's'} requesting your review — click to see them`} shrink={false}>
+          <button type="button" onClick={onOpenPanel} data-testid="git-review-requested-count" style={{ ...gitChip, ...gitTonePulls, ...pullCountBtn }}>
+            <PullRequestChipIcon />
+            {review} to review
+          </button>
+        </Tooltip>
+      )}
+      {mentioned !== null && (
+        <Tooltip label={`${mentioned} open pull request${mentioned === 1 ? '' : 's'} mentioning you — click to see them`} shrink={false}>
+          <button type="button" onClick={onOpenPanel} data-testid="git-mention-count" style={{ ...gitChip, ...gitTonePulls, ...pullCountBtn }}>
+            <CommentIcon size={12} />
+            {mentioned} mentioning you
+          </button>
+        </Tooltip>
+      )}
+      {named && repo && (
+        // R-8.1's disclosure rides in the tooltip AND stays on screen, because the two say
+        // different things: the visible `on owner/repo` is what stops unlabelled numbers
+        // being read as this directory's, and the tooltip is where the *reason* fits
+        // without spending a header row on it.
+        <Tooltip label={`These counts are of ${repo.owner}/${repo.repo}, the configured collaboration repository, which is not this directory's origin`}>
           <span data-testid="git-pull-count-repo" style={pullRepoNote}>
-            on {pulls.repo.owner}/{pulls.repo.repo}
+            on {repo.owner}/{repo.repo}
           </span>
-        )}
-      </button>
-    </Tooltip>
+        </Tooltip>
+      )}
+    </>
   );
 }
 

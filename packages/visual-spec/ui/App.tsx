@@ -16,6 +16,34 @@ const MAX_W = 680;
 const CMT_MIN_W = 260;
 const CMT_MAX_W = 720;
 
+/**
+ * The two resizable widths are CSS custom properties rather than React state.
+ *
+ * They used to be `useState` on App, set from the splitter's `mousemove`. That made a
+ * drag re-render the whole shell — MainHeader, the sidebar's FileTree, and the open
+ * editor — once per pointer event, and write `localStorage` synchronously inside the
+ * same loop. The width is pure presentation; nothing branches on its value. Pushing it
+ * into a variable the panes are sized by lets the drag repaint with zero React renders,
+ * and the value is persisted once, on mouse-up.
+ */
+const SIDEBAR_W = '--vs-sidebar-w';
+const COMMENT_W = '--vs-comment-w';
+const sidebarWidthVar = `var(${SIDEBAR_W})`;
+const commentWidthVar = `var(${COMMENT_W})`;
+
+const clamp = (w: number, min: number, max: number): number => Math.min(max, Math.max(min, w));
+
+/** Seed both variables from the last session before the first paint, so nothing jumps. */
+if (typeof document !== 'undefined') {
+  const seed = (name: string, key: string, min: number, max: number, fallback: number) => {
+    const saved = Number(localStorage.getItem(key));
+    const w = saved >= min && saved <= max ? saved : fallback;
+    document.documentElement.style.setProperty(name, `${w}px`);
+  };
+  seed(SIDEBAR_W, 'vs:sidebarWidth', MIN_W, MAX_W, 280);
+  seed(COMMENT_W, 'vs:commentWidth', CMT_MIN_W, CMT_MAX_W, 340);
+}
+
 export function App() {
   const { entries, loading, reload } = useTree();
   const [selected, setSelected] = useState<TreeEntry | null>(null);
@@ -38,25 +66,11 @@ export function App() {
   // view. What the drawer hands back is always a full intent, so the surface below only
   // ever mounts on something already chosen.
   const [picker, setPicker] = useState(false);
-  const [width, setWidth] = useState<number>(() => {
-    const saved = Number(localStorage.getItem('vs:sidebarWidth'));
-    return saved >= MIN_W && saved <= MAX_W ? saved : 280;
-  });
-  const [commentWidth, setCommentWidth] = useState<number>(() => {
-    const saved = Number(localStorage.getItem('vs:commentWidth'));
-    return saved >= CMT_MIN_W && saved <= CMT_MAX_W ? saved : 340;
-  });
-
-  const resize = (w: number) => {
-    const clamped = Math.min(MAX_W, Math.max(MIN_W, w));
-    setWidth(clamped);
-    localStorage.setItem('vs:sidebarWidth', String(clamped));
-  };
-  const resizeComment = (w: number) => {
-    const clamped = Math.min(CMT_MAX_W, Math.max(CMT_MIN_W, w));
-    setCommentWidth(clamped);
-    localStorage.setItem('vs:commentWidth', String(clamped));
-  };
+  // Called once, when the drag ends. Stable identities matter here: `Splitter` binds
+  // window listeners keyed on them, and a fresh function per render re-subscribed
+  // `mousemove`/`mouseup` on every render — which, mid-drag, was every pointer event.
+  const persistWidth = useCallback((w: number) => localStorage.setItem('vs:sidebarWidth', String(w)), []);
+  const persistCommentWidth = useCallback((w: number) => localStorage.setItem('vs:commentWidth', String(w)), []);
 
   // Live dirty state + a success-returning save, reported up by the doc editor,
   // so switching to View can guard unsaved edits instead of dropping them.
@@ -186,6 +200,9 @@ export function App() {
       onBranchChanged: () => void onBranchChanged(),
       onResumeCollab: (documentId: string) => setCollab({ documentId }),
       onReviewPull: (reviewPull: number) => setCollab({ reviewPull }),
+      // R-A3.1 — the same surface the sidebar opens, reached from the header's awaiting
+      // chips. `setPicker` is a state setter, so it is stable and adds no dependency.
+      onOpenPulls: () => setPicker(true),
     }),
     [confirmUnsaved, onBranchChanged],
   );
@@ -199,7 +216,10 @@ export function App() {
   const current = selected?.path ?? '';
   const isMarkdown = selected?.type === 'file' && selected.kind === 'markdown';
   const editing = isMarkdown && mode === 'edit';
-  const commentSplitter = <Splitter onResize={resizeComment} fromRight />;
+  const commentSplitter = useMemo(
+    () => <Splitter cssVar={COMMENT_W} min={CMT_MIN_W} max={CMT_MAX_W} onCommit={persistCommentWidth} fromRight />,
+    [persistCommentWidth],
+  );
 
   const shell = (
     <>
@@ -209,15 +229,15 @@ export function App() {
         <BrandHeader actions={headerActions} />
       )}
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-        <Sidebar entries={entries} current={current} loading={loading} onPick={pick} width={width} onOpenCollab={() => setPicker(true)} onCreated={onCreated} onRenamed={onRenamed} />
-        <Splitter onResize={resize} />
+        <Sidebar entries={entries} current={current} loading={loading} onPick={pick} onOpenCollab={() => setPicker(true)} onCreated={onCreated} onRenamed={onRenamed} />
+        <Splitter cssVar={SIDEBAR_W} min={MIN_W} max={MAX_W} onCommit={persistWidth} />
         {selected ? (
           editing ? (
-            <MarkdownDocEditor key={current} path={current} previewWidth={commentWidth} splitter={commentSplitter} onExitToView={exitToView} onStateChange={onEditorState} />
+            <MarkdownDocEditor key={current} path={current} previewWidth={commentWidthVar} splitter={commentSplitter} onExitToView={exitToView} onStateChange={onEditorState} />
           ) : isMarkdown ? (
-            <MarkdownEditor path={current} commentWidth={commentWidth} splitter={commentSplitter} />
+            <MarkdownEditor path={current} commentWidth={commentWidthVar} splitter={commentSplitter} />
           ) : (
-            <GenericEditor key={current} entry={selected} commentWidth={commentWidth} splitter={commentSplitter} />
+            <GenericEditor key={current} entry={selected} commentWidth={commentWidthVar} splitter={commentSplitter} />
           )
         ) : (
           <main style={{ flex: 1, display: 'grid', placeItems: 'center', opacity: 0.6 }}>
@@ -318,27 +338,59 @@ function UnsavedDialog({ onSaveAndContinue, onDiscard, onCancel, message, primar
   );
 }
 
-function Splitter({ onResize, fromRight = false }: { onResize: (w: number) => void; fromRight?: boolean }) {
+/**
+ * The drag writes `cssVar` directly and coalesces to one write per animation frame, so
+ * a resize costs no React render at all — the panes are sized by the variable. State is
+ * only touched on mouse-up, and only to persist the final width.
+ */
+function Splitter({
+  cssVar,
+  min,
+  max,
+  onCommit,
+  fromRight = false,
+}: {
+  cssVar: string;
+  min: number;
+  max: number;
+  onCommit: (w: number) => void;
+  fromRight?: boolean;
+}) {
   const dragging = useRef(false);
+  const latest = useRef<number | null>(null);
   const [hot, setHot] = useState(false);
 
   useEffect(() => {
+    let raf: number | null = null;
+    const paint = () => {
+      raf = null;
+      if (latest.current != null) document.documentElement.style.setProperty(cssVar, `${latest.current}px`);
+    };
     const move = (e: MouseEvent) => {
-      if (dragging.current) onResize(fromRight ? window.innerWidth - e.clientX : e.clientX);
+      if (!dragging.current) return;
+      // Several mousemoves can land inside one frame; only the last one is worth painting.
+      latest.current = clamp(fromRight ? window.innerWidth - e.clientX : e.clientX, min, max);
+      if (raf == null) raf = requestAnimationFrame(paint);
     };
     const up = () => {
       if (!dragging.current) return;
       dragging.current = false;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
+      if (raf != null) {
+        cancelAnimationFrame(raf);
+        paint(); // the frame that was still queued still owes the final position
+      }
+      if (latest.current != null) onCommit(latest.current);
     };
     window.addEventListener('mousemove', move);
     window.addEventListener('mouseup', up);
     return () => {
       window.removeEventListener('mousemove', move);
       window.removeEventListener('mouseup', up);
+      if (raf != null) cancelAnimationFrame(raf);
     };
-  }, [onResize, fromRight]);
+  }, [cssVar, min, max, onCommit, fromRight]);
 
   return (
     <div
@@ -362,7 +414,6 @@ function Sidebar({
   current,
   loading,
   onPick,
-  width,
   onOpenCollab,
   onCreated,
   onRenamed,
@@ -371,7 +422,6 @@ function Sidebar({
   current: string;
   loading: boolean;
   onPick: (e: TreeEntry) => void;
-  width: number;
   onOpenCollab: () => void;
   onCreated: (path: string) => void;
   onRenamed: (from: string, to: string) => void;
@@ -389,7 +439,7 @@ function Sidebar({
   const fileCount = entries.filter((e) => e.type === 'file').length;
 
   return (
-    <nav style={{ ...sidebar, width }}>
+    <nav style={{ ...sidebar, width: sidebarWidthVar }}>
       <ReviewPullRequestsItem onOpenCollab={onOpenCollab} />
       <div style={{ padding: 12, borderBottom: '1px solid #e5e7eb', background: 'white', flexShrink: 0 }}>
         <div style={{ fontWeight: 700, marginBottom: 8 }}>

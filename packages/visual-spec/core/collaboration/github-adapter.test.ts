@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { GitHubError, createGitHubAdapter } from './github-adapter';
+import { GitHubError, createGitHubAdapter, createMentionsReader, mentionIn } from './github-adapter';
+import type { GitHubAdapter, PullRequestSummary, RepoRef, ReviewComment } from './github-adapter';
 import { buildPullRequestBody } from './lifecycle';
 import type { GhExecutor, GhResult } from './github-executor';
 import { scrubCredentials } from './github-executor';
@@ -372,6 +373,315 @@ describe('createGitHubAdapter — listPullRequests (R-7.4 / R-7.5)', () => {
     for (const fragment of ['visual-spec collab open', 'Bumps eslint', 'Half-written by hand', '<!--']) {
       expect(serialized).not.toContain(fragment);
     }
+  });
+});
+
+/*
+ * The two counts of "pull requests awaiting you" (R-A2.1 / R-A2.6 / R-A2.10).
+ *
+ * Search items are written inline rather than captured into a fixture because what is
+ * being asserted about them is what the adapter *drops* — a foreign repository, a closed
+ * pull request — and a capture cannot contain those by construction.
+ */
+const searchItem = (number: number, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+  number,
+  title: `PR ${number}`,
+  html_url: `https://github.com/acme/docs/pull/${number}`,
+  state: 'open',
+  repository_url: 'https://api.github.com/repos/acme/docs',
+  pull_request: { url: `https://api.github.com/repos/acme/docs/pulls/${number}` },
+  ...over,
+});
+
+const searchBody = (totalCount: number, items: Record<string, unknown>[]): string =>
+  JSON.stringify({ total_count: totalCount, incomplete_results: false, items });
+
+/*
+ * Every search is preceded by the R-A2.11 name resolution, so the queue every one of
+ * these tests hands the recorder starts with the `/repos/{owner}/{repo}` answer. The
+ * unrenamed case is a repository whose `full_name` is the name that was asked for.
+ */
+const resolvesTo = (fullName: string): Partial<GhResult> => ({ stdout: JSON.stringify({ full_name: fullName }) });
+const unrenamed = resolvesTo('acme/docs');
+
+describe('createGitHubAdapter — searchPullRequests (R-A2.1, R-A2.10)', () => {
+  it('asks search/issues for the repository-scoped open pull requests requesting the user', async () => {
+    const { exec, calls } = recorder([unrenamed, { stdout: searchBody(0, []) }]);
+    await createGitHubAdapter(exec).searchPullRequests(repo, 'review-requested', 'ana');
+
+    // `q` goes through `-f` so gh encodes it; the qualifiers are the only free text
+    // this adapter sends, and their order and spelling are the contract.
+    expect(calls[1]?.args).toEqual([
+      'api',
+      '-X',
+      'GET',
+      'search/issues',
+      '-f',
+      'q=is:pr is:open review-requested:ana repo:acme/docs',
+    ]);
+  });
+
+  it('carries the query own total, not the number of items it retrieved (R-A2.10)', async () => {
+    // Search pages at 30. A repository with 47 review requests must report 47.
+    const items = Array.from({ length: 30 }, (_, i) => searchItem(i + 1));
+    const { exec } = recorder([unrenamed, { stdout: searchBody(47, items) }]);
+    const result = await createGitHubAdapter(exec).searchPullRequests(repo, 'review-requested', 'ana');
+
+    expect(result.total).toBe(47);
+    expect(result.items).toHaveLength(30);
+    expect(result.total).not.toBe(result.items.length);
+  });
+
+  it('projects each item to what a row can be built from', async () => {
+    const { exec } = recorder([unrenamed, { stdout: searchBody(1, [searchItem(11, { title: 'Rename the thing' })]) }]);
+    const result = await createGitHubAdapter(exec).searchPullRequests(repo, 'mentions', 'ana');
+
+    expect(result.items).toEqual([
+      { number: 11, title: 'Rename the thing', htmlUrl: 'https://github.com/acme/docs/pull/11' },
+    ]);
+  });
+
+  it('drops an item of another repository or a closed one (R-A1.6, R-A1.7)', async () => {
+    const foreign = searchItem(90, { repository_url: 'https://api.github.com/repos/other/docs' });
+    const closed = searchItem(91, { state: 'closed' });
+    const { exec } = recorder([unrenamed, { stdout: searchBody(3, [searchItem(11), foreign, closed]) }]);
+    const result = await createGitHubAdapter(exec).searchPullRequests(repo, 'mentions', 'ana');
+
+    expect(result.items.map((i) => i.number)).toEqual([11]);
+  });
+});
+
+/*
+ * R-A2.11. The rename that motivated this is real: this project's own `origin` names an
+ * org GitHub has renamed, every REST call follows the 301 without anyone noticing, and
+ * the search endpoint alone answers 422 — which R-A4.3 turns into a count that never
+ * moves and never complains.
+ */
+describe('createGitHubAdapter — searchPullRequests resolves a renamed repository (R-A2.11)', () => {
+  const renamedItem = (number: number): Record<string, unknown> =>
+    searchItem(number, { repository_url: 'https://api.github.com/repos/acme-ai/docs' });
+
+  it('queries the name GitHub currently holds, not the configured one', async () => {
+    const { exec, calls } = recorder([resolvesTo('acme-ai/docs'), { stdout: searchBody(1, [renamedItem(7)]) }]);
+    const result = await createGitHubAdapter(exec).searchPullRequests(repo, 'review-requested', 'ana');
+
+    expect(calls[0]?.args).toContain('/repos/acme/docs');
+    expect(calls[1]?.args).toContain('q=is:pr is:open review-requested:ana repo:acme-ai/docs');
+    expect(calls[1]?.args.join(' ')).not.toContain('repo:acme/docs');
+    // The scope filter has to move with the query, or the rows the new name returns are
+    // all read as foreign and dropped.
+    expect(result.items.map((i) => i.number)).toEqual([7]);
+  });
+
+  it('resolves once for the adapter, not once per query', async () => {
+    const { exec, calls } = recorder([
+      resolvesTo('acme-ai/docs'),
+      { stdout: searchBody(0, []) },
+      { stdout: searchBody(0, []) },
+      { stdout: searchBody(0, []) },
+    ]);
+    const adapter = createGitHubAdapter(exec);
+    await adapter.searchPullRequests(repo, 'review-requested', 'ana');
+    await adapter.searchPullRequests(repo, 'mentions', 'ana');
+    await adapter.searchPullRequests(repo, 'review-requested', 'ana');
+
+    expect(calls.filter((c) => c.args.includes('/repos/acme/docs'))).toHaveLength(1);
+    expect(calls).toHaveLength(4);
+    for (const call of calls.slice(1)) expect(call.args.join(' ')).toContain('repo:acme-ai/docs');
+  });
+
+  it('falls back to the configured name when the resolution fails', async () => {
+    // Not a shortcut: an unreachable repository is the case R-A4.6 already answers, and
+    // the search failing on its own terms is what the caller is built to absorb.
+    const { exec, calls } = recorder([
+      { exitCode: 1, stderr: 'gh: Not Found (HTTP 404)' },
+      { stdout: searchBody(0, []) },
+    ]);
+    const result = await createGitHubAdapter(exec).searchPullRequests(repo, 'mentions', 'ana');
+
+    expect(calls[1]?.args).toContain('q=is:pr is:open mentions:ana repo:acme/docs');
+    expect(result.total).toBe(0);
+  });
+});
+
+/*
+ * Mention matching (R-A1.9 / R-A1.10). The hyphen case is the whole reason this is a
+ * function and not a `\b` regex at the call site.
+ */
+describe('mentionIn', () => {
+  const cases: Array<[string, boolean]> = [
+    ['@ana.', true],
+    ['@ana,', true],
+    ['can @ana take a look', true],
+    ['ping @ana', true],
+    ['@ana\nnext line', true],
+    ['@ana-b should look at this', false],
+    ['@anabel wrote it', false],
+    ['ana without the at sign', false],
+  ];
+
+  for (const [body, matches] of cases) {
+    it(`${matches ? 'matches' : 'does not match'} @ana in ${JSON.stringify(body)}`, () => {
+      expect(mentionIn(body, 'ana') !== null).toBe(matches);
+    });
+  }
+
+  it('matches case-insensitively, as GitHub logins are', () => {
+    expect(mentionIn('thanks @Ana!', 'ana')).not.toBeNull();
+  });
+
+  it('carries the passage around the mention, not the whole comment', () => {
+    const excerpt = mentionIn('The parser is wrong here, @ana — see the second branch.', 'ana');
+    expect(excerpt).toContain('@ana');
+    expect(excerpt).toContain('see the second branch');
+  });
+});
+
+/*
+ * The mentions union (R-A2.6 / R-A2.7 / R-A2.8).
+ *
+ * A stub adapter rather than the recorded executor: what these assert is the *number of
+ * calls the reader makes*, which the executor would report only after the adapter had
+ * turned each into an argv — one indirection away from the thing under test.
+ */
+type StubComments = Record<number, Array<{ user: string; body: string }>>;
+
+function stubAdapter(opts: { search?: number[]; searchFails?: boolean; comments?: StubComments }): {
+  adapter: GitHubAdapter;
+  reviewCalls: number[];
+} {
+  const reviewCalls: number[] = [];
+  const adapter = {
+    async searchPullRequests(_repo: RepoRef, _qualifier: string, _login: string) {
+      if (opts.searchFails) throw new GitHubError('searchPullRequests', 'rate limited', 403);
+      const items = (opts.search ?? []).map((number) => ({
+        number,
+        title: `PR ${number}`,
+        htmlUrl: `https://github.com/acme/docs/pull/${number}`,
+      }));
+      return { total: items.length, items };
+    },
+    async listReviewComments(_repo: RepoRef, pullNumber: number) {
+      reviewCalls.push(pullNumber);
+      return (opts.comments?.[pullNumber] ?? []).map((c) => ({ ...c }) as unknown as ReviewComment);
+    },
+  } as unknown as GitHubAdapter;
+  return { adapter, reviewCalls };
+}
+
+const summary = (number: number, updatedAt: string): PullRequestSummary => ({
+  number,
+  title: `PR ${number}`,
+  state: 'open',
+  draft: false,
+  headBranch: `feature-${number}`,
+  baseBranch: 'main',
+  headSha: `sha-${number}`,
+  htmlUrl: `https://github.com/acme/docs/pull/${number}`,
+  author: 'someone',
+  updatedAt,
+});
+
+describe('createMentionsReader — the union of two sources (R-A2.6, R-A2.8)', () => {
+  it('unions search with review comments and counts a pull request found by both once', async () => {
+    // 1 by search only, 2 by review comment only, 3 by both — three, not four.
+    const { adapter } = stubAdapter({
+      search: [1, 3],
+      comments: {
+        1: [],
+        2: [{ user: 'bob', body: 'over to @ana' }],
+        3: [{ user: 'bob', body: '@ana again' }],
+      },
+    });
+    const pulls = [summary(1, 't1'), summary(2, 't1'), summary(3, 't1')];
+    const result = await createMentionsReader(adapter).read(repo, 'ana', pulls);
+
+    expect(result.items.map((i) => i.number).sort()).toEqual([1, 2, 3]);
+    expect(result.total).toBe(3);
+    expect(result.complete).toBe(true);
+  });
+
+  it('carries the mention author and passage for a review-comment mention (R-A3.7)', async () => {
+    const { adapter } = stubAdapter({
+      comments: { 2: [{ user: 'bob', body: 'this looks off to me, @ana' }] },
+    });
+    const result = await createMentionsReader(adapter).read(repo, 'ana', [summary(2, 't1')]);
+
+    expect(result.items[0]?.mention?.author).toBe('bob');
+    expect(result.items[0]?.mention?.excerpt).toContain('looks off to me');
+  });
+
+  it('does not count a mention the counted user wrote themselves (R-A1.10)', async () => {
+    const { adapter } = stubAdapter({ comments: { 2: [{ user: 'ana', body: 'note to self: @ana' }] } });
+    const result = await createMentionsReader(adapter).read(repo, 'ana', [summary(2, 't1')]);
+    expect(result.items).toEqual([]);
+  });
+
+  it('does not count @ana-b as a mention of @ana (R-A1.9)', async () => {
+    const { adapter } = stubAdapter({ comments: { 2: [{ user: 'bob', body: 'asking @ana-b about this' }] } });
+    const result = await createMentionsReader(adapter).read(repo, 'ana', [summary(2, 't1')]);
+    expect(result.items).toEqual([]);
+  });
+
+  it('reports what one source found and marks the number incomplete when the other fails (R-A4.5)', async () => {
+    const { adapter } = stubAdapter({ searchFails: true, comments: { 2: [{ user: 'bob', body: '@ana' }] } });
+    const result = await createMentionsReader(adapter).read(repo, 'ana', [summary(2, 't1')]);
+
+    expect(result.items.map((i) => i.number)).toEqual([2]);
+    expect(result.complete).toBe(false);
+  });
+});
+
+describe('createMentionsReader — re-reads only what moved (R-A2.7)', () => {
+  it('reads every listed pull request once, then only those whose updatedAt advanced', async () => {
+    const { adapter, reviewCalls } = stubAdapter({ comments: { 1: [], 2: [], 3: [] } });
+    const reader = createMentionsReader(adapter);
+
+    await reader.read(repo, 'ana', [summary(1, 't1'), summary(2, 't1'), summary(3, 't1')]);
+    expect(reviewCalls).toEqual([1, 2, 3]);
+
+    reviewCalls.length = 0;
+    await reader.read(repo, 'ana', [summary(1, 't1'), summary(2, 't2'), summary(3, 't1')]);
+    expect(reviewCalls).toEqual([2]);
+
+    reviewCalls.length = 0;
+    await reader.read(repo, 'ana', [summary(1, 't1'), summary(2, 't2'), summary(3, 't1')]);
+    expect(reviewCalls).toEqual([]);
+  });
+
+  it('keeps a mention found by an earlier scan of a pull request that has not moved', async () => {
+    const { adapter, reviewCalls } = stubAdapter({ comments: { 2: [{ user: 'bob', body: '@ana' }] } });
+    const reader = createMentionsReader(adapter);
+
+    await reader.read(repo, 'ana', [summary(2, 't1')]);
+    const second = await reader.read(repo, 'ana', [summary(2, 't1')]);
+
+    expect(reviewCalls).toEqual([2]);
+    expect(second.items.map((i) => i.number)).toEqual([2]);
+  });
+
+  it('reads review comments of no pull request outside the listing (R-A1.6, R-A1.7)', async () => {
+    // 91 is closed and carries a mention; it is not in the listing, so it is not read
+    // and cannot be counted.
+    const { adapter, reviewCalls } = stubAdapter({
+      comments: { 1: [], 91: [{ user: 'bob', body: '@ana' }] },
+    });
+    const result = await createMentionsReader(adapter).read(repo, 'ana', [summary(1, 't1')]);
+
+    expect(reviewCalls).toEqual([1]);
+    expect(result.items).toEqual([]);
+  });
+
+  it('forgets a pull request that has left the listing, and re-reads it if it returns', async () => {
+    const { adapter, reviewCalls } = stubAdapter({ comments: { 1: [], 2: [] } });
+    const reader = createMentionsReader(adapter);
+
+    await reader.read(repo, 'ana', [summary(1, 't1'), summary(2, 't1')]);
+    await reader.read(repo, 'ana', [summary(1, 't1')]);
+    reviewCalls.length = 0;
+    await reader.read(repo, 'ana', [summary(1, 't1'), summary(2, 't1')]);
+
+    expect(reviewCalls).toEqual([2]);
   });
 });
 

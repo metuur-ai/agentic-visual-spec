@@ -23,8 +23,18 @@
  * R-7.11: a failed read leaves the last known count on screen. It reuses this file's
  * one piece of state by simply not writing to it, which is why there is no error field
  * — nothing renders one, and a field nothing renders is a field somebody will render.
+ *
+ * THE READ IS COALESCED (R-A4.2). `focus` and `visibilitychange` both fire on a single
+ * tab switch, so the two listeners below have always cost two listings — a read still in
+ * flight now swallows the second event. That is de-duplication and not a timer, so
+ * R-7.10 stands.
+ *
+ * WHAT IS *WAITING* ON THE USER IS NOT HERE. `GET /pulls/awaiting` is read by
+ * `use-awaiting-pulls.ts`, because its two readers — the header chips and the panel's
+ * sections — sit in different trees with no common ancestor short of `App`. A copy per
+ * caller is what that module exists to avoid; see its header.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { type CollabAvailabilitySnapshot, type PullRequestSummary, createCollabClient } from './collab-client';
 
 /** The configured repository, as `GET /__vs/collab` reports it. */
@@ -53,6 +63,12 @@ export function useCollabPulls(fetchImpl?: typeof fetch): CollabPulls {
   const client = useMemo(() => createCollabClient(fetchImpl), [fetchImpl]);
   const [availability, setAvailability] = useState<CollabAvailabilitySnapshot | null>(null);
   const [pulls, setPulls] = useState<PullRequestSummary[] | null>(null);
+  /**
+   * R-A4.2's whole implementation. A ref and not state: the second event has to be
+   * refused *within the same tick* the first was accepted in, and a state write would
+   * not be visible until the next render.
+   */
+  const reading = useRef(false);
 
   useEffect(() => {
     let live = true;
@@ -71,10 +87,21 @@ export function useCollabPulls(fetchImpl?: typeof fetch): CollabPulls {
     let live = true;
 
     const read = () => {
-      void client.pullRequests('open').then((res) => {
-        // R-7.11 — a failure writes nothing, so the previous count survives it.
-        if (live && res.ok) setPulls(res.value);
-      });
+      if (reading.current) return; // R-A4.2 — one tab switch, one read
+      reading.current = true;
+
+      // `finally` and not `then`: the flag has to be cleared even if this rejects for a
+      // reason the client did not turn into a result, or one throw would wedge the hook
+      // into never reading again.
+      void client
+        .pullRequests('open')
+        .then((res) => {
+          // R-7.11 — a failure writes nothing, so the previous count survives it.
+          if (live && res.ok) setPulls(res.value);
+        })
+        .finally(() => {
+          reading.current = false;
+        });
     };
 
     read(); // on mount (R-7.10)

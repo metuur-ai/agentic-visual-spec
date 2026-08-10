@@ -19,6 +19,9 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { BrandHeader, MainHeader } from './main-header';
+// The awaiting counts live in a module store; a test that re-stubs the server mid-test
+// has to drop the cache too, or it renders the previous stub's answer.
+import { resetAwaitingCache } from './use-awaiting-pulls';
 
 const OPEN_COMMENT = {
   id: 'c-1',
@@ -743,5 +746,139 @@ describe('the brand row yields the served path before the git chips', () => {
     await mountChip(REMOTE_GITHUB);
     const row = screen.getByTestId('git-chip-area').parentElement as HTMLElement;
     expect(row.style.flexWrap === '' || row.style.flexWrap === 'nowrap').toBe(true);
+  });
+});
+
+/*
+ * The two "waiting on you" chips (R-A1.1 … R-A1.5, R-A1.8, R-A1.11).
+ *
+ * Driven through `MainHeader` against a stubbed server rather than by handing a component
+ * two numbers: the counts arrive through a module store shared with the pull request
+ * panel, and a test that injected them would hold whether or not the header ever
+ * subscribed to it — which is the one thing these have to prove.
+ *
+ * THE GROUPING ASSERTION IS THE POINT OF THE LAST TWO. R-8.1 named the repository inside
+ * the single count's pill; with three pills that sentence is either said three times or
+ * not at all, and R-A1.11 chose neither. It is said once, for the group.
+ */
+describe('the counts waiting on you are two chips, captioned once', () => {
+  const AWAITING_BOTH = {
+    reviewRequested: { ok: true, total: 3, items: [{ number: 41, title: 'a', htmlUrl: 'https://github.com/acme/docs/pull/41' }], complete: true },
+    mentioned: { ok: true, total: 2, items: [{ number: 41, title: 'a', htmlUrl: 'https://github.com/acme/docs/pull/41' }], complete: true },
+  };
+
+  /** `PENDING` here means the awaiting read never settles — the pre-first-read state. */
+  function installAwaiting(awaiting: unknown, git: unknown = REMOTE_GITHUB, repo = { owner: 'acme', repo: 'docs' }) {
+    const impl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/__vs/git') return jsonRes(git);
+      if (url === '/__vs/git/branches') return { ok: false, status: 404, json: async () => ({ error: 'no route' }) } as Response;
+      if (url === '/__vs/collab') return jsonRes({ available: true, login: 'ana', repo, scopes: [] });
+      // Matched before the listing: what is waiting on me is not the listing.
+      if (url.startsWith('/__vs/collab/pulls/awaiting')) {
+        if (awaiting === PENDING) return new Promise<Response>(() => {});
+        return jsonRes(awaiting);
+      }
+      if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: [] });
+      if (url.startsWith('/__vs/comments')) return jsonRes([OPEN_COMMENT]);
+      if (url === '/__vs/source/root') return jsonRes({ root: '/repo/docs' });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', impl);
+    return impl;
+  }
+
+  /* 1.1 / R-A1.4 — two indicators, and no element anywhere reading the sum. */
+  it('renders the two counts separately and never adds them up', async () => {
+    installAwaiting(AWAITING_BOTH);
+    render(<MainHeader file="docs/spec.md" />);
+
+    const review = await screen.findByTestId('git-review-requested-count');
+    const mention = await screen.findByTestId('git-mention-count');
+    expect(review.textContent).toContain('3');
+    expect(mention.textContent).toContain('2');
+    // Distinct from each other and from the open count, which is a different obligation.
+    expect(review.contains(mention)).toBe(false);
+    expect(screen.getByTestId('git-pull-count').textContent).toContain('0 open');
+    expect(screen.getByTestId('git-chip').textContent).not.toContain('5');
+  });
+
+  /* 1.5 — both lead to the panel, which is where their sections are (R-A3.1). */
+  it('opens the pull request panel from either chip', async () => {
+    installAwaiting(AWAITING_BOTH);
+    const onOpenPulls = vi.fn();
+    render(<MainHeader file="docs/spec.md" actions={{ onOpenPulls }} />);
+
+    fireEvent.click(await screen.findByTestId('git-review-requested-count'));
+    fireEvent.click(screen.getByTestId('git-mention-count'));
+    expect(onOpenPulls).toHaveBeenCalledTimes(2);
+    // And the open count still opens its own popover, not the panel.
+    fireEvent.click(screen.getByTestId('git-pull-count'));
+    expect(onOpenPulls).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId('git-pull-menu')).toBeTruthy();
+  });
+
+  /* 1.2 / R-A1.5 — zero is not a chip reading "0", and neither is "not yet known". */
+  it('renders neither chip at zero', async () => {
+    installAwaiting({ reviewRequested: { ok: true, total: 0, items: [], complete: true }, mentioned: { ok: true, total: 0, items: [], complete: true } });
+    render(<MainHeader file="docs/spec.md" />);
+
+    await screen.findByTestId('git-pull-count'); // the header has finished rendering
+    expect(screen.queryByTestId('git-review-requested-count')).toBeNull();
+    expect(screen.queryByTestId('git-mention-count')).toBeNull();
+  });
+
+  it('renders neither chip before the first read lands, or for a side that never answered', async () => {
+    installAwaiting(PENDING);
+    render(<MainHeader file="docs/spec.md" />);
+    await screen.findByTestId('git-pull-count');
+    expect(screen.queryByTestId('git-review-requested-count')).toBeNull();
+    expect(screen.queryByTestId('git-mention-count')).toBeNull();
+
+    // A side that failed is the same absence, and it does not take the other side with it.
+    vi.unstubAllGlobals();
+    vi.stubGlobal('EventSource', FakeEventSource);
+    resetAwaitingCache();
+    installAwaiting({ reviewRequested: { ok: false }, mentioned: { ok: true, total: 1, items: [], complete: true } });
+    render(<MainHeader file="docs/spec.md" />);
+    expect(await screen.findByTestId('git-mention-count')).toBeTruthy();
+    expect(screen.queryByTestId('git-review-requested-count')).toBeNull();
+  });
+
+  /* 1.3 / R-A1.8 — one pull request, two obligations, both counted. */
+  it('counts a pull request that is both requested and mentioning in both chips', async () => {
+    const one = { number: 41, title: 'a', htmlUrl: 'https://github.com/acme/docs/pull/41' };
+    installAwaiting({
+      reviewRequested: { ok: true, total: 1, items: [one], complete: true },
+      mentioned: { ok: true, total: 1, items: [{ ...one, mention: { author: 'bo', excerpt: 'ping @ana' } }], complete: true },
+    });
+    render(<MainHeader file="docs/spec.md" />);
+
+    expect((await screen.findByTestId('git-review-requested-count')).textContent).toContain('1');
+    expect((await screen.findByTestId('git-mention-count')).textContent).toContain('1');
+  });
+
+  /* 1.4 / R-A1.11 — the caption belongs to the group of counts, so it is said once. */
+  it('names the repository exactly once across the three chips', async () => {
+    // The served directory is `acme/website`; the counts are of `acme/docs`. Without the
+    // caption all three numbers would read as this directory's.
+    installAwaiting(AWAITING_BOTH, { ...REMOTE_GITHUB, owner: 'acme', repo: 'website', url: 'git@github.com:acme/website.git' });
+    render(<MainHeader file="docs/spec.md" />);
+
+    await screen.findByTestId('git-mention-count');
+    expect(screen.getAllByTestId('git-pull-count-repo')).toHaveLength(1);
+    // And it is nobody's child: it captions the counts rather than living in one of them.
+    const note = screen.getByTestId('git-pull-count-repo');
+    for (const id of ['git-pull-count', 'git-review-requested-count', 'git-mention-count']) {
+      expect(screen.getByTestId(id).contains(note)).toBe(false);
+    }
+    expect(note.textContent).toContain('acme/docs');
+  });
+
+  it('says nothing about the repository where it is the directory’s own', async () => {
+    installAwaiting(AWAITING_BOTH);
+    render(<MainHeader file="docs/spec.md" />);
+    await screen.findByTestId('git-mention-count');
+    expect(screen.queryByTestId('git-pull-count-repo')).toBeNull();
   });
 });

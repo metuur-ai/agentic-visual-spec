@@ -10,7 +10,7 @@
  */
 import { render, screen, waitFor } from '@testing-library/react';
 import { fireEvent } from '@testing-library/dom';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CollabPullsPanel, groupByOwner, shortSha } from './collab-pulls-panel';
 
 const PULL = {
@@ -488,5 +488,220 @@ describe('opening a pull request from a deep link', () => {
     render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
     expect(screen.queryByRole('heading', { name: /Opening #/ })).toBeNull();
     await waitFor(() => expect(screen.getByText(/Rework the payment rules/)).toBeTruthy());
+  });
+});
+
+/*
+ * The two sections of R-A3.1 … R-A3.9.
+ *
+ * TWO FETCHES, ON PURPOSE. The panel's own reads go through the injected `fetchImpl`; the
+ * `awaiting` store reads the *global* `fetch`, because it is a module store shared with the
+ * header and has no props to be injected through. Stubbing both is what the running app
+ * does too, and it keeps the store's own de-duplication in the picture rather than mocking
+ * the hook and asserting against a fiction.
+ */
+describe('what is waiting on you, as two sections of this list', () => {
+  const WITH_DOC = { ...PULL, documentId: 'doc-1' };
+  /** In the listing (#42) and not in it (#99) — R-7.9 bounds the list, not the count. */
+  const MENTION = { author: 'dev-dan', excerpt: 'can @reviewer-rita take the rounding rule?' };
+
+  const awaitingBody = (over: Record<string, unknown> = {}) => ({
+    reviewRequested: {
+      ok: true,
+      complete: true,
+      total: 2,
+      items: [
+        { number: 42, title: PULL.title, htmlUrl: PULL.htmlUrl },
+        { number: 99, title: 'Retire the legacy importer', htmlUrl: 'https://github.com/acme/docs/pull/99' },
+      ],
+    },
+    mentioned: {
+      ok: true,
+      complete: true,
+      total: 1,
+      items: [{ number: 42, title: PULL.title, htmlUrl: PULL.htmlUrl, mention: MENTION }],
+    },
+    ...over,
+  });
+
+  /** The store's server: availability, then the two counts. Nothing else is reachable. */
+  function stubStore(body: unknown = awaitingBody()) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        const json =
+          url === '/__vs/collab'
+            ? { available: true, login: 'reviewer-rita', repo: { owner: 'acme', repo: 'docs' }, scopes: [] }
+            : url === '/__vs/collab/pulls/awaiting'
+              ? body
+              : (() => {
+                  throw new Error(`unexpected global fetch: ${url}`);
+                })();
+        return { ok: true, status: 200, json: async () => json } as Response;
+      }),
+    );
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const section = (key: string) => document.querySelector(`[data-vs-awaiting="${key}"]`) as HTMLElement;
+
+  async function mountPanel(over: Parameters<typeof fakeFetch>[0] = {}) {
+    const { impl, calls } = fakeFetch({
+      '/__vs/collab/pulls?state=open': { ok: true, status: 200, json: { pulls: [WITH_DOC] } },
+      ...over,
+    });
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    await waitFor(() => expect(section('review')).toBeTruthy());
+    return { calls };
+  }
+
+  it('renders both sections above the listing, and leaves the listing whole (R-A3.1/2/6)', async () => {
+    stubStore();
+    await mountPanel();
+
+    expect(screen.getByText('Waiting on your review')).toBeTruthy();
+    expect(screen.getByText('You were mentioned')).toBeTruthy();
+
+    // "Inside the existing list, above it" is a claim about document order, so it is read
+    // off the document rather than inferred from the JSX.
+    const blocks = [...document.querySelectorAll('[data-vs-awaiting], [data-vs-pull-group]')].map(
+      (n) => n.getAttribute('data-vs-awaiting') ?? `group:${n.getAttribute('data-vs-pull-group')}`,
+    );
+    expect(blocks).toEqual(['review', 'mentions', 'group:all']);
+
+    // R-A3.6 — the listing is not filtered down to what the sections show.
+    const group = document.querySelector('[data-vs-pull-group="all"]') as HTMLElement;
+    expect(group.querySelectorAll('[data-vs-pull]')).toHaveLength(1);
+    expect(group.textContent).toContain(PULL.title);
+  });
+
+  it('gives a listed pull request the same actions it has in the listing (R-A3.3)', async () => {
+    stubStore();
+    await mountPanel();
+
+    const names = (root: HTMLElement) =>
+      [...root.querySelectorAll('[data-vs-pull="42"] button')].map((b) => b.textContent);
+    const group = document.querySelector('[data-vs-pull-group="all"]') as HTMLElement;
+
+    expect(names(section('review'))).toEqual(['Resume writing', 'Review the code', 'View description']);
+    expect(names(section('review'))).toEqual(names(group));
+    // And the link out, which is the one control the unlisted row also gets.
+    expect((section('review').querySelector('[data-vs-pull="42"] a') as HTMLAnchorElement).href).toBe(PULL.htmlUrl);
+  });
+
+  it('renders a pull request the listing does not have, without a checkout (R-A3.4/5)', async () => {
+    stubStore();
+    await mountPanel();
+
+    const row = section('review').querySelector('[data-vs-awaiting-unlisted="99"]') as HTMLElement;
+    expect(row.textContent).toContain('#99');
+    expect(row.textContent).toContain('Retire the legacy importer');
+    expect((row.querySelector('a') as HTMLAnchorElement).href).toBe('https://github.com/acme/docs/pull/99');
+    // The whole point: no button that would need a branch and a head commit nobody fetched.
+    expect(row.querySelectorAll('button')).toHaveLength(0);
+    expect(row.textContent).toContain('Not among the pull requests listed below');
+  });
+
+  it('shows who wrote the mention and what they said (R-A3.7)', async () => {
+    stubStore();
+    await mountPanel();
+
+    const quote = section('mentions').querySelector('[data-vs-awaiting-mention="42"]') as HTMLElement;
+    expect(quote.textContent).toContain('@dev-dan');
+    expect(quote.textContent).toContain('can @reviewer-rita take the rounding rule?');
+    // It belongs to the mention, not to every appearance of the pull request.
+    expect(section('review').querySelector('[data-vs-awaiting-mention="42"]')).toBeNull();
+  });
+
+  it('says when it shows fewer rows than it counts (R-A3.8)', async () => {
+    stubStore(
+      awaitingBody({
+        reviewRequested: {
+          ok: true,
+          complete: true,
+          total: 40,
+          items: [{ number: 42, title: PULL.title, htmlUrl: PULL.htmlUrl }],
+        },
+      }),
+    );
+    await mountPanel();
+
+    expect(section('review').textContent).toContain('Showing 1 of 40');
+    // The mentions side is whole, so it says nothing — a note on every section is noise.
+    expect(section('mentions').querySelector('[data-vs-awaiting-shortfall]')).toBeNull();
+  });
+
+  it('stays open-only, and says so, when the listing is switched (R-A3.9)', async () => {
+    stubStore();
+    await mountPanel({ '/__vs/collab/pulls?state=closed': { ok: true, status: 200, json: { pulls: [] } } });
+    expect(section('review').querySelector('[data-vs-awaiting-open-only]')).toBeNull();
+
+    fireEvent.change(screen.getByLabelText('Pull request state'), { target: { value: 'closed' } });
+
+    await waitFor(() =>
+      expect(section('review').querySelector('[data-vs-awaiting-open-only="review"]')).toBeTruthy(),
+    );
+    expect(section('review').textContent).toContain('applies to the listing, not to this section');
+    expect(section('mentions').querySelector('[data-vs-awaiting-open-only="mentions"]')).toBeTruthy();
+    // The pull requests counted are unchanged: the toggle re-queried the listing, not these.
+    expect(section('review').textContent).toContain('#42');
+    expect(section('review').textContent).toContain('#99');
+  });
+
+  it('renders no section for a side that has not answered (R-A1.5)', async () => {
+    stubStore(awaitingBody({ mentioned: { ok: false } }));
+    await mountPanel();
+
+    expect(section('mentions')).toBeNull();
+    expect(screen.queryByText('You were mentioned')).toBeNull();
+  });
+
+  /*
+   * FOUND IN THE BROWSER, NOT HERE. The section wrappers are `display: contents`, so the
+   * rows of the listing sat flush under "You were mentioned" with nothing between them —
+   * a one-row section reading as a three-row one. Document order was already correct and
+   * already asserted, which is exactly why the order assertions could not see it. These
+   * assert the *grouping*: whose subtree a row is in, and what separates it from the block
+   * above.
+   */
+  it('gives the listing its own heading once a section is stacked above it', async () => {
+    stubStore();
+    await mountPanel();
+
+    const heading = screen.getByRole('heading', { name: 'All open pull requests' });
+    const firstListed = document.querySelector('[data-vs-pull-group="all"] [data-vs-pull]') as HTMLElement;
+
+    // The defect, stated directly: the listing's rows are not part of the mention section.
+    expect(section('mentions').contains(firstListed)).toBe(false);
+    // And something says where one ends and the other begins.
+    expect(heading.compareDocumentPosition(firstListed) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(section('mentions').compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // The author split owns its own headings; it must not gain a second one above them.
+    expect(screen.queryByText('Yours')).toBeNull();
+  });
+
+  /*
+   * The 99% case, and the one that must not move: nothing is waiting on you, so the panel
+   * is the listing and a heading over the only block would be a label, not a division.
+   */
+  it('adds no heading to the listing when neither section renders', async () => {
+    stubStore({ reviewRequested: { ok: false }, mentioned: { ok: false } });
+    const { impl } = fakeFetch({ '/__vs/collab/pulls?state=open': { ok: true, status: 200, json: { pulls: [WITH_DOC] } } });
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+    await screen.findByText(new RegExp(PULL.title));
+
+    expect(document.querySelector('[data-vs-awaiting]')).toBeNull();
+    // "Open collaborations" is the panel's own `h2` and predates all of this.
+    expect(screen.getAllByRole('heading').map((h) => h.textContent)).toEqual(['Open collaborations']);
+  });
+
+  it('does not fetch the counts itself — the store is the only caller', async () => {
+    stubStore();
+    const { calls } = await mountPanel();
+    expect(calls.filter((c) => c.url.includes('awaiting'))).toEqual([]);
   });
 });

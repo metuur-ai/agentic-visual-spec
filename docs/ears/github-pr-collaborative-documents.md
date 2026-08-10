@@ -384,3 +384,6 @@ pushes, or merges, and Unit 7's "merging is not part of visual-spec" is unchange
 | R-13.18 | THE SYSTEM SHALL distinguish, in the reviewing interface, a comment held locally from one that exists on the pull request, so that a reviewer is never left inferring a comment's origin from the absence of a control. |
 | R-13.19 | THE SYSTEM SHALL NOT commit, push, or merge from a pull request checkout. |
 | R-13.20 | THE SYSTEM SHALL include tests that drive the checkout operations against real git repositories, since the behaviours being relied on — the fork reference, the detached checkout, and the path git reports — are git's, not this system's. |
+| R-13.21 | THE SYSTEM SHALL allow a reviewer to reply, from the reviewing interface of a checked-out pull request, to a comment that is on that pull request, and SHALL post the reply to that comment's thread rather than holding it locally. |
+| R-13.22 | THE SYSTEM SHALL offer the reply affordance only on comments that are on the pull request, since a comment held locally has no thread on GitHub to answer. |
+| R-13.23 | WHEN a reply has been posted, THE SYSTEM SHALL re-read the pull request's comments so that the reply is shown from GitHub's record of the thread rather than from what this machine remembers sending. |

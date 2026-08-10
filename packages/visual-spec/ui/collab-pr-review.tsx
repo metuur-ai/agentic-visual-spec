@@ -306,6 +306,26 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
     await loadDrafts();
   };
 
+  /**
+   * R-7.15 — answer a review thread from here instead of from github.com.
+   *
+   * `id` is the thread root's record id, exactly as the panel listed it. The reply is
+   * GitHub's own, so the only local work is re-reading the conversation afterwards: the
+   * new reply belongs under the root it answered, and `loadThreads` is what puts it there.
+   *
+   * Throws on refusal. The panel keeps the composer open with the reviewer's text when the
+   * promise rejects, and the banner below says what GitHub said.
+   */
+  const replyToThread = async (id: string, text: string) => {
+    const res = await client.replyToReviewComment(pull.number, id, { comment: text });
+    if (!res.ok) {
+      setThreadsError(res.message);
+      throw new Error(res.message);
+    }
+    setThreadsError(null);
+    await loadThreads();
+  };
+
   const heldCount = drafts.filter((d) => d.status === 'draft').length;
   /*
    * What is on the pull request is counted from the pull request, not from the local
@@ -570,6 +590,7 @@ export function CollabPrReview({ pull, worktree, onExit, fetchImpl }: CollabPrRe
             onHold={hold}
             onPublish={publish}
             onDiscard={discard}
+            onReply={replyToThread}
           />
         ) : (
           <main style={centerMsg}>
@@ -612,6 +633,8 @@ type CheckoutFileViewProps = {
   onHold: (input: ReviewDraftInput) => Promise<boolean>;
   onPublish: (id: string, force?: boolean) => Promise<void>;
   onDiscard: (id: string) => Promise<void>;
+  /** Answer a thread on this file. Rejects when GitHub refuses; the composer keeps the text. */
+  onReply: (id: string, text: string) => Promise<void>;
 };
 
 /**
@@ -620,7 +643,7 @@ type CheckoutFileViewProps = {
  * viewer already reports, and it is what a held comment anchors to (R-13.13): picking a
  * line is reading, and the composer below writes a comment, never the file.
  */
-function CheckoutFileView({ entry, prefix, headSha, drafts, threads, pullNumber, notices, error, threadsError, onHold, onPublish, onDiscard }: CheckoutFileViewProps) {
+function CheckoutFileView({ entry, prefix, headSha, drafts, threads, pullNumber, notices, error, threadsError, onHold, onPublish, onDiscard, onReply }: CheckoutFileViewProps) {
   const path = checkoutPath(prefix, entry.path);
   const { file, loading } = useFile(entry.type === 'dir' ? '' : path, entry.kind);
   const [selection, setSelection] = useState<LineSelection | null>(null);
@@ -673,13 +696,25 @@ function CheckoutFileView({ entry, prefix, headSha, drafts, threads, pullNumber,
         hold: onHold,
         publish: onPublish,
         discard: onDiscard,
+        reply: onReply,
         notice: (id) => {
           const n = notices[id];
           if (!n) return null;
           return <DraftNoticeBox notice={n} onPublish={onPublish} draftId={id} />;
         },
       }),
-    [entry.path, headSha, drafts, threads, pullNumber, onHold, onPublish, onDiscard, notices],
+    [
+      entry.path,
+      headSha,
+      drafts,
+      threads,
+      pullNumber,
+      onHold,
+      onPublish,
+      onDiscard,
+      onReply,
+      notices,
+    ],
   );
 
   const body = (

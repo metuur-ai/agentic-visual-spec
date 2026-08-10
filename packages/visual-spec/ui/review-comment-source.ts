@@ -52,6 +52,14 @@ export type ReviewCommentSourceDeps = {
   hold: (input: ReviewDraftInput) => Promise<boolean>;
   publish: (id: string, force?: boolean) => Promise<void>;
   discard: (id: string) => Promise<void>;
+  /**
+   * R-7.15 — answer a thread on the pull request. `id` is the thread root's record id.
+   *
+   * Optional because the caller owns the write: the reply goes to GitHub and the thread
+   * list has to be re-read afterwards, and both of those live with the pull request one
+   * level up, not with the file on screen.
+   */
+  reply?: (id: string, text: string) => Promise<void>;
   /** Per-draft warning or receipt, already rendered by the caller. */
   notice?: (id: string) => React.ReactNode | null;
 };
@@ -160,9 +168,19 @@ export function reviewCommentPanelSource(deps: ReviewCommentSourceDeps): Comment
       return draft ? draftOrigin(draft) : { where: 'local', label: 'Draft — not sent' };
     },
     link: (c) => byThreadId.get(c.id)?.github.htmlUrl ?? byId.get(c.id)?.published?.htmlUrl,
-    // Read-only: the panel shows the thread, github.com is where it is answered. Adding
-    // `reply` here would be a write this surface has not been asked for.
     replies: (c) => (byThreadId.get(c.id)?.replies ?? []).map(toPanelReply),
+    /*
+     * Answering happens here now, not only on github.com.
+     *
+     * The panel could already SHOW a thread's replies while offering no way to add one,
+     * which sent a reviewer who wanted to answer out to the browser and back. The reply
+     * is GitHub's own — `POST /pulls/:n/comments/:id/reply` — so it inherits the thread's
+     * anchor and appears the same to everyone reading the pull request.
+     */
+    ...(deps.reply ? { reply: deps.reply } : {}),
+    // Only a thread has a root for a reply to hang off. A held draft is not on the pull
+    // request yet, and a published one is listed as its thread (see the dedupe above).
+    canReply: (c) => byThreadId.has(c.id),
     notice: (c) => deps.notice?.(c.id) ?? null,
     label: (c) => {
       const line = startLineOf(c);

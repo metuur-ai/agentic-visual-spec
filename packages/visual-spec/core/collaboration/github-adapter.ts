@@ -116,6 +116,52 @@ export type PullRequestSummary = {
 };
 
 /**
+ * Which qualifier a search-derived count is built from. GitHub's own vocabulary,
+ * passed through — and deliberately a closed union rather than a `string`, because
+ * this value is interpolated into the search `q` and a free-form one would make the
+ * qualifier a second injection point beside the login (R-A2.5).
+ */
+export type PullRequestSearchQualifier = 'review-requested' | 'mentions';
+
+/** Who wrote the mention, and the passage of their comment carrying it (R-A3.7). */
+export type AwaitingMention = { author: string; excerpt: string };
+
+/**
+ * One pull request that is waiting on the user. Deliberately *not* a
+ * `PullRequestSummary`: search returns issue-shaped items, which carry `number`,
+ * `title` and `html_url` but no `head.ref` / `head.sha`. Promising the summary shape
+ * here would mean promising a branch and a head commit that were never fetched — and a
+ * checkout button built on them would fail (R-A3.5). The panel joins these onto the
+ * listing by number when it can, and renders the minimal row when it cannot.
+ */
+export type AwaitingItem = {
+  number: number;
+  title: string;
+  htmlUrl: string;
+  /** Present only for mentions found in a review comment — search cannot say who. */
+  mention?: AwaitingMention;
+};
+
+/**
+ * `total` is GitHub's own `total_count`, NOT `items.length` (R-A2.10). Search answers
+ * 30 items per page and this reads one page, so the two genuinely differ on any busy
+ * repository. Collapsing them would force a choice between a count that disagrees with
+ * github.com and a list that pretends to be complete; the panel states the shortfall
+ * instead (R-A3.8).
+ */
+export type PullRequestSearchResult = { total: number; items: AwaitingItem[] };
+
+/**
+ * The mentions count. `total` here is the size of the union and therefore *is*
+ * `items.length` — unlike the search result above, no single `total_count` exists for a
+ * number with two sources.
+ *
+ * `complete` is `false` when one of the two sources failed: the number is then real but
+ * low, and R-A4.5 forbids presenting a reduced count as if it were whole.
+ */
+export type MentionsResult = { total: number; items: AwaitingItem[]; complete: boolean };
+
+/**
  * `GET /compare/{base}...{head}` reduced to what a divergence check needs: the branch
  * point and the paths that changed between it and `head` (R-8.22).
  */
@@ -230,6 +276,33 @@ export interface GitHubAdapter {
    * browser — ever holds a body to parse (R-7.5).
    */
   listPullRequests(repo: RepoRef, state?: PullRequestListState): Promise<PullRequestSummary[]>;
+  /**
+   * R-A2.1 — one page of `search/issues` for the open pull requests of this repository
+   * matching `<qualifier>:<login>`.
+   *
+   * The search API is the source because it is stateless and answers exactly what
+   * github.com answers for the same query, which is the property Unit 7 spent R-7.3
+   * establishing for the open count (R-A2.2 rejects the obvious-looking alternative,
+   * whose contents change when it is read elsewhere).
+   *
+   * `q` is passed as `-f q=…` rather than interpolated into the endpoint path, because
+   * `gh` URL-encodes a field value and would not encode a path. The qualifiers are
+   * space-separated free text — the only free text this adapter sends — so encoding it
+   * by hand at each call site is exactly the mistake this method exists to make once.
+   *
+   * A search failure is an ordinary condition, not an exceptional one: the search rate
+   * limit is 30/minute and separate from the core limit, so a 403 here says nothing
+   * about the health of the listing (R-A4.6). It throws like every other method and the
+   * caller retains its last value (R-7.11).
+   *
+   * `repo` is resolved to the name GitHub currently holds before it enters `q` (R-A2.11)
+   * — this endpoint is the one place a repository rename is not survived for free.
+   */
+  searchPullRequests(
+    repo: RepoRef,
+    qualifier: PullRequestSearchQualifier,
+    login: string,
+  ): Promise<PullRequestSearchResult>;
   /**
    * R-8.22 — `GET /compare/{base}...{head}`. Called as `compareCommits(repo, branch,
    * baseBranch)`, `files` is exactly "what changed on the base branch since the branch
@@ -534,8 +607,9 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
    *
    * `GET /repos/{owner}/{repo}` is a read, and `gh` follows the permanent redirect on a
    * read — so asking the OLD name returns the NEW repository, whose `full_name` is the
-   * answer. That asymmetry is the whole trick: the information needed to fix a write is
-   * available over exactly the verb that still works.
+   * answer. That asymmetry is the whole trick: the information needed to fix a write —
+   * or a search, which follows no redirect either (R-A2.11) — is available over exactly
+   * the verb that still works.
    */
   async function canonicalRepo(stale: string): Promise<string | null> {
     const cached = canonicalNames.get(stale);
@@ -755,6 +829,60 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
       throw new Error(`listPullRequests: ${repo.owner}/${repo.repo} did not terminate within ${MAX_PAGES} pages of ${PER_PAGE}`);
     },
 
+    async searchPullRequests(repo, qualifier, login) {
+      /*
+       * R-A2.11 — THE NAME THAT ENTERS THE QUERY IS THE ONE GITHUB CURRENTLY HOLDS.
+       *
+       * `call()` above can repair a rename *after* the fact because a REST endpoint says
+       * it moved (301/307/308) and where to. The search endpoint does neither: it does
+       * not follow the redirect and it does not report one. A renamed owner comes back
+       * 422 "the listed users and repositories cannot be searched" — which R-A4.3 then
+       * correctly swallows into an unchanged count, so the chips would read zero forever
+       * with nothing on screen to say why. Found against the real API on this very
+       * repository, whose `origin` still names the org GitHub renamed.
+       *
+       * So the resolution happens before the query is built, over the verb that still
+       * works, and is cached for the process by `canonicalRepo` — a rename does not
+       * un-happen, and the LLD's whole objection to a per-refresh cost applies here.
+       *
+       * A resolution that cannot be made answers `null` and the configured name is used
+       * unchanged. A renamed repository is the rare case; an unreachable one is already
+       * covered, and the search then fails exactly as it would have (R-A4.6).
+       */
+      const configured = `${repo.owner}/${repo.repo}`;
+      const target = (await canonicalRepo(configured).catch(() => null)) ?? configured;
+      const q = `is:pr is:open ${qualifier}:${login} repo:${target}`;
+      /*
+       * One page, on purpose. R-A2.10 makes the count `total_count`, so paginating would
+       * buy rows the panel is not required to show (R-7.9 bounds the list and R-A3.8 has
+       * it say when it shows fewer than it counts) at the price of one search request per
+       * page against a 30/minute budget.
+       */
+      const raw = await call<Json>('searchPullRequests', ['api', '-X', 'GET', 'search/issues', '-f', `q=${q}`]);
+      const items = Array.isArray(raw.items) ? (raw.items as Json[]) : [];
+      // The same resolved name, because that is what the items will carry back.
+      const repoUrl = `/repos/${target}`.toLowerCase();
+      return {
+        // GitHub's own answer, kept even where fewer items came back with it (R-A2.10).
+        total: typeof raw.total_count === 'number' ? raw.total_count : items.length,
+        /*
+         * The scope of R-A1.6 / R-A1.7 is re-checked here rather than left entirely to
+         * `q`. The qualifiers say `is:pr is:open repo:…` already, so this filter should
+         * never drop anything — which is the point: `q` is one string, and a count that
+         * silently spanned repositories or included closed pull requests would render
+         * under the wrong repository name with nothing to distinguish it from a true one.
+         */
+        items: items
+          .filter(
+            (item) =>
+              item.pull_request !== undefined &&
+              str(item.state) === 'open' &&
+              str(item.repository_url).toLowerCase().endsWith(repoUrl),
+          )
+          .map((item) => ({ number: num(item.number), title: str(item.title), htmlUrl: str(item.html_url) })),
+      };
+    },
+
     async compareCommits(repo, base, head) {
       const raw = await get('compareCommits', `/repos/${repo.owner}/${repo.repo}/compare/${base}...${head}`);
       const files = Array.isArray(raw.files) ? (raw.files as Json[]) : [];
@@ -902,6 +1030,151 @@ export function createGitHubAdapter(exec: GhExecutor = defaultExecGh): GitHubAda
         if (!after) return out;
       }
       throw new Error(`listThreadResolution: pull ${pullNumber} did not terminate within ${MAX_PAGES} pages`);
+    },
+  };
+}
+
+/** How much of the comment travels with a mention, either side of the `@`. */
+const EXCERPT_BEFORE = 40;
+const EXCERPT_AFTER = 120;
+
+/**
+ * The passage of `body` around the first mention of `login`, or `null` when there is
+ * none (R-A1.9).
+ *
+ * `\b` IS THE WRONG TOOL HERE. A hyphen is legal in a GitHub login and is a word
+ * boundary to a regex, so `/@ana\b/` matches inside `@ana-b` — a different person.
+ * The rule is `@` + the login + a character that cannot occur in a login, where the
+ * login character set is `[A-Za-z0-9-]`, so the terminator is a negative lookahead on
+ * that set and end-of-string satisfies it for free.
+ *
+ * The login is escaped before it reaches the pattern. Task 2.2 validates it against the
+ * same character set before it is ever placed in a query, but this function is also the
+ * one that reads *comment bodies*, and a matcher that could be turned into a different
+ * pattern by its own argument is not worth the two lines it saves.
+ *
+ * Matching is case-insensitive because GitHub logins are.
+ */
+export function mentionIn(body: string, login: string): string | null {
+  const escaped = login.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`@${escaped}(?![A-Za-z0-9-])`, 'i').exec(body);
+  if (!match) return null;
+  const start = Math.max(0, match.index - EXCERPT_BEFORE);
+  const end = Math.min(body.length, match.index + EXCERPT_AFTER);
+  // Collapsed to one line: a review comment is markdown, and the row shows a passage.
+  const passage = body.slice(start, end).replace(/\s+/g, ' ').trim();
+  return `${start > 0 ? '…' : ''}${passage}${end < body.length ? '…' : ''}`;
+}
+
+/**
+ * Reads the mentions count. Stateful across reads — see `read`.
+ */
+export interface MentionsReader {
+  /**
+   * The union of both mention sources for `login`, over `openPulls` (R-A2.6).
+   *
+   * `openPulls` is the listing the caller already holds; this never lists on its own,
+   * which is what bounds the scan to open pull requests of the configured repository
+   * (R-A1.6 / R-A1.7) and what makes a subsequent read nearly free.
+   */
+  read(repo: RepoRef, login: string, openPulls: readonly PullRequestSummary[]): Promise<MentionsResult>;
+}
+
+/**
+ * Build the mentions reader over an adapter.
+ *
+ * WHY TWO SOURCES. `search/issues` with `mentions:` indexes the pull request body and
+ * its conversation comments. It does **not** index review comments — the diff-anchored
+ * ones, which are the only kind this tool writes. Measured against three live pull
+ * requests inside a date window where the unfiltered search provably contained them:
+ * the one mentioning a user in a conversation comment came back, the two mentioning one
+ * only in a review comment did not. A feature built on that search alone would miss
+ * precisely the case it exists for, and would do so silently.
+ *
+ * WHY PER-PULL-REQUEST, NOT THE REPOSITORY-WIDE COMMENT ENDPOINT. `GET
+ * /repos/:o/:r/pulls/comments` looks cheaper — one paginated call instead of one per
+ * pull request — and it was the first design. Its page cap is consumed *before* the
+ * open-pull-request filter can run, because it returns closed and merged pull requests'
+ * comments too, so on a repository with a fast merge rate the count falls as a function
+ * of other people's activity. Bounding it with `since` instead makes the count decay
+ * with the clock, which is the same defect — a number mutated by something other than
+ * the fact it reports — reintroduced from the other side.
+ *
+ * WHY THIS OBJECT HAS A LIFETIME. The cost of source B is one request per open pull
+ * request on the first read, and R-A2.7 is what stops it staying that way: the listing
+ * already carries `updatedAt`, so a later read re-reads only the pull requests whose
+ * last update moved. In the steady state of a tab being switched back to, that is
+ * usually none — but only if something remembers the previous read, which is why this
+ * is a factory and not a free function. The caller holds one per server.
+ */
+export function createMentionsReader(adapter: GitHubAdapter): MentionsReader {
+  /** Pull request number → what the last scan found, and the `updatedAt` it saw. */
+  const scanned = new Map<number, { updatedAt: string; mention: AwaitingMention | null }>();
+
+  return {
+    async read(repo, login, openPulls) {
+      // Keyed by number so a pull request found by both sources is one entry (R-A2.8).
+      const found = new Map<number, AwaitingItem>();
+      let complete = true;
+
+      // Source A — body and conversation comments, as GitHub indexes them.
+      try {
+        const search = await adapter.searchPullRequests(repo, 'mentions', login);
+        for (const item of search.items) found.set(item.number, item);
+      } catch {
+        // R-A4.5: the other source still answers; the union just says it is partial.
+        complete = false;
+      }
+
+      /*
+       * A pull request that has left the listing has been closed or has fallen off the
+       * bound of R-7.9. Either way it is no longer counted, and keeping its scan would
+       * leak one entry per merge for the lifetime of the server.
+       */
+      const listed = new Set(openPulls.map((pull) => pull.number));
+      for (const number of [...scanned.keys()]) if (!listed.has(number)) scanned.delete(number);
+
+      // Source B — review comments, which source A cannot see.
+      for (const pull of openPulls) {
+        const cached = scanned.get(pull.number);
+        let mention = cached?.mention ?? null;
+        if (!cached || cached.updatedAt !== pull.updatedAt) {
+          try {
+            const comments = await adapter.listReviewComments(repo, pull.number);
+            mention = null;
+            for (const comment of comments) {
+              // R-A1.10 — a mention you wrote yourself is not a debt you owe.
+              if (comment.user.toLowerCase() === login.toLowerCase()) continue;
+              const excerpt = mentionIn(comment.body, login);
+              if (excerpt !== null) {
+                mention = { author: comment.user, excerpt };
+                break;
+              }
+            }
+            scanned.set(pull.number, { updatedAt: pull.updatedAt, mention });
+          } catch {
+            /*
+             * The read failed, so `mention` still holds what the previous scan found and
+             * the cache entry is left at its old `updatedAt` — the next read retries it.
+             * A stale hit is closer to the truth than dropping a mention that is still
+             * there, and `complete` says the number cannot be trusted as whole.
+             */
+            complete = false;
+          }
+        }
+        if (mention) {
+          found.set(pull.number, {
+            number: pull.number,
+            title: pull.title,
+            htmlUrl: pull.htmlUrl,
+            mention,
+          });
+        }
+      }
+
+      // Newest first, the order the listing itself uses.
+      const items = [...found.values()].sort((a, b) => b.number - a.number);
+      return { total: items.length, items, complete };
     },
   };
 }

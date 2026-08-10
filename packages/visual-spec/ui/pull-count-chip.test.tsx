@@ -44,6 +44,13 @@ type Server = {
   git?: unknown;
   availability?: unknown;
   pulls?: () => Response;
+  /**
+   * `GET /pulls/awaiting` — R-A4.7's subject. It is a sibling of the listing under the
+   * same prefix, so it is matched *before* it and counted separately: a read of what is
+   * waiting on me is not a read of the listing, and the R-7.10 assertions below count
+   * listings.
+   */
+  awaiting?: () => Response;
   /** What `POST /__vs/dir/pick` answers, for the root change R-8.1 is reached through. */
   pick?: unknown;
 };
@@ -55,6 +62,9 @@ function installFetch(server: Server = {}) {
     // R-6.3 — the branch routes are off here; this suite is about the count.
     if (url === '/__vs/git/branches') return jsonRes({ error: 'no route' }, 404);
     if (url === '/__vs/collab') return jsonRes(server.availability ?? CONFIGURED);
+    if (url.startsWith('/__vs/collab/pulls/awaiting')) {
+      return (server.awaiting ?? (() => jsonRes({ reviewRequested: { ok: false }, mentioned: { ok: false } })))();
+    }
     if (url.startsWith('/__vs/collab/pulls')) return (server.pulls ?? (() => jsonRes({ pulls: PULLS })))();
     if (url === '/__vs/collab/open') return jsonRes({ ok: true, jobId: 'job-1', kind: 'open' });
     if (url === '/__vs/dir/pick') return jsonRes(server.pick ?? { root: '/repo2' });
@@ -92,7 +102,8 @@ async function mountCount(server: Server = {}) {
 }
 
 const pullReads = (impl: ReturnType<typeof installFetch>) =>
-  impl.mock.calls.filter(([u]) => String(u).startsWith('/__vs/collab/pulls')).length;
+  impl.mock.calls.filter(([u]) => String(u).startsWith('/__vs/collab/pulls') && !String(u).startsWith('/__vs/collab/pulls/awaiting'))
+    .length;
 
 describe('the count, where collaboration is configured (R-7.1 / R-7.3)', () => {
   it('appears in the chip, beside the repository the chip already names', async () => {
@@ -160,6 +171,28 @@ describe('when the count is read (R-7.10 / R-7.11)', () => {
     // Not an error, not a blank: the last thing that was actually true.
     expect(screen.getByTestId('git-pull-count').textContent).toContain('3');
     expect(screen.getByTestId('git-chip').textContent).not.toMatch(/unreachable|error/i);
+  });
+});
+
+/*
+ * R-A4.7. `pull-requests-awaiting-you` is an amendment, and nothing an amendment adds is
+ * allowed to take down what already worked. The chips that read `/pulls/awaiting` are not
+ * in the header yet — this stands guard for the commit that adds them, and asserts the
+ * property in the place it has to hold rather than after it has already been broken once.
+ */
+describe('a failed awaiting read takes nothing with it (R-A4.7)', () => {
+  it('leaves the open count, its list and the header rendering', async () => {
+    const { count } = await mountCount({ awaiting: () => jsonRes({ error: 'search is unavailable' }, 500) });
+
+    expect(count.textContent).toContain('3');
+    expect(screen.getByTestId('git-chip').textContent).toContain('acme/docs');
+    expect(screen.getByTestId('git-chip').textContent).not.toMatch(/unavailable|error|failed/i);
+
+    // And the list the count opens is untouched: a reviewer who cannot see their
+    // mentions can still see everything they could see yesterday.
+    fireEvent.click(count);
+    const menu = await screen.findByTestId('git-pull-menu');
+    expect(within(menu).getAllByTestId(/^git-pull-\d+$/)).toHaveLength(3);
   });
 });
 
