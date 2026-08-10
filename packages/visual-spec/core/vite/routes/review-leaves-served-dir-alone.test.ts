@@ -348,7 +348,9 @@ describe('R-W5.3 / R-W5.4 — a checkout-supplied review leaves the served direc
      */
     expect(results[0]).toMatchObject({ status: 200, json: { ok: true, source: 'checkout', headSha } });
     const mounted = (results[0]!.json as { worktree: { path: string } }).worktree;
-    expect(mounted.path).toContain('.visual-spec/worktrees/pr-7');
+    // The repository is half the address, not decoration: two repositories' #7 used to
+    // land on one directory, and R-W3.5 moved the mount under `<owner>/<repo>/` to stop it.
+    expect(mounted.path).toContain('.visual-spec/worktrees/acme/specs/pr-7');
 
     // The bytes came from the pull request's tree, not from the served directory — the
     // file says so, and `docs/local.md` (which exists only in the served directory) is not

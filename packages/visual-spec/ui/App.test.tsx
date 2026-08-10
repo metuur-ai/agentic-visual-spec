@@ -119,7 +119,13 @@ function installFetch(availability: unknown = AVAILABILITY) {
     }
     // The sidebar's collaborate item and the header chip both count these (R-7.1).
     if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: OPEN_PULLS });
-    if (url === '/__vs/collab/open' && method === 'POST') return jsonRes({ ok: true });
+    // Both spellings of the same request. A pasted URL now carries its repository in the
+    // path (R-W4.1), so a link to `acme/docs` opens against `acme/docs` rather than
+    // against whatever this session happens to be configured for; a bare number still
+    // takes the legacy form, which applies the configured repository (R-W4.2).
+    if (method === 'POST' && (url === '/__vs/collab/open' || /^\/__vs\/collab\/repos\/[^/]+\/[^/]+\/open$/.test(url))) {
+      return jsonRes({ ok: true });
+    }
     if (url === '/__vs/collab/doc-1') {
       return jsonRes({
         documentId: 'doc-1',

@@ -160,13 +160,13 @@
   - verify: the local-mode and `pull-requests-awaiting-you` suites pass with no assertion edits
   - landed:
 
-- [ ] 5.2 The served directory is undisturbed by a review (deps: 1.3, est: ~1h)
+- [x] 5.2 The served directory is undisturbed by a review (deps: 1.3, est: ~1h)
   - why: the promise the worktree design was built on, now extended to a source that has no working copy at all. Unsaved edits are the case that matters.
   - acceptance: R-W5.3 — WHILE a review is open, THE SYSTEM SHALL leave the served directory's working copy, current branch, and unsaved contents unmodified. R-W5.4 — WHEN a review is closed, THE SYSTEM SHALL return the interface to the served directory.
   - verify: with uncommitted edits present, complete a foreign-repository review; edits, branch and working copy unchanged, and the file tree returns to the project
   - landed:
 
-- [ ] 5.3 No writes, no serve-path creep, no credential leak (deps: 1.3, est: ~1h)
+- [x] 5.3 No writes, no serve-path creep, no credential leak (deps: 1.3, est: ~1h)
   - why: R-W5.6 is the guard against the withdrawn design creeping back — the server has never accepted a caller-supplied directory to serve, and that must stay true now that nothing needs it to change.
   - acceptance: R-W5.5 — THE SYSTEM SHALL NOT commit, push, create a branch, or merge as part of a review. R-W5.6 — THE SYSTEM SHALL NOT accept a directory to serve that the user did not choose through the operating system's own directory chooser. R-W5.8 — no credential in any response, event, or client-visible state.
   - verify: no write git command issued across a full review; a caller-supplied serve path is refused; token scan over responses and SSE events is clean
@@ -198,7 +198,7 @@
   - verify: write-on-A read-only-on-B credential; B's review is reviewer-classified and no route substitutes a repository
   - landed: `core/collaboration/authorization.test.ts` for the classification, `collab.repo-scoped.test.ts` for the route half
 
-- [ ] 6.4 Checkout tests stay on real git (deps: 1.2, est: ~30m)
+- [x] 6.4 Checkout tests stay on real git (deps: 1.2, est: ~30m)
   - why: already the practice in this package, and the reason a hand-written `.git` parser was replaced once before. The extraction in 1.2 must not quietly swap real repositories for fixtures.
   - acceptance: R-W6.8 — THE SYSTEM SHALL include tests that drive the checkout source against real git repositories.
   - verify: the checkout suite still creates real repositories; no fixture `.git` directories introduced
