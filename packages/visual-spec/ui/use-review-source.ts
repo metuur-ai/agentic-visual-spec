@@ -61,6 +61,25 @@ function toTreeEntry(entry: ReviewEntry): TreeEntry {
     : { path: entry.path, name: entry.name, type: 'file', kind: reviewFileKind(entry.name) };
 }
 
+/**
+ * What a 200 that is not the shape the route promised is called on screen.
+ *
+ * `CollabClient.call` casts the parsed body to the route's type without reading it, so
+ * "the request succeeded" and "the body is a listing" are separate facts and only the
+ * first one is checked there. A proxy interstitial, a dev-server HTML fallback, a route
+ * whose shape moves — each arrives here as `res.ok` with nothing to map. Before this, the
+ * mapping threw inside a React state updater; nothing above the reviewing surface catches
+ * that, so the reviewer got a blank page rather than any of the sentences R-11.4 and
+ * R-W2.7 went to the trouble of writing.
+ *
+ * The wording sits in R-W2.7's middle bucket on purpose: this is not a missing credential
+ * and not an unreachable host, it is a read that came back unusable. There is no server
+ * sentence to quote — the server is exactly what is in doubt — so the module supplies one
+ * and sends it down the same `setError` path as every other failed read.
+ */
+const unreadableBody = (what: 'folder' | 'file') =>
+  `This ${what} could not be read — the server answered something this review could not understand.`;
+
 export type ReviewTree = {
   /** Every entry read so far, parents before children. Grows as directories are opened. */
   entries: TreeEntry[];
@@ -112,12 +131,22 @@ export function useReviewTree(client: CollabClient, pullNumber: number): ReviewT
         setError(res.message);
         return;
       }
+      // Checked out here, before the state updater, and not inside it. An updater runs
+      // during React's own work; a throw in there takes the whole surface down, whereas a
+      // failure recognised out here is just another failed listing.
+      const entries = (res.value as { entries?: unknown } | null)?.entries;
+      if (!Array.isArray(entries)) {
+        // Forgotten for the same reason a route failure is: reopening the folder retries.
+        asked.current.delete(path);
+        setError(unreadableBody('folder'));
+        return;
+      }
       setError(null);
       setByDir((prev) => {
         const next = new Map(prev);
         // `set` on an existing key keeps its original position, so a re-read cannot move
         // a directory ahead of its own parent.
-        next.set(path, res.value.entries.map(toTreeEntry));
+        next.set(path, (entries as ReviewEntry[]).map(toTreeEntry));
         return next;
       });
     },
@@ -167,10 +196,19 @@ export function useReviewFile(client: CollabClient, pullNumber: number, entry: T
     setState({ text: null, loading: true, error: null });
     void client.pullRequestFile(pullNumber, path).then((res) => {
       if (!live) return;
+      if (!res.ok) {
+        setState({ text: null, loading: false, error: res.message });
+        return;
+      }
+      // The same unchecked cast, one route over. This one does not throw — `undefined`
+      // simply becomes the file's `text` and travels on as a string that isn't one — which
+      // is worse in its own way: the viewer opens on nothing and says nothing was wrong.
+      // A body with no text is a file that could not be read, and is reported as one.
+      const text = (res.value as { text?: unknown } | null)?.text;
       setState(
-        res.ok
-          ? { text: res.value.text, loading: false, error: null }
-          : { text: null, loading: false, error: res.message },
+        typeof text === 'string'
+          ? { text, loading: false, error: null }
+          : { text: null, loading: false, error: unreadableBody('file') },
       );
     });
     return () => {
