@@ -120,26 +120,27 @@ asserted in a test with no requirement above it, which is why it is stated here 
 | R-5.5 | BEFORE changing branch, THE SYSTEM SHALL evaluate R-5.4; IF any path is reported, THE SYSTEM SHALL refuse the change and SHALL NOT invoke `checkout`. |
 | R-5.6 | THE SYSTEM SHALL NOT stash, discard, force or otherwise modify uncommitted work in order to change branch. |
 | R-5.7 | THE SYSTEM SHALL change branch only to a branch that already exists locally, or to a branch of `origin` for which a tracking branch is created; THE SYSTEM SHALL NOT create a branch from an arbitrary name supplied by the client. |
-| R-5.8 | WHEN a branch change succeeds, THE SYSTEM SHALL ensure the collaboration ignore entry is present in `.gitignore` before reporting success. |
+| R-5.8 | THE SYSTEM SHALL keep the collaboration directory ignored across a branch change, and SHALL NOT write to the working tree in order to do so. |
 | R-5.9 | WHEN a branch change succeeds, THE SYSTEM SHALL report the git context of Unit 1 as read after the change, and the client SHALL NOT infer the resulting context. |
 | R-5.10 | THE SYSTEM SHALL emit only branch names, ahead and behind counts, and repository-relative paths beyond the process boundary, and SHALL NOT emit absolute filesystem paths or git's error output. |
 | R-5.11 | IF `git` cannot be started, exits non-zero, or refuses the directory, THE SYSTEM SHALL report the failure and SHALL NOT throw. |
-| R-5.12 | IF a branch change succeeds and the ignore entry of R-5.8 cannot be written, THE SYSTEM SHALL report the branch as changed, carrying the git context of R-5.9, and SHALL report that the entry was not written without emitting git's or the filesystem's error text. |
 
-**Note on R-5.8:** `.gitignore` is tracked, so a branch whose `.gitignore` predates
-the collaboration entry un-ignores `.visual-spec/` — which turns every mounted
-pull-request worktree into thousands of untracked entries in `git status`. The
-existing guarantee runs when a worktree is mounted and never again; a branch change
-is the second moment it must run.
+**Note on R-5.8:** what this requires depends entirely on where the entry lives, and it
+used to require a great deal. Written to `.gitignore` the entry is tracked content, so a
+branch predating it un-ignores `.visual-spec/` — turning every mounted pull-request
+worktree into thousands of untracked entries in `git status`. That made a branch change
+the second moment the entry had to be written, and because that write goes through the
+filesystem rather than through git it could fail for reasons git never sees (a read-only
+checkout, a read-only volume) with the absolute path of the file in the error, on the one
+route in the package that writes — so it also needed a state for "the branch changed and
+the entry did not get written", carried as a warning beside the fresh context rather than
+as a failure, since R-6.7 has the client adopt the returned context and nothing else.
 
-**Note on R-5.12:** that entry is written through the filesystem rather than through
-git, so it can fail for reasons git never sees — a read-only checkout, a read-only
-volume — and Node puts the absolute path of the file into the error it raises. This is
-the only route in the package that writes, so it is the only place such an error could
-reach the boundary R-1.11 and R-5.10 draw. Reporting the change as a failure would be
-worse than the leak: the branch really did move, R-6.7 has the client adopt the
-returned context and nothing else, so a failure would leave the chip naming a branch
-the repository has already left.
+None of that is required now. The entry is written to `.git/info/exclude`, which is
+per-clone and outside the working tree: no branch carries a version of it, so a checkout
+cannot take it away. The guarantee is kept by ensuring it once, where R-13.5 already
+does — before the first checkout is created — and this unit writes nothing at all. The
+requirement is therefore stated as the property to preserve, not as a write to perform.
 
 ## Unit 6: Changing branch from the header
 

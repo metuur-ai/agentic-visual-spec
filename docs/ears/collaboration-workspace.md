@@ -72,6 +72,24 @@ into another.
 | R-W3.6 | THE SYSTEM SHALL identify locally held review comments by repository together with pull request number, for the same reason. |
 | R-W3.7 | THE SYSTEM SHALL decode a repository identifier supplied in a request before validating it, and SHALL refuse one that does not name a well-formed repository. |
 | R-W3.8 | THE SYSTEM SHALL treat reviewing a pull request of any repository as a read operation, requiring no write access to it. |
+| R-W3.9 | WHERE locally held review comments exist under the identification that predates R-W3.6, THE SYSTEM SHALL adopt them into the configured repository's identification on first read, SHALL NOT adopt them into any other repository's, and SHALL NOT replace comments already held under the new identification. |
+
+**Note on R-W3.7:** the refusal happens in two places and only one of them is this
+requirement's. A traversal spelled in encoded form is normalised away by URL parsing before
+any router sees it, so over HTTP the request arrives naming no pull request route at all
+and is answered as an unknown route. The decode-then-validate of this requirement is what
+answers the forms that do reach the router, and it is asserted where it lives, by calling
+the router directly. Both are needed: the first is a property of the hosts, which R-W5.7
+pins but this requirement does not own, and the second is what survives a host that
+normalises differently or no host at all.
+
+**Note on R-W3.9:** the file predates repository-scoped identification, so it was written
+when only one repository could be reviewed and belongs to that one as a matter of fact.
+Letting any repository claim it would invent a provenance and put one project's comments
+into another's review, which is what R-W3.4 and R-W3.6 exist to prevent. Adopting it
+matters rather than being tidy: it holds the record of which comments have already been
+posted, and nothing can reconstruct that — abandoning the file silently rearms every
+duplicate.
 
 ## Unit 4: Entry point
 
@@ -103,6 +121,24 @@ clone by hand.
 | R-W5.6 | THE SYSTEM SHALL NOT accept, from any caller, a directory to serve that the user did not choose through the operating system's own directory chooser. |
 | R-W5.7 | THE SYSTEM SHALL expose this behaviour identically from both hosts, without host-specific implementation. |
 | R-W5.8 | THE SYSTEM SHALL NOT include a credential in any response, event, or client-visible state. |
+| R-W5.9 | WHEN a checkout is mounted for a pull request, THE SYSTEM SHALL remove any checkout of that same pull request left under the path form that predates R-W3.5, and SHALL leave checkouts of other pull requests untouched. |
+
+**Note on R-W5.3:** R-13.5 requires the collaboration directory to be ignored by git before
+the first checkout is created, and ensuring that is a write. It is not an exception to this
+requirement because it does not go into the working copy: it is written to the repository's
+own exclude file, which is per-clone, outside the working tree, invisible to `git status`,
+and unaffected by which branch is checked out. A review therefore leaves no diff for the
+reviewer to discard and imposes nothing on anyone who pulls the branch. Writing it to
+`.gitignore` would do all three, and did.
+
+**Note on R-W5.9:** the opposite of R-W3.9, and the difference is what the thing is. A
+checkout holds no bytes the user wrote — it is a detached copy of a commit the next fetch
+produces again — so there is nothing to preserve, and it is registered with git by absolute
+path, so it cannot be adopted by a rename the way a plain file can. Leaving it is the
+harmful option: nothing collides on disk, but the listing reads the repository out of the
+path, so a pre-scoping checkout stops being reported while remaining registered with git
+and holding objects alive — invisible to every surface that could remove it. It is removed
+at the one moment its identity is not a guess, a mount of that same number.
 
 ## Unit 6: Testability
 

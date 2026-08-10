@@ -164,11 +164,15 @@ because git writes absolute paths into it, so git's own "would be overwritten"
 message is unavailable by construction. `--porcelain` puts repository-relative paths
 on stdout, which is the only form allowed across the boundary anyway (R-5.10).
 
-`ensureIgnored` runs again after a successful change (R-5.8). `.gitignore` is
-tracked, so a branch predating the collaboration entry un-ignores `.visual-spec/`
-and every mounted worktree becomes untracked noise in `git status` — the failure
-`core/collaboration/worktree.ts` already exists to prevent, at the one other moment
-it can occur.
+**Nothing re-asserts the collaboration ignore entry (R-5.8).** It ran here once, because
+`.gitignore` is tracked and a branch predating the entry un-ignores `.visual-spec/` —
+every mounted worktree becoming untracked noise in `git status`, the failure
+`core/collaboration/worktree.ts` exists to prevent, at the one other moment it can occur.
+`ensureIgnored` now writes `.git/info/exclude` instead, which is per-clone and outside
+the working tree, so no branch can carry a version of it and the entry survives the
+change on its own. What went with that move: this call, the `ignore-failed` result of
+`CheckoutResult`, the 200-with-warning arm of `routes/git.ts`, and the end-to-end test
+that provoked an unwritable `.gitignore` to prove no absolute path reached the wire.
 
 **Mounted worktrees do not block a change.** They are detached checkouts holding no
 branch, so git permits it, and the review surface reads them by absolute path, so a

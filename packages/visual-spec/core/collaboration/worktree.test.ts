@@ -93,28 +93,74 @@ describe('worktree', () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  /**
+   * The entry goes to `.git/info/exclude`, which is per-clone and outside the working
+   * tree. Every case below asserts the destination and not just the content, because the
+   * destination is the whole decision: `.gitignore` would ignore the directory just as
+   * well and would be tracked content, a diff the reviewer did not ask for, and — the
+   * reason the checkout path used to need a second call — versioned, so a branch change
+   * could take it away.
+   */
   describe('ensureIgnored', () => {
-    it('creates .gitignore when there is none', async () => {
+    /** A repository with a working tree, so the exclude file has somewhere to live. */
+    async function repo(): Promise<string> {
       const dir = await mkdtemp(join(tmpdir(), 'vs-ignore-'));
+      await git(dir, 'init', '-q', '-b', 'main');
+      return dir;
+    }
+
+    const excludeOf = (dir: string) => join(dir, '.git', 'info', 'exclude');
+
+    it('writes the entry to .git/info/exclude and leaves tracked content untouched', async () => {
+      const dir = await repo();
+      await writeFile(join(dir, '.gitignore'), 'node_modules/\n', 'utf8');
+      await git(dir, 'add', '.gitignore');
+
       await ensureIgnored(dir);
-      expect(await readFile(join(dir, '.gitignore'), 'utf8')).toBe('.visual-spec/\n');
+
+      expect(await readFile(excludeOf(dir), 'utf8')).toContain('.visual-spec/\n');
+      // The point of the destination: nothing the user owns moved.
+      expect(await readFile(join(dir, '.gitignore'), 'utf8')).toBe('node_modules/\n');
+      expect(await git(dir, 'status', '--porcelain')).toBe('A  .gitignore');
       await rm(dir, { recursive: true, force: true });
     });
 
     it('appends without eating the last existing line when the file lacks a trailing newline', async () => {
-      const dir = await mkdtemp(join(tmpdir(), 'vs-ignore-'));
-      await writeFile(join(dir, '.gitignore'), 'node_modules', 'utf8');
+      const dir = await repo();
+      await writeFile(excludeOf(dir), '# comment', 'utf8');
       await ensureIgnored(dir);
-      expect(await readFile(join(dir, '.gitignore'), 'utf8')).toBe('node_modules\n.visual-spec/\n');
+      expect(await readFile(excludeOf(dir), 'utf8')).toBe('# comment\n.visual-spec/\n');
       await rm(dir, { recursive: true, force: true });
     });
 
     it('is idempotent, and recognises the entry written without a trailing slash', async () => {
+      const dir = await repo();
+      await writeFile(excludeOf(dir), '.visual-spec\n', 'utf8');
+      await ensureIgnored(dir);
+      await ensureIgnored(dir);
+      expect(await readFile(excludeOf(dir), 'utf8')).toBe('.visual-spec\n');
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    it('ignores the directory from a subdirectory of the repository, not beside it', async () => {
+      // `baseDir` is whatever directory is being served, which need not be the root.
+      const dir = await repo();
+      const nested = join(dir, 'docs');
+      await mkdir(nested, { recursive: true });
+
+      await ensureIgnored(nested);
+
+      expect(await readFile(excludeOf(dir), 'utf8')).toContain('.visual-spec/\n');
+      // Not a second exclude file beside the served directory — there is no such thing.
+      await expect(readFile(join(nested, '.git', 'info', 'exclude'), 'utf8')).rejects.toThrow();
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    it('does nothing at all outside a repository', async () => {
+      // No git means nothing that could see the directory, which is the outcome asked for.
       const dir = await mkdtemp(join(tmpdir(), 'vs-ignore-'));
-      await writeFile(join(dir, '.gitignore'), '.visual-spec\n', 'utf8');
-      await ensureIgnored(dir);
-      await ensureIgnored(dir);
-      expect(await readFile(join(dir, '.gitignore'), 'utf8')).toBe('.visual-spec\n');
+      await expect(ensureIgnored(dir)).resolves.toBeUndefined();
+      await expect(readFile(join(dir, '.gitignore'), 'utf8')).rejects.toThrow();
       await rm(dir, { recursive: true, force: true });
     });
   });
@@ -145,7 +191,9 @@ describe('worktree', () => {
       expect(await git(result.worktree.path, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('HEAD');
 
       // The whole point of ensureIgnored — the mount adds nothing to `git status`.
-      expect(await git(base, 'status', '--porcelain')).toBe('?? .gitignore');
+      // Empty, not `?? .gitignore`: the entry lives in `.git/info/exclude` now, so the
+      // mount leaves no trace in the served directory's tracked content either (R-W5.3).
+      expect(await git(base, 'status', '--porcelain')).toBe('');
     });
 
     it('moves an existing mount to the new head instead of recreating it', async () => {

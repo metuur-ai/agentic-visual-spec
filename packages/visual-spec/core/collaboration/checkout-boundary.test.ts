@@ -17,9 +17,10 @@
  * working copy. They are two different relationships with git, and joining them
  * reintroduces exactly the disturbance the worktree design exists to avoid.
  *
- * Note the edge that legitimately runs the other way: `core/git-branches.ts` imports
- * `ensureIgnored` from `worktree.ts` (R-5.8). This guard is directional and says
- * nothing about that.
+ * This guard is directional: it forbids `core/collaboration/` reaching for
+ * `git-branches.ts`, and says nothing about the other way round. `git-branches.ts` used
+ * to import `ensureIgnored` to re-assert the entry after a checkout, and no longer needs
+ * to now that the entry lives in `.git/info/exclude` and no branch can carry it away.
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';

@@ -109,16 +109,6 @@ export async function handleGitRequest(
     if (result.ok) return { status: 200, json: { context: result.context } };
     if (result.reason === 'dirty') return { status: 409, json: { error: 'dirty', paths: result.paths } };
     if (result.reason === 'unknown-branch') return { status: 400, json: { error: 'unknown-branch' } };
-    // Answered 200, not 500, and this is the one failure arm that is. The branch
-    // changed; only the ignore entry did not get written. A 5xx here would make the
-    // client keep the branch it was on (R-6.7 adopts the returned context and nothing
-    // else), so the chip would name a branch the repository has already left — the
-    // class of lie Unit 3's states exist to prevent. The warning travels with the
-    // context so the caller can say what did not happen without contradicting what
-    // did.
-    if (result.reason === 'ignore-failed') {
-      return { status: 200, json: { context: result.context, warning: 'ignore-failed' } };
-    }
     return { status: 500, json: { error: result.reason } };
   }
 

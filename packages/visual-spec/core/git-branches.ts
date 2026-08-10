@@ -38,7 +38,6 @@
  * sibling core modules only.
  */
 import { defaultExecGit, type GitContext, type GitExecutor, type GitResult, readGitContext } from './git-context';
-import { ensureIgnored } from './collaboration/worktree';
 
 /** A local branch as the chip's switcher needs it. */
 export type LocalBranch = {
@@ -83,13 +82,6 @@ export type CheckoutResult =
   | { ok: false; reason: 'dirty'; paths: string[] }
   /** R-5.7 — the name is not a branch git just reported, so it was never passed on. */
   | { ok: false; reason: 'unknown-branch' }
-  /**
-   * R-5.8 — the branch **did** change and the ignore entry could not be written.
-   * Distinct from every other failure here because the repository moved: the caller
-   * is handed the context it moved to, and the user is told the one thing that did
-   * not happen rather than that nothing did.
-   */
-  | { ok: false; reason: 'ignore-failed'; context: GitContext }
   | { ok: false; reason: GitFailure };
 
 const failureOf = (result: GitResult): GitFailure =>
@@ -202,10 +194,14 @@ export async function readDirtyPaths(
  *      `checkout` is not invoked, so git never gets the chance to succeed the way
  *      this module exists to prevent;
  *   3. check out, creating a tracking branch where the name is only on `origin`;
- *   4. re-assert the collaboration ignore entry, because `.gitignore` is tracked and
- *      the branch just arrived at may predate it (R-5.8);
- *   5. read the context back rather than composing it, so the caller is told what
+ *   4. read the context back rather than composing it, so the caller is told what
  *      the repository is instead of what it was asked to become (R-5.9).
+ *
+ * Nothing re-asserts the collaboration ignore entry here, and that is a property of where
+ * the entry lives rather than an omission: `ensureIgnored` writes `.git/info/exclude`,
+ * which is per-clone and outside the working tree, so a checkout cannot take it away
+ * (R-5.8). While it was written to the tracked `.gitignore` it could, and this function
+ * carried a fourth step and a failure state for it.
  */
 export async function checkoutBranch(
   dir: string,
@@ -230,22 +226,6 @@ export async function checkoutBranch(
       // repository with more than one remote carrying the same branch name.
       await exec(['-C', dir, 'checkout', '-b', branch, '--track', `origin/${branch}`]);
   if (changed.exitCode !== 0) return { ok: false, reason: failureOf(changed) };
-
-  // Caught, not awaited bare. `ensureIgnored` reads and writes `.gitignore` through
-  // `node:fs`, and both can throw for reasons that have nothing to do with git —
-  // `EACCES` on a read-only checkout, `EROFS` on a mounted volume. Node puts the
-  // absolute path into the message ("EACCES: permission denied, open '/Users/…'"),
-  // this module has no caller that catches (`core/vite/routes/git.ts` treats every
-  // failure as a value, deliberately), and the host's last-resort handler answers
-  // 500 with `err.message` — so an uncaught throw here is an absolute filesystem path
-  // crossing the process boundary from the one route that writes, breaking R-5.10 and
-  // R-1.11 at once. The branch did change, so this is not reported as a failed
-  // checkout; it is the ignore entry that could not be written.
-  try {
-    await ensureIgnored(dir);
-  } catch {
-    return { ok: false, reason: 'ignore-failed', context: await readGitContext(dir, exec) };
-  }
 
   return { ok: true, context: await readGitContext(dir, exec) };
 }

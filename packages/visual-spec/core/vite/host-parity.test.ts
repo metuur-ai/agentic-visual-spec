@@ -580,8 +580,10 @@ describe('5.4 — the branch routes answer identically on both hosts', () => {
         },
       },
     });
-    // R-5.8 — the ignore entry is present before success was reported.
-    expect(await readFile(join(repo, '.gitignore'), 'utf8')).toContain('.visual-spec/');
+    // R-5.8 — the change wrote nothing into the working tree at all. The ignore entry is
+    // ensured at mount, into `.git/info/exclude`, which a branch change cannot un-ignore,
+    // so neither host has any reason to touch `.gitignore` here — and neither does.
+    await expect(readFile(join(repo, '.gitignore'), 'utf8')).rejects.toThrow();
     await onMainAndClean();
   });
 

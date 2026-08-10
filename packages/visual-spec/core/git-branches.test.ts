@@ -12,14 +12,14 @@
  * portable way to uninstall `git` from inside a test.
  */
 import { execFile } from 'node:child_process';
-import { access, chmod, constants, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { defaultExecGit, type GitExecutor } from './git-context';
 import { checkoutBranch, listBranches, readDirtyPaths } from './git-branches';
-import { IGNORE_ENTRY } from './collaboration/worktree';
+import { ensureIgnored, IGNORE_ENTRY } from './collaboration/worktree';
 
 /**
  * Raised for this file only; the suite default stays 5s.
@@ -397,9 +397,12 @@ describe('checkoutBranch', () => {
     expect(await git(repo, 'rev-parse', '--abbrev-ref', 'published@{upstream}')).toBe('origin/published');
   });
 
-  it('ensures the collaboration ignore entry before reporting success (R-5.8)', async () => {
-    // `.gitignore` is tracked, so a branch predating the entry un-ignores
-    // `.visual-spec/` and every mounted worktree becomes untracked noise.
+  it('leaves the collaboration ignore entry in force across the change, writing nothing (R-5.8)', async () => {
+    // The requirement this replaces made `checkoutBranch` re-assert the entry, because
+    // `.gitignore` is tracked and a branch predating it un-ignores `.visual-spec/` —
+    // turning every mounted worktree into untracked noise. `.git/info/exclude` is
+    // per-clone, so the branch it arrives at cannot carry a version of it: the guarantee
+    // holds without this function doing anything, which is why it no longer does.
     const repo = join(base, 'ignore-entry');
     await initRepo(repo);
     await writeFile(join(repo, '.gitignore'), 'node_modules/\n');
@@ -407,68 +410,18 @@ describe('checkoutBranch', () => {
     await git(repo, 'commit', '-q', '-m', 'gitignore without the entry');
     await git(repo, 'checkout', '-q', '-b', 'older');
     await git(repo, 'checkout', '-q', 'main');
-    await writeFile(join(repo, '.gitignore'), `node_modules/\n${IGNORE_ENTRY}\n`);
-    await git(repo, 'commit', '-q', '-am', 'add the entry on main');
+    // Mounting is what ensures the entry; this is that one call, made once.
+    await ensureIgnored(repo);
     await mkdir(join(repo, '.visual-spec', 'worktrees'), { recursive: true });
     await writeFile(join(repo, '.visual-spec', 'worktrees', 'note'), 'x\n');
 
     const result = await checkoutBranch(repo, 'older');
 
     expect(result).toMatchObject({ ok: true });
-    expect(await readFile(join(repo, '.gitignore'), 'utf8')).toContain(IGNORE_ENTRY);
     expect(await git(repo, 'status', '--porcelain')).not.toContain('.visual-spec');
-  });
-
-  it('reports a branch that changed but could not be ignored, without throwing and without a path (R-5.8, R-5.10)', async () => {
-    // `ensureIgnored` rethrows any read error that is not ENOENT and can fail on the
-    // write for reasons that have nothing to do with git — a read-only checkout, a
-    // read-only volume. Node puts the absolute path into that error, this module's
-    // caller catches nothing on purpose, and the host answers 500 with `err.message`,
-    // so an uncaught throw here would put the served directory on the wire.
-    const repo = join(base, 'ignore-unwritable');
-    await initRepo(repo);
-    await git(repo, 'remote', 'add', 'origin', 'https://github.com/acme/widgets.git');
-    await writeFile(join(repo, '.gitignore'), 'node_modules/\n');
-    await git(repo, 'add', '-A');
-    await git(repo, 'commit', '-q', '-m', 'gitignore without the entry');
-    // Identical on both branches, so `checkout` never rewrites the read-only file and
-    // the only write refused is the one this test is about.
-    await git(repo, 'branch', 'older');
-    await chmod(join(repo, '.gitignore'), 0o444);
-    // A process that writes through mode bits (root) cannot produce the failure, so
-    // the precondition is asserted rather than assumed.
-    let readOnlyHolds = true;
-    try {
-      await access(join(repo, '.gitignore'), constants.W_OK);
-      readOnlyHolds = false;
-    } catch {
-      readOnlyHolds = true;
-    }
-    expect(readOnlyHolds).toBe(true);
-
-    const result = await checkoutBranch(repo, 'older');
-
-    // The repository moved, so this is not reported as a checkout that failed: the
-    // caller gets the context it moved to, and the one thing that did not happen.
-    expect(result).toEqual({
-      ok: false,
-      reason: 'ignore-failed',
-      context: {
-        state: 'remote',
-        branch: 'older',
-        detached: false,
-        host: 'github.com',
-        owner: 'acme',
-        repo: 'widgets',
-        url: 'https://github.com/acme/widgets.git',
-      },
-    });
-    expect(await git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('older');
-    // Nothing of the filesystem's or git's error text survives into the value.
-    expect(JSON.stringify(result)).not.toContain(repo);
-    expect(JSON.stringify(result)).not.toMatch(/EACCES|permission denied/i);
-    expect(await readFile(join(repo, '.gitignore'), 'utf8')).not.toContain(IGNORE_ENTRY);
-    await chmod(join(repo, '.gitignore'), 0o644);
+    // And the change wrote nothing into content the user owns.
+    expect(await readFile(join(repo, '.gitignore'), 'utf8')).toBe('node_modules/\n');
+    expect(await readFile(join(repo, '.git', 'info', 'exclude'), 'utf8')).toContain(IGNORE_ENTRY);
   });
 
   it('reports the failure rather than throwing when git cannot run (R-5.11)', async () => {

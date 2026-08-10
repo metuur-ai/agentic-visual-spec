@@ -391,14 +391,15 @@ describe('R-W5.3 / R-W5.4 — a checkout-supplied review leaves the served direc
     expect(await gitState(served)).toEqual(gitBefore);
   }, 60_000);
 
-  it('adds the ignore line, and only the ignore line, when the served directory has none', async () => {
+  it('ignores the collaboration directory without touching tracked content, when the served directory has none', async () => {
     /*
-     * The one write into tracked content a review is allowed. `ensureIgnored` runs before
-     * the worktree is created, deliberately: a checkout inside the working tree that git
-     * can see is thousands of untracked files in `git status`, which is itself a way of
-     * disturbing the directory. So the exception exists to serve the requirement rather
-     * than to escape it — and it is pinned here to exactly one appended line, on one file,
-     * so it cannot quietly grow into a second write.
+     * There used to be one exception here: `ensureIgnored` appended a line to the served
+     * directory's `.gitignore`, which is tracked, so a review did leave a diff behind. The
+     * write is still made — a checkout inside the working tree that git can see is
+     * thousands of untracked files in `git status`, which is its own way of disturbing the
+     * directory — but it goes to `.git/info/exclude`, which is per-clone and outside the
+     * working tree. So R-W5.3 now holds with no exception at all, and this asserts the
+     * absence: not one tracked byte changed, and the directory is still ignored.
      */
     const other = join(base, 'no-ignore');
     await mkdir(other);
@@ -415,8 +416,9 @@ describe('R-W5.3 / R-W5.4 — a checkout-supplied review leaves the served direc
 
     const contentAfter = contentSnapshot(other);
     const changed = Object.keys(contentAfter).filter((p) => contentAfter[p] !== contentBefore[p]);
-    expect(changed).toEqual(['.gitignore']);
-    expect(readFileSync(join(other, '.gitignore'), 'utf8')).toBe('.visual-spec/\n');
+    expect(changed).toEqual([]);
+    // Ignored all the same — the guarantee is kept, just not out of the user's file.
+    expect(readFileSync(join(other, '.git', 'info', 'exclude'), 'utf8')).toContain('.visual-spec/\n');
     // And the unsaved work is still unsaved work, which is the point of the whole file.
     expect(readFileSync(join(other, 'notes.md'), 'utf8')).toBe(UNSAVED);
     expect(await git(other, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(WORKING_BRANCH);

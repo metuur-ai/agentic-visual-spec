@@ -13,10 +13,11 @@
  *
  * WHERE IT LIVES. `<baseDir>/.visual-spec/worktrees/<owner>/<repo>/pr-<n>`. Inside the
  * repository, because the state belongs to this project and travels with it, and because
- * the user asked for it there. That makes `.gitignore` load-bearing rather than cosmetic:
- * a worktree inside the working tree that git can see is thousands of untracked files
- * in `git status`. `ensureIgnored` is therefore called before the worktree is created,
- * never after.
+ * the user asked for it there. That makes the ignore entry load-bearing rather than
+ * cosmetic: a worktree inside the working tree that git can see is thousands of untracked
+ * files in `git status`. `ensureIgnored` is therefore called before the worktree is
+ * created, never after — and it writes `.git/info/exclude`, not `.gitignore`, so a review
+ * leaves no diff in tracked content (R-W5.3).
  *
  * WHY THE REPOSITORY IS IN THAT PATH (R-W3.5). It was `pr-<n>` until this server could
  * review a pull request of any repository the credential can read, and pull request 42
@@ -43,14 +44,14 @@
  * `@lyfie/luthor`, no react (R-12.6 / R-12.6a, guarded by `core/bundle-guard.test.ts`).
  */
 import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { defaultExecGit, type GitExecutor, parseRemoteUrl } from '../git-context';
 import type { RepoRef } from './github-adapter';
 
 /** Where PR worktrees are mounted, relative to the served directory. */
 export const WORKTREE_DIR = '.visual-spec/worktrees';
 
-/** The `.gitignore` entry that keeps every worktree — and the collab sidecars — out of git. */
+/** The exclude entry that keeps every worktree — and the collab sidecars — out of git. */
 export const IGNORE_ENTRY = '.visual-spec/';
 
 /** The private ref namespace PR heads are fetched into. */
@@ -211,13 +212,15 @@ function prRef(pullNumber: number): string {
  * RETIRED, NOT ADOPTED — the opposite of what `review-drafts.ts` chose for its own
  * pre-scoping file, and both halves of that difference come from what the thing IS.
  *
- * It cannot be adopted the way the drafts file was. That was a rename of a plain file. A
- * worktree is registered with git: the checkout's `.git` file and git's
+ * It cannot be adopted the way the drafts file was — that was one `rename` of a plain
+ * file. A worktree is registered with git: the checkout's `.git` file and git's
  * `.git/worktrees/<name>` admin directory point at each other by absolute path, so moving
- * one behind git's back leaves a checkout git believes is somewhere else. `git worktree
- * move` exists precisely because a rename is corruption.
+ * one behind git's back leaves a checkout git believes is somewhere else. Adopting it
+ * would mean `git worktree move`, which is a different operation with its own failure
+ * modes, not the same line of code with a different destination.
  *
- * And it does not need to be adopted. The drafts file had to be, because it holds the
+ * And it does not need to be adopted, which is what actually decides it. The drafts file
+ * had to be, because it holds the
  * `published` records that stop a comment being posted to GitHub twice and nothing can
  * reconstruct them. A checkout holds no user-authored bytes at all — it is a detached copy
  * of a commit that the next fetch produces again — which is the same fact that lets
@@ -252,14 +255,36 @@ async function retireLegacyMount(baseDir: string, pullNumber: number, exec: GitE
 }
 
 /**
- * Add `.visual-spec/` to `<baseDir>/.gitignore` unless some line already ignores it.
+ * Ignore `.visual-spec/` in the repository hosting `baseDir`, unless it already is.
  *
- * Idempotent by reading first, and tolerant of the file not existing. The match is on
- * the trimmed line, both with and without the trailing slash, so a user who wrote
- * `.visual-spec` by hand does not get a duplicate.
+ * WHY `.git/info/exclude` AND NOT `.gitignore`. Both ignore the directory; only one of
+ * them is a file the user owns. `.gitignore` is tracked content, so writing to it puts a
+ * diff in front of a reviewer who asked to review somebody else's, imposes this tool's
+ * private directory on everyone who pulls the branch, and — the expensive part — is
+ * *versioned*, so it un-ignores itself the moment the served directory changes branch to
+ * one whose `.gitignore` predates the entry. That last property is why this used to have
+ * to run again after every checkout, with its own failure state and its own route
+ * behaviour. `info/exclude` is per-clone and outside the working tree: it is invisible to
+ * `git status`, never travels, and does not care what branch is checked out, so ensuring
+ * it once at mount is ensuring it for good.
+ *
+ * The entry carries no leading slash, so it ignores `.visual-spec/` at any depth. That is
+ * deliberate: `baseDir` need not be the repository root, and the pattern in `info/exclude`
+ * is read relative to the root.
+ *
+ * Silent when `baseDir` is not in a repository — there is then nothing that could see the
+ * directory, which is the outcome this exists to produce. Idempotent by reading first, and
+ * tolerant of the file not existing. The match is on the trimmed line, both with and
+ * without the trailing slash, so an entry written by hand does not get a duplicate.
  */
-export async function ensureIgnored(baseDir: string): Promise<void> {
-  const path = join(baseDir, '.gitignore');
+export async function ensureIgnored(baseDir: string, exec: GitExecutor = defaultExecGit): Promise<void> {
+  // The *common* dir, not `--git-dir`: from inside a linked worktree the latter is that
+  // worktree's admin directory, whose `info/exclude` git does not read.
+  const common = await exec(['-C', baseDir, 'rev-parse', '--git-common-dir']);
+  if (common.exitCode !== 0) return;
+  // Relative output is relative to the directory `-C` moved git into.
+  const gitDir = common.stdout.trim();
+  const path = join(isAbsolute(gitDir) ? gitDir : join(baseDir, gitDir), 'info', 'exclude');
   let current = '';
   try {
     current = await readFile(path, 'utf8');

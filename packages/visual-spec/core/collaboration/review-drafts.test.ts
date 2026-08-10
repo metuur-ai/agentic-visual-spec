@@ -5,9 +5,11 @@
  * and `.gitignore` must exist before the first draft does. A mocked fs would assert the
  * calls this module makes, which is the one thing already visible in the source.
  */
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   addReviewDraft,
@@ -99,9 +101,15 @@ describe('review-drafts', () => {
       expect((await readReviewDrafts(at, 42)).map((d) => d.id)).toEqual([first.id, second.id]);
     });
 
-    it('gitignores .visual-spec/ before the first draft lands', async () => {
+    it('excludes .visual-spec/ from git before the first draft lands, without touching .gitignore', async () => {
+      // A real repository, because the entry goes to `.git/info/exclude` — outside the
+      // working tree, which is the whole reason a draft leaves no diff behind.
+      await promisify(execFile)('git', ['init', '-q'], { cwd: base });
+
       await addReviewDraft(at, 42, { path: 'a.ts', comment: 'one', headSha: HEAD });
-      expect(await readFile(join(base, '.gitignore'), 'utf8')).toContain('.visual-spec/');
+      expect(await readFile(join(base, '.git', 'info', 'exclude'), 'utf8')).toContain('.visual-spec/');
+      // The reviewer's own comments are the last thing that should show up as a diff.
+      await expect(readFile(join(base, '.gitignore'), 'utf8')).rejects.toThrow();
     });
 
     it('refuses a target path that escapes the worktree root', async () => {

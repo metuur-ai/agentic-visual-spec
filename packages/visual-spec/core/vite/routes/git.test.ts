@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { GitExecutor, GitResult } from '../../git-context';
-import { IGNORE_ENTRY } from '../../collaboration/worktree';
+
 import { resolveConfig } from '../../config';
 import { handleGitRequest } from './git';
 
@@ -293,8 +293,6 @@ describe('POST /__vs/git/checkout', () => {
   });
 
   it('returns the context read after the change, not the one it was asked for (R-5.9)', async () => {
-    // A real directory, because a successful change re-asserts the ignore entry
-    // (R-5.8) and that writes a `.gitignore` for real.
     const dir = await mkdtemp(join(tmpdir(), 'vs-git-route-'));
     const { exec } = fakeGit(dir, {
       head: 'main',
@@ -316,7 +314,9 @@ describe('POST /__vs/git/checkout', () => {
         url: 'https://github.com/acme/widgets.git',
       },
     });
-    expect(await readFile(join(dir, '.gitignore'), 'utf8')).toContain(IGNORE_ENTRY);
+    // Nothing was written: the ignore entry is ensured at mount, into
+    // `.git/info/exclude`, and a branch change has no reason to touch it (R-5.8).
+    await expect(readFile(join(dir, '.gitignore'), 'utf8')).rejects.toThrow();
     await rm(dir, { recursive: true, force: true });
   });
 });
