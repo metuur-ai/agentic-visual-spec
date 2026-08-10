@@ -19,11 +19,11 @@
 
 ## Unit 3: Refreshing — the store seam
 
-- [ ] 3.1 Add `refreshAwaiting()` to the awaiting store, joining any read already in flight (est: ~25m)
+- [x] 3.1 Add `refreshAwaiting()` to the awaiting store, joining any read already in flight (est: ~25m)
   - why: the refresh control has to re-read the two counts, and the store exposes no way to ask — only `useAwaitingPulls`, `retainedAwaiting` and `resetAwaitingCache`. It must join the existing shared in-flight promise rather than start a second read, or pressing refresh during a focus-triggered read costs two of everything and re-renders the header's chips from the panel, which is the exact coupling the module store exists to prevent.
   - acceptance: R-C3.4 — a refresh requested while a read is in flight joins it rather than issuing a duplicate.
   - verify: store test counts requests, not results — a `focus` and a `refreshAwaiting()` in the same tick issue exactly one; and a second test counts renders in two mounted roots to confirm a refresh finding identical data re-renders neither.
-  - landed:
+  - landed: `e7a2b40` — `ui/use-awaiting-pulls.ts`, a door onto the store's existing `load()`; the de-duplication R-C3.4 asks for is the one R-A4.2 has always had. Tests count requests, not results, and renders across two roots.
 
 ## Unit 1: The checkouts on disk
 
