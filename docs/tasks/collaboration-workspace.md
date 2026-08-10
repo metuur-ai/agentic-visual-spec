@@ -130,7 +130,7 @@
   - why: pull request 42 exists in most repositories. Keying on the number alone was safe only while there was one repository.
   - acceptance: R-W3.5 — THE SYSTEM SHALL identify a review by repository together with pull request number.
   - verify: two repositories' pull request 42 resolve to two distinct reviews
-  - landed: the held-source map was already keyed by repository and number; the requested repository now reaches it. Residual: worktrees still mount at `pr-<n>`, see the note in the test
+  - landed: the held-source map was already keyed by repository and number; the requested repository now reaches it. The checkout arm followed: worktrees mount at `.visual-spec/worktrees/<owner>/<repo>/pr-<n>`, `mountPullRequest` / `unmountPullRequest` / `worktreeRelPath` take the repository, the mounted listing parses it back and `GET /pulls/mounted` answers only the requested repository's checkouts. A pre-scoping `pr-<n>` mount is retired with `git worktree remove` when the same number is mounted — not renamed, because a worktree is registered with git, and not left, because the listing could no longer report it
 
 - [x] 3.5 Identify held review comments by repository and number (deps: 3.4, est: ~1.5h) (mutex: collab-routes)
   - why: drafts live at `<servedDir>/.visual-spec/reviews/pr-<n>.json`, keyed by number alone. Under multi-repository review two repositories' drafts would share a file. Five call sites pass `baseDir()` today and all five change.

@@ -36,7 +36,13 @@ const PULL = {
   updatedAt: '2026-02-01T10:00:00Z',
 };
 
-const WORKTREE = { pullNumber: 42, path: '/repo/.visual-spec/worktrees/pr-42', headSha: 'abc1234def5678' };
+const WORKTREE = {
+  pullNumber: 42,
+  // R-W3.5 — a checkout is addressed by repository and number, so the path carries both.
+  repo: { owner: 'acme', repo: 'docs' },
+  path: '/repo/.visual-spec/worktrees/acme/docs/pr-42',
+  headSha: 'abc1234def5678',
+};
 
 /**
  * The review as `CollabPullsPanel` hands it over. `source` is the label R-W1.5 requires the
@@ -877,7 +883,7 @@ describe('R-13.18 — a held comment and a published one are told apart by a lab
  */
 describe('the review row carries the whole identity, once', () => {
   it('names the number, the mounted tree’s commit and read-only, from props alone', async () => {
-    const moved = { pullNumber: 42, path: WORKTREE.path, headSha: 'f00dbee9999' };
+    const moved = { pullNumber: 42, repo: WORKTREE.repo, path: WORKTREE.path, headSha: 'f00dbee9999' };
     const { impl } = fakeCollabFetch(changedFiles(['src/pay.ts']));
     render(<CollabPrReview pull={PULL} review={{ source: 'checkout' as const, headSha: moved.headSha, repo: REPO, worktree: moved }} onExit={vi.fn()} fetchImpl={impl} />);
 

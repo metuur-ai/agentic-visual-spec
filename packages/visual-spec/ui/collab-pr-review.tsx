@@ -10,7 +10,8 @@
  *
  * WHY IT READS THROUGH `/__vs/collab/pulls/:n/{tree,raw}` AND NOT `/__vs/tree`. It used to
  * browse the served directory, on the reasoning that a checkout lives inside it at
- * `<served>/.visual-spec/worktrees/pr-<n>` (R-13.5) and is therefore already enumerable.
+ * `<served>/.visual-spec/worktrees/<owner>/<repo>/pr-<n>` (R-13.5, R-W3.5) and is
+ * therefore already enumerable.
  * True, and it made the whole surface conditional on there being a checkout at all: a
  * reviewer serving a directory that is not a git working tree got a review that opened,
  * named its source and listed its changed files, and then said "No preview for this file."

@@ -601,7 +601,7 @@ A `git worktree` gives the whole tree at one commit for one fetch.
 work. `git checkout` would disturb it; a linked worktree materialises the pull request
 elsewhere and leaves the served copy at whatever commit it was on.
 
-**Location.** `<servedDir>/.visual-spec/worktrees/pr-<n>`. Inside the repository,
+**Location.** `<servedDir>/.visual-spec/worktrees/<owner>/<repo>/pr-<n>`. Inside the repository,
 because the state belongs to the project and travels with it. That makes `.gitignore`
 load-bearing rather than cosmetic — a worktree git can see is thousands of untracked
 files in `git status` — so the ignore entry is written *before* the first worktree is

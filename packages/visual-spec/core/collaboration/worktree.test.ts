@@ -18,8 +18,9 @@ import { mkdtemp, rm, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { GitExecutor } from '../git-context';
+import type { RepoRef } from './github-adapter';
 import {
   ensureIgnored,
   fetchSource,
@@ -49,6 +50,12 @@ function stubExec(answer: (args: string[]) => { stdout?: string; exitCode: numbe
   };
   return { exec: execFn, calls };
 }
+
+/**
+ * The repository every single-repository case below mounts. Named rather than inlined so
+ * the pair of tests that mount TWO repositories reads as the exception it is.
+ */
+const REPO: RepoRef = { owner: 'acme', repo: 'specs' };
 
 describe('worktree', () => {
   let root: string;
@@ -114,12 +121,12 @@ describe('worktree', () => {
 
   describe('mountPullRequest', () => {
     it('materialises the PR tree, detached, and ignores it before creating it', async () => {
-      const result = await mountPullRequest(base, 1);
+      const result = await mountPullRequest(base, REPO, 1);
       expect(result.ok).toBe(true);
       if (!result.ok) return;
 
       expect(result.worktree.headSha).toBe(prHead);
-      expect(result.worktree.path.endsWith(worktreeRelPath(1))).toBe(true);
+      expect(result.worktree.path.endsWith(worktreeRelPath(REPO, 1))).toBe(true);
       // The invariant that matters, and the one a literal path assertion missed:
       // `mount` and `list` must spell the same worktree the same way, or a caller
       // asking "is this PR already mounted?" by path gets the wrong answer. On macOS
@@ -151,7 +158,7 @@ describe('worktree', () => {
       await git(upstream, 'checkout', '-q', 'main');
 
       const before = (await listMountedWorktrees(base))[0]?.path;
-      const result = await mountPullRequest(base, 1);
+      const result = await mountPullRequest(base, REPO, 1);
       expect(result.ok).toBe(true);
       if (!result.ok) return;
 
@@ -167,12 +174,12 @@ describe('worktree', () => {
       ['fetch-failed', (args: string[]) => args.includes('fetch')],
     ] as const)('reports %s rather than a generic failure', async (reason, fails) => {
       const { exec: stub } = stubExec((args) => ({ exitCode: fails(args) ? 1 : 0 }));
-      const result = await mountPullRequest(base, 1, stub);
+      const result = await mountPullRequest(base, REPO, 1, stub);
       expect(result).toEqual({ ok: false, reason });
     });
 
     it('reports head-mismatch, with both commits, rather than serving the wrong tree', async () => {
-      const result = await mountPullRequest(base, 1, undefined, {
+      const result = await mountPullRequest(base, REPO, 1, undefined, {
         expectedHeadSha: '0'.repeat(40),
       });
       expect(result.ok).toBe(false);
@@ -186,7 +193,7 @@ describe('worktree', () => {
 
     it('accepts the mount when the head is the one the caller expected', async () => {
       const at = (await listMountedWorktrees(base))[0]!.headSha;
-      const result = await mountPullRequest(base, 1, undefined, { expectedHeadSha: at });
+      const result = await mountPullRequest(base, REPO, 1, undefined, { expectedHeadSha: at });
       expect(result.ok).toBe(true);
     });
 
@@ -195,7 +202,7 @@ describe('worktree', () => {
         stdout: args.includes('get-url') ? 'https://github.com/someone/served\n' : '',
         exitCode: 0,
       }));
-      await mountPullRequest(base, 1, stub, { repo: { owner: 'metuur-ai', repo: 'other' } });
+      await mountPullRequest(base, { owner: 'metuur-ai', repo: 'other' }, 1, stub);
       const fetched = calls.find((args) => args.includes('fetch'));
       expect(fetched).toContain('https://github.com/metuur-ai/other.git');
       expect(fetched).not.toContain('origin');
@@ -203,7 +210,7 @@ describe('worktree', () => {
 
     it.each([0, -1, 1.5, Number.NaN])('refuses pullNumber %s before touching git', async (n) => {
       const { exec: stub, calls } = stubExec(() => ({ exitCode: 0 }));
-      await expect(mountPullRequest(base, n, stub)).rejects.toThrow('invalid pullNumber');
+      await expect(mountPullRequest(base, REPO, n, stub)).rejects.toThrow('invalid pullNumber');
       // The guard exists to keep `../..` out of a path, so it must fire before the
       // fetch, not after a worktree has already been created somewhere unexpected.
       expect(calls.some((args) => args.includes('worktree'))).toBe(false);
@@ -242,8 +249,15 @@ describe('worktree', () => {
     it('reports the mounted PR and not the main worktree', async () => {
       const listed = await listMountedWorktrees(base);
       expect(listed.map((w) => w.pullNumber)).toEqual([1]);
-      expect(listed[0]?.path.endsWith(worktreeRelPath(1))).toBe(true);
+      expect(listed[0]?.path.endsWith(worktreeRelPath(REPO, 1))).toBe(true);
       expect(listed[0]?.headSha).toMatch(/^[0-9a-f]{40}$/);
+    });
+
+    // R-W3.5 — the listing parses the mount path back, so the repository has to survive
+    // the round trip or a mount stops being reportable at all. Asserted on the object the
+    // route hands the browser, not on the path, because that is what the surface reads.
+    it('says which repository each mount belongs to (R-W3.5)', async () => {
+      expect((await listMountedWorktrees(base))[0]?.repo).toEqual(REPO);
     });
 
     it('skips worktrees this module did not create', async () => {
@@ -256,13 +270,177 @@ describe('worktree', () => {
 
   describe('unmountPullRequest', () => {
     it('removes the checkout and the private ref', async () => {
-      expect(await unmountPullRequest(base, 1)).toBe(true);
+      expect(await unmountPullRequest(base, REPO, 1)).toBe(true);
       expect(await listMountedWorktrees(base)).toEqual([]);
       await expect(git(base, 'rev-parse', '--verify', 'refs/visual-spec/pr/1')).rejects.toThrow();
     });
 
     it('resolves false when nothing was mounted, rather than throwing', async () => {
-      expect(await unmountPullRequest(base, 99)).toBe(false);
+      expect(await unmountPullRequest(base, REPO, 99)).toBe(false);
     });
+  });
+});
+
+/* ================================================================== *
+ * R-W3.5 — a checkout is a repository AND a number
+ * ================================================================== */
+
+describe('worktreeRelPath', () => {
+  it('carries the repository, so pull request 42 names one checkout per repository (R-W3.5)', () => {
+    expect(worktreeRelPath({ owner: 'acme', repo: 'one' }, 42)).toBe('.visual-spec/worktrees/acme/one/pr-42');
+    expect(worktreeRelPath({ owner: 'acme', repo: 'two' }, 42)).toBe('.visual-spec/worktrees/acme/two/pr-42');
+  });
+
+  // The same guard, and the same threat model, as `assertPullNumber`: no shell is ever
+  // involved, and the danger is `..`, `-` and the empty string reaching `join()` and
+  // escaping `.visual-spec/worktrees/`. `.` and `..` are the two that pass a character
+  // check and still mean something to a path resolver, so they are named individually.
+  it.each([
+    ['owner', { owner: '..', repo: 'specs' }],
+    ['owner', { owner: '.', repo: 'specs' }],
+    ['owner', { owner: '', repo: 'specs' }],
+    ['owner', { owner: 'a/../..', repo: 'specs' }],
+    ['repo', { owner: 'acme', repo: '..' }],
+    ['repo', { owner: 'acme', repo: '' }],
+    ['repo', { owner: 'acme', repo: 'spec s' }],
+  ] as const)('refuses a %s that is not one: %o', (what, repo) => {
+    expect(() => worktreeRelPath(repo, 1)).toThrow(`invalid ${what}`);
+  });
+});
+
+/**
+ * Two repositories, each with their own pull request 42, against real git.
+ *
+ * The served directory's `origin` is repointed between the two mounts rather than the
+ * repository name being trusted to redirect the fetch: `fetchSource` leaves a filesystem
+ * `origin` alone (it cannot be parsed into owner/repo), so this is how a local upstream
+ * pair can stand in for two GitHub repositories without inventing a URL parser's answer.
+ * The point of the fixture is that the two #42s are DIFFERENT COMMITS with different
+ * bytes, so a collision shows up as content rather than as a path assertion.
+ */
+describe('R-W3.5 — two repositories’ pull request #42 mount side by side', () => {
+  let root: string;
+  let served: string;
+
+  async function upstreamWith(name: string): Promise<string> {
+    const dir = join(root, name);
+    await mkdir(dir, { recursive: true });
+    await git(dir, 'init', '-q', '-b', 'main');
+    await git(dir, 'config', 'user.email', 'test@example.invalid');
+    await git(dir, 'config', 'user.name', 'Visual Spec Test');
+    await writeFile(join(dir, 'spec.md'), `# ${name}\n`, 'utf8');
+    await git(dir, 'add', '.');
+    await git(dir, 'commit', '-q', '-m', name);
+    await git(dir, 'update-ref', 'refs/pull/42/head', await git(dir, 'rev-parse', 'HEAD'));
+    return dir;
+  }
+
+  beforeAll(async () => {
+    root = await mkdtemp(join(tmpdir(), 'vs-worktree-two-'));
+    const one = await upstreamWith('one');
+    const two = await upstreamWith('two');
+    served = join(root, 'served');
+    await exec('git', ['clone', '-q', one, served], { cwd: root });
+
+    await mountPullRequest(served, { owner: 'acme', repo: 'one' }, 42);
+    // The second repository, reached the way a reviewer serving one clone reaches another
+    // repository: same number, different upstream.
+    await git(served, 'remote', 'set-url', 'origin', two);
+    await mountPullRequest(served, { owner: 'acme', repo: 'two' }, 42);
+  });
+
+  afterAll(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('mounts both, and each holds its own repository’s tree', async () => {
+    const first = join(served, worktreeRelPath({ owner: 'acme', repo: 'one' }, 42));
+    const second = join(served, worktreeRelPath({ owner: 'acme', repo: 'two' }, 42));
+    expect(first).not.toBe(second);
+    // The decisive half. Before this change both mounts contended for
+    // `.visual-spec/worktrees/pr-42`, so the second could not be made at all — and the
+    // first repository's bytes are still there afterwards, which is what "neither
+    // disturbs the other" means when the disturbance would be a shared directory.
+    expect(await readFile(join(first, 'spec.md'), 'utf8')).toBe('# one\n');
+    expect(await readFile(join(second, 'spec.md'), 'utf8')).toBe('# two\n');
+  });
+
+  it('reports both to the listing, each under its own repository', async () => {
+    const listed = await listMountedWorktrees(served);
+    expect(listed.map((w) => ({ ...w.repo, pullNumber: w.pullNumber }))).toEqual([
+      { owner: 'acme', repo: 'one', pullNumber: 42 },
+      { owner: 'acme', repo: 'two', pullNumber: 42 },
+    ]);
+    // Two mounts, two commits: the listing is not reporting one checkout twice.
+    expect(new Set(listed.map((w) => w.headSha)).size).toBe(2);
+  });
+
+  it('removes one without touching the other', async () => {
+    expect(await unmountPullRequest(served, { owner: 'acme', repo: 'one' }, 42)).toBe(true);
+    const listed = await listMountedWorktrees(served);
+    expect(listed.map((w) => w.repo.repo)).toEqual(['two']);
+    expect(await readFile(join(listed[0]!.path, 'spec.md'), 'utf8')).toBe('# two\n');
+  });
+});
+
+/**
+ * The pre-scoping mount. See `legacyWorktreeRelPath` in `worktree.ts` for the argument;
+ * this asserts the outcome — it is removed with git's own command, not renamed, and not
+ * left registered where nothing could ever report it.
+ */
+describe('R-W3.5 — a checkout mounted before the repository was in the path is retired', () => {
+  let root: string;
+  let served: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'vs-worktree-legacy-'));
+    const upstream = join(root, 'upstream');
+    await mkdir(upstream, { recursive: true });
+    await git(upstream, 'init', '-q', '-b', 'main');
+    await git(upstream, 'config', 'user.email', 'test@example.invalid');
+    await git(upstream, 'config', 'user.name', 'Visual Spec Test');
+    await writeFile(join(upstream, 'spec.md'), '# pull request\n', 'utf8');
+    await git(upstream, 'add', '.');
+    await git(upstream, 'commit', '-q', '-m', 'pr');
+    await git(upstream, 'update-ref', 'refs/pull/1/head', await git(upstream, 'rev-parse', 'HEAD'));
+    served = join(root, 'served');
+    await exec('git', ['clone', '-q', upstream, served], { cwd: root });
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  /** A real linked worktree at the old path — registered with git, exactly as one was. */
+  async function mountTheOldWay(): Promise<string> {
+    const rel = '.visual-spec/worktrees/pr-1';
+    await git(served, 'worktree', 'add', '--detach', '-f', rel, 'HEAD');
+    return join(served, rel);
+  }
+
+  it('unregisters it when the same pull request is mounted, rather than stranding it', async () => {
+    const legacy = await mountTheOldWay();
+    expect(await git(served, 'worktree', 'list', '--porcelain')).toContain('worktrees/pr-1');
+
+    const result = await mountPullRequest(served, REPO, 1);
+    expect(result.ok).toBe(true);
+
+    // Gone from git's registry — which is the whole point. Left behind it would hold
+    // objects alive and show in `git worktree list` while being invisible to a listing
+    // that now requires a repository in the path, so nothing could remove it.
+    expect(await git(served, 'worktree', 'list', '--porcelain')).not.toContain('/worktrees/pr-1');
+    await expect(readFile(join(legacy, 'spec.md'), 'utf8')).rejects.toThrow();
+    // ...and the checkout the reviewer asked for is there, under the repository.
+    expect(
+      await readFile(join(served, worktreeRelPath(REPO, 1), 'spec.md'), 'utf8'),
+    ).toBe('# pull request\n');
+  });
+
+  it('leaves another pull request’s pre-scoping mount alone', async () => {
+    await git(served, 'worktree', 'add', '--detach', '-f', '.visual-spec/worktrees/pr-2', 'HEAD');
+    // Retiring is keyed to the number being mounted: #2 is not the directory a mount of
+    // #1 is about, and guessing at it would be removing a checkout nobody asked about.
+    expect((await mountPullRequest(served, REPO, 1)).ok).toBe(true);
+    expect(await git(served, 'worktree', 'list', '--porcelain')).toContain('worktrees/pr-2');
   });
 });

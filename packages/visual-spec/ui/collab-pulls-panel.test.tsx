@@ -26,7 +26,13 @@ const PULL = {
   updatedAt: '2026-02-01T10:00:00Z',
 };
 
-const WORKTREE = { pullNumber: 42, path: '/repo/.visual-spec/worktrees/pr-42', headSha: 'abc1234def5678' };
+const WORKTREE = {
+  pullNumber: 42,
+  // R-W3.5 — a checkout is addressed by repository and number, so the path carries both.
+  repo: { owner: 'acme', repo: 'docs' },
+  path: '/repo/.visual-spec/worktrees/acme/docs/pr-42',
+  headSha: 'abc1234def5678',
+};
 
 /** What the mount route answers where a checkout supplies the review (R-W1.5). */
 const REPO = { owner: 'acme', repo: 'docs' };

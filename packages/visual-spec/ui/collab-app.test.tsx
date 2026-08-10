@@ -30,7 +30,13 @@ const PULL = {
   updatedAt: '2026-02-01T10:00:00Z',
 };
 
-const WORKTREE = { pullNumber: 42, path: '/repo/.visual-spec/worktrees/pr-42', headSha: 'fedcba9876543' };
+const WORKTREE = {
+  pullNumber: 42,
+  // R-W3.5 — a checkout is addressed by repository and number, so the path carries both.
+  repo: { owner: 'acme', repo: 'docs' },
+  path: '/repo/.visual-spec/worktrees/acme/docs/pr-42',
+  headSha: 'fedcba9876543',
+};
 /** The review as `CollabPullsPanel` hands it over: the source, the pinned commit, the checkout. */
 /** R-W4.5 — the repository the review reads from travels with it. */
 const REPO = { owner: 'acme', repo: 'docs' };
@@ -84,7 +90,12 @@ describe('CollabHeader', () => {
 describe('CollabApp opens where the caller asked (R-7.7 / R-7.8)', () => {
   const BINDING = { owner: 'acme', repo: 'docs', branch: 'visual-spec/doc-c', pullNumber: 10 };
   const DOCUMENT = { documentId: 'doc-c', documentPath: 'docs/spec.md', title: 'The Spec', markdown: '# The Spec\n' };
-  const WORKTREE_43 = { pullNumber: 43, path: '/repo/.visual-spec/worktrees/pr-43', headSha: 'deadbee1234' };
+  const WORKTREE_43 = {
+    pullNumber: 43,
+    repo: { owner: 'acme', repo: 'docs' },
+    path: '/repo/.visual-spec/worktrees/acme/docs/pr-43',
+    headSha: 'deadbee1234',
+  };
 
   function jsonRes(body: unknown) {
     return { ok: true, status: 200, json: async () => body } as Response;
@@ -168,7 +179,12 @@ describe('CollabApp opens where the caller asked (R-7.7 / R-7.8)', () => {
  */
 describe('one header row while a pull request is under review (P5)', () => {
   const DOCUMENT = { documentId: 'doc-c', documentPath: 'docs/spec.md', title: 'The Spec', markdown: '# The Spec\n' };
-  const WORKTREE_43 = { pullNumber: 43, path: '/repo/.visual-spec/worktrees/pr-43', headSha: 'deadbee1234' };
+  const WORKTREE_43 = {
+    pullNumber: 43,
+    repo: { owner: 'acme', repo: 'docs' },
+    path: '/repo/.visual-spec/worktrees/acme/docs/pr-43',
+    headSha: 'deadbee1234',
+  };
 
   function jsonRes(body: unknown) {
     return { ok: true, status: 200, json: async () => body } as Response;

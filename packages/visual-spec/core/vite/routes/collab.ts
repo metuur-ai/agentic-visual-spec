@@ -1421,11 +1421,23 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
        * Answered from git's own worktree registry rather than from anything this process
        * remembers, so a mount made by a previous run of the server, or a worktree removed
        * by hand, is reported correctly on the first request after a restart.
+       *
+       * SCOPED TO THE REPOSITORY THE REQUEST RESOLVED TO (R-W3.5). Checkouts are now
+       * addressed by repository and number, so the registry can hold two repositories'
+       * #42 at once — and this route answers a surface that lists one repository's pull
+       * requests and asks, per row, "is this one checked out?". Handing it every mount
+       * would let another repository's #42 answer yes for a pull request it has nothing
+       * to do with. Each entry still carries its `repo`, so the answer says what it is
+       * about rather than relying on the caller remembering what it asked.
        */
       if (method === 'GET' && pathname === '/pulls/mounted') {
         const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
-        return { status: 200, json: { worktrees: await listMountedWorktrees(baseDir(), git) } };
+        const repo = repoRefOf(gated.repo);
+        const mountedWorktrees = (await listMountedWorktrees(baseDir(), git)).filter(
+          (w) => w.repo.owner === repo.owner && w.repo.repo === repo.repo,
+        );
+        return { status: 200, json: { worktrees: mountedWorktrees } };
       }
 
       /*
@@ -1509,9 +1521,13 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
         const gated = await gate('read', null, requestedRepo);
         if (!gated.ok) return gated.result;
 
-        /* DELETE — "already gone" is the outcome the caller wanted, so it is a 200. */
+        /*
+         * DELETE — "already gone" is the outcome the caller wanted, so it is a 200. The
+         * repository goes with the number (R-W3.5): the checkout being removed is one
+         * repository's, and a request that named another one must not take it away.
+         */
         if (method === 'DELETE') {
-          const removed = await unmountPullRequest(baseDir(), pullNumber, git);
+          const removed = await unmountPullRequest(baseDir(), repoRefOf(gated.repo), pullNumber, git);
           return { status: 200, json: { ok: true, removed } };
         }
 

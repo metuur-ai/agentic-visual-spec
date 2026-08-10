@@ -392,7 +392,7 @@ Recorded so they are not re-litigated.
 ### Landed
 
 - **`core/collaboration/worktree.ts`** — mount/list/unmount a PR's tree at
-  `.visual-spec/worktrees/pr-<n>`, detached, fetched via `refs/pull/<n>/head` so fork
+  `.visual-spec/worktrees/<owner>/<repo>/pr-<n>`, detached, fetched via `refs/pull/<n>/head` so fork
   PRs work. `ensureIgnored` writes the ignore entry before the first mount. 16 tests
   against real repositories.
 - **`listPullRequests`** on the GitHub adapter, paginated like the comment lists.

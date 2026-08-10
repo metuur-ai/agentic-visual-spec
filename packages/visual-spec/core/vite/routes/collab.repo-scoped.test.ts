@@ -501,17 +501,15 @@ describe('R-W3.7 — a repository identifier is decoded before it is validated',
  * ================================================================== */
 describe('R-W3.5 — the same pull request number in two repositories denotes two reviews', () => {
   /*
-   * WHAT THIS DOES NOT COVER, AND WHY IT IS SAID HERE RATHER THAN NOWHERE. The identity of
-   * a review — the source held per open review, and every read that goes through it — is
-   * repository plus number, and that is what these two assert. The CHECKOUT a review may
-   * be supplied from is not: `worktree.ts` mounts at `<servedDir>/.visual-spec/worktrees/
-   * pr-<n>`, keyed by the number alone, so two repositories' #42 supplied from checkouts
-   * would contend for one directory. `mountPullRequest` is handed `expectedHeadSha` and
-   * refuses a checkout that landed on another commit, so the outcome is a `head-mismatch`
-   * refusal rather than one repository's bytes served under the other's name — wrong, but
-   * loudly wrong. Fixing it means renaming the worktree directory, which is `worktree.ts`,
-   * which this unit does not touch. These tests therefore drive the host source, where
-   * there is no directory to contend for.
+   * WHAT THIS COVERS AND WHERE THE REST OF IT LIVES. The identity of a review — the source
+   * held per open review, and every read that goes through it — is repository plus number,
+   * and that is what these two assert, driving the host source because it has no directory
+   * on disk to confuse the question. The CHECKOUT half of the same requirement is asserted
+   * against real git in `core/collaboration/worktree.test.ts`: mounts are addressed
+   * `<servedDir>/.visual-spec/worktrees/<owner>/<repo>/pr-<n>`, so two repositories' #42
+   * are two checkouts. They used to share `pr-<n>` — never silently, because
+   * `expectedHeadSha` refused a checkout that landed on another commit, but a loud refusal
+   * is still "cannot review the second one".
    */
   /**
    * An adapter whose answers differ per repository, so a review that resolved the wrong

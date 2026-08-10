@@ -178,10 +178,14 @@ function recordingGit(opts: { isRepo: boolean }, worktreeAbs: () => string) {
     if (sub === 'rev-parse' && args.includes('--short')) return { stdout: 'deadbee\n', exitCode: 0 };
     if (sub === 'remote') return { stdout: 'https://github.com/acme/specs.git\n', exitCode: 0 };
     if (sub === 'rev-parse' && args.includes('--git-dir')) {
-      // The worktree directory does not exist yet, so the mount takes the `worktree add`
+      // No checkout of this pull request exists yet, so the mount takes the `worktree add`
       // arm rather than the `checkout --detach` one. Both are exercised: see the second
-      // mount below.
-      return dir === worktreeAbs() ? { stdout: '', exitCode: 128 } : { stdout: '.git\n', exitCode: 0 };
+      // mount below. Answered for the whole of `.visual-spec/worktrees/` rather than for
+      // one path, so the pre-scoping `pr-<n>` directory is reported absent too — nothing
+      // in this fixture was mounted before the repository was part of the address.
+      return dir.startsWith(join(baseDir, '.visual-spec/worktrees'))
+        ? { stdout: '', exitCode: 128 }
+        : { stdout: '.git\n', exitCode: 0 };
     }
     if (sub === 'rev-parse' && args.includes('--show-toplevel')) return { stdout: `${worktreeAbs()}\n`, exitCode: 0 };
     if (sub === 'rev-parse') return { stdout: `${HEAD}\n`, exitCode: 0 };
@@ -251,7 +255,7 @@ async function fullReview(r: ReturnType<typeof router>): Promise<CollabRouteResu
  * ================================================================== */
 describe('R-W5.5 — a checkout-supplied review issues no git write', () => {
   it('never commits, pushes, branches, merges, or checks out a branch', async () => {
-    const worktreeAbs = () => join(baseDir, '.visual-spec/worktrees/pr-7');
+    const worktreeAbs = () => join(baseDir, '.visual-spec/worktrees/acme/specs/pr-7');
     const git = recordingGit({ isRepo: true }, worktreeAbs);
     const r = router(git.exec);
 
@@ -271,7 +275,7 @@ describe('R-W5.5 — a checkout-supplied review issues no git write', () => {
     // The negative control for the rule above: it passes just as happily when nothing
     // reached git. These are the two commands that legitimately move a HEAD, and both
     // must have been issued in their detached form for the assertion to mean anything.
-    const worktreeAbs = () => join(baseDir, '.visual-spec/worktrees/pr-7');
+    const worktreeAbs = () => join(baseDir, '.visual-spec/worktrees/acme/specs/pr-7');
     let mounted = false;
     const git = recordingGit({ isRepo: true }, worktreeAbs);
     const wrapped: GitExecutor = async (args) => {
@@ -295,7 +299,7 @@ describe('R-W5.5 — a checkout-supplied review issues no git write', () => {
   });
 
   it('fetches the pull request head into its own ref namespace, never into refs/heads/', async () => {
-    const worktreeAbs = () => join(baseDir, '.visual-spec/worktrees/pr-7');
+    const worktreeAbs = () => join(baseDir, '.visual-spec/worktrees/acme/specs/pr-7');
     const git = recordingGit({ isRepo: true }, worktreeAbs);
     const r = router(git.exec);
     await fullReview(r);
@@ -315,7 +319,7 @@ describe('R-W5.5 — a checkout-supplied review issues no git write', () => {
  * ================================================================== */
 describe('R-W5.5 — a host-supplied review issues no git write either', () => {
   it('never fetches or checks anything out, having decided there is nothing to check out from', async () => {
-    const git = recordingGit({ isRepo: false }, () => join(baseDir, '.visual-spec/worktrees/pr-7'));
+    const git = recordingGit({ isRepo: false }, () => join(baseDir, '.visual-spec/worktrees/acme/specs/pr-7'));
     const r = router(git.exec);
 
     const results = await fullReview(r);

@@ -66,7 +66,12 @@ const OPEN_PULLS = [
 ];
 
 /** What `POST /pulls/42/mount` answers with — git's own path (R-13.8), never a guessed one. */
-const WORKTREE = { pullNumber: 42, path: '/repo/.visual-spec/worktrees/pr-42', headSha: 'a'.repeat(40) };
+const WORKTREE = {
+  pullNumber: 42,
+  repo: { owner: 'acme', repo: 'docs' },
+  path: '/repo/.visual-spec/worktrees/acme/docs/pr-42',
+  headSha: 'a'.repeat(40),
+};
 
 function jsonRes(body: unknown, ok = true, status = ok ? 200 : 500) {
   return { ok, status, json: async () => body } as Response;

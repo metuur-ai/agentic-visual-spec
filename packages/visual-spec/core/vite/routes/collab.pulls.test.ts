@@ -448,7 +448,7 @@ describe('POST /__vs/collab/pulls/:n/mount', () => {
     const head = 'a'.repeat(40);
     const git = stubGit((args) => {
       if (isCommand(args, 'rev-parse') && args[3] === 'HEAD') return { stdout: `${head}\n`, exitCode: 0 };
-      if (isCommand(args, 'rev-parse') && args[3] === '--show-toplevel') return { stdout: `${dir}/.visual-spec/worktrees/pr-7\n`, exitCode: 0 };
+      if (isCommand(args, 'rev-parse') && args[3] === '--show-toplevel') return { stdout: `${dir}/.visual-spec/worktrees/acme/specs/pr-7\n`, exitCode: 0 };
       if (isCommand(args, 'rev-parse') && args[1] !== dir) return { exitCode: 1 };
       return undefined;
     });
@@ -463,7 +463,14 @@ describe('POST /__vs/collab/pulls/:n/mount', () => {
       // R-W4.5 — and which repository it is of, on every answer, so the surface can keep
       // it on screen without inferring it from the row that was clicked.
       repo: { owner: 'acme', repo: 'specs' },
-      worktree: { pullNumber: 7, path: `${dir}/.visual-spec/worktrees/pr-7`, headSha: head },
+      // R-W3.5 — and the checkout is addressed by both, so its path carries the
+      // repository and the reported worktree names it.
+      worktree: {
+        pullNumber: 7,
+        repo: { owner: 'acme', repo: 'specs' },
+        path: `${dir}/.visual-spec/worktrees/acme/specs/pr-7`,
+        headSha: head,
+      },
     });
     // The fetch uses the fork-safe refspec, not the head branch by name.
     expect(git.calls.some((c) => c.includes('+refs/pull/7/head:refs/visual-spec/pr/7'))).toBe(true);
@@ -675,7 +682,7 @@ describe('the mounted worktrees', () => {
       'HEAD 1111111111111111111111111111111111111111',
       'branch refs/heads/main',
       '',
-      'worktree /repo/.visual-spec/worktrees/pr-7',
+      'worktree /repo/.visual-spec/worktrees/acme/specs/pr-7',
       'HEAD 2222222222222222222222222222222222222222',
       'detached',
       '',
@@ -684,7 +691,16 @@ describe('the mounted worktrees', () => {
     const res = await call(router({ git: git.exec }), 'GET', '/pulls/mounted');
     expect(res.status).toBe(200);
     expect(res.json).toEqual({
-      worktrees: [{ pullNumber: 7, path: '/repo/.visual-spec/worktrees/pr-7', headSha: '2'.repeat(40) }],
+      worktrees: [
+        {
+          pullNumber: 7,
+          // R-W3.5 — parsed back out of the path, so the listing says which repository
+          // each checkout is of rather than leaving the caller to assume.
+          repo: { owner: 'acme', repo: 'specs' },
+          path: '/repo/.visual-spec/worktrees/acme/specs/pr-7',
+          headSha: '2'.repeat(40),
+        },
+      ],
     });
   });
 

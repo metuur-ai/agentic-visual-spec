@@ -176,9 +176,12 @@ describe('resolveReviewSource', () => {
     });
     expect(resolved.ok).toBe(true);
     if (!resolved.ok || !resolved.worktree) throw new Error('expected a checkout');
-    // `.visual-spec/worktrees/pr-7` under the served directory — R-13.5, unchanged. macOS
-    // resolves `/tmp` to `/private/tmp`, so the tail is what is asserted, as elsewhere.
-    expect(resolved.worktree.path.endsWith(join('served', '.visual-spec', 'worktrees', 'pr-7'))).toBe(true);
+    // `.visual-spec/worktrees/<owner>/<repo>/pr-7` under the served directory — R-13.5,
+    // now carrying the repository (R-W3.5). macOS resolves `/tmp` to `/private/tmp`, so
+    // the tail is what is asserted, as elsewhere.
+    expect(
+      resolved.worktree.path.endsWith(join('served', '.visual-spec', 'worktrees', REPO.owner, REPO.repo, 'pr-7')),
+    ).toBe(true);
   });
 
   /* ---------------------------------------------------------------- *

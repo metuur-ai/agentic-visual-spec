@@ -172,7 +172,7 @@ export async function resolveReviewSource(input: ReviewResolveInput): Promise<Re
   const ctx = await readGitContext(baseDir, exec);
   if (!hasOriginRemote(ctx)) return host();
 
-  const mounted = await mountPullRequest(baseDir, pullNumber, exec, { repo, expectedHeadSha: pull.headSha });
+  const mounted = await mountPullRequest(baseDir, repo, pullNumber, exec, { expectedHeadSha: pull.headSha });
   if (!mounted.ok) {
     /*
      * The two conditions R-13.9a retired. They are reachable here even though the context
