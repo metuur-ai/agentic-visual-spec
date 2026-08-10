@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createCollabAuthorizer } from '../../collaboration/authorization';
 import type { CollaborationPreflight } from '../../collaboration/credentials';
 import type { GitHubAdapter, RepoRef } from '../../collaboration/github-adapter';
 import { createJobHubRegistry } from '../../collaboration/job-hub';
@@ -358,6 +359,69 @@ describe('R-W3.8 — reviewing a pull request of any repository is a read', () =
     await call(r, 'GET', '/repos/other/tools/pulls');
     await call(r, 'GET', '/repos/other/tools/pulls/42/files');
     expect(probed).toBe(0);
+  });
+});
+
+/* ================================================================== *
+ * R-W6.4 / R-W6.5 — the two tests Unit 6 asks for by name
+ * ================================================================== */
+describe('R-W6.4 / R-W6.5 — authorization does not cross repositories, and nothing is defaulted', () => {
+  /*
+   * R-W6.4's other half. The classification itself — write on A, read-only on B, and the
+   * same credential coming out author on one and reviewer on the other — is asserted
+   * against the real authorizer in `authorization.test.ts`, which is where the permission
+   * cache lives. What can only be asserted HERE is the half that feeds it: the route
+   * layer hands the authorizer the repository the request named. Together they close the
+   * loop; either alone leaves a gap the other covers.
+   *
+   * This drives the real `createCollabAuthorizer` rather than a double, so a route that
+   * reached the authorizer with the wrong repository would be visible in what `gh` was
+   * asked about, not merely in a spy.
+   */
+  it('asks GitHub about the repository the request named, and about no other', async () => {
+    const endpoints: string[] = [];
+    const authorize = createCollabAuthorizer({
+      exec: async (args) => {
+        endpoints.push(args[args.length - 1] as string);
+        return { stdout: '{"permissions":{"push":false}}', stderr: '', exitCode: 0 };
+      },
+      documents: () => {
+        throw new Error('the /pulls family must not read the document store');
+      },
+    });
+    const r = router({ authorize });
+
+    // Reviewing is any-role, so the authorizer answers without asking `gh` anything —
+    // which is R-W3.8 restated as a cost. The assertion is that nothing was probed about
+    // ANY repository, and in particular nothing about the configured one on behalf of a
+    // request that named another.
+    expect((await call(r, 'GET', '/repos/other/tools/pulls/42/files')).status).toBe(200);
+    expect(endpoints).toEqual([]);
+    // The write probe is the one thing that would name a repository, and no review route
+    // reaches it (R-W3.8 — reviewing needs no write access).
+    expect(await authorize.writeAccess?.({ owner: 'other', repo: 'tools', baseBranch: 'main' })).toMatchObject({
+      write: false,
+    });
+    expect(endpoints).toEqual(['/repos/other/tools']);
+  });
+
+  /*
+   * R-W6.5, stated as the requirement states it and separated from the routing table
+   * above deliberately: that table is about the shapes a path can take, this is about the
+   * one guarantee — a route that requires a repository refuses a request that names none,
+   * rather than reaching for the configured one. The `config` thunk throws, so a handler
+   * that got as far as consulting availability would surface here instead of answering.
+   */
+  it('refuses rather than defaulting when a route that requires a repository is given none', async () => {
+    const r = router({
+      config: () => {
+        throw new Error('a request naming no repository must not reach the configured one');
+      },
+    });
+    for (const path of ['/repos/pulls/42/files', '/repos/acme/pulls/42/files', '/repos//tools/pulls/42/files']) {
+      const res = await call(r, 'GET', path);
+      expect(res.status, path).toBe(404);
+    }
   });
 });
 

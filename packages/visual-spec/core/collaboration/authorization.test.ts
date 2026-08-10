@@ -530,6 +530,66 @@ describe('caching — a stale author verdict is bounded, a stale reviewer verdic
 });
 
 /* ================================================================== *
+ * R-W6.4 — permissions held in one repository do not authorize another
+ * ================================================================== */
+describe('R-W6.4 — a review of one repository is not authorized by permissions held in another', () => {
+  /*
+   * THE STORY MOST LIKELY TO LOOK FINISHED WHILE BEING WRONG. The permission cache is
+   * keyed by `owner/repo`, so this is correct by construction — but "by construction" is
+   * exactly the claim that stops being true when somebody adds a cache, a fast path or a
+   * default, and the failure is invisible until a repository-scoped route asks an
+   * author-only question. There is no such route today, which is precisely why the
+   * property is asserted against the authorizer directly rather than through one: waiting
+   * for a route to exist means the guarantee is untested for as long as it matters least
+   * and untestable for as long as it matters most.
+   *
+   * The credential is real about both repositories: write on A, read-only on B. That is
+   * the ordinary shape of a reviewer's session — a maintainer of their own project,
+   * reading somebody else's.
+   */
+  const A = { owner: 'acme', repo: 'specs', baseBranch: 'main' } as const;
+  const B = { owner: 'other', repo: 'tools', baseBranch: 'main' } as const;
+
+  function writeOnAReadOnlyOnB() {
+    const endpoints: string[] = [];
+    const exec: GhExecutor = async (args) => {
+      const endpoint = args[args.length - 1] as string;
+      endpoints.push(endpoint);
+      if (endpoint === '/repos/acme/specs') return { stdout: fixture('repo-write-access.json'), stderr: '', exitCode: 0 };
+      if (endpoint === '/repos/other/tools') return { stdout: fixture('repo-read-only.json'), stderr: '', exitCode: 0 };
+      return { stdout: fixture('pull-author-octocat.json'), stderr: '', exitCode: 0 };
+    };
+    return { exec, endpoints };
+  }
+
+  it('classifies the same credential author on the repository it can write and reviewer on the one it cannot', async () => {
+    const stub = writeOnAReadOnlyOnB();
+    const authorize = createCollabAuthorizer({ exec: stub.exec, documents: () => memoryDocuments([document()]) });
+
+    // A first, so B is decided with A's write grant already in the cache — the ordering
+    // that would produce the wrong answer if the cache were keyed by anything less than
+    // the repository.
+    expect(await authorize('publish', { documentId: 'doc-1', login: 'octocat', repo: { ...A } })).toEqual({ ok: true });
+
+    const onB = await authorize('publish', { documentId: 'doc-1', login: 'octocat', repo: { ...B } });
+    expect(onB.ok).toBe(false);
+    expect(onB.ok === false && onB.error).toContain('no write access to other/tools');
+    // And it asked GitHub about B rather than answering from A's entry.
+    expect(stub.endpoints).toContain('/repos/other/tools');
+  });
+
+  it('does not let a repository already decided answer for one that has not been', async () => {
+    const stub = writeOnAReadOnlyOnB();
+    const authorize = createCollabAuthorizer({ exec: stub.exec, documents: () => memoryDocuments([document()]) });
+    await authorize.writeAccess?.({ ...A });
+    // The availability hint reads the same cache the verdicts do, so it is the other half
+    // of the same guarantee: a session that can publish to A must not report that it can
+    // publish to B.
+    expect(await authorize.writeAccess?.({ ...B })).toMatchObject({ write: false, reason: 'no_write_access' });
+  });
+});
+
+/* ================================================================== *
  * R-9.6 — attribution. VERIFIED AGAINST 5.1/5.2's CODE, NOT REBUILT:
  * the comment goes through the real `githubCommentStore`, and the only
  * thing asserted is what that module actually puts on the wire.
