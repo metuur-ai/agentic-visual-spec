@@ -140,17 +140,17 @@
 
 ## Unit 4: Entry point
 
-- [ ] 4.1 A pasted URL carries its repository (deps: 3.1, est: ~1h)
+- [x] 4.1 A pasted URL carries its repository (deps: 3.1, est: ~1h)
   - why: the panel already advertises "for a pull request in another repository" and cannot deliver it, because `parsePullRequestReference` extracts the digits and discards the owner and repo. Cheapest requirement in the spec and the one that makes a link-holding reviewer self-sufficient.
   - acceptance: R-W4.1 — WHEN a reference is supplied as a URL, THE SYSTEM SHALL take the repository from it together with the number. R-W4.2 — THE SYSTEM SHALL continue to accept a bare number and apply the configured repository. R-W4.3 — IF a reference names no repository and none is configured, THE SYSTEM SHALL report the repository is unknown rather than attempting the review.
   - verify: a URL from an unconfigured repository opens that pull request; `#42` still resolves the configured one; a bare number with nothing configured reports unknown repository
-  - landed:
+  - landed: `parsePullRequestReference` answers `{ pullNumber, repo }` and `repositoryForReference` decides what to apply; `POST /open` joins the repository-scoped form (the only document route that does) and `open` joins `REVIEW_OPERATIONS`; `ui/collab-open-panel.test.tsx`, `core/vite/routes/collab.repo-scoped.test.ts`
 
-- [ ] 4.2 Display the repository under review (deps: 1.4, est: ~30m)
+- [x] 4.2 Display the repository under review (deps: 1.4, est: ~30m)
   - why: with multiple repositories reachable, a wrong-repository review must be obvious in a second rather than after twenty minutes of reading a plausible diff. This is the cheap half of the defence; 3.1's 404 is the other.
   - acceptance: R-W4.5 — THE SYSTEM SHALL display the repository of the pull request under review at all times while a review is open.
   - verify: the repository is visible in the review surface without scrolling or hovering
-  - landed:
+  - landed: the mount response carries `repo` (the server's own resolution, not `pull.htmlUrl`), `OpenedReview.repo` is required, and it leads the review header's identity line as `owner/repo#n`; `ui/collab-pr-review.test.tsx`, `core/vite/routes/collab.repo-scoped.test.ts`
 
 ## Unit 5: What must not change
 
@@ -172,11 +172,11 @@
   - verify: no write git command issued across a full review; a caller-supplied serve path is refused; token scan over responses and SSE events is clean
   - landed:
 
-- [ ] 5.4 Host parity (deps: 1.3, 3.1, est: ~45m)
+- [x] 5.4 Host parity (deps: 1.3, 3.1, est: ~45m)
   - why: source selection lives in the shared route layer, and the bundle guard already fails any host source containing `writeFile(`, `mkdir(` or `readGitContext(` — free enforcement worth an explicit assertion rather than an assumption.
   - acceptance: R-W5.7 — THE SYSTEM SHALL expose this behaviour identically from both hosts, without host-specific implementation.
   - verify: the host-parity suite drives both servers through the same review; bundle guard passes
-  - landed:
+  - landed: R-W5.7 named in `routes-host-agnostic.test.ts`, a review-source entry added to `bundle-guard.test.ts`'s host block, and eleven review requests driven through both live servers in `core/vite/host-parity.test.ts`. Note: `check-bundle.mjs` guards the emitted bundles for react/luthor/lexical only — the `writeFile(`/`mkdir(`/`readGitContext(` host guard is `bundle-guard.test.ts`, which is where the entry went
 
 ## Unit 6: Testability
 
