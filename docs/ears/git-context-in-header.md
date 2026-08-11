@@ -217,6 +217,23 @@ directory has no recognised `origin` as well as when the two names disagree.
 | R-8.1 | WHERE the chip does not already name the `origin` of the served directory as the configured collaboration repository — because the two differ, or because the served directory has no recognised `origin` — THE SYSTEM SHALL name the repository the count belongs to. |
 | R-8.2 | WHEN the configured collaboration repository matches the `origin` of the served directory, THE SYSTEM SHALL NOT add that naming. |
 | R-8.3 | THE SYSTEM SHALL NOT resolve the difference by changing either repository. |
+| R-8.4 | THE SYSTEM SHALL name the collaboration repository on every surface that lists its pull requests or offers to check one out, and SHALL NOT refer to it only as the repository of the served directory. |
+
+**Note on R-8.4:** R-8.1 was written about the count, and the disclosure stopped where
+the count did. The panel behind the chip opened with "Every open pull request in this
+repository" and named none — and "this" is read as the directory on screen, which is the
+one pairing that can be false. That surface is also the one that acts: a checkout from
+it lands inside the served directory, at
+`<served>/.visual-spec/worktrees/<owner>/<repo>/pr-<n>`, and a comment written from it is
+posted to the collaboration repository. Naming the repository beside the number is what
+stops a reviewer checking a foreign pull request into their own workspace believing it is
+their project's.
+
+Where the surface can compare — the header and its popover both hold the served
+directory's context — R-8.2's rule still applies and nothing is added when the two agree.
+Where it cannot, the repository is named unconditionally: a sentence that always says
+which repository is never noise, and silence there is not neutral, it is an invitation to
+assume.
 
 ## Unit 9: Naming the pull request under review
 

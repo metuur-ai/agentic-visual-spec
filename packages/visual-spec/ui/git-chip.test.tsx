@@ -887,4 +887,53 @@ describe('the counts waiting on you are two chips, captioned once', () => {
     await screen.findByTestId('git-mention-count');
     expect(screen.queryByTestId('git-pull-count-repo')).toBeNull();
   });
+
+  /*
+   * R-8.4 — the disclosure follows the reader into the list, because the list is what acts.
+   *
+   * Reported from a running server: the chip said `on metuur/agentic-visual-spec` and the
+   * popover under it listed "#2 readme" with a `Review` button and no repository anywhere.
+   * `Review` checks that pull request out INSIDE the served directory, so a reader who
+   * takes the rows for their own project mounts a foreign one into their workspace.
+   */
+  function installWithPulls(git: unknown, repo = { owner: 'acme', repo: 'docs' }) {
+    const pulls = [{ number: 2, title: 'readme', htmlUrl: 'https://github.com/acme/docs/pull/2' }];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/__vs/git') return jsonRes(git);
+        if (url === '/__vs/git/branches') return { ok: false, status: 404, json: async () => ({ error: 'no route' }) } as Response;
+        if (url === '/__vs/collab') return jsonRes({ available: true, login: 'ana', repo, scopes: [] });
+        if (url.startsWith('/__vs/collab/pulls/awaiting')) return jsonRes(AWAITING_BOTH);
+        if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls });
+        if (url.startsWith('/__vs/comments')) return jsonRes([OPEN_COMMENT]);
+        if (url === '/__vs/source/root') return jsonRes({ root: '/repo/docs' });
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+  }
+
+  it('names the repository in the popover when it is not the served directory’s', async () => {
+    installWithPulls({ ...REMOTE_GITHUB, owner: 'acme', repo: 'website', url: 'git@github.com:acme/website.git' });
+    render(<MainHeader file="docs/spec.md" />);
+
+    fireEvent.click(await screen.findByTestId('git-pull-count'));
+
+    const menu = await screen.findByTestId('git-pull-menu');
+    expect(screen.getByTestId('git-pull-menu-repo').textContent).toContain('acme/docs');
+    // The row itself is unchanged; the naming captions the list, once.
+    expect(menu.textContent).toContain('readme');
+    expect(screen.getAllByTestId('git-pull-menu-repo')).toHaveLength(1);
+  });
+
+  it('adds nothing to the popover where the two repositories agree (R-8.2)', async () => {
+    installWithPulls(REMOTE_GITHUB);
+    render(<MainHeader file="docs/spec.md" />);
+
+    fireEvent.click(await screen.findByTestId('git-pull-count'));
+
+    expect((await screen.findByTestId('git-pull-menu')).textContent).toContain('readme');
+    expect(screen.queryByTestId('git-pull-menu-repo')).toBeNull();
+  });
 });

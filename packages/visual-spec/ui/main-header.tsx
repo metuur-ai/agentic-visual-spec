@@ -571,6 +571,7 @@ function GitChip({ actions }: { actions?: HeaderActions }) {
       {menu === 'pulls' && (
         <PullMenu
           pulls={pulls.pulls ?? []}
+          foreignRepo={ctx && namesCountRepo(ctx, pulls.repo) ? pulls.repo : null}
           onResume={(pull) => {
             // R-7.7 — the id the *server* resolved from the body (R-7.4/R-7.5), passed
             // through untouched. Nothing here re-derives it, and nothing here could:
@@ -855,11 +856,21 @@ const PULL_LIST_BOUND = 8;
  */
 function PullMenu({
   pulls,
+  foreignRepo,
   onResume,
   onReview,
   onClose,
 }: {
   pulls: PullRequestSummary[];
+  /**
+   * R-8.4 — the collaboration repository, when it is NOT the served directory's `origin`.
+   * Null where they agree, which is R-8.2's rule: nothing is added where nothing diverges.
+   *
+   * The chip that opens this popover carries the same disclosure, and it is repeated here
+   * because this is the list that acts — `Review` checks a pull request out beside the
+   * reader's own files, and a row naming only "#2 readme" says nothing about whose #2.
+   */
+  foreignRepo: ConfiguredRepo | null;
   onResume: (pull: PullRequestSummary) => void;
   onReview: (pull: PullRequestSummary) => void;
   onClose: () => void;
@@ -868,7 +879,15 @@ function PullMenu({
   return (
     <div style={gitPop} data-testid="git-pull-menu">
       <div style={applyPopHead}>
-        <span style={{ fontWeight: 700 }}>Open pull requests</span>
+        <span style={{ fontWeight: 700 }}>
+          Open pull requests
+          {foreignRepo && (
+            <span data-testid="git-pull-menu-repo" style={pullRepoNote}>
+              {' '}
+              on {foreignRepo.owner}/{foreignRepo.repo}
+            </span>
+          )}
+        </span>
         <button type="button" onClick={onClose} style={closeBtn} title="Close" aria-label="Close">
           ✕
         </button>

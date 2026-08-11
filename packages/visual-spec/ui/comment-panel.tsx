@@ -23,6 +23,7 @@
 import { collectSection, headingBlockOf, useComments, useInspector } from '../core/app';
 import type { SelectedTarget } from '../core/app';
 import type { CommentRecord } from '../core/editing/comment-doc';
+import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { toPath } from './md-path';
 import { WorkflowSelect, loadWorkflow } from './workflow-select';
@@ -68,6 +69,24 @@ export type PanelReply = {
   createdAt: string;
   htmlUrl?: string;
 };
+
+/**
+ * A thread's reply in the panel's shape. Ids are stringified; the panel keys on them.
+ *
+ * It lives beside `PanelReply` rather than in either source because both of them project
+ * the same `ReviewThreadRecord` — the review surface and the collaboration document
+ * surface show one conversation read two ways. It used to live in `review-comment-source`
+ * alone, and the surface that did not have it simply rendered no replies at all.
+ */
+export function toPanelReply(reply: ReviewThreadRecord['replies'][number]): PanelReply {
+  return {
+    id: String(reply.id),
+    user: reply.user,
+    body: reply.body,
+    createdAt: reply.createdAt,
+    htmlUrl: reply.htmlUrl,
+  };
+}
 
 /** How the current selection reads, or why it cannot be commented on at all. */
 export type SelectionDescription = { title: string; detail: string } | { uncommentable: string };

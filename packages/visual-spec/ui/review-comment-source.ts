@@ -28,7 +28,7 @@ import type { ReviewDraftInput } from '../core/collaboration/review-drafts';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { resolveMarkdownAnchors } from './anchor-resolver';
 import { flash } from './comment-history-list';
-import type { CommentAction, CommentOrigin, CommentPanelSource, PanelReply } from './comment-panel';
+import { type CommentAction, type CommentOrigin, type CommentPanelSource, toPanelReply } from './comment-panel';
 import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
 import type { IndicatorTarget } from './indicator-layer';
 
@@ -90,17 +90,6 @@ function draftOrigin(draft: ReviewDraft): CommentOrigin {
 function threadOrigin(thread: ReviewThreadRecord, pullNumber: number): CommentOrigin {
   const resolved = thread.github.isResolved === true ? ' · resolved' : '';
   return { where: 'github', label: `On GitHub · #${pullNumber}${resolved}` };
-}
-
-/** A thread's reply in the panel's shape. Ids are stringified; the panel keys on them. */
-function toPanelReply(reply: ReviewThreadRecord['replies'][number]): PanelReply {
-  return {
-    id: String(reply.id),
-    user: reply.user,
-    body: reply.body,
-    createdAt: reply.createdAt,
-    htmlUrl: reply.htmlUrl,
-  };
 }
 
 /** The projection the panel lists. See the header on why `status` is always `open`. */

@@ -265,13 +265,38 @@ export function useCollabDocument(documentId: string, options: UseCollabDocument
     [client, documentId],
   );
 
+  /**
+   * Re-read the conversation. Threads are grouped on the server, where the whole listing
+   * is in hand, so this is the only place a reply can be put under the root it answers.
+   */
+  const loadComments = useCallback(async (): Promise<void> => {
+    const result = await client.comments(documentId);
+    if (result.ok) setComments(result.value);
+    else setCommentsError(result);
+  }, [client, documentId]);
+
   const replyToComment = useCallback(
     async (commentId: string, comment: string): Promise<void> => {
       const result = await client.replyToComment(documentId, commentId, { comment });
-      if (result.ok) setComments((current) => [...current, result.value.comment]);
-      else setCommentsError(result);
+      if (!result.ok) {
+        setCommentsError(result);
+        return;
+      }
+      /*
+       * Re-read rather than append. The reply route answers with the created comment
+       * projected as a thread of its own — `projectCreated` builds exactly that, a root
+       * with no replies — because a create knows nothing about a listing it was not given.
+       * Appending it to `comments` therefore put the answer on screen as a SECOND
+       * top-level comment on the same line, and it only fell into place under its root on
+       * the next full read, so the panel disagreed with itself until something refreshed.
+       *
+       * `in_reply_to_id` is what makes it a reply, and `groupIntoThreads` is what reads
+       * it; both live on the server. Reconstructing that grouping here would be a second
+       * implementation of it in the browser, free to drift from the first.
+       */
+      await loadComments();
     },
-    [client, documentId],
+    [client, documentId, loadComments],
   );
 
   const patchComment = useCallback(

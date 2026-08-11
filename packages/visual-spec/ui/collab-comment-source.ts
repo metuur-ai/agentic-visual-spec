@@ -33,7 +33,7 @@ import type { SelectedTarget } from '../core/app';
 import { resolveMarkdownAnchors } from './anchor-resolver';
 import { flash } from './comment-history-list';
 import type { IndicatorTarget } from './indicator-layer';
-import type { CommentOrigin, CommentPanelSource } from './comment-panel';
+import { type CommentOrigin, type CommentPanelSource, toPanelReply } from './comment-panel';
 
 /** R-6.10 — a thread GitHub reports as having lost its line. */
 function isOutdated(comment: CommentRecord): boolean {
@@ -195,6 +195,16 @@ export function collabCommentPanelSource(deps: CollabCommentSourceDeps): Comment
     // Orphans have their own section (R-5.7); listing them twice would double-render them.
     comments: deps.comments.filter((c) => !orphaned.has(c.id)),
     reply: deps.reply,
+    /*
+     * The rest of the thread, which this surface offered to write and then did not show.
+     *
+     * `reply` alone was here: a reviewer could answer, the answer reached GitHub, and the
+     * panel went on rendering the root by itself — so the conversation looked unanswered
+     * from the one place that had just answered it, and the only way to read it was
+     * github.com. The replies were never missing from the data; every record here is a
+     * `ReviewThreadRecord` and has carried them all along.
+     */
+    replies: (c) => ((c as Partial<ReviewThreadRecord>).replies ?? []).map(toPanelReply),
     link: threadLink,
     origin: () => collabOrigin(record),
     orphans,

@@ -105,6 +105,10 @@ function Probe({ client, factory, documentId = 'doc-1' }: { client: CollabClient
       <span data-testid="markdown">{state.fullDocument ? String(state.fullDocument.markdown.length) : '-1'}</span>
       <span data-testid="comments">{state.comments.map((c) => `${c.id}:${c.comment}:${c.status}`).join('|') || '—'}</span>
       <span data-testid="comments-error">{state.commentsError?.kind ?? '—'}</span>
+      {/* The answers, which the panel renders under their root and this probe reads flat. */}
+      <span data-testid="replies">
+        {state.comments.flatMap((c) => (c as { replies?: { body: string }[] }).replies ?? []).map((r) => r.body).join('|')}
+      </span>
       <button data-testid="add" onClick={() => void state.addComment({ startLine: 3, comment: 'tighten', workflow: 'visual-spec' })} />
       <button data-testid="reply" onClick={() => void state.replyToComment('c-1', 'agreed')} />
       <button data-testid="patch" onClick={() => void state.patchComment('c-1', { status: 'applied' })} />
@@ -306,18 +310,55 @@ describe('comment mutations, shaped for CollabCommentSourceDeps', () => {
     expect(client.comments).toHaveBeenCalledTimes(1);
   });
 
-  it('reply appends the reply the server saved', async () => {
-    const saved = comment('c-2', 'agreed', { collab: { replyTo: 'c-1' } } as Partial<CommentRecord>);
+  /*
+   * Reported from a running server: an answer rendered as a SECOND comment on the same
+   * line, beside the one it answered, and only fell into place under its root when
+   * something refreshed. This test used to assert that — `…|c-2:agreed:open`, the reply
+   * appended as a root — and so pinned the defect rather than a decision.
+   *
+   * The reply route answers with the created comment projected as a thread of its own
+   * (`projectCreated`: a root, no replies), because a create is told nothing about the
+   * listing it belongs to. `in_reply_to_id` is what makes it a reply and
+   * `groupIntoThreads` is what reads it, both on the server — so the conversation is
+   * re-read, and the browser never groups anything.
+   */
+  it('reply re-reads the conversation rather than appending a second root', async () => {
+    const root = comment('c-1', 'tighten');
+    const answered = { ...root, replies: [{ id: 900, user: 'ana', body: 'agreed', createdAt: 'T1' }] } as CommentRecord;
+    const comments = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, value: [root] })
+      .mockResolvedValue({ ok: true, value: [answered] });
     const client = stubClient({
-      comments: vi.fn(async () => ({ ok: true, value: [comment('c-1', 'tighten')] })),
-      replyToComment: vi.fn(async () => ({ ok: true, value: { ok: true, id: 'c-2', comment: saved } })),
+      comments,
+      replyToComment: vi.fn(async () => ({ ok: true, value: { ok: true, id: 'c-2', comment: comment('c-2', 'agreed') } })),
     } as unknown as Partial<CollabClient>);
     render(<Probe client={client} factory={fakeStream().factory} />);
     await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-1:tighten:open'));
 
     screen.getByTestId('reply').click();
-    await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-1:tighten:open|c-2:agreed:open'));
+
     expect(client.replyToComment).toHaveBeenCalledWith('doc-1', 'c-1', { comment: 'agreed' });
+    await waitFor(() => expect(comments).toHaveBeenCalledTimes(2));
+    // Still one comment, carrying the answer — not two comments sitting side by side.
+    expect(screen.getByTestId('comments').textContent).toBe('c-1:tighten:open');
+    expect((screen.getByTestId('replies').textContent ?? '')).toBe('agreed');
+  });
+
+  it('leaves the conversation alone and reports a reply the server refused', async () => {
+    const comments = vi.fn(async () => ({ ok: true, value: [comment('c-1', 'tighten')] }));
+    const client = stubClient({
+      comments,
+      replyToComment: vi.fn(async () => ({ ok: false, kind: 'failed', status: 422, message: 'no' })),
+    } as unknown as Partial<CollabClient>);
+    render(<Probe client={client} factory={fakeStream().factory} />);
+    await waitFor(() => expect(screen.getByTestId('comments').textContent).toBe('c-1:tighten:open'));
+
+    screen.getByTestId('reply').click();
+
+    await waitFor(() => expect(screen.getByTestId('comments-error').textContent).toBe('failed'));
+    // No second read: there is nothing new to read, and one would only cost a round trip.
+    expect(comments).toHaveBeenCalledTimes(1);
   });
 
   /*

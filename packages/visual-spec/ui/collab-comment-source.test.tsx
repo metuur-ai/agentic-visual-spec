@@ -312,6 +312,66 @@ describe('R-5.13 / R-5.14 — resolution is read, never written', () => {
 });
 
 /* ================================================================== *
+ * The answers, which this surface offered to write and did not show
+ * ================================================================== */
+describe('a thread reads as a conversation, not as its opening line', () => {
+  /**
+   * Reported from a running server: a reviewer answered a thread here, the answer reached
+   * GitHub — visible on the pull request — and this panel went on rendering the root by
+   * itself. `reply` was wired and `replies` was not, so the one surface that had just
+   * answered was the one place the answer could not be read.
+   *
+   * The records were never short of the data. Everything this panel lists is a
+   * `ReviewThreadRecord` off `GET /:documentId/comments`, replies included; only the
+   * source's projection dropped them. The review surface's own version of this test
+   * (`collab-pr-review.test.tsx`) passed throughout, which is exactly why the gap lasted.
+   */
+  const withReplies = (): CommentRecord =>
+    ({
+      ...comment('c-answered', { startLine: 3 }, { text: 'ne wcomment' }),
+      github: {
+        reviewCommentId: 700003,
+        isOutdated: false,
+        htmlUrl: 'https://github.com/acme/docs/pull/42#discussion_r700003',
+        user: 'octocat',
+        updatedAt: 'T0',
+      },
+      replies: [
+        { id: 700004, user: 'javierhbr', body: 'reply of comment', createdAt: '2026-08-10T09:00:00.000Z' },
+      ],
+    }) as unknown as CommentRecord;
+
+  const mount = (c: CommentRecord) =>
+    render(
+      <InspectorProvider surfaceId="docs/spec.md" pageIndex={0}>
+        <CommentPanel
+          width={320}
+          source={collabCommentPanelSource({ document: record(), comments: [c], add: async () => {}, reply: async () => {} })}
+        />
+      </InspectorProvider>,
+    );
+
+  it('renders the reply under the root it answers', () => {
+    mount(withReplies());
+    expect(screen.getByText('ne wcomment')).toBeTruthy();
+    expect(screen.getByText('reply of comment')).toBeTruthy();
+  });
+
+  it('says who wrote it and when, so the answer is attributable', () => {
+    mount(withReplies());
+    const card = screen.getByText('reply of comment').closest('[data-vs-reply]');
+    expect(card).toBeTruthy();
+    expect(card?.textContent).toContain('javierhbr');
+    expect(card?.textContent).toContain('2026-08-10');
+  });
+
+  it('adds nothing to a thread nobody has answered', () => {
+    mount(comment('c-quiet', { startLine: 3 }, { outdated: false }));
+    expect(document.querySelector('[data-vs-reply]')).toBeNull();
+  });
+});
+
+/* ================================================================== *
  * The presentation defects the first screenshot of this panel showed
  * ================================================================== */
 describe('the row controls say what the system actually does', () => {

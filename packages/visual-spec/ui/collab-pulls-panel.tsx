@@ -146,6 +146,17 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
   /** The signed-in login, or null while unknown — which is what turns the split off. */
   const [login, setLogin] = useState<string | null>(null);
   /**
+   * R-8.4 — the repository these rows are of, named on the surface that acts on them.
+   *
+   * It rides in the same snapshot as `login` and used to be dropped on arrival. The chip
+   * in the header already discloses it (R-8.1), but the disclosure stopped there: this
+   * panel said "this repository" and named none, and "this" reads as the directory on
+   * screen — which is exactly the pairing that can be false, because the collaboration
+   * repository is configured independently of the served directory's `origin`. A reviewer
+   * checks a pull request out INTO their own workspace from here and posts comments to it.
+   */
+  const [repo, setRepo] = useState<{ owner: string; repo: string } | null>(null);
+  /**
    * The descriptions a reviewer has asked to read, keyed by pull number.
    *
    * A listing of titles answers "what is open" and not "what is this", and the second
@@ -313,7 +324,10 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
     void client.availability().then((res) => {
       // An unreadable snapshot costs the split and nothing else — the flat list below is
       // the same list, and a banner about it would be about a heading.
-      if (live && res.ok && res.value.available) setLogin(res.value.login);
+      if (live && res.ok && res.value.available) {
+        setLogin(res.value.login);
+        setRepo({ owner: res.value.repo.owner, repo: res.value.repo.repo });
+      }
     });
     return () => {
       live = false;
@@ -791,9 +805,21 @@ export function CollabPullsPanel({ onReview, onResume, autoReview, onAutoReviewF
     <section data-vs-collab-pulls style={wrap}>
       <h2 style={heading}>Open collaborations</h2>
       <p style={note}>
-        Every open pull request in this repository. One with a visual-spec document can be picked up where it was left;
-        any of them can be checked out beside your files, detached at its head, as a read-only view — nothing here
-        commits, pushes or merges.
+        {/*
+          * R-8.4 — "this repository" named none, and on this surface that is the one thing
+          * a reader cannot infer: the rows are of the configured collaboration repository,
+          * the files behind them are this directory's, and the two need not be the same.
+          * Named unconditionally rather than only on divergence (R-8.2's rule for the
+          * chip): a sentence that always says which repository is never noise, and this
+          * panel has no reading of the served directory's `origin` to compare against.
+          */}
+        Every open pull request in{' '}
+        <strong data-testid="collab-pulls-repo" style={{ fontWeight: 600 }}>
+          {repo ? `${repo.owner}/${repo.repo}` : 'the configured collaboration repository'}
+        </strong>
+        , which is not necessarily the repository of the directory you are serving. One with a visual-spec document can
+        be picked up where it was left; any of them can be checked out beside your files, detached at its head, as a
+        read-only view — nothing here commits, pushes or merges.
       </p>
 
       <div style={row}>

@@ -63,6 +63,46 @@ function fakeFetch(overrides: Record<string, Reply> = {}) {
   return { impl: impl as unknown as typeof fetch, calls };
 }
 
+/* ================================================================== *
+ * R-8.4 — which repository these rows are of
+ * ================================================================== */
+describe('R-8.4 — the panel names the repository it is listing', () => {
+  /*
+   * It said "Every open pull request in this repository" and named none, so "this" was
+   * read as the directory on screen — the one pairing that can be false. The collaboration
+   * repository is configured independently of the served directory's `origin`, and this is
+   * the surface that checks a pull request out INTO that directory.
+   *
+   * `availability` already travels here for the Yours/From-others split, so naming the
+   * repository costs no request; the snapshot's `repo` was simply dropped on arrival.
+   */
+  const available = (repo: { owner: string; repo: string }) => ({
+    ok: true,
+    status: 200,
+    json: { available: true, login: 'ana', repo, scopes: [] },
+  });
+
+  it('names it, rather than calling it “this repository”', async () => {
+    const { impl } = fakeFetch({ '/__vs/collab': available({ owner: 'metuur', repo: 'agentic-visual-spec' }) });
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+
+    await waitFor(() => expect(screen.getByTestId('collab-pulls-repo').textContent).toBe('metuur/agentic-visual-spec'));
+    expect(document.body.textContent).not.toContain('pull request in this repository');
+    // And it says the pairing a reader would otherwise assume is not guaranteed.
+    expect(document.body.textContent).toContain('not necessarily the repository of the directory you are serving');
+  });
+
+  it('still says which kind of repository it means when the snapshot cannot be read', async () => {
+    // No `/__vs/collab` route in the fake — the listing renders regardless, and a panel
+    // that fell back to "this repository" would reintroduce exactly the wrong reading.
+    const { impl } = fakeFetch();
+    render(<CollabPullsPanel onReview={vi.fn()} fetchImpl={impl} />);
+
+    await waitFor(() => expect(screen.getByText(/Rework the payment rules/)).toBeTruthy());
+    expect(screen.getByTestId('collab-pulls-repo').textContent).toBe('the configured collaboration repository');
+  });
+});
+
 describe('R-13.1 — the reviewer sees what there is to review', () => {
   it('lists each pull request with its number, title, branches, author and head', async () => {
     const { impl } = fakeFetch();
