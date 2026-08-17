@@ -1,41 +1,76 @@
 import { InspectorProvider, useComments } from '../core/app';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { CollabApp, type CollabIntent, clearCollabUrl, intentFromUrl } from './collab-app';
+import { CollabDrawer } from './collab-drawer';
 import { FileTree } from './file-tree';
 import { GenericEditor } from './generic-editor';
-import { BrandHeader, MainHeader, type ViewMode } from './main-header';
+import { BrandHeader, type HeaderActions, MainHeader, type ViewMode } from './main-header';
 import { MarkdownEditor } from './markdown-editor';
 import { MarkdownDocEditor } from './markdown-doc-editor';
 import { toSurfaceId } from './md-path';
-import { type TreeEntry, useTree } from './use-tree';
+import { useCollabPulls } from './use-collab-pulls';
+import { type TreeEntry, invalidateTree, useTree } from './use-tree';
 
 const MIN_W = 180;
 const MAX_W = 680;
 const CMT_MIN_W = 260;
 const CMT_MAX_W = 720;
 
+/**
+ * The two resizable widths are CSS custom properties rather than React state.
+ *
+ * They used to be `useState` on App, set from the splitter's `mousemove`. That made a
+ * drag re-render the whole shell — MainHeader, the sidebar's FileTree, and the open
+ * editor — once per pointer event, and write `localStorage` synchronously inside the
+ * same loop. The width is pure presentation; nothing branches on its value. Pushing it
+ * into a variable the panes are sized by lets the drag repaint with zero React renders,
+ * and the value is persisted once, on mouse-up.
+ */
+const SIDEBAR_W = '--vs-sidebar-w';
+const COMMENT_W = '--vs-comment-w';
+const sidebarWidthVar = `var(${SIDEBAR_W})`;
+const commentWidthVar = `var(${COMMENT_W})`;
+
+const clamp = (w: number, min: number, max: number): number => Math.min(max, Math.max(min, w));
+
+/** Seed both variables from the last session before the first paint, so nothing jumps. */
+if (typeof document !== 'undefined') {
+  const seed = (name: string, key: string, min: number, max: number, fallback: number) => {
+    const saved = Number(localStorage.getItem(key));
+    const w = saved >= min && saved <= max ? saved : fallback;
+    document.documentElement.style.setProperty(name, `${w}px`);
+  };
+  seed(SIDEBAR_W, 'vs:sidebarWidth', MIN_W, MAX_W, 280);
+  seed(COMMENT_W, 'vs:commentWidth', CMT_MIN_W, CMT_MAX_W, 340);
+}
+
 export function App() {
-  const { entries, loading } = useTree();
+  const { entries, loading, reload } = useTree();
   const [selected, setSelected] = useState<TreeEntry | null>(null);
   const [mode, setMode] = useState<ViewMode>('view');
-  const [width, setWidth] = useState<number>(() => {
-    const saved = Number(localStorage.getItem('vs:sidebarWidth'));
-    return saved >= MIN_W && saved <= MAX_W ? saved : 280;
-  });
-  const [commentWidth, setCommentWidth] = useState<number>(() => {
-    const saved = Number(localStorage.getItem('vs:commentWidth'));
-    return saved >= CMT_MIN_W && saved <= CMT_MAX_W ? saved : 340;
-  });
-
-  const resize = (w: number) => {
-    const clamped = Math.min(MAX_W, Math.max(MIN_W, w));
-    setWidth(clamped);
-    localStorage.setItem('vs:sidebarWidth', String(clamped));
-  };
-  const resizeComment = (w: number) => {
-    const clamped = Math.min(CMT_MAX_W, Math.max(CMT_MIN_W, w));
-    setCommentWidth(clamped);
-    localStorage.setItem('vs:commentWidth', String(clamped));
-  };
+  // A collaboration document has no local-file entry (ui/use-tree.ts enumerates the
+  // file tree only), so it cannot be reached through `selected`/`pick()`. It is a
+  // genuinely separate top-level route that swaps the whole shell instead.
+  //
+  // It carries an intent rather than a boolean because there are now three ways in and
+  // they arrive at different places: the sidebar link opens the surface's own two
+  // entry panels, while the header's pull request list already knows which document to
+  // resume (R-7.7) or which pull request to check out (R-7.8) and would otherwise ask
+  // the user to find it again on the screen they just came from.
+  // Seeded from the URL, so a reload during a review or an open document comes back to
+  // it rather than to the file tree. `intentFromUrl` owns which parameter wins.
+  const [collab, setCollab] = useState<CollabIntent | null>(intentFromUrl);
+  // The picker that leads to it. It is a right-side drawer over the file shell rather
+  // than the first screen of the swapped-in route: "what pull requests are there?" is a
+  // question asked *while* looking at the files, and answering it used to cost the whole
+  // view. What the drawer hands back is always a full intent, so the surface below only
+  // ever mounts on something already chosen.
+  const [picker, setPicker] = useState(false);
+  // Called once, when the drag ends. Stable identities matter here: `Splitter` binds
+  // window listeners keyed on them, and a fresh function per render re-subscribed
+  // `mousemove`/`mouseup` on every render — which, mid-drag, was every pointer event.
+  const persistWidth = useCallback((w: number) => localStorage.setItem('vs:sidebarWidth', String(w)), []);
+  const persistCommentWidth = useCallback((w: number) => localStorage.setItem('vs:commentWidth', String(w)), []);
 
   // Live dirty state + a success-returning save, reported up by the doc editor,
   // so switching to View can guard unsaved edits instead of dropping them.
@@ -90,6 +125,88 @@ export function App() {
     [selected, doPick],
   );
 
+  // R-5.4 — a file that was just created is not in `entries` yet (the walk that
+  // would list it has not run), so the pane is pointed at the path the server
+  // confirmed rather than looked up. Created files are always markdown, and
+  // landing in Edit is what "ready to edit" means.
+  const onCreated = useCallback(
+    (path: string) => {
+      invalidateTree();
+      reload();
+      editorState.current = { dirty: false, save: async () => true };
+      setSelected({ path, name: baseName(path), type: 'file', kind: 'markdown' });
+      setMode('edit');
+    },
+    [reload],
+  );
+
+  // R-5.5 — the pane follows the document it is showing to its new path; a pane on
+  // any other file is left alone.
+  const onRenamed = useCallback(
+    (from: string, to: string) => {
+      invalidateTree();
+      reload();
+      setSelected((cur) => (cur && cur.path === from ? { ...cur, path: to, name: baseName(to) } : cur));
+    },
+    [reload],
+  );
+
+  /**
+   * R-6.5 — the branch switcher's half of the unsaved-changes guard.
+   *
+   * It reuses the machinery the mode switch and the file pick already run through
+   * rather than growing a second dialog: `editorState` is the live dirty flag the
+   * document editor reports, `pending` is the deferred action, and `UnsavedDialog`
+   * below is the prompt. Note which editor this guards — `MarkdownDocEditor`, the one
+   * on screen. `CollabEditor` can also be dirty, but it lives inside `CollabApp`,
+   * which this component returns early, so the switcher and it are never mounted
+   * together and a guard naming it would protect nothing.
+   */
+  const confirmUnsaved = useCallback((proceed: () => void) => {
+    if (!editorState.current.dirty) {
+      proceed();
+      return;
+    }
+    setPending({
+      run: proceed,
+      primaryLabel: 'Save & Change',
+      message: 'You have edits that aren’t saved yet. Save them before changing branch?',
+    });
+  }, []);
+
+  /**
+   * R-6.7 / R-6.8 — the branch moved, so the tree is a different tree.
+   *
+   * The chip needs nothing back: the checkout route answered with the context git
+   * reported after the change and `useGitContext` has already adopted it (R-5.9). What
+   * only this component can do is re-read the tree and decide what happens to the open
+   * pane — and a file that is not on the new branch must not go on rendering the
+   * previous branch's bytes under the new branch's name.
+   */
+  const onBranchChanged = useCallback(async () => {
+    invalidateTree();
+    const next = await reload();
+    setSelected((current) => {
+      if (!current || next.some((e) => e.path === current.path)) return current;
+      editorState.current = { dirty: false, save: async () => true };
+      setMode('view');
+      return null; // R-6.8 — back to the empty state
+    });
+  }, [reload]);
+
+  const headerActions = useMemo<HeaderActions>(
+    () => ({
+      confirmUnsaved,
+      onBranchChanged: () => void onBranchChanged(),
+      onResumeCollab: (documentId: string) => setCollab({ documentId }),
+      onReviewPull: (reviewPull: number) => setCollab({ reviewPull }),
+      // R-A3.1 — the same surface the sidebar opens, reached from the header's awaiting
+      // chips. `setPicker` is a state setter, so it is stable and adds no dependency.
+      onOpenPulls: () => setPicker(true),
+    }),
+    [confirmUnsaved, onBranchChanged],
+  );
+
   // Jump to a path from the cart dropdown.
   const navigate = (path: string) => {
     const e = entries.find((x) => x.path === path);
@@ -99,25 +216,28 @@ export function App() {
   const current = selected?.path ?? '';
   const isMarkdown = selected?.type === 'file' && selected.kind === 'markdown';
   const editing = isMarkdown && mode === 'edit';
-  const commentSplitter = <Splitter onResize={resizeComment} fromRight />;
+  const commentSplitter = useMemo(
+    () => <Splitter cssVar={COMMENT_W} min={CMT_MIN_W} max={CMT_MAX_W} onCommit={persistCommentWidth} fromRight />,
+    [persistCommentWidth],
+  );
 
   const shell = (
     <>
       {selected ? (
-        <MainHeader file={current} onNavigate={navigate} withInspector={isMarkdown} isMarkdown={isMarkdown} mode={mode} onModeChange={requestMode} />
+        <MainHeader file={current} onNavigate={navigate} withInspector={isMarkdown} isMarkdown={isMarkdown} mode={mode} onModeChange={requestMode} actions={headerActions} />
       ) : (
-        <BrandHeader />
+        <BrandHeader actions={headerActions} />
       )}
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-        <Sidebar entries={entries} current={current} loading={loading} onPick={pick} width={width} />
-        <Splitter onResize={resize} />
+        <Sidebar entries={entries} current={current} loading={loading} onPick={pick} onOpenCollab={() => setPicker(true)} onCreated={onCreated} onRenamed={onRenamed} />
+        <Splitter cssVar={SIDEBAR_W} min={MIN_W} max={MAX_W} onCommit={persistWidth} />
         {selected ? (
           editing ? (
-            <MarkdownDocEditor key={current} path={current} previewWidth={commentWidth} splitter={commentSplitter} onExitToView={exitToView} onStateChange={onEditorState} />
+            <MarkdownDocEditor key={current} path={current} previewWidth={commentWidthVar} splitter={commentSplitter} onExitToView={exitToView} onStateChange={onEditorState} />
           ) : isMarkdown ? (
-            <MarkdownEditor path={current} commentWidth={commentWidth} splitter={commentSplitter} />
+            <MarkdownEditor path={current} commentWidth={commentWidthVar} splitter={commentSplitter} />
           ) : (
-            <GenericEditor key={current} entry={selected} commentWidth={commentWidth} splitter={commentSplitter} />
+            <GenericEditor key={current} entry={selected} commentWidth={commentWidthVar} splitter={commentSplitter} />
           )
         ) : (
           <main style={{ flex: 1, display: 'grid', placeItems: 'center', opacity: 0.6 }}>
@@ -143,8 +263,43 @@ export function App() {
           onCancel={() => setPending(null)}
         />
       )}
+      {picker && (
+        <CollabDrawer
+          onClose={() => setPicker(false)}
+          onResume={(documentId) => {
+            setPicker(false);
+            setCollab({ documentId });
+          }}
+          onReview={(pull, review) => {
+            setPicker(false);
+            setCollab({ review: { pull, review } });
+          }}
+        />
+      )}
     </>
   );
+
+  if (collab) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+        {/*
+          * A checkout's way back is labelled `← Pull requests`, so it goes to the list —
+          * which now means reopening the drawer. The document surface's is labelled
+          * `← Files` and means it, so that one just leaves.
+          */}
+        <CollabApp
+          initial={collab}
+          onExit={() => {
+            // Leaving the surface takes its parameters with it, or the next reload would
+            // put the reviewer straight back on a review they just walked out of.
+            clearCollabUrl();
+            setCollab(null);
+            if (collab.review) setPicker(true);
+          }}
+        />
+      </div>
+    );
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -183,27 +338,59 @@ function UnsavedDialog({ onSaveAndContinue, onDiscard, onCancel, message, primar
   );
 }
 
-function Splitter({ onResize, fromRight = false }: { onResize: (w: number) => void; fromRight?: boolean }) {
+/**
+ * The drag writes `cssVar` directly and coalesces to one write per animation frame, so
+ * a resize costs no React render at all — the panes are sized by the variable. State is
+ * only touched on mouse-up, and only to persist the final width.
+ */
+function Splitter({
+  cssVar,
+  min,
+  max,
+  onCommit,
+  fromRight = false,
+}: {
+  cssVar: string;
+  min: number;
+  max: number;
+  onCommit: (w: number) => void;
+  fromRight?: boolean;
+}) {
   const dragging = useRef(false);
+  const latest = useRef<number | null>(null);
   const [hot, setHot] = useState(false);
 
   useEffect(() => {
+    let raf: number | null = null;
+    const paint = () => {
+      raf = null;
+      if (latest.current != null) document.documentElement.style.setProperty(cssVar, `${latest.current}px`);
+    };
     const move = (e: MouseEvent) => {
-      if (dragging.current) onResize(fromRight ? window.innerWidth - e.clientX : e.clientX);
+      if (!dragging.current) return;
+      // Several mousemoves can land inside one frame; only the last one is worth painting.
+      latest.current = clamp(fromRight ? window.innerWidth - e.clientX : e.clientX, min, max);
+      if (raf == null) raf = requestAnimationFrame(paint);
     };
     const up = () => {
       if (!dragging.current) return;
       dragging.current = false;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
+      if (raf != null) {
+        cancelAnimationFrame(raf);
+        paint(); // the frame that was still queued still owes the final position
+      }
+      if (latest.current != null) onCommit(latest.current);
     };
     window.addEventListener('mousemove', move);
     window.addEventListener('mouseup', up);
     return () => {
       window.removeEventListener('mousemove', move);
       window.removeEventListener('mouseup', up);
+      if (raf != null) cancelAnimationFrame(raf);
     };
-  }, [onResize, fromRight]);
+  }, [cssVar, min, max, onCommit, fromRight]);
 
   return (
     <div
@@ -220,7 +407,25 @@ function Splitter({ onResize, fromRight = false }: { onResize: (w: number) => vo
   );
 }
 
-function Sidebar({ entries, current, loading, onPick, width }: { entries: TreeEntry[]; current: string; loading: boolean; onPick: (e: TreeEntry) => void; width: number }) {
+const baseName = (path: string): string => path.slice(path.lastIndexOf('/') + 1);
+
+function Sidebar({
+  entries,
+  current,
+  loading,
+  onPick,
+  onOpenCollab,
+  onCreated,
+  onRenamed,
+}: {
+  entries: TreeEntry[];
+  current: string;
+  loading: boolean;
+  onPick: (e: TreeEntry) => void;
+  onOpenCollab: () => void;
+  onCreated: (path: string) => void;
+  onRenamed: (from: string, to: string) => void;
+}) {
   const [q, setQ] = useState('');
   const { comments } = useComments(); // all → to flag which paths have open comments
   const commentCounts = useMemo(() => {
@@ -234,7 +439,8 @@ function Sidebar({ entries, current, loading, onPick, width }: { entries: TreeEn
   const fileCount = entries.filter((e) => e.type === 'file').length;
 
   return (
-    <nav style={{ ...sidebar, width }}>
+    <nav style={{ ...sidebar, width: sidebarWidthVar }}>
+      <ReviewPullRequestsItem onOpenCollab={onOpenCollab} />
       <div style={{ padding: 12, borderBottom: '1px solid #e5e7eb', background: 'white', flexShrink: 0 }}>
         <div style={{ fontWeight: 700, marginBottom: 8 }}>
           Files <span style={{ opacity: 0.5, fontWeight: 400 }}>({fileCount})</span>
@@ -242,10 +448,80 @@ function Sidebar({ entries, current, loading, onPick, width }: { entries: TreeEn
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="filter…" style={filter} />
       </div>
       <div style={{ padding: 8, flex: 1, overflow: 'auto' }}>
-        {loading ? <div style={{ opacity: 0.6, padding: 8 }}>Loading…</div> : <FileTree entries={entries} current={current} filter={q} onPick={onPick} commentCounts={commentCounts} />}
+        {loading ? <div style={{ opacity: 0.6, padding: 8 }}>Loading…</div> : <FileTree entries={entries} current={current} filter={q} onPick={onPick} commentCounts={commentCounts} onCreated={onCreated} onRenamed={onRenamed} />}
       </div>
       <SidebarFooter />
     </nav>
+  );
+}
+
+/**
+ * Two people, one of them behind the other — the shape a UI draws for "together".
+ *
+ * It replaced a pull-request glyph (a branch with a commit on it). That icon named the
+ * *object* on the other side of the click, which the label already does; what the row
+ * had nowhere to say was that a reviewer goes there to work with someone. The count
+ * beside it still says how many pull requests there are, so nothing is lost by the icon
+ * describing the activity instead of the artifact.
+ */
+function CollaborateIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block', flexShrink: 0 }} aria-hidden>
+      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    </svg>
+  );
+}
+
+/**
+ * The way in to pull requests, at the top of the sidebar where navigation belongs.
+ *
+ * It used to be the first line of the *footer*, between the copyright and the
+ * buy-me-a-coffee link, at 11px muted — which is how this sidebar dresses chrome.
+ * Reviewing a pull request is not chrome: it is one of the two jobs this tool does,
+ * and the only one the file tree below cannot lead anyone to. Everything else on the
+ * route to it (the git chip's count, `CollabPullsPanel`) already assumed the user had
+ * decided to look; nothing offered the decision.
+ *
+ * THE COUNT IS THE HEADER CHIP'S COUNT (R-7.1 … R-7.3), on the chip's own terms.
+ * `useCollabPulls` reads `GET /__vs/collab` first and requests nothing at all where
+ * collaboration is unconfigured (R-7.2), so mounting it a second time here adds no
+ * GitHub traffic — and the badge stays absent until the first listing lands, rather
+ * than rendering a `0` that would be a claim the server has not made yet.
+ */
+function ReviewPullRequestsItem({ onOpenCollab }: { onOpenCollab: () => void }) {
+  const pulls = useCollabPulls();
+  // Same gate as `PullCount` in the header: unconfigured says nothing, and neither
+  // does a listing that has not arrived.
+  const count = pulls.configured === true && pulls.pulls !== null ? pulls.pulls.length : null;
+
+  return (
+    <div style={navSection}>
+      <button
+        type="button"
+        onClick={onOpenCollab}
+        className="vs-focus-ring"
+        style={navItem}
+        title="Browse the repository’s open pull requests — review the code, or pick a document up where it was left"
+      >
+        <CollaborateIcon />
+        {/*
+          * "Pull requests" alone named a destination and left the reason for going
+          * unsaid, next to a file tree that is the obvious thing to click instead. The
+          * label now leads with the verb. It wraps rather than truncates at a narrow
+          * sidebar — `navItem` has a `minHeight`, not a fixed one — because half a
+          * sentence is worse here than two lines.
+          */}
+        <span style={navItemLabel}>Collaborate on pull requests</span>
+        {count !== null && (
+          <span style={navCount} data-testid="sidebar-pull-count">
+            {count}
+          </span>
+        )}
+      </button>
+    </div>
   );
 }
 
@@ -271,6 +547,17 @@ function SidebarFooter() {
 const sidebar: React.CSSProperties = { height: '100%', flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid #e5e7eb', background: 'white', overflow: 'hidden', font: '13px system-ui' };
 const footer: React.CSSProperties = { flexShrink: 0, padding: '10px 12px', borderTop: '1px solid #f1f5f9', background: '#fbfaff', font: '11px system-ui', color: '#94a3b8', lineHeight: 1.5 };
 const footerLink: React.CSSProperties = { color: '#a78bca', textDecoration: 'none', fontWeight: 600 };
+const navSection: React.CSSProperties = { flexShrink: 0, padding: 8, borderBottom: '1px solid #e5e7eb', background: 'white' };
+/**
+ * Sized as navigation, not as a link: a 36px row is a comfortable pointer target and
+ * matches the density of the tree rows below it, so the two read as one column of
+ * places to go rather than a caption sitting above a list.
+ */
+const navItem: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, width: '100%', minHeight: 36, padding: '0 10px', border: '1px solid transparent', borderRadius: 6, background: '#f8f5ff', color: '#6d28d9', font: '600 13px system-ui', cursor: 'pointer' };
+/** Takes the slack and wraps into it; the icon and the count keep their size. */
+const navItemLabel: React.CSSProperties = { flex: 1, textAlign: 'left', lineHeight: 1.3, padding: '7px 0' };
+/** The count, quiet enough to read as a fact about the row rather than a second control. */
+const navCount: React.CSSProperties = { font: '600 11px ui-monospace, monospace', padding: '1px 7px', borderRadius: 99, background: '#ede9fe', color: '#6d28d9', flexShrink: 0 };
 const splitter: React.CSSProperties = { width: 6, flexShrink: 0, cursor: 'col-resize', background: 'transparent', transition: 'background 120ms', marginLeft: -3, zIndex: 5 };
 const filter: React.CSSProperties = { width: '100%', padding: '5px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: 'inherit' };
 const dialogBackdrop: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 100, display: 'grid', placeItems: 'center', background: 'rgba(15,23,42,0.35)' };

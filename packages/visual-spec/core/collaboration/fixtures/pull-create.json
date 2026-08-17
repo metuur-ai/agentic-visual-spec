@@ -1,0 +1,14 @@
+{
+  "number": 42,
+  "state": "open",
+  "title": "Doc: onboarding guide",
+  "html_url": "https://github.com/acme/docs/pull/42",
+  "head": {
+    "ref": "vs/doc-1",
+    "sha": "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432"
+  },
+  "base": {
+    "ref": "main",
+    "sha": "5f2a1c9b8d4e6f0a1b2c3d4e5f60718293a4b5c6"
+  }
+}

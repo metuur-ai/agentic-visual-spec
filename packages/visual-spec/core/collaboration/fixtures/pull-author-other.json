@@ -1,0 +1,9 @@
+{
+  "number": 7,
+  "state": "open",
+  "title": "Spec: doc-1",
+  "user": { "login": "hubot" },
+  "head": { "ref": "vs/doc-1", "sha": "5f2a1c9b8d4e6f0a1b2c3d4e5f60718293a4b5c6" },
+  "base": { "ref": "main" },
+  "html_url": "https://github.com/acme/specs/pull/7"
+}

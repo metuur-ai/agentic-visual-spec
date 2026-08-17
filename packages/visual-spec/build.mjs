@@ -11,6 +11,25 @@ import { build } from 'esbuild';
 import { cp } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 
+/**
+ * R-3.3 / R-12.6 — the CLI bundle must stay free of the browser ecosystem.
+ * Marking these `external` would only defer the failure to runtime, so resolution
+ * is rejected outright: a stray import from core/ fails the build instead of
+ * shipping a 3.8 MB binary that throws `Dynamic require of "react-dom/server.node.js"`.
+ */
+const forbidBrowserDeps = {
+  name: 'forbid-browser-deps',
+  setup(build) {
+    build.onResolve({ filter: /^(react|react-dom|@lyfie\/luthor)($|\/)/ }, (args) => ({
+      errors: [
+        {
+          text: `Node-reachable bundle must not import "${args.path}" (imported by ${args.importer}). Luthor and React are UI-only — see R-3.3.`,
+        },
+      ],
+    }));
+  },
+};
+
 await build({
   entryPoints: ['src/cli.ts'],
   outfile: 'dist/cli.js',
@@ -19,6 +38,7 @@ await build({
   format: 'esm',
   target: 'node18',
   // Pull core's TS source in directly; node built-ins stay external automatically.
+  plugins: [forbidBrowserDeps],
   banner: { js: '#!/usr/bin/env node' },
 });
 

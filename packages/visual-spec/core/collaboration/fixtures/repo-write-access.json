@@ -1,0 +1,8 @@
+{
+  "id": 500001,
+  "name": "specs",
+  "full_name": "acme/specs",
+  "private": true,
+  "default_branch": "main",
+  "permissions": { "admin": false, "maintain": false, "push": true, "triage": true, "pull": true }
+}

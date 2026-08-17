@@ -4,10 +4,12 @@
  * own inspector-based panel in comment-panel.tsx.)
  */
 import { useComments } from '../core/app';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { LineSelection } from './code-view';
 import type { FileKind } from './use-tree';
 import { WorkflowSelect, loadWorkflow } from './workflow-select';
+import { resolveCodeAnchors } from './anchor-resolver';
+import { useActiveComment } from './active-comment';
 
 export function GenericPanel({
   path,
@@ -22,13 +24,21 @@ export function GenericPanel({
   kind?: FileKind;
   selection: LineSelection | null;
   content?: string;
-  width: number;
+  width: number | string;
 }) {
   const comments = useComments(path);
   const [text, setText] = useState('');
   const [workflow, setWorkflow] = useState(loadWorkflow);
   const [confirmId, setConfirmId] = useState<string | null>(null);
+  const { activeId } = useActiveComment();
+  const rows = useRef<Record<string, HTMLLIElement | null>>({});
   const open = comments.comments.filter((c) => c.target.path === path && c.status === 'open');
+  // Scroll the row an inline indicator activated into view (R-2.2).
+  useEffect(() => {
+    if (activeId && rows.current[activeId]) {
+      rows.current[activeId]!.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }, [activeId]);
 
   const isFolder = type === 'dir';
   const targetKind = isFolder ? 'folder' : selection ? 'range' : 'file';
@@ -99,10 +109,16 @@ export function GenericPanel({
           <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 8 }}>{open.length} open on this {isFolder ? 'folder' : 'file'}</div>
           <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 8 }}>
             {open.map((c) => (
-              <li key={c.id} style={card}>
+              <li key={c.id} ref={(el) => { rows.current[c.id] = el; }} style={{ ...card, ...(c.id === activeId ? cardActive : {}) }}>
                 <div style={{ fontSize: 12, opacity: 0.6 }}>
-                  {c.target.kind === 'range'
-                    ? c.target.endLine && c.target.endLine > (c.target.startLine ?? 0)
+                  {/*
+                    `startLine` is optional even on a `range` target — `POST /__vs/comments/add`
+                    accepts `{path, comment, kind:'range'}` with no line. Falling through to the
+                    kind rather than printing "line undefined" is the same guard the comment
+                    panel and the header picker use, in the shape this label needs.
+                  */}
+                  {c.target.kind === 'range' && c.target.startLine != null
+                    ? c.target.endLine && c.target.endLine > c.target.startLine
                       ? `lines ${c.target.startLine}–${c.target.endLine}`
                       : `line ${c.target.startLine}`
                     : c.target.kind}
@@ -155,15 +171,9 @@ export function GenericPanel({
 
 /** Scroll the code view to a commented line (range → flash every row in span). */
 function locateLine(startLine: number, endLine?: number) {
-  const first = document.querySelector(`[data-line="${startLine}"]`) as HTMLElement | null;
-  if (!first) return;
-  const last = endLine && endLine > startLine ? endLine : startLine;
-  const els: HTMLElement[] = [];
-  for (let n = startLine; n <= last; n++) {
-    const el = document.querySelector(`[data-line="${n}"]`) as HTMLElement | null;
-    if (el) els.push(el);
-  }
-  first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  const els = resolveCodeAnchors(startLine, endLine);
+  if (!els.length) return;
+  els[0]!.scrollIntoView({ behavior: 'smooth', block: 'center' });
   for (const el of els) {
     el.style.transition = 'background-color 0.2s';
     el.style.backgroundColor = 'rgba(59,130,246,0.22)';
@@ -201,6 +211,7 @@ const tip: React.CSSProperties = { fontSize: 12.5, color: '#64748b', margin: '0 
 const textarea: React.CSSProperties = { width: '100%', height: 70, padding: '6px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: 'inherit', resize: 'vertical' };
 const btn: React.CSSProperties = { padding: '5px 12px', border: '1px solid #2563eb', borderRadius: 4, background: '#2563eb', color: 'white', cursor: 'pointer', font: 'inherit' };
 const card: React.CSSProperties = { border: '1px solid #f1f5f9', borderRadius: 8, padding: 8, overflowWrap: 'anywhere' };
+const cardActive: React.CSSProperties = { border: '1px solid #f59e0b', background: '#fffbeb', boxShadow: '0 0 0 2px rgba(245,158,11,0.25)' };
 const iconBtn: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, width: 22, height: 22, padding: 0, border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer' };
 const delBtn: React.CSSProperties = { ...iconBtn, color: '#ef4444' };
 const confirmYes: React.CSSProperties = { padding: '2px 8px', border: '1px solid #ef4444', borderRadius: 4, background: '#ef4444', color: 'white', cursor: 'pointer', fontSize: 12 };

@@ -17,6 +17,7 @@
  */
 import { spawn } from 'node:child_process';
 import type { ServerResponse } from 'node:http';
+import { setStatus } from '../../editing/comment-doc';
 import { buildApplyPrompt } from '../../editing/apply-prompt';
 import type { CommentDocStore } from './comments';
 
@@ -208,7 +209,22 @@ export async function runApply(deps: ApplyDeps, emit: (e: ApplyEvent) => void, s
   });
 
   // Re-read the sidecar: the skill flipped applied comments to status "applied".
-  const after = await deps.comments.read();
+  let after = await deps.comments.read();
+
+  // R-1.5: stamp a server-generated result on any applied comment that lacks one,
+  // so the run never fails because the agent omitted the result field.
+  const needsResult = after.comments.filter(
+    (c) => c.status === 'applied' && !c.result,
+  );
+  if (needsResult.length > 0) {
+    let patched = after;
+    for (const c of needsResult) {
+      patched = setStatus(patched, c.id, 'applied', 'Applied successfully.');
+    }
+    await deps.comments.write(patched);
+    after = patched;
+  }
+
   const stillOpen = new Set(after.comments.filter((c) => c.status === 'open').map((c) => c.id));
   const appliedComments: AppliedComment[] = open
     .filter((c) => !stillOpen.has(c.id))

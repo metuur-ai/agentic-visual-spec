@@ -28,7 +28,11 @@ export function useSpecsRoot(): string {
   useEffect(() => {
     fetch('/__vs/source/root')
       .then((r) => json<{ root: string }>(r))
-      .then((d) => setRoot(d.root))
+      // `json<T>` is an unchecked cast, so a response without `root` puts
+      // `undefined` behind a `string` type and every consumer that calls a string
+      // method on it throws — `Brand` in main-header.tsx takes the whole header
+      // down that way. The type is the contract; make the runtime honour it.
+      .then((d) => setRoot(d.root ?? ''))
       .catch(() => setRoot(''));
   }, []);
   return root;
@@ -54,10 +58,19 @@ export function useMarkdownSource(surfaceId: string): { source: string; loading:
     // has no HMR, so the Apply button fires a window event after `claude -p`
     // rewrites the file — listen for both.
     const hot = import.meta.hot;
-    hot?.on('visual-spec:surface-changed', refetch);
+    // `hot?.on(...)` guards the wrong thing. Optional chaining only answers "is
+    // `hot` there", and the object that actually breaks is one that IS there
+    // with half the API on it: the test runner's `import.meta.hot` shim
+    // implements `on` and not `off`. The cleanup then threw
+    // `hot.off is not a function`, React reported it as an unmount error, and
+    // the tree came down — no test could mount a markdown pane for real. Check
+    // the method is callable, not that its owner exists.
+    if (typeof hot?.on === 'function') hot.on('visual-spec:surface-changed', refetch);
     window.addEventListener('vs:source-changed', refetch);
     return () => {
-      hot?.off('visual-spec:surface-changed', refetch);
+      // Guarded first for the same reason, and because this cleanup owns the
+      // window listener too: a throw here would leave that one attached forever.
+      if (typeof hot?.off === 'function') hot.off('visual-spec:surface-changed', refetch);
       window.removeEventListener('vs:source-changed', refetch);
     };
   }, [refetch]);

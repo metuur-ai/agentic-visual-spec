@@ -23,6 +23,8 @@ import { extname, join, normalize, resolve } from 'node:path';
 // shipped dist/cli.js carries this logic inline with no runtime dependency.
 import { mdSurfaceStore } from '../core/vite/md-store';
 import { pickDirectoryNative } from '../core/vite/native-pick';
+import { GUARD_NOT_RUN, attestGuardRan, guardRan } from '../core/vite/guard-attestation';
+import { checkRequest } from '../core/vite/request-guard';
 import type { SurfaceStore } from '../core/vite/surface-store';
 import { type TreeStore, treeStore } from '../core/vite/tree-store';
 import {
@@ -30,7 +32,14 @@ import {
   fileCommentStore,
   handleCommentsRequest,
 } from '../core/vite/routes/comments';
+import { handleFilesRequest } from '../core/vite/routes/files';
+import { handleGitRequest } from '../core/vite/routes/git';
 import { createApplyHub } from '../core/vite/routes/apply';
+import { createCollabRoutes } from '../core/vite/routes/collab';
+import { createCollabWiring } from '../core/vite/routes/collab-wiring';
+import { createJobHubRegistry } from '../core/collaboration/job-hub';
+import { fsCollaborationStore } from '../core/collaboration/record-store';
+import { type VisualSpecConfig, resolveConfig } from '../core/config';
 import { MAX_UPLOAD_BYTES, saveUploadedAsset } from '../core/vite/routes/upload';
 
 const MIME: Record<string, string> = {
@@ -78,7 +87,10 @@ async function readRawBody(req: IncomingMessage, limit: number): Promise<Buffer>
   return Buffer.concat(chunks);
 }
 
-async function handleTree(store: TreeStore, method: string, pathname: string, query: Record<string, string>) {
+// `_body` is unread here and read by the write routes that land on this prefix
+// next; it is in the signature now so the two hosts hand the handler the same
+// four arguments (R-4.1) rather than one of them growing a body later.
+async function handleTree(store: TreeStore, method: string, pathname: string, query: Record<string, string>, _body?: Record<string, unknown>) {
   if (method === 'GET' && (pathname === '' || pathname === '/')) {
     return { status: 200, json: await store.tree() };
   }
@@ -135,6 +147,8 @@ export type ServeOptions = {
   commentsFile?: string;
   /** Folder (relative to contentDir) where toolbar image uploads are saved. Defaults to "assets". */
   assetsDir?: string;
+  /** visual-spec.config.ts contents. Omitting `collaboration` keeps collaboration off (R-9.19). */
+  config?: VisualSpecConfig;
   port: number;
   host?: string;
 };
@@ -153,6 +167,32 @@ export function createVisualSpecServer(opts: ServeOptions) {
   // many SSE subscribers. The thunk reads the current (mutable) dir + store so a
   // runtime "change directory" re-roots the next run too.
   const applyHub = createApplyHub(() => ({ cwd: contentDir, comments }));
+  // Collaboration (R-7.1). One job registry per server, never module-level. The route
+  // layer is shared with the Vite host verbatim (R-7.6): both hosts do nothing but slice
+  // the prefix off the path and hand the request to `collab.handle`. With no
+  // `collaboration` block configured this stays inert and reports itself unavailable
+  // (R-7.8 / R-9.19) — local mode is untouched (R-7.2).
+  const collabConfig = resolveConfig(opts.config);
+  const collabJobs = createJobHubRegistry();
+  // The 8.2 job bodies and the interval poller, built once in shared code so both hosts
+  // are identical (R-7.6). With no `collaboration` block this constructs no adapter at
+  // all and yields no bodies, so 7.2's honest stubs stay in place (R-9.19).
+  const collabWiring = createCollabWiring({
+    config: () => collabConfig,
+    documents: () => fsCollaborationStore(contentDir),
+    jobs: collabJobs,
+    commentCachePath: () => commentsPath,
+  });
+  const collab = createCollabRoutes({
+    jobs: collabJobs,
+    config: () => collabConfig,
+    documents: () => fsCollaborationStore(contentDir),
+    // A thunk, like every other store above: PR worktrees are mounted under whatever
+    // directory is being served *now*, so a runtime re-root moves them with it.
+    baseDir: () => contentDir,
+    bodies: collabWiring.bodies,
+    authorize: collabWiring.authorize,
+  });
 
   /** Re-root every store at a new directory (comments follow to <dir>/…json). */
   const setRoot = (dir: string) => {
@@ -171,10 +211,74 @@ export function createVisualSpecServer(opts: ServeOptions) {
         const url = new URL(req.url ?? '/', 'http://localhost');
         const method = req.method ?? 'GET';
 
+        // Refuse anything a browser issued for another origin before it can reach
+        // a handler — see core/vite/request-guard.ts for why this is not a token.
+        if (url.pathname.startsWith('/__vs/')) {
+          const verdict = checkRequest(req.headers);
+          if (!verdict.ok) return sendJson(res, 403, { error: verdict.reason });
+          attestGuardRan(req.headers);
+        }
+
         if (url.pathname === '/__vs/tree' || url.pathname.startsWith('/__vs/tree/')) {
           const sub = url.pathname.slice('/__vs/tree'.length);
           const query = Object.fromEntries(url.searchParams.entries());
-          const r = await handleTree(tree, method, sub, query);
+          // R-4.2. The Vite host runs this prefix through its `middleware` helper,
+          // which always reads the body, so not reading it here would make the same
+          // POST answer differently on the two hosts. It also leaves the request
+          // stream undrained, which stalls the keep-alive connection it arrived on.
+          const body = await readJsonBody(req);
+          // The write routes branch off *here*, inside the `/__vs/tree` block, rather
+          // than at a `/__vs/tree/create` case of their own further up. Three reasons,
+          // all of them about the two hosts staying identical (R-4.1):
+          //   1. the prefix slicing and the R-4.2 body read above are the transport
+          //      contract for this prefix. A sibling block would own a second copy of
+          //      both, and a second copy is the drift this feature keeps closing;
+          //   2. `handleTree`'s own 404 stays the single fallback for the prefix, so
+          //      an unknown subpath answers with one message and not two;
+          //   3. it puts the branch after the `/__vs/` guard above with nothing in
+          //      between, which is what R-4.3 asks for — no filesystem access at all
+          //      on a refused request.
+          if (sub === '/create' || sub === '/rename') {
+            // R-4.4. These routes write to a path the caller chooses on an
+            // unauthenticated localhost server, so the same reasoning as the
+            // collaboration dispatch applies: registration order is invisible at
+            // runtime and both hosts express it differently, so this refuses unless
+            // it can *prove* the guard ran on this very request. Delete the guard
+            // above and creating files breaks loudly instead of opening quietly.
+            if (!guardRan(req.headers)) return sendJson(res, 500, { error: GUARD_NOT_RUN });
+            const w = await handleFilesRequest(tree, comments, method, sub, body);
+            return sendJson(res, w.status, w.json);
+          }
+          const r = await handleTree(tree, method, sub, query, body);
+          return sendJson(res, r.status, r.json);
+        }
+
+        // R-2.1 (git). This block was read-only through Units 1–4 and said so; it
+        // stopped being read-only when `POST /__vs/git/checkout` (R-5.5) joined it,
+        // and a checkout changes the user's own working tree. So the write method
+        // attests like every other write route: registration order is invisible at
+        // runtime and the two hosts express the guard differently, which is the whole
+        // argument in `core/vite/guard-attestation.ts`. The reads keep inheriting the
+        // guard by position — they open nothing if it breaks. The root is passed as a
+        // getter because `setRoot` reassigns `contentDir` at runtime; capturing the
+        // string once would report the first directory ever served for the life of
+        // the process (R-2.2).
+        if (url.pathname === '/__vs/git' || url.pathname.startsWith('/__vs/git/')) {
+          if (method !== 'GET' && !guardRan(req.headers)) {
+            req.resume();
+            return sendJson(res, 500, { error: GUARD_NOT_RUN });
+          }
+          const sub = url.pathname.slice('/__vs/git'.length);
+          // R-6.3. The branch routes are absent unless configuration enabled them,
+          // and the flag is read from the same resolved configuration the
+          // collaboration routes use. The body is read for a POST for the same
+          // reason the `/__vs/tree` block reads one: the Vite host's `middleware`
+          // helper always does, and a body read on one host only is the same POST
+          // answering differently on the two (R-2.3).
+          const body = method === 'POST' ? await readJsonBody(req) : undefined;
+          const r = await handleGitRequest(() => contentDir, method, sub, body, {
+            allowCheckout: collabConfig.git.allowCheckout,
+          });
           return sendJson(res, r.status, r.json);
         }
 
@@ -275,6 +379,20 @@ export function createVisualSpecServer(opts: ServeOptions) {
           return sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
         }
 
+        // Collaboration routes (R-7.1). Everything below `/__vs/collab` is decided by the
+        // shared router — no host-specific logic (R-7.6).
+        if (url.pathname === '/__vs/collab' || url.pathname.startsWith('/__vs/collab/')) {
+          // R-9.16: publish commits client bytes to a remote repo, so the dispatch
+          // refuses outright unless the guard above provably ran on this request.
+          if (!guardRan(req.headers)) return sendJson(res, 500, { error: GUARD_NOT_RUN });
+          const sub = url.pathname.slice('/__vs/collab'.length);
+          const query = Object.fromEntries(url.searchParams.entries());
+          const body = await readJsonBody(req);
+          const r = await collab.handle({ method, pathname: sub, query, body, sse: res });
+          if (r.streamed) return; // SSE: the hub already wrote the head and the sync frame
+          return sendJson(res, r.status, r.json);
+        }
+
         if (url.pathname === '/__vs/comments' || url.pathname.startsWith('/__vs/comments/')) {
           const sub = url.pathname.slice('/__vs/comments'.length);
           const query = Object.fromEntries(url.searchParams.entries());
@@ -283,11 +401,31 @@ export function createVisualSpecServer(opts: ServeOptions) {
           return sendJson(res, r.status, r.json);
         }
 
+        // R-4.5. Every route above answers for itself, so anything still on `/__vs/`
+        // is a path this server does not implement. `serveStatic` below SPA-falls-back
+        // to index.html, which would answer such a request 200 with HTML: a client
+        // newer than its server would see `res.ok` and then fail parsing JSON, with
+        // nothing to report. Only `/__vs/` is claimed — an unknown app path still
+        // reaches the SPA shell.
+        if (url.pathname.startsWith('/__vs/')) {
+          // Discarded rather than buffered: the bytes are already on the wire and
+          // an unread stream costs the client its connection, but a path with no
+          // route has no reason to hold an arbitrary upload in memory.
+          req.resume();
+          return sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
+        }
+
         await serveStatic(opts.uiDir, url.pathname, res);
       } catch (err) {
         sendJson(res, 500, { error: (err as Error).message });
       }
     })();
+  });
+
+  // Stop every poller, abort every in-flight collaboration job and drop every hub.
+  server.on('close', () => {
+    collabWiring.stopAllPolling();
+    collab.dispose();
   });
 
   return { server, commentsPath };

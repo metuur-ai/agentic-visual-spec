@@ -22,6 +22,11 @@ export default defineConfig({
     'react',
     'react-dom',
     'react/jsx-runtime',
+    // Luthor is UI-only (R-3.3). Never inline it: esbuild pulls `react-dom/server`
+    // in with it, producing an artifact that throws `Dynamic require of
+    // "react-dom/server.node.js"` at import. core/ must not import it at all —
+    // core/bundle-guard.test.ts enforces that; this is the second line of defence.
+    /^@lyfie\/luthor/,
     'vite',
     '@babel/parser',
     '@babel/traverse',

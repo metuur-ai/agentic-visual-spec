@@ -37,6 +37,7 @@ export type CommentRecord = {
   spec?: string; // optional: normalized EARS sentence(s) for the agent
   status: CommentStatus;
   ts: string;
+  result?: string; // short summary of the resulting change, set when applied (R-2.1)
 };
 
 export type CommentDoc = { version: 1; comments: CommentRecord[] };
@@ -84,6 +85,7 @@ function upgrade(raw: unknown): CommentRecord {
     ...(rec.spec ? { spec: rec.spec as string } : {}),
     status: (rec.status as CommentStatus) ?? 'open',
     ts: String(rec.ts ?? ''),
+    ...(rec.result ? { result: rec.result as string } : {}), // R-2.2: preserve result in legacy branch
   };
 }
 
@@ -111,10 +113,12 @@ export function removeComment(doc: CommentDoc, id: string): CommentDoc {
   return { ...doc, comments: doc.comments.filter((c) => c.id !== id) };
 }
 
-export function setStatus(doc: CommentDoc, id: string, status: CommentStatus): CommentDoc {
+export function setStatus(doc: CommentDoc, id: string, status: CommentStatus, result?: string): CommentDoc {
   return {
     ...doc,
-    comments: doc.comments.map((c) => (c.id === id ? { ...c, status } : c)),
+    comments: doc.comments.map((c) =>
+      c.id === id ? { ...c, status, ...(result !== undefined ? { result } : {}) } : c
+    ),
   };
 }
 
@@ -136,4 +140,29 @@ export function openByWorkflow(doc: CommentDoc): Record<string, CommentRecord[]>
     (out[c.workflow] ??= []).push(c);
   }
   return out;
+}
+
+/**
+ * R-3.2 / R-3.3 / R-3.4 — applied comments for a path, sorted ts descending.
+ * Non-mutating (copies before sort).
+ */
+export function historyFor(comments: CommentRecord[], path: string): CommentRecord[] {
+  return comments
+    .filter((c) => c.target.path === path && c.status === 'applied')
+    .slice()
+    .sort((a, b) => (b.ts > a.ts ? 1 : b.ts < a.ts ? -1 : 0));
+}
+
+/**
+ * R-3.7 — human-readable anchor label for a comment.
+ * Priority: heading → line range → path fallback.
+ */
+export function anchorLabelOf(c: CommentRecord): string {
+  if (c.target.heading) return c.target.heading;
+  if (c.target.startLine != null) {
+    return c.target.endLine != null && c.target.endLine !== c.target.startLine
+      ? `L${c.target.startLine}–${c.target.endLine}`
+      : `L${c.target.startLine}`;
+  }
+  return c.target.path;
 }

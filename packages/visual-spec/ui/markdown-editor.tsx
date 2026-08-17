@@ -6,8 +6,11 @@
 import { InspectOverlay, SelectionReporter, useMarkdownSource } from '../core/app';
 import { CommentPanel } from './comment-panel';
 import { ContentTitle } from './content-title';
+import { useMemo } from 'react';
 import { MarkdownSurface } from './markdown-surface';
-import { toSurfaceId } from './md-path';
+import { makeImageResolver, toPath, toSurfaceId } from './md-path';
+import { ActiveCommentProvider } from './active-comment';
+import { IndicatorLayer } from './indicator-layer';
 
 export function MarkdownEditor({
   path,
@@ -15,23 +18,29 @@ export function MarkdownEditor({
   splitter,
 }: {
   path: string; // real .md path
-  commentWidth: number;
+  /** A CSS length — the host drives this with a custom property so a drag costs no render. */
+  commentWidth: number | string;
   splitter: React.ReactNode;
 }) {
   const surfaceId = toSurfaceId(path);
+  const commentPath = toPath(surfaceId); // same key the sidebar uses
   const { source, loading } = useMarkdownSource(surfaceId);
+  // Resolve relative image paths against the file's dir for display; the stored
+  // .md keeps its plain relative srcs, so it stays portable to simpler viewers.
+  const resolveImageSrc = useMemo(() => makeImageResolver(path), [path]);
   return (
-    <>
+    <ActiveCommentProvider>
       <main style={{ flex: 1, minWidth: 0, position: 'relative', overflow: 'auto', background: '#f8fafc' }}>
         <ContentTitle path={path} />
         <div style={{ maxWidth: 1200, margin: '0 auto', padding: '32px 56px 120px' }}>
-          {loading ? <p style={{ opacity: 0.6 }}>Loading…</p> : <MarkdownSurface source={source} />}
+          {loading ? <p style={{ opacity: 0.6 }}>Loading…</p> : <MarkdownSurface source={source} resolveImageSrc={resolveImageSrc} />}
         </div>
         <InspectOverlay />
+        {!loading && <IndicatorLayer path={commentPath} mode="markdown" />}
       </main>
       {splitter}
       <CommentPanel file={surfaceId} width={commentWidth} />
       <SelectionReporter />
-    </>
+    </ActiveCommentProvider>
   );
 }

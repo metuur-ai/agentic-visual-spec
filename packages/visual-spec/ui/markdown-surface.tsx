@@ -85,11 +85,25 @@ function FrontmatterBlock({ yaml }: { yaml: string }) {
   );
 }
 
-export function MarkdownSurface({ source }: { source: string }) {
+export function MarkdownSurface({
+  source,
+  resolveImageSrc,
+}: {
+  source: string;
+  // Optional render-time transform for image srcs (e.g. resolving relative
+  // paths to a stream endpoint). Omitted ⇒ srcs render as-authored, so this
+  // stays a plain markdown viewer for any consumer; the stored .md is unchanged.
+  resolveImageSrc?: (src: string) => string;
+}) {
   const { inner, body } = splitFrontmatter(source);
   // Body is a suffix of source; the stripped prefix is the frontmatter block.
   // Count its lines so the inspector's source-line stamps stay accurate.
   const lineOffset = inner == null ? 0 : source.slice(0, source.length - body.length).split('\n').length - 1;
+  // Only override the img renderer when a resolver is supplied — with none, the
+  // base components render images natively (portable, viewer-agnostic markdown).
+  const surfaceComponents: Components = resolveImageSrc
+    ? { ...components, img: ({ node, src, ...props }) => <img src={typeof src === 'string' ? resolveImageSrc(src) : src} {...props} /> }
+    : components;
   return (
     <div data-inspector-root className="md">
       {inner != null && <FrontmatterBlock yaml={inner} />}
@@ -97,7 +111,7 @@ export function MarkdownSurface({ source }: { source: string }) {
           image wrapper) into real nodes; it runs before the vs-loc stamper so the
           reconstructed tree still gets source positions. Plain markdown images render
           natively, so files authored elsewhere are unaffected. */}
-      <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw, rehypeVsLoc(lineOffset)]} components={components}>
+      <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw, rehypeVsLoc(lineOffset)]} components={surfaceComponents}>
         {body}
       </Markdown>
     </div>

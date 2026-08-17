@@ -3,7 +3,7 @@
  *   useTree()      → the whole visible tree (dirs + files) from /__vs/tree
  *   useFile(path)  → one file's content/metadata from /__vs/tree/file
  */
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 export type FileKind = 'markdown' | 'code' | 'text' | 'image' | 'binary';
 
@@ -52,9 +52,24 @@ export function invalidateTree(): void {
   treeCache = null;
 }
 
-export function useTree(): { entries: TreeEntry[]; loading: boolean } {
+/**
+ * `reload` hands back the entries it re-read, as well as pushing them into the hook's
+ * own state. R-6.8 needs both: the sidebar has to show the new branch's tree, and the
+ * caller has to know whether the file it had open is still in it — a question the
+ * hook's state cannot answer, because reading it after `reload()` returns the tree
+ * from *before* the render that replaces it.
+ *
+ * The two reads are one request. `fetchTree` shares its in-flight promise for the
+ * length of the TTL, so the effect below joins the call made here rather than issuing
+ * a second walk.
+ */
+export function useTree(): { entries: TreeEntry[]; loading: boolean; reload: () => Promise<TreeEntry[]> } {
   const [entries, setEntries] = useState<TreeEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  // Bumped by reload(). invalidateTree() alone only clears the cache — a mounted
+  // consumer never re-reads, so a file created from the tree would stay missing
+  // from the sidebar until something else remounted the hook.
+  const [generation, setGeneration] = useState(0);
   useEffect(() => {
     let live = true;
     fetchTree()
@@ -64,8 +79,12 @@ export function useTree(): { entries: TreeEntry[]; loading: boolean } {
     return () => {
       live = false;
     };
+  }, [generation]);
+  const reload = useCallback(() => {
+    setGeneration((g) => g + 1);
+    return fetchTree();
   }, []);
-  return { entries, loading };
+  return { entries, loading, reload };
 }
 
 export function useFile(path: string, kind?: FileKind): { file: FileContent | null; loading: boolean } {

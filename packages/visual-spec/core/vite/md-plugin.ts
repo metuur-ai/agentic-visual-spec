@@ -10,13 +10,25 @@
  *   POST /__vs/comments/add                → append { file, heading, line, snippet, comment }
  *   PATCH/DELETE /__vs/comments/:id        → status / remove
  */
+import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { extname, isAbsolute, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { extname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
 import type { Connect, Plugin } from 'vite';
+import { GUARD_NOT_RUN, attestGuardRan, guardRan } from './guard-attestation';
+import { checkRequest } from './request-guard';
 import { type CommentDocStore, fileCommentStore, handleCommentsRequest } from './routes/comments';
+import { handleFilesRequest } from './routes/files';
+import { handleGitRequest } from './routes/git';
 import { createApplyHub } from './routes/apply';
+import { createCollabRoutes } from './routes/collab';
+import { createCollabWiring } from './routes/collab-wiring';
+import { collaborationFromOrigin } from '../collaboration/open';
+import { createJobHubRegistry } from '../collaboration/job-hub';
+import { fsCollaborationStore } from '../collaboration/record-store';
+import { type VisualSpecConfig, resolveConfig } from '../config';
 import { MAX_UPLOAD_BYTES, saveUploadedAsset } from './routes/upload';
 import { currentPlugin } from './current-plugin';
 import { mdSurfaceStore } from './md-store';
@@ -79,7 +91,10 @@ function middleware(fn: (req: IncomingMessage, query: Record<string, string>, pa
   };
 }
 
-async function handleTree(store: TreeStore, method: string, pathname: string, query: Record<string, string>) {
+// `_body` is unread here and read by the write routes that land on this prefix
+// next; it is in the signature now so the two hosts hand the handler the same
+// four arguments (R-4.1) rather than one of them growing a body later.
+async function handleTree(store: TreeStore, method: string, pathname: string, query: Record<string, string>, _body?: Record<string, unknown>) {
   if (method === 'GET' && (pathname === '' || pathname === '/')) return { status: 200, json: await store.tree() };
   if (method === 'GET' && pathname === '/file') {
     if (!query.path) return { status: 400, json: { error: 'missing path' } };
@@ -104,7 +119,39 @@ async function handleSource(store: SurfaceStore, method: string, pathname: strin
   return { status: 404, json: { error: `no route: ${method} /__vs/source${pathname}` } };
 }
 
-export type MarkdownOptions = { contentDir?: string; commentsFile?: string; assetsDir?: string };
+export type MarkdownOptions = {
+  contentDir?: string;
+  commentsFile?: string;
+  assetsDir?: string;
+  /** visual-spec.config.ts contents. Omitting `collaboration` keeps collaboration off (R-9.19). */
+  config?: VisualSpecConfig;
+};
+
+/** `child` is `parent` or sits underneath it. */
+function isInside(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/**
+ * Where Vite's dep-optimizer cache goes when the Vite root IS the directory we are
+ * serving.
+ *
+ * Vite derives `cacheDir` from `root` — `<root>/.vite`, or `<pkg>/node_modules/.vite`
+ * when a package.json is found above it. That default assumes `root` is a project
+ * you own. Here it is the user's *content* directory, so the optimizer drops `.vite`
+ * (plus its `deps_temp_*` scratch dirs) straight into the workspace being browsed:
+ * serve `~/docs` and `~/docs/.vite` appears. `.visualspecignore`/DEFAULT_IGNORE hides
+ * it from the tree, which is why it went unnoticed, but hidden is not "not written" —
+ * it still churns files in someone else's folder, and it made the on-disk snapshots in
+ * host-parity.test.ts diverge between hosts on the optimizer's own schedule.
+ *
+ * The cache is a rebuildable, root-specific artifact, so it belongs in the OS temp
+ * dir, keyed by a hash of the root so two served directories never share one.
+ */
+function externalCacheDir(root: string): string {
+  return join(tmpdir(), 'visual-spec-vite-cache', createHash('sha256').update(root).digest('hex').slice(0, 16));
+}
 
 function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
   let root = process.cwd();
@@ -112,10 +159,24 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
   return {
     name: 'visual-spec:md-api',
     apply: 'serve',
+    // Runs before Vite resolves its defaults — `cacheDir` is read once at resolve
+    // time, so redirecting it in `configResolved` would be too late.
+    config(userConfig) {
+      // An explicit `cacheDir` is the caller's decision; never second-guess it.
+      if (userConfig.cacheDir) return null;
+      const viteRoot = resolvePath(userConfig.root ?? process.cwd());
+      const served = isAbsolute(opts.contentDir) ? resolvePath(opts.contentDir) : resolvePath(viteRoot, opts.contentDir);
+      // Every default Vite would pick sits at or above `root`, so the cache can only
+      // land in the served tree when `root` itself does. When the content dir is a
+      // subfolder of a real project root (the `dev` layout), the default is already
+      // outside it and is left alone.
+      if (!isInside(served, viteRoot)) return null;
+      return { cacheDir: externalCacheDir(viteRoot) };
+    },
     configResolved(config) {
       root = config.root;
     },
-    configureServer(server) {
+    async configureServer(server) {
       // Absolute paths point at a folder outside the app (e.g. a real docs dir);
       // relative paths resolve under the Vite root.
       const resolve = (p: string) => (isAbsolute(p) ? p : join(root, p));
@@ -139,6 +200,20 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         server.watcher.add(specsRoot);
         console.log(`\n  visual-spec (dev) → switched directory: ${specsRoot}\n`);
       };
+
+      // Registered first, so every `/__vs` middleware below is behind it —
+      // registration order is the only ordering primitive Connect gives us, and a
+      // guard registered after a handler silently does nothing.
+      server.middlewares.use('/__vs', (req, res, next) => {
+        const verdict = checkRequest(req.headers);
+        if (verdict.ok) {
+          attestGuardRan(req.headers);
+          return next();
+        }
+        res.statusCode = 403;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ error: verdict.reason }));
+      });
 
       // Current directory + the native "change directory" picker (matches server.ts).
       server.middlewares.use('/__vs/dir', middleware(async (req, _query, pathname) => {
@@ -164,8 +239,47 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       }));
 
       // Generic directory browser API (matches the production server.ts).
-      server.middlewares.use('/__vs/tree', middleware((req, query, pathname) =>
-        handleTree(tree, req.method ?? 'GET', pathname, query)));
+      //
+      // The write routes branch off *inside* this middleware rather than from a
+      // `use('/__vs/tree/create')` of their own, so the two hosts match line for
+      // line (R-4.1). A separate mount would also acquire its own body read and its
+      // own 404, and this prefix already has both: the `middleware` helper reads the
+      // body for every non-GET, and `handleTree`'s trailing 404 is the one fallback
+      // for anything on the prefix that no branch claims.
+      server.middlewares.use('/__vs/tree', middleware((req, query, pathname, body) => {
+        const method = req.method ?? 'GET';
+        if (pathname === '/create' || pathname === '/rename') {
+          // R-4.4. These routes write to a caller-chosen path on an unauthenticated
+          // localhost server, so — exactly as the collaboration dispatch below does —
+          // they refuse unless they can *prove* the guard registered above ran on
+          // this request, instead of trusting that registration order never breaks.
+          if (!guardRan(req.headers)) return Promise.resolve({ status: 500, json: { error: GUARD_NOT_RUN } });
+          return handleFilesRequest(tree, comments, method, pathname, body);
+        }
+        return handleTree(tree, method, pathname, query, body);
+      }));
+
+      // R-2.1 (git). The reads inherit the `/__vs` guard registered above by position
+      // and need no attestation — they open nothing if it breaks. `POST
+      // /__vs/git/checkout` (R-5.5) does: it changes the user's own working tree, so
+      // it attests like every other write route, for the reason set out in
+      // `core/vite/guard-attestation.ts` — registration order is invisible at runtime
+      // and the two hosts express the guard differently. The root is a getter because
+      // `setRoot` reassigns `specsRoot` at runtime; a captured string would report
+      // the startup directory forever (R-2.2).
+      // R-6.3: the branch routes of Unit 5 are absent unless configuration enabled
+      // them. `gitConfig` is resolved once here rather than read from the
+      // `collabConfig` further down, which is constructed after this registration —
+      // same call, same answer, and the flag is a startup value in both hosts.
+      const gitConfig = resolveConfig(opts.config).git;
+      server.middlewares.use('/__vs/git', middleware((req, _query, pathname, body) => {
+        if ((req.method ?? 'GET') !== 'GET' && !guardRan(req.headers)) {
+          return Promise.resolve({ status: 500, json: { error: GUARD_NOT_RUN } });
+        }
+        return handleGitRequest(() => specsRoot, req.method ?? 'GET', pathname, body, {
+          allowCheckout: gitConfig.allowCheckout,
+        });
+      }));
 
       // Raw bytes for image previews / downloads. Streams (not JSON), so it's not
       // wrapped in the json `middleware` helper.
@@ -254,6 +368,95 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         return next();
       });
 
+      // Collaboration routes (R-7.1). Same registry discipline as the standalone host —
+      // one registry per server, created here and never at module level — and the same
+      // shared router, so neither host owns any collaboration logic of its own (R-7.6).
+      // Registered after the guard above, like every other `/__vs` handler (R-9.13).
+      /*
+       * The same default the CLI applies (`collaborationFromOrigin`): with no
+       * `collaboration` block configured, the served directory's GitHub origin names one.
+       *
+       * IT IS AWAITED, NOT RACED. `config()` below is synchronous and is called per
+       * request, so resolving the inference in the background would leave the first
+       * `GET /__vs/collab` — which the UI issues on mount — answering "not configured"
+       * and needing a reload to correct itself. Vite awaits an async `configureServer`,
+       * so the two git reads happen before the first request can arrive.
+       *
+       * An explicit block always wins: this only fills a gap, and `VS_NO_COLLAB` is the
+       * Vite host's `--no-collab`, since a plugin takes flags from nobody.
+       */
+      let collabConfig = resolveConfig(opts.config);
+      let collabFromOrigin: string | null = null;
+      if (!collabConfig.collaboration && !process.env.VS_NO_COLLAB) {
+        const inferred = await collaborationFromOrigin(specsRoot);
+        if (inferred) {
+          collabConfig = resolveConfig({ ...opts.config, collaboration: inferred });
+          collabFromOrigin = `${inferred.owner}/${inferred.repo}`;
+        }
+      }
+      // Said out loud for the same reason the CLI says it: a repository the developer
+      // wrote into vite.config.ts needs no announcement; one this plugin chose does.
+      if (collabFromOrigin) {
+        server.config.logger.info(`  visual-spec collab: ${collabFromOrigin} (from origin — VS_NO_COLLAB=1 to disable)`);
+      }
+      const collabJobs = createJobHubRegistry();
+      // The 8.2 job bodies and the interval poller, built once in shared code so both
+      // hosts are identical (R-7.6). With no `collaboration` block this constructs no
+      // adapter at all and yields no bodies, so 7.2's honest stubs stay in place (R-9.19).
+      const collabWiring = createCollabWiring({
+        config: () => collabConfig,
+        documents: () => fsCollaborationStore(specsRoot),
+        jobs: collabJobs,
+        commentCachePath: () => commentsPath,
+      });
+      const collab = createCollabRoutes({
+        jobs: collabJobs,
+        config: () => collabConfig,
+        documents: () => fsCollaborationStore(specsRoot),
+        // Same directory the documents come from, read per request for the same reason.
+        baseDir: () => specsRoot,
+        bodies: collabWiring.bodies,
+        authorize: collabWiring.authorize,
+      });
+      server.middlewares.use('/__vs/collab', (req, res) => {
+        void (async () => {
+          try {
+            // R-9.16: publish commits client bytes to a remote repo, so the dispatch
+            // refuses outright unless the guard above provably ran on this request.
+            if (!guardRan(req.headers)) return sendJson(res, 500, { error: GUARD_NOT_RUN });
+            const url = new URL(req.url ?? '', 'http://localhost');
+            const sub = url.pathname === '/' ? '' : url.pathname;
+            const query = Object.fromEntries(url.searchParams.entries());
+            const body = await readJsonBody(req);
+            const r = await collab.handle({ method: req.method ?? 'GET', pathname: sub, query, body, sse: res });
+            if (r.streamed) return; // SSE: the hub already wrote the head and the sync frame
+            sendJson(res, r.status, r.json);
+          } catch (err) {
+            sendJson(res, 500, { error: (err as Error).message });
+          }
+        })();
+      });
+      // Stop every poller, abort every in-flight collaboration job and drop every hub.
+      server.httpServer?.on('close', () => {
+        collabWiring.stopAllPolling();
+        collab.dispose();
+      });
+
+      // R-4.5. Registered last, so it only ever sees a `/__vs` path none of the
+      // handlers above claimed — including the ones that `next()` on a method they
+      // do not serve. Without it those fall through to Vite's SPA fallback and
+      // answer 200 with index.html, so a client newer than its server reads
+      // `res.ok` and then fails parsing JSON, with no status to report. Connect
+      // strips the mount prefix from `req.url`, so it is put back for the message.
+      server.middlewares.use('/__vs', (req, res) => {
+        // Discarded rather than buffered: the bytes are already on the wire and an
+        // unread stream costs the client its connection, but a path with no route
+        // has no reason to hold an arbitrary upload in memory.
+        req.resume();
+        const sub = new URL(req.url ?? '', 'http://localhost').pathname;
+        sendJson(res, 404, { error: `no route: ${req.method ?? 'GET'} /__vs${sub === '/' ? '' : sub}` });
+      });
+
       // Live-reload: when a .md file under the specs dir changes (it may live
       // outside the Vite root), ping the client to refetch the surface/list.
       // `watchRoot` is updated by setRoot when the directory is switched.
@@ -299,6 +502,7 @@ export function visualSpecMarkdown(opts: MarkdownOptions = {}): Plugin[] {
     contentDir: opts.contentDir ?? 'content',
     commentsFile: opts.commentsFile ?? 'visual-spec-comments.json',
     assetsDir: opts.assetsDir ?? 'assets',
+    config: opts.config ?? {},
   };
   return [virtualSurfacesStubPlugin(), mdApiPlugin(resolved), currentPlugin()];
 }

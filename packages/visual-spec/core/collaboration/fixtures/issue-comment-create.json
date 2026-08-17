@@ -1,0 +1,8 @@
+{
+  "id": 900001,
+  "body": "Tighten this paragraph.\n\n<!-- visual-spec: documentId=doc-1 nodeId=n-7 -->",
+  "user": { "login": "reviewer-rita" },
+  "created_at": "2026-08-07T10:00:00Z",
+  "updated_at": "2026-08-07T10:00:00Z",
+  "html_url": "https://github.com/acme/docs/pull/42#issuecomment-900001"
+}

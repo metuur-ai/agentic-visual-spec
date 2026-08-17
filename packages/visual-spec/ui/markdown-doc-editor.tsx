@@ -12,35 +12,12 @@ import { ContentTitle } from './content-title';
 import { MarkdownSurface } from './markdown-surface';
 import { combineFrontmatter, splitFrontmatter } from './frontmatter';
 import { detectFidelityRisk } from './md-fidelity';
-import { toSurfaceId } from './md-path';
+import { makeImageResolver, normalizeRelPath, toSurfaceId } from './md-path';
 import { SourceEditor } from './source-editor';
+import { Spinner } from './spinner';
 import { type CommentDraft, WysiwygEditor } from './wysiwyg-editor';
 
 export type EditorEngine = 'source' | 'wysiwyg';
-
-/** Normalize a relative path, collapsing `.`/`..` segments. */
-function normalizeRelPath(p: string): string {
-  const parts: string[] = [];
-  for (const seg of p.split('/')) {
-    if (seg === '' || seg === '.') continue;
-    if (seg === '..') parts.pop();
-    else parts.push(seg);
-  }
-  return parts.join('/');
-}
-
-/**
- * Build a resolver for markdown image srcs. Absolute URLs/data URIs pass through;
- * relative paths resolve against the file's directory and stream from /__vs/raw.
- */
-function makeImageResolver(filePath: string): (src: string) => string {
-  const dir = filePath.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/')) : '';
-  return (src: string) => {
-    if (/^(https?:|data:|blob:|\/\/)/i.test(src)) return src;
-    const joined = normalizeRelPath(dir ? `${dir}/${src}` : src);
-    return `/__vs/raw?path=${encodeURIComponent(joined)}`;
-  };
-}
 
 /**
  * Inverse of {@link makeImageResolver}: turn a /__vs/raw display URL back into a
@@ -89,7 +66,8 @@ export function MarkdownDocEditor({
   onStateChange,
 }: {
   path: string; // real .md path
-  previewWidth: number;
+  /** A CSS length — the host drives this with a custom property so a drag costs no render. */
+  previewWidth: number | string;
   splitter: React.ReactNode;
   defaultEngine?: EditorEngine;
   // "Done" (and the host's save-and-view guard) return to the rendered view.
@@ -244,7 +222,7 @@ export function MarkdownDocEditor({
           <div style={previewHead}>Preview</div>
           <div style={previewBody}>
             <div style={{ maxWidth: 900, margin: '0 auto' }}>
-              <MarkdownSurface source={value} />
+              <MarkdownSurface source={value} resolveImageSrc={resolveImageSrc} />
             </div>
           </div>
         </aside>
@@ -288,7 +266,11 @@ function SaveBar({
         ))}
       </div>
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
-        <span style={{ fontSize: 12, fontWeight: 600, color }}>{status}</span>
+        {/* The word already said "Saving…"; the ring is what makes it noticed. */}
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, fontWeight: 600, color }}>
+          {saving && <Spinner size={11} />}
+          {status}
+        </span>
         <button type="button" onClick={onDone} disabled={saving} style={{ ...doneBtn, opacity: saving ? 0.5 : 1 }} title="Save and return to the rendered view (⌘/Ctrl+S saves without leaving)">
           ✓ Done
         </button>

@@ -23,22 +23,73 @@ import { randomHex8 } from '../../editing/id';
 
 export type RouteResult = { status: number; json: unknown };
 
+/** What a PATCH may change on a single comment. */
+export type CommentPatch = {
+  status?: CommentStatus;
+  result?: string;
+  comment?: string;
+};
+
+/**
+ * `read`/`write` are the original snapshot contract and stay required.
+ *
+ * The three mutation methods are **optional and intent-based** (LLD §5 "The seam").
+ * `write(doc)` is a whole-document snapshot swap returning `void`, so a remote-backed
+ * store cannot tell "one comment was added" from a new snapshot and has no channel to
+ * return the created comment's id. Making them optional keeps every existing store —
+ * including the in-memory ones in the test suites — a valid `CommentDocStore` with no
+ * change; `handleCommentsRequest` falls back to the snapshot path when they are absent.
+ */
 export interface CommentDocStore {
   read(): Promise<CommentDoc>;
   write(doc: CommentDoc): Promise<void>;
+  /** Persist one new comment and return the stored record (ids may be assigned here). */
+  addComment?(record: CommentRecord): Promise<CommentRecord>;
+  /** Apply a patch to one comment. Resolves `null` when the id is unknown. */
+  updateComment?(id: string, patch: CommentPatch): Promise<CommentRecord | null>;
+  deleteComment?(id: string): Promise<void>;
 }
 
+/**
+ * The sidecar-file store. Its intent methods are written in terms of the same
+ * snapshot read/modify/write it has always used, so local-mode behaviour — including
+ * the quirks pinned by `local-mode.regression.test.ts` — is unchanged.
+ */
 export function fileCommentStore(path: string): CommentDocStore {
+  const read = async (): Promise<CommentDoc> => {
+    try {
+      return parseDoc(await readFile(path, 'utf8'));
+    } catch {
+      return parseDoc(null);
+    }
+  };
+  const write = async (doc: CommentDoc): Promise<void> => {
+    await writeFile(path, serializeDoc(doc), 'utf8');
+  };
   return {
-    async read() {
-      try {
-        return parseDoc(await readFile(path, 'utf8'));
-      } catch {
-        return parseDoc(null);
-      }
+    read,
+    write,
+    async addComment(record) {
+      await write(addComment(await read(), record));
+      return record;
     },
-    async write(doc) {
-      await writeFile(path, serializeDoc(doc), 'utf8');
+    async updateComment(id, patch) {
+      const base = await read();
+      // `status` is assigned whenever the key is present, even as undefined — that is
+      // the existing PATCH behaviour and a regression test pins it.
+      const withStatus = 'status' in patch ? setStatus(base, id, patch.status as CommentStatus, patch.result) : base;
+      const next =
+        patch.comment === undefined
+          ? withStatus
+          : {
+              ...withStatus,
+              comments: withStatus.comments.map((c) => (c.id === id ? { ...c, comment: patch.comment as string } : c)),
+            };
+      await write(next);
+      return next.comments.find((c) => c.id === id) ?? null;
+    },
+    async deleteComment(id) {
+      await write(removeComment(await read(), id));
     },
   };
 }
@@ -112,18 +163,24 @@ export async function handleCommentsRequest(
         status: 'open',
         ts: req.ts ?? now(),
       };
-      await store.write(addComment(await store.read(), record));
-      return { status: 200, json: { ok: true, id: record.id } };
+      const saved = store.addComment
+        ? await store.addComment(record)
+        : (await store.write(addComment(await store.read(), record)), record);
+      return { status: 200, json: { ok: true, id: saved.id } };
     }
     const idMatch = /^\/(c-[a-f0-9]+)$/.exec(pathname);
     if (idMatch) {
       const id = idMatch[1]!;
       if (method === 'PATCH') {
-        await store.write(setStatus(await store.read(), id, body.status as CommentStatus));
+        const result = typeof body.result === 'string' ? body.result : undefined;
+        const patch: CommentPatch = { status: body.status as CommentStatus, ...(result !== undefined ? { result } : {}) };
+        if (store.updateComment) await store.updateComment(id, patch);
+        else await store.write(setStatus(await store.read(), id, patch.status as CommentStatus, result));
         return { status: 200, json: { ok: true } };
       }
       if (method === 'DELETE') {
-        await store.write(removeComment(await store.read(), id));
+        if (store.deleteComment) await store.deleteComment(id);
+        else await store.write(removeComment(await store.read(), id));
         return { status: 200, json: { ok: true } };
       }
     }
