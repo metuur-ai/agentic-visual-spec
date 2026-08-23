@@ -35,6 +35,7 @@ import {
 import { handleFilesRequest } from '../core/vite/routes/files';
 import { handleGitRequest } from '../core/vite/routes/git';
 import { createApplyHub } from '../core/vite/routes/apply';
+import { createReviewHub, handleReviewRequest } from '../core/vite/routes/review';
 import { createCollabRoutes } from '../core/vite/routes/collab';
 import { createCollabWiring } from '../core/vite/routes/collab-wiring';
 import { createJobHubRegistry } from '../core/collaboration/job-hub';
@@ -167,6 +168,9 @@ export function createVisualSpecServer(opts: ServeOptions) {
   // many SSE subscribers. The thunk reads the current (mutable) dir + store so a
   // runtime "change directory" re-roots the next run too.
   const applyHub = createApplyHub(() => ({ cwd: contentDir, comments }));
+  // Interactive review sessions (R-8.1), sharing the apply hub's single slot through
+  // `sharedRunLock`. Same thunk discipline, and the same handler the Vite host uses.
+  const reviewHub = createReviewHub(() => ({ cwd: contentDir, comments }));
   // Collaboration (R-7.1). One job registry per server, never module-level. The route
   // layer is shared with the Vite host verbatim (R-7.6): both hosts do nothing but slice
   // the prefix off the path and hand the request to `collab.handle`. With no
@@ -377,6 +381,19 @@ export function createVisualSpecServer(opts: ServeOptions) {
             return sendJson(res, r.status, r.json);
           }
           return sendJson(res, 404, { error: `no route: ${method} ${url.pathname}` });
+        }
+
+        // Interactive review sessions (R-8.1). The host slices the prefix and hands the
+        // request to the shared handler — no review logic lives here (R-8.2).
+        if (url.pathname === '/__vs/review' || url.pathname.startsWith('/__vs/review/')) {
+          const r = handleReviewRequest(reviewHub, {
+            method,
+            pathname: url.pathname.slice('/__vs/review'.length),
+            body: await readJsonBody(req),
+            sse: res,
+          });
+          if ('streamed' in r) return; // SSE: the hub wrote the head and the sync frame
+          return sendJson(res, r.status, r.json);
         }
 
         // Collaboration routes (R-7.1). Everything below `/__vs/collab` is decided by the

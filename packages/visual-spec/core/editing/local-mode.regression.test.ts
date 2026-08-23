@@ -619,6 +619,10 @@ describe('R-10.5 — local mode requires no GitHub connectivity', () => {
     '../vite/routes/comments.ts',
     '../vite/routes/apply.ts',
     '../vite/routes/run-lock.ts',
+    // Added deliberately (LLD Constraints): the review hub is on the local path, and the
+    // collab arm must arrive as a second implementation of `ReviewSessionOps` — not as
+    // collaboration identity leaking into this module.
+    '../vite/routes/review.ts',
     '../vite/tree-store.ts',
     '../vite/surface-store.ts',
     '../app/lib/use-comments.ts',

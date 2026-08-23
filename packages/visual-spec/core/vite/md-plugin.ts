@@ -23,6 +23,7 @@ import { type CommentDocStore, fileCommentStore, handleCommentsRequest } from '.
 import { handleFilesRequest } from './routes/files';
 import { handleGitRequest } from './routes/git';
 import { createApplyHub } from './routes/apply';
+import { createReviewHub, handleReviewRequest } from './routes/review';
 import { createCollabRoutes } from './routes/collab';
 import { createCollabWiring } from './routes/collab-wiring';
 import { collaborationFromOrigin } from '../collaboration/open';
@@ -366,6 +367,29 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
           return sendJson(res, r.status, r.json);
         }
         return next();
+      });
+
+      // Interactive review sessions (R-8.1). Same shared-lock slot as the apply hub —
+      // `sharedRunLock` by default — so one of the two runs at a time. The host does
+      // nothing but slice the prefix and hand the request to the shared handler (R-8.2).
+      const reviewHub = createReviewHub(() => ({ cwd: specsRoot, comments }));
+      server.middlewares.use('/__vs/review', (req, res) => {
+        void (async () => {
+          try {
+            const url = new URL(req.url ?? '', 'http://localhost');
+            const body = await readJsonBody(req);
+            const r = handleReviewRequest(reviewHub, {
+              method: req.method ?? 'GET',
+              pathname: url.pathname,
+              body,
+              sse: res,
+            });
+            if ('streamed' in r) return; // SSE: the hub wrote the head and the sync frame
+            sendJson(res, r.status, r.json);
+          } catch (err) {
+            sendJson(res, 500, { error: (err as Error).message });
+          }
+        })();
       });
 
       // Collaboration routes (R-7.1). Same registry discipline as the standalone host —
