@@ -616,6 +616,10 @@ describe('R-10.5 — local mode requires no GitHub connectivity', () => {
   const localModules = [
     'comment-doc.ts',
     'apply-prompt.ts',
+    // Added deliberately, like `review.ts` below: the review prompt is a separate module
+    // from `apply-prompt.ts` and so inherits none of its constraints by proximity. It runs
+    // on the local path, so it gets the guard by name rather than by neighbourhood.
+    'review-prompt.ts',
     '../vite/routes/comments.ts',
     '../vite/routes/apply.ts',
     '../vite/routes/run-lock.ts',

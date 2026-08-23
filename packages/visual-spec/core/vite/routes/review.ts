@@ -37,6 +37,13 @@ import { readFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { isAbsolute, resolve as resolvePath } from 'node:path';
 import { setStatus } from '../../editing/comment-doc';
+import {
+  buildReviewPrompt,
+  type Proposal,
+  PROPOSAL_SCHEMA_ARGS,
+  proposalFromLine,
+  type ReviewPromptOptions,
+} from '../../editing/review-prompt';
 import { type ApplyEvent, type ClaudeChild, type RouteResult, summarize } from './apply';
 import type { CommentDocStore } from './comments';
 import { conflictFor, type RunLock, sharedRunLock } from './run-lock';
@@ -54,6 +61,8 @@ export type ReviewEvent =
   | { type: 'review-start'; commentId: string; startedAt: number }
   /** A turn the user sent, echoed back by `--replay-user-messages` (R-8.7). */
   | { type: 'user-turn'; text: string }
+  /** The pinned envelope for a turn — interpretation, reasoning, and the applicable patch. */
+  | { type: 'proposal'; proposal: Proposal }
   | { type: 'awaiting-input' }
   | { type: 'drift'; message: string }
   | { type: 'ended'; ok: boolean; reason: ReviewEndReason; exitCode?: number | null };
@@ -75,14 +84,25 @@ export type ReviewSync = {
  * The session interface — the local/collab seam (LLD decision (b))
  * ------------------------------------------------------------------ */
 
-/** The comment a session is about, in the shape the hub needs — never the store record. */
+/**
+ * The comment a session is about, in the shape the hub needs — never the store record.
+ *
+ * It carries the whole anchor (`heading`, both snippets, both line numbers) rather than
+ * just the start, because the prompt locates the target by snippet + heading and a
+ * half-carried anchor would silently degrade that ladder to a line number the file may
+ * have drifted past.
+ */
 export type ResolvedComment = {
   id: string;
   comment: string;
   workflow: string;
   path: string;
+  kind?: 'file' | 'range' | 'folder';
   startLine?: number;
+  endLine?: number;
   snippet?: string;
+  endSnippet?: string;
+  heading?: string | null;
 };
 
 /** The located target plus the state pinned at propose time, which `checkDrift` compares. */
@@ -110,6 +130,13 @@ export interface ReviewSessionOps {
   finish(comment: ResolvedComment, outcome: ReviewOutcome): Promise<void>;
   /** Whether the scoped re-derive pass exists as a fallback. Local yes, collab no. */
   readonly fallbackAvailable: boolean;
+  /**
+   * R-3.8 — which arm of the prompt this session runs. The origin of a comment picks the
+   * implementation, and the implementation carries its own prompt mode, so the hub never
+   * reads a `mode` field and no route body carries one. The plain discriminant survives
+   * only inside the prompt, which is where the LLD leaves it.
+   */
+  readonly promptMode: ReviewPromptOptions;
 }
 
 /* ------------------------------------------------------------------ *
@@ -161,6 +188,10 @@ export type ReviewSpawn = (comment: ResolvedComment, cwd: string) => ReviewChild
  *
  * `ExitPlanMode` is not available in `--print` sessions (spike 0.1), so nothing here
  * depends on the model calling it; approval is a server-side act (B4.1).
+ *
+ * `--json-schema` is spawned alongside these but lives in `review-prompt.ts` next to the
+ * schema it carries — see `PROPOSAL_SCHEMA_ARGS`. It is the envelope's flag, not the
+ * transport's, and this list stays the transport.
  */
 export const REVIEW_CLI_ARGS: readonly string[] = [
   '--print',
@@ -181,7 +212,11 @@ export const REVIEW_CLI_ARGS: readonly string[] = [
  * in-channel every follow-up turn travels down (R-8.3).
  */
 export const defaultSpawnReviewSession: ReviewSpawn = (_comment, cwd) =>
-  spawn('claude', [...REVIEW_CLI_ARGS], { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  spawn('claude', [...REVIEW_CLI_ARGS, ...PROPOSAL_SCHEMA_ARGS], {
+    cwd,
+    env: process.env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
 
 /** One turn, in the frame shape spike 0.1 verified the CLI accepts on stdin. */
 export function userTurnFrame(text: string): string {
@@ -246,6 +281,9 @@ export function createLocalSessionOps(getDeps: () => ReviewDeps): ReviewSessionO
   };
   return {
     fallbackAvailable: true,
+    // The sidecar only ever holds local comments, so a comment resolved from it is local
+    // by construction — this is the origin, not a guess at it (R-3.8).
+    promptMode: { mode: 'local' },
     async resolve(commentId) {
       const doc = await getDeps().comments.read();
       const c = doc.comments.find((r) => r.id === commentId);
@@ -255,8 +293,12 @@ export function createLocalSessionOps(getDeps: () => ReviewDeps): ReviewSessionO
         comment: c.comment,
         workflow: c.workflow,
         path: c.target.path,
+        kind: c.target.kind,
         ...(c.target.startLine !== undefined ? { startLine: c.target.startLine } : {}),
+        ...(c.target.endLine !== undefined ? { endLine: c.target.endLine } : {}),
         ...(c.target.snippet !== undefined ? { snippet: c.target.snippet } : {}),
+        ...(c.target.endSnippet !== undefined ? { endSnippet: c.target.endSnippet } : {}),
+        ...(c.target.heading !== undefined ? { heading: c.target.heading } : {}),
       };
     },
     async locate(comment) {
@@ -318,6 +360,8 @@ export function createReviewHub(
   let child: ReviewChild | null = null;
   let located: LocatedTarget | null = null;
   let comment: ResolvedComment | null = null;
+  /** The latest envelope this session produced — what B4.1's approval applies. */
+  let proposal: Proposal | null = null;
   const subs = new Set<ServerResponse>();
   const ops = makeOps(getDeps);
 
@@ -338,6 +382,7 @@ export function createReviewHub(
     child = null;
     located = null;
     comment = null;
+    proposal = null;
     broadcast({ type: 'ended', ok, reason, ...(exitCode !== undefined ? { exitCode } : {}) });
     lock.release('review');
   };
@@ -357,6 +402,15 @@ export function createReviewHub(
         // ahead of whatever the same line yields through the shared reader.
         const echoed = replayedUserText(line);
         if (echoed) broadcast({ type: 'user-turn', text: echoed.slice(0, 2000) });
+        // R-4.1–R-4.6: the envelope `--json-schema` pinned, read off the turn's result
+        // frame. Spike 2.1 confirmed the CLI populates `structured_output` on EVERY turn,
+        // so a refined proposal (R-5.2) arrives by exactly this path — there is no
+        // prose-parsing lane behind it, and a turn without an envelope emits no proposal.
+        const p = proposalFromLine(line);
+        if (p) {
+          proposal = p;
+          broadcast({ type: 'proposal', proposal: p });
+        }
         for (const f of summarize(line)) {
           if (f.type === 'start' || f.type === 'done') continue; // apply-shaped, never emitted here
           broadcast(f);
@@ -396,10 +450,10 @@ export function createReviewHub(
       return end(false, 'error');
     }
     pipeOutput(child);
-    // The opening turn. The proposal prompt proper — interpretation, strategy, the
-    // applicable patch, the pinned envelope — is B2.1's `buildReviewPrompt`; this states
-    // the comment and its target so the transport is exercisable end to end before then.
-    child.stdin?.write(userTurnFrame(openingTurn(resolved)));
+    // The opening turn: one comment, its anchor, and what the proposal must contain. The
+    // arm is the ops implementation's, not a field on the request (R-3.8) — nothing above
+    // this line knows whether the session is local or collaborative.
+    child.stdin?.write(userTurnFrame(buildReviewPrompt(resolved, ops.promptMode)));
   };
 
   return {
@@ -446,13 +500,19 @@ export function createReviewHub(
       const guard = noSession(phase);
       if (guard) return guard;
       if (!located || !comment) return { status: 409, json: { error: 'the review session has ended', code: 'session-ended' } };
+      // Nothing to approve until a turn has produced an envelope: approval means "apply
+      // this patch", and with no patch there is nothing that could be applied without
+      // re-deriving the change — which is the defect the envelope exists to prevent.
+      if (!proposal) return { status: 409, json: { error: 'no proposal to approve yet', code: 'no-proposal' } };
       // Drift is checked before anything is authorised, so a stale proposal cannot land.
-      // The write itself — applying the approved patch — is B4.1.
       const pinned = located;
       void ops.checkDrift(pinned).then((d) => {
         if (d.drifted) broadcast({ type: 'drift', message: d.reason });
       });
-      return { status: 409, json: { error: 'no proposal to approve yet', code: 'no-proposal' } };
+      // The write itself — `git apply` of `proposal.patch` through the GitExecutor — is
+      // B4.1. Refusing here is deliberate: the one thing that must never happen in the
+      // meantime is a write that re-derives the change and calls it the approved diff.
+      return { status: 501, json: { error: 'applying an approved patch is not implemented yet', code: 'not-implemented' } };
     },
 
     cancel() {
@@ -468,12 +528,6 @@ export function createReviewHub(
       return { running: running(), startedAt, commentId, phase };
     },
   };
-}
-
-/** Interim opening turn — replaced by `buildReviewPrompt` in B2.1. */
-function openingTurn(c: ResolvedComment): string {
-  const where = c.startLine !== undefined ? `${c.path}:${c.startLine}` : c.path;
-  return `A reviewer left this comment on ${where}:\n\n${c.comment}\n\nRead the file and propose how you would address it. Do not edit anything yet.`;
 }
 
 /**

@@ -14,6 +14,7 @@ import { Readable, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 import type { CommentDoc, CommentRecord } from '../../editing/comment-doc';
+import { buildReviewPrompt, PROPOSAL_SCHEMA, type Proposal } from '../../editing/review-prompt';
 import { createApplyHub } from './apply';
 import type { CommentDocStore } from './comments';
 import {
@@ -26,6 +27,7 @@ import {
   type ReviewChild,
   type ReviewDeps,
   type ReviewEvent,
+  type ReviewSessionOps,
   type ReviewSync,
   userTurnFrame,
 } from './review';
@@ -487,6 +489,194 @@ describe('propose writes nothing to the workspace (R-4.7, R-3.7)', () => {
     expect(readFileSync(target)).toEqual(before);
     // …and the comment is still open: propose changes no state at all (R-3.2).
     expect((await store.read()).comments[0].status).toBe('open');
+  });
+});
+
+/* ================================================================== *
+ * B2.1 — the proposal envelope (R-4.1…R-4.6)
+ * ================================================================== */
+
+/** What a turn's result frame really looks like: an envelope on `structured_output`. */
+const ENVELOPE: Proposal = {
+  interpretation: 'The reviewer wants the heading to name the audience.',
+  strategy: 'Rewrite the heading.',
+  reasoning: 'A heading that names the audience orients the reader immediately.',
+  assumptions: [],
+  ambiguities: [],
+  alternatives: [],
+  patch: 'diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n@@ -1 +1 @@\n-# heading\n+# heading for reviewers\n',
+  impact: 'One line; nothing else in the file refers to it.',
+};
+
+const resultFrame = (proposal: Proposal) => JSON.stringify({ type: 'result', subtype: 'success', structured_output: proposal });
+
+describe('the proposal envelope reaches subscribers (R-4.1–R-4.6)', () => {
+  it('spawns with `--json-schema` carrying the pinned envelope', () => {
+    const child = defaultSpawnReviewSession({ id: 'c-1', comment: 'x', workflow: 'visual-spec', path: 'a.md' }, tmpdir());
+    child.on('error', () => {}); // claude may not be on PATH — irrelevant to this assertion
+    const args = (child as unknown as { spawnargs: string[] }).spawnargs;
+    child.kill?.('SIGKILL');
+
+    // Populated deterministically by the CLI rather than parsed out of prose: the schema
+    // *is* the contract, so it is asserted here rather than described.
+    const at = args.indexOf('--json-schema');
+    expect(at).toBeGreaterThan(-1);
+    expect(JSON.parse(args[at + 1] as string)).toEqual(PROPOSAL_SCHEMA);
+    // …alongside, not instead of, the transport flags.
+    for (const flag of REVIEW_CLI_ARGS) expect(args).toContain(flag);
+  });
+
+  it('surfaces a result frame carrying an envelope as a `proposal` event', async () => {
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    const sub = fakeRes();
+    hub.subscribe(sub.res);
+    hub.start('c-1');
+    await tick();
+
+    child.emit(resultFrame(ENVELOPE));
+    await tick();
+    expect(sub.frames()).toContainEqual({ type: 'proposal', proposal: ENVELOPE });
+  });
+
+  it('emits one proposal per turn, so a refinement replaces rather than appends to it (R-5.2)', async () => {
+    // Verified against the real CLI (spike 2.1): `--json-schema` pins EVERY turn's result
+    // frame on a persistent stream-json session, not only the final one — so the refine
+    // phase gets a whole updated envelope, patch included, on each turn.
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    const sub = fakeRes();
+    hub.subscribe(sub.res);
+    hub.start('c-1');
+    await tick();
+
+    child.emit(resultFrame(ENVELOPE));
+    await tick();
+    hub.message('shorter please');
+    const refined: Proposal = { ...ENVELOPE, patch: `${ENVELOPE.patch}\n`, strategy: 'Shorten the heading instead.' };
+    child.emit(resultFrame(refined));
+    await tick();
+
+    const proposals = sub.frames().filter((f) => f.type === 'proposal') as Array<{ proposal: Proposal }>;
+    expect(proposals).toHaveLength(2);
+    expect(proposals[1].proposal.patch).not.toBe(proposals[0].proposal.patch);
+  });
+
+  it('a turn with no envelope produces no proposal — nothing is invented from prose', async () => {
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    const sub = fakeRes();
+    hub.subscribe(sub.res);
+    hub.start('c-1');
+    await tick();
+
+    // A plain prose result, which is what a session without the schema would produce.
+    child.emit(JSON.stringify({ type: 'result', result: 'I would rewrite the heading to name the audience.' }));
+    await tick();
+    expect(sub.frames().some((f) => f.type === 'proposal')).toBe(false);
+    // …and it still shows up as ordinary activity, so nothing is silently swallowed.
+    expect(sub.frames()).toContainEqual({ type: 'log', kind: 'result', text: 'I would rewrite the heading to name the audience.' });
+  });
+
+  it('refuses an approval with no proposal, and does not re-derive once there is one', async () => {
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    hub.start('c-1');
+    await tick();
+    expect(hub.approve()).toMatchObject({ status: 409, json: { code: 'no-proposal' } });
+
+    child.emit(resultFrame(ENVELOPE));
+    await tick();
+    // The write is B4.1. What must not happen in the meantime is a write that re-derives
+    // the change and presents it as the approved diff (R-6.2, R-6.8).
+    expect(hub.approve()).toMatchObject({ status: 501, json: { code: 'not-implemented' } });
+  });
+});
+
+/* ================================================================== *
+ * B2.2 — start propose (R-3.1, R-3.2, R-3.8)
+ * ================================================================== */
+describe('POST /review/start begins propose (R-3.1, R-3.2, R-3.8)', () => {
+  it('opens the session with the real review prompt, not a placeholder', async () => {
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    hub.start('c-1');
+    await tick();
+
+    const frame = JSON.parse(child.written[0] as string) as { message: { content: Array<{ text: string }> } };
+    expect(frame.message.content[0].text).toBe(
+      buildReviewPrompt(
+        { id: 'c-1', comment: 'make it clearer', workflow: 'visual-spec', path: 'a.md', kind: 'file' },
+        { mode: 'local' },
+      ),
+    );
+  });
+
+  it('carries the whole anchor into the prompt, not just the start line', async () => {
+    const anchored: CommentRecord = {
+      id: 'c-9',
+      workflow: 'visual-spec',
+      comment: 'name the audience',
+      status: 'open',
+      ts: '',
+      target: { path: 'a.md', kind: 'range', startLine: 3, endLine: 5, snippet: 'first', endSnippet: 'last', heading: 'Intro' },
+    };
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ comments: memoryStore([anchored]), spawnSession: () => child }), createRunLock());
+    hub.start('c-9');
+    await tick();
+
+    const text = (JSON.parse(child.written[0] as string) as { message: { content: Array<{ text: string }> } }).message.content[0].text;
+    expect(text).toContain('Where: Intro · lines 3–5');
+    expect(text).toContain('From: "first"');
+    expect(text).toContain('Through: "last"');
+  });
+
+  it('takes the prompt arm from the session ops, never from the request body (R-3.8)', async () => {
+    // The origin picks the implementation; the implementation carries the arm. A route
+    // body that could name a mode would be a fifth `if (mode === 'collab')` site.
+    const child = liveChild();
+    const collabOps = (get: () => ReviewDeps): ReviewSessionOps => ({
+      ...createLocalSessionOps(get),
+      promptMode: { mode: 'collab', documentPath: 'docs/x.json' },
+    });
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock(), collabOps);
+    hub.start('c-1');
+    await tick();
+
+    const text = (JSON.parse(child.written[0] as string) as { message: { content: Array<{ text: string }> } }).message.content[0].text;
+    expect(text).toContain('docs/x.json');
+    expect(handleReviewRequest(hub, { method: 'POST', pathname: '/start', body: {}, sse: fakeRes().res })).toMatchObject({ status: 400 });
+  });
+
+  it('the local arm reports itself as local', () => {
+    expect(createLocalSessionOps(() => deps()).promptMode).toEqual({ mode: 'local' });
+  });
+
+  it('writes nothing to the workspace and leaves the comment open while proposing', async () => {
+    // R-3.1 / R-3.2. The propose-phase no-write invariant is asserted against the *target*
+    // file (spike 0.1: plan mode is workspace-scoped, and the CLI writes its own plan files
+    // under ~/.claude/plans regardless), across a proposal actually arriving.
+    const dir = mkdtempSync(join(tmpdir(), 'vs-review-start-'));
+    try {
+      const target = join(dir, 'a.md');
+      writeFileSync(target, '# heading\n');
+      const before = readFileSync(target);
+      const store = memoryStore([rec('c-1')]);
+      const child = liveChild();
+      const hub = createReviewHub(() => ({ cwd: dir, comments: store, spawnSession: () => child, now: () => 1000 }), createRunLock());
+
+      expect(hub.start('c-1')).toEqual({ status: 200, json: { ok: true } });
+      await tick();
+      child.emit(resultFrame(ENVELOPE));
+      await tick();
+
+      expect(readFileSync(target)).toEqual(before);
+      expect((await store.read()).comments[0].status).toBe('open');
+      expect((await store.read()).comments[0].result).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

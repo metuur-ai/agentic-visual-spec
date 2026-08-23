@@ -106,18 +106,18 @@ Source of truth: `docs/ears/inline-indicators-interactive-apply.md` (acceptance 
 
 ## Phase B — Propose
 
-- [ ] B2.1 `buildReviewPrompt` + proposal envelope carrying an applicable patch (deps: B1.3, est: ~2h)
+- [x] B2.1 `buildReviewPrompt` + proposal envelope carrying an applicable patch (deps: B1.3, est: ~2h)
   - why: the diff is the only field carrying decision weight, and it must be a patch the server can apply rather than prose about a change — that is what makes R-6.2 true by construction instead of by hope. The other fields are pinned via `--json-schema` so they are testable rather than parsed out of prose.
   - acceptance: R-4.1, R-4.2, R-4.3, R-4.4, R-4.5, R-4.6 — prompt resolves the comment by snippet+heading and elicits interpretation / strategy / assumptions / alternatives (only when the model identifies them) / **a machine-applicable unified diff** / impact, emitted against a pinned envelope surfaced as a `proposal` event.
   - verify: a session produces a `proposal` frame with all fields populated, and the diff field applies cleanly via `git apply --check` against the unmodified target; alternatives are absent when the model identifies none.
   - note: `review-prompt.ts` is a **separate module** from `apply-prompt.ts`, sharing only the comment-manifest formatter — module choice is not the safety question (see LLD). Both it and `review.ts` are added to the R-10.5 module list in `local-mode.regression.test.ts` deliberately.
-  - landed:
+  - landed: core/editing/review-prompt.ts (`PROPOSAL_SCHEMA`, `PROPOSAL_SCHEMA_ARGS`, `buildReviewPrompt`, `toProposal`, `proposalFromLine`), core/editing/review-prompt.test.ts, core/editing/apply-prompt.ts (`formatCommentEntry` — the one shared piece), core/vite/routes/review.ts (`proposal` event, spawn carries `--json-schema`), core/editing/local-mode.regression.test.ts (R-10.5 list). **`--json-schema` pins EVERY turn, not just the last** — verified against `claude` 2.1.220 on a persistent stream-json session, `.devlocal/spikes/2.1-json-schema.mjs` and `.devlocal/spikes/2.1-live-prompt.ts`: each turn's `result` frame carries `structured_output` with the full envelope, and both turns' `patch` fields were accepted by `git apply --check`. There is no prose-parsing fallback: a turn with no envelope emits no proposal.
 
-- [ ] B2.2 Start propose — no disk write, comment stays open, mode selected from origin (deps: B2.1, est: ~1h)
+- [x] B2.2 Start propose — no disk write, comment stays open, mode selected from origin (deps: B2.1, est: ~1h)
   - why: selecting Apply Comment must open a reviewable proposal rather than mutate the document, and the origin decides which prompt and approval path the session runs.
   - acceptance: R-3.1, R-3.2, R-3.8 — `POST /review/start {commentId}` begins propose, writes nothing to disk, keeps the comment `open`, and resolves the comment's origin to select the prompt mode and approval path.
   - verify: start a review → proposal streams; the target file's bytes and the comment's `status` are unchanged; a local comment selects the local implementation.
-  - landed:
+  - landed: core/vite/routes/review.ts (the interim opening turn is replaced by `buildReviewPrompt`; `ReviewSessionOps.promptMode` carries the arm), core/vite/routes/review.test.ts. R-3.8 rides the existing ops seam: the origin picks the implementation and the implementation carries its prompt mode, so no `mode` field travels through the route body or the hub. `createLocalSessionOps` is still the only implementation; `ResolvedComment` now carries the whole anchor (heading + both snippets + both line numbers) so the prompt gets the full snippet+heading ladder rather than a start line.
 
 ## Phase B — Refine
 
