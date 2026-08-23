@@ -189,47 +189,47 @@ Source of truth: `docs/ears/inline-indicators-interactive-apply.md` (acceptance 
 
 Ships after Phase B is in users' hands. Everything here depends on B1.2's session interface, and lands the collaborative apply path that `copyHandoff` (`ui/collab-app.tsx:370-386`) deliberately deferred.
 
-- [ ] C1.1 Collab start contract — session receives the projected record (deps: B2.2, est: ~1.5h)
+- [x] C1.1 Collab start contract — session receives the projected record (deps: B2.2, est: ~1.5h)
   - why: `{commentId, documentPath}` is not enough. Collab comments are projected at runtime (`comment-projection.ts:136`, `review-comments.ts:282`) so the record exists only in the client's projection; the id identifies neither repo nor pull request, no route resolves one, and R-9.1 bars falling back to the sidecar.
   - acceptance: R-8.8, R-9.1 — the start request carries `documentPath` plus the projected record (id, node id, text, workflow); the session runs without reading, editing, or trusting `visual-spec-comments.json`.
   - verify: start a collab review with the sidecar file deleted → the session runs normally; assert no read of the sidecar path occurs during a collab session.
-  - landed:
+  - landed: core/collaboration/review-session-collab.ts (`parseCollabStart`, `createCollabSessionOps.resolve`, `createReviewSessionOpsSelector`), core/collaboration/review-session-collab.test.ts, core/vite/routes/review.ts (`ReviewStartRequest`), ui/collab-app.tsx, ui/review-session.ts, ui/collab-review-entry.test.tsx. The LLD's option (a) as written: the body is `{commentId, documentId, documentPath, comment:{id,text,workflow,nodeId?,reviewCommentId?|issueCommentId?}}`. **Two fields the LLD's sketch did not name.** `documentId` is how the server reaches the `CollaborationRecord` — and through it the branch head C1.4 pins and the repo/pull the C1.6 reply needs — without a second projection site; `documentPath` alone names a file but no conversation. The GitHub comment id is there because `recordIdFor` and `reviewRecordIdFor` are the *same function* over different inputs, so the projected `c-<8hex>` id cannot say whether the comment is a review thread or a flat issue comment, and the reply has nowhere to go without that. **R-9.1 is asserted, not asserted-about:** every collaborative test in the new suite hands the hub a `CommentDocStore` whose `read` and `write` both throw, so a session that touches the sidecar fails rather than quietly succeeding.
 
-- [ ] C1.2 Collab target resolution by node id (deps: C1.1, est: ~1h)
+- [x] C1.2 Collab target resolution by node id (deps: C1.1, est: ~1h)
   - why: collaborative anchoring is an exact lookup with no snippet or line ladder, and a comment with no node id is a statement about the whole document.
   - acceptance: R-9.2, R-9.3 — locate the target by node id with no snippet/line fallback; treat a record with no node id as document-level.
   - verify: a node-anchored comment resolves to that node; a document-level comment produces a whole-document proposal rather than an error.
-  - landed:
+  - landed: core/collaboration/review-session-collab.ts (`documentHasNode`, `locate`), core/collaboration/review-session-collab.test.ts. Exact scan, no ladder — a test gives the document the comment's own sentence verbatim and asserts a wrong node id still resolves to nothing, which is the ladder's absence made visible rather than stated. **The document format moved under this requirement and it is worth reading the spec note below:** `document-record.ts` now says the document IS the Markdown file, and `ui/collab-comment-source.ts` records that the nodeId-keyed resolver "went with the format that issued the ids". Live review threads project with line anchors and no `nodeId`, so in practice every collaborative comment today takes the R-9.3 document-level path.
 
-- [ ] C1.3 Collab write confinement (deps: C1.2, est: ~1h)
+- [x] C1.3 Collab write confinement (deps: C1.2, est: ~1h)
   - why: an agent handed both the canonical JSON and the generated Markdown will edit whichever it finds first, and the Markdown is write-only output.
   - acceptance: R-9.4 — every write is confined to the canonical JSON at the supplied document path; the generated Markdown is never edited.
   - verify: run a collab approval and assert the Markdown file's bytes are unchanged while the canonical JSON changed.
-  - landed:
+  - landed: core/collaboration/review-session-collab.ts (`patchPaths`, `admitPatchFor`, `admitPatch`), core/vite/routes/review.ts (`ReviewSessionOps.admitPatch` + the one call in `approve()`), core/collaboration/review-session-collab.test.ts. **Confinement is a server check, not a prompt sentence.** The prompt already said which file may be edited and that shapes what a good-faith model proposes; it decides nothing about what the server writes. `admitPatch` reads every path the diff claims — `diff --git`, `---` and `+++`, deliberately over-reading rather than under-reading — and refuses before `git` runs, so a refused patch leaves nothing to undo. A test asserts `git` is never invoked on that path.
 
-- [ ] C1.4 Collab drift — head SHA pin (deps: C1.3, est: ~1h)
+- [x] C1.4 Collab drift — head SHA pin (deps: C1.3, est: ~1h)
   - why: the canonical document lives on a branch, so the branch head moving is a cheaper and stronger staleness signal than diffing node content. `review-drafts.ts:399` already uses this guard shape.
   - acceptance: R-9.7 — pin the branch head at propose time; at approval, drift is head movement or the target node no longer existing.
   - verify: move the branch head between propose and approve → approval surfaces drift and writes nothing; delete the target node → same.
-  - landed:
+  - landed: core/collaboration/review-session-collab.ts (`headOf`, `locate`'s pin, `checkDrift`), core/collaboration/review-session-collab.test.ts. `LocatedTarget.pin` already existed as an opaque string, so the branch head goes straight into it and the hub compares nothing itself — the SHA-compare shape of `review-drafts.ts:399` without the module. The head is re-read from GitHub rather than taken from the record's cached binding, because a cached head is only rewritten on sync and a value that never moves cannot detect one that did. **One thing the story did not ask for:** a GitHub read failure is NOT drift. Falling back to the last head we provably saw means a rate limit or a dropped connection refuses nothing and invents no staleness; treating an unreadable head as movement would make every approval fail exactly when the network is worst.
 
-- [ ] C1.5 Collab approval — no status write, ready-to-publish handoff (deps: C1.4, est: ~1.5h)
+- [x] C1.5 Collab approval — no status write, ready-to-publish handoff (deps: C1.4, est: ~1.5h)
   - why: resolution in collab mode is recorded on the conversation, not on disk, and publishing is human-initiated by design.
   - acceptance: R-9.5, R-9.6 — approval writes no `status` or `result` to any file, and emits a `ready-to-publish` frame identifying the document without publishing.
   - verify: approve a collab change → canonical JSON updated, sidecar and GitHub comment bodies untouched, a `ready-to-publish` frame carries the document path, and nothing publishes.
-  - landed:
+  - landed: core/collaboration/review-session-collab.ts (`finish`), core/vite/routes/review.ts (`ReviewEvent` gains `ready-to-publish`; `finish` returns frames the hub broadcasts). R-9.5 is proved by construction and by the throwing sidecar: the collab `finish` has no writer in it at all, and the store that would receive a status throws on `write`. R-9.6's frame carries `documentPath` and the module holds no publish call, so "does not publish" is the absence of a code path rather than a flag. **The frame arrives without a hub branch:** `finish` returns the frames it wants broadcast and the hub broadcasts them without reading them, which is how a second terminal outcome landed in a hub that still has no idea two arms exist.
 
-- [ ] C1.6 Collab resolution recorded on the thread (deps: C1.5, est: ~1.5h)
+- [x] C1.6 Collab resolution recorded on the thread (deps: C1.5, est: ~1.5h)
   - why: without this the loop never closes — both projections hardcode `status: 'open'` (`comment-projection.ts:156`, `review-comments.ts:294`), so an applied collab comment re-projects as open and R-1.11 keeps rendering its indicator. Deriving status from GitHub's `isResolved` is ruled out at `review-comments.ts:274-281`: that conflates "the local apply agent acted" with "the remote thread is resolved".
   - acceptance: R-9.10, R-9.11 — the session posts a reply on the review conversation recording what was applied; collaborative comments still project as `open` regardless of remote resolution state.
   - verify: approve a collab change → a reply appears on the thread describing what was applied; the projected record still reads `open`, and this is documented as intended rather than filed as a bug.
-  - landed:
+  - landed: core/collaboration/review-session-collab.ts (`postResolutionReply`, `replyBody`), core/collaboration/review-session-collab.test.ts. A review thread gets `replyToReviewComment` inside the thread; a flat issue comment gets a new `createIssueComment` quoting the one it answers, because a PR issue comment has no thread to reply inside. **A reply that fails does not fail the approval** — the bytes already landed, so saying the write failed would be a lie about the file; the failure is reported as its own frame and the session still completes. **R-9.11 is a comment as much as a test.** After an approved collab apply the comment re-projects `open` and its indicator stays up. That is correct: `status` records whether the LOCAL apply agent acted, it has no file to live in here (R-9.5), and `review-comments.ts:274-281` (R-5.21) rules out deriving it from `isResolved` because that gives the system two resolution models with nothing able to say which is right. The note in `finish` opens by saying it looks exactly like a bug, because it does.
 
-- [ ] C1.7 Collab entry point, clipboard path preserved, safe cancel (deps: C1.6, est: ~1.5h)
+- [x] C1.7 Collab entry point, clipboard path preserved, safe cancel (deps: C1.6, est: ~1.5h)
   - why: the collab surface needs its own way in, and the existing manual path must keep working for anyone who prefers it or hits a session failure.
   - acceptance: R-9.8, R-9.9 — a per-comment review action on the collab panel; `copyHandoff` unchanged and still available; cancel or failure leaves the canonical document unchanged.
   - verify: start a collab review from the panel; confirm "Copy prompt" still produces the same prompt it does today; cancel mid-session → canonical JSON byte-identical.
-  - landed:
+  - landed: ui/collab-app.tsx (`useReviewSession`, `reviewActions`, the `ReviewDrawer` mount), ui/collab-comment-source.ts (`actions` pass-through), ui/review-session.ts (`start` takes an opaque extras bag), ui/collab-review-entry.test.tsx. It rides the same `CommentPanelSource.actions` seam B6.1 used, but the action is built in `collab-app.tsx` rather than in the projection module: a review needs a live session, a drawer and a subscription, and `collab-comment-source.ts` is a pure projection with none of them. **The subscription is on the app, not the drawer** — the server arms R-7.6's abandonment bound when the last subscriber leaves, so mounting the `EventSource` inside the view would make closing the drawer silently start reaping a live session. `copyHandoff` is untouched and is asserted so three ways: the source still builds the same `buildApplyPrompt(open, {mode:'collab', documentPath})`, the control is still on the toolbar, and the rendered surface still offers it. It is the escape hatch for a session that cannot start and for anyone who would rather drive the agent themselves, so a session-based path arriving beside it is not a reason to remove it.
 
 ---
 

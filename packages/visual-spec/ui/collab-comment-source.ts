@@ -181,6 +181,16 @@ export type CollabCommentSourceDeps = {
    * and R-5.13 forbids this system writing resolution at all. A thread is resolved by a
    * reviewer on github.com, and `threadLink` above is how a reader gets there (R-5.14).
    */
+  /**
+   * R-9.8 (Unit 9) — the per-comment review action, supplied by the surface that owns a
+   * review session rather than built here.
+   *
+   * It is a pass-through for the same reason the local panel's is: `CommentPanelSource.actions`
+   * is already "an act that belongs to exactly one source", and a review needs a live
+   * session, a drawer and a subscription — three things this pure projection module has
+   * none of. `collab-app.tsx` owns those and hands the button down.
+   */
+  actions?: CommentPanelSource['actions'];
   /** Where the document is rendered. Defaults to the whole document. */
   root?: ParentNode | null;
 };
@@ -195,6 +205,7 @@ export function collabCommentPanelSource(deps: CollabCommentSourceDeps): Comment
     // Orphans have their own section (R-5.7); listing them twice would double-render them.
     comments: deps.comments.filter((c) => !orphaned.has(c.id)),
     reply: deps.reply,
+    ...(deps.actions ? { actions: deps.actions } : {}),
     /*
      * The rest of the thread, which this surface offered to write and then did not show.
      *

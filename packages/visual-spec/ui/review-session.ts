@@ -170,7 +170,17 @@ export type ReviewSession = {
   /** Which POST is in flight, so the view can disable exactly one control. */
   busy: 'start' | 'message' | 'approve' | 'cancel' | null;
   problem: ReviewProblem | null;
-  start: (commentId: string) => Promise<void>;
+  /**
+   * Begin a session on one comment.
+   *
+   * `extra` is what a collaborative start adds (R-8.8): the document path and the
+   * projected record, which exist only in this browser's projection and cannot be
+   * resolved from the id. It is an opaque bag rather than a typed second parameter
+   * because this module has no business knowing what kinds of session the server runs —
+   * the caller that has a collaborative record is the one that knows how to describe it.
+   * A local start passes nothing and the body is exactly what it always was.
+   */
+  start: (commentId: string, extra?: Record<string, unknown>) => Promise<void>;
   send: (text: string) => Promise<void>;
   approve: () => Promise<void>;
   cancel: () => Promise<void>;
@@ -238,13 +248,15 @@ export function useReviewSession(): ReviewSession {
   }, []);
 
   const start = useCallback(
-    async (commentId: string) => {
+    async (commentId: string, extra?: Record<string, unknown>) => {
       setOpen(true);
       // Clear the previous session's proposal *before* the request, not when
       // `review-start` comes back: between the click and the first frame the drawer is
       // on screen, and the last session's diff sitting in it reads as this comment's.
       dispatch({ type: 'sync', running: false, phase: 'idle', commentId, startedAt: null, events: [] });
-      await run('start', 'start', { commentId });
+      // `commentId` last, so a caller's bag can never overwrite the one field the server
+      // itself reads off the body.
+      await run('start', 'start', { ...extra, commentId });
     },
     [run],
   );
