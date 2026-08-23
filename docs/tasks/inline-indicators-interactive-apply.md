@@ -177,11 +177,11 @@ Source of truth: `docs/ears/inline-indicators-interactive-apply.md` (acceptance 
 
 ## Phase B — Invariant guards
 
-- [ ] B7.1 Regression guards for the untouched surfaces (deps: B4.1, est: ~1h)
+- [x] B7.1 Regression guards for the untouched surfaces (deps: B4.1, est: ~1h)
   - why: three invariants are easy to break silently while building the review path, and each one breaks a shipped behavior rather than a new one.
   - acceptance: R-3.9, R-6.7 — bulk apply remains one-shot with no proposal or approval step (only the `RunLock` touches it); `CommentStatus` stays the two-value `open | applied` union with no intermediate value reaching `visual-spec-comments.json` or a GitHub comment body via `formatCommentBody`/`CommentTrailer`.
   - verify: existing bulk-apply and `local-mode.regression.test.ts` suites pass unchanged, including the output pin at `:377-383` and the source pins at `:423-425`; a test asserts no third status value can round-trip through either store.
-  - landed:
+  - landed: 737e270 — core/vite/routes/apply-invariants.test.ts (11 guards), core/vite/routes/apply.ts (stamp scoped to the run's id set), core/vite/routes/comments.ts (PATCH rejects a status outside the union), core/vite/routes/apply.test.ts
 
 ---
 
