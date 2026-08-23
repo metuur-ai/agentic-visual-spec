@@ -14,6 +14,8 @@ import { useAwaitingPulls } from './use-awaiting-pulls';
 import { type CollabPulls, type ConfiguredRepo, useCollabPulls } from './use-collab-pulls';
 import { type BranchListing, useGitBranches } from './use-git-branches';
 import { type GitContext, useGitContext } from './use-git-context';
+import { useChangedFiles } from './use-changed-files';
+import { recordVisit, useVisitedFiles } from './use-visited-files';
 
 /**
  * What the chip needs from the shell around it, and the whole of it.
@@ -1689,7 +1691,10 @@ function StartPullRequestButton({
   file: string;
   /** The caller's verdict that this document's notes are worked through — see `readyToShare`. */
   ready?: boolean;
-  /** R-8.34 — other local files that carry notes, offerable on the same pull request. */
+  /**
+   * R-8.34 — other local files that carry notes. Merged with the working tree's changed
+   * files (R-8.36) and this session's visited files (R-8.37) into what is offered.
+   */
   candidates?: string[];
   onStarted?: (documentId: string) => void;
 }) {
@@ -1707,6 +1712,33 @@ function StartPullRequestButton({
    */
   const [chosen, setChosen] = useState<ReadonlySet<string>>(() => new Set());
   const rootRef = useRef<HTMLDivElement>(null);
+  // R-8.36 — read while the popover is open, and re-read when a save lands, so the list
+  // is what the working tree holds now rather than what it held at boot.
+  const changed = useChangedFiles(open);
+  const visited = useVisitedFiles();
+
+  // R-8.37 — looking at a file is what puts it in reach of the next pull request.
+  useEffect(() => {
+    recordVisit(file);
+  }, [file]);
+
+  /*
+   * R-8.34 — everything offerable, from the three things that can make a file relevant:
+   * a note left on it, an uncommitted edit to it, and a visit to it. One list, because
+   * the author is answering one question — "what else goes on this?" — and splitting it
+   * by provenance would make them ask it three times.
+   *
+   * The open file is removed rather than listed: it is the document, always sent, and a
+   * checkbox for it would be one that cannot be unticked (R-8.35's default lives in
+   * `chosen` holding only the extras).
+   */
+  const offered = useMemo(() => {
+    const paths = new Set<string>(candidates);
+    for (const path of changed) if (path.endsWith('.md')) paths.add(path);
+    for (const path of visited) if (path.endsWith('.md')) paths.add(path);
+    paths.delete(file);
+    return [...paths].sort();
+  }, [candidates, changed, visited, file]);
 
   useEffect(() => {
     let live = true;
@@ -1765,7 +1797,7 @@ function StartPullRequestButton({
      * quietly contains three of the four files someone chose is worse than one that was
      * never opened, because nothing afterwards says a file is missing.
      */
-    const selection = [file, ...candidates.filter((p) => chosen.has(p))];
+    const selection = [file, ...offered.filter((p) => chosen.has(p))];
     let files: { path: string; markdown: string }[];
     try {
       files = await Promise.all(selection.map(async (path) => ({ path, markdown: await readMarkdown(path) })));
@@ -1838,14 +1870,14 @@ function StartPullRequestButton({
                   include" list is a control that explains a capability nobody can use
                   here, and it would sit in the popover every single time.
                 */}
-                {candidates.length > 0 && (
+                {offered.length > 0 && (
                   <fieldset style={prFieldset} data-vs-start-pr-companions>
                     <legend style={prLegend}>Also include</legend>
                     {/* The document, stated and not offered — it is not the author's to untick. */}
                     <p style={prCompanionDoc}>
                       <code>{file}</code> — the document
                     </p>
-                    {candidates.map((path) => (
+                    {offered.map((path) => (
                       <label key={path} style={prCompanionRow}>
                         <input
                           type="checkbox"

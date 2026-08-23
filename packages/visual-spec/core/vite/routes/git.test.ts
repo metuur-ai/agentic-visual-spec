@@ -363,3 +363,67 @@ describe('R-6.3 — the branch routes are not exposed unless configuration enabl
     }
   });
 });
+
+/**
+ * R-8.36 — the uncommitted paths, as the pull request picker needs them: relative to the
+ * SERVED directory, not to the repository root git reports them against.
+ */
+describe('GET /__vs/git/changed', () => {
+  /** `status --porcelain -z` plus the served directory's offset inside the repository. */
+  const changedGit = (dirty: string[], prefix = ''): GitExecutor => async (args) => {
+    const cmd = args.slice(2).join(' ');
+    if (cmd === 'status --porcelain -z') return ok(dirty.map((p) => ` M ${p}\0`).join(''));
+    if (cmd === 'rev-parse --show-prefix') return ok(`${prefix}\n`);
+    return fail();
+  };
+
+  it('serves the changed paths of a repository served at its root', async () => {
+    const exec = changedGit(['docs/rules.md', 'src/app.ts']);
+
+    const res = await handleGitRequest('/srv/repo', 'GET', '/changed', undefined, { exec });
+
+    expect(res.status).toBe(200);
+    expect(res.json).toEqual({ paths: ['docs/rules.md', 'src/app.ts'] });
+  });
+
+  it('rebases the paths onto the served subdirectory, dropping what is outside it', async () => {
+    // Serving `packages/docs` of a repository whose dirty files span two packages.
+    const exec = changedGit(['packages/docs/rules.md', 'packages/api/src/app.ts'], 'packages/docs/');
+
+    const res = await handleGitRequest('/srv/repo/packages/docs', 'GET', '/changed', undefined, { exec });
+
+    // `../api/src/app.ts` is not served, cannot be read back and is therefore not offered.
+    expect(res.json).toEqual({ paths: ['rules.md'] });
+  });
+
+  it('reports a git failure rather than throwing', async () => {
+    const enoent: GitExecutor = async () => ({ stdout: '', exitCode: null });
+
+    const res = await handleGitRequest('/srv/repo', 'GET', '/changed', undefined, { exec: enoent });
+
+    expect(res.status).toBe(500);
+    expect(res.json).toEqual({ error: 'git-unavailable' });
+  });
+
+  it('answers whether or not branch switching is configured (R-6.3 is about the write)', async () => {
+    const exec = changedGit(['docs/rules.md']);
+
+    for (const options of [{ exec }, { exec, ...ENABLED }]) {
+      const res = await handleGitRequest('/srv/repo', 'GET', '/changed', undefined, options);
+      expect(res.json).toEqual({ paths: ['docs/rules.md'] });
+    }
+  });
+
+  it('asks about the root current at request time, not the one it was wired with (R-2.2)', async () => {
+    let root = '/srv/first';
+    const exec: GitExecutor = async (args) =>
+      changedGit(args[1] === '/srv/first' ? ['first.md'] : ['second.md'])(args);
+
+    const before = await handleGitRequest(() => root, 'GET', '/changed', undefined, { exec });
+    root = '/srv/second';
+    const after = await handleGitRequest(() => root, 'GET', '/changed', undefined, { exec });
+
+    expect(before.json).toEqual({ paths: ['first.md'] });
+    expect(after.json).toEqual({ paths: ['second.md'] });
+  });
+});

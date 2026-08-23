@@ -158,6 +158,11 @@ export function MarkdownDocEditor({
       await saveSource(surfaceId, snapshot);
       baseline.current = snapshot;
       setValue((v) => v); // re-render to clear the dirty flag
+      // R-8.36 — the bytes on disk just changed, and things outside this editor are
+      // derived from them (the working tree's changed files, the rendered source).
+      // `useMarkdownSource`'s echoed refetch is a no-op here: `value` already equals
+      // what was written.
+      window.dispatchEvent(new CustomEvent('vs:source-changed'));
       return true;
     } catch (e) {
       setError((e as Error).message);
