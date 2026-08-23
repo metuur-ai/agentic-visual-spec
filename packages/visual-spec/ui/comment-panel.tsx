@@ -29,6 +29,8 @@ import { toPath } from './md-path';
 import { WorkflowSelect, loadWorkflow } from './workflow-select';
 import { CommentHistoryList, locate } from './comment-history-list';
 import { useActiveComment } from './active-comment';
+import { useReviewSession } from './review-session';
+import { ReviewDrawer } from './review-view';
 import { BusyLabel } from './spinner';
 
 /** Nearest heading at or above the clicked element — the robust markdown anchor. */
@@ -262,11 +264,34 @@ export function CommentPanel({ file, width, source }: { file?: string; width: nu
 function LocalCommentPanel({ file, width }: { file: string; width: number | string }) {
   const path = toPath(file);
   const comments = useComments(path);
+  /*
+   * R-8.10 — the per-comment way in, which did not exist.
+   *
+   * The header's Apply control is the *bulk* scope chooser: it runs the apply-comments
+   * skill fire-and-forget over a set, with no proposal and no approval step, and it is
+   * untouched by this. A review is the other act — one comment, a diff you read, and a
+   * write that happens only when you say so — so it belongs on the row that names the
+   * comment rather than on a control whose subject is "all of them".
+   *
+   * It rides the source's existing `actions` seam rather than becoming a fifth
+   * first-class row control: reviewing is local-only until Phase C wires the collab
+   * panel, and `actions` is exactly the hook for "an act that belongs to one source".
+   */
+  const review = useReviewSession();
+  const startReview = review.start;
   const source = useMemo<CommentPanelSource>(
     () => ({
       path,
       comments: comments.comments.filter((c) => c.target.path === path),
       remove: (id) => comments.remove(id),
+      actions: (c) => [
+        {
+          label: 'Review & apply',
+          tone: 'primary',
+          title: 'Propose a change for this comment, read the diff, then approve it',
+          run: () => startReview(c.id),
+        },
+      ],
       supportsSections: true,
       orphans: [],
       // `startLine` is optional: a whole-file comment (`kind: 'file'`) has no line, and
@@ -307,9 +332,23 @@ function LocalCommentPanel({ file, width }: { file: string; width: number | stri
         });
       },
     }),
-    [path, comments],
+    [path, comments, startReview],
   );
-  return <Panel width={width} source={source} />;
+  const reviewed = review.state.commentId
+    ? (source.comments.find((c) => c.id === review.state.commentId) ?? null)
+    : null;
+  return (
+    <>
+      <Panel width={width} source={source} />
+      {/*
+        * Beside the panel rather than inside it: a diff is not readable in a 320px
+        * column. The session's stream is subscribed above, so the drawer closing leaves
+        * the review running (and leaves a subscriber attached, which is what keeps the
+        * server's abandonment timer disarmed — R-7.6).
+        */}
+      {review.open && <ReviewDrawer session={review} label={reviewed ? source.label(reviewed) : undefined} />}
+    </>
+  );
 }
 
 function Panel({ width, source }: { width: number | string; source: CommentPanelSource }) {

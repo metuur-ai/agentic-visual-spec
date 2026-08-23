@@ -74,6 +74,14 @@ beforeEach(() => {
   // One synchronous pass, then stop: the loop is production behaviour, not test behaviour.
   vi.stubGlobal('requestAnimationFrame', () => 0);
   vi.stubGlobal('cancelAnimationFrame', () => {});
+  // jsdom has no `EventSource`; the local panel's review session opens one unconditionally.
+  vi.stubGlobal(
+    'EventSource',
+    class {
+      onmessage: ((e: { data: string }) => void) | null = null;
+      close() {}
+    },
+  );
 });
 afterEach(() => {
   vi.restoreAllMocks();
