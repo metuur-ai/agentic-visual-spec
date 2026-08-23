@@ -92,17 +92,17 @@ Source of truth: `docs/ears/inline-indicators-interactive-apply.md` (acceptance 
   - verify: subscribe to `/__vs/review/events` in dev and prod builds; first frame is a `sync` snapshot; routes resolve in both servers; both decisions are written into the LLD before the task closes.
   - landed: ce466db — core/vite/routes/review.ts, core/vite/routes/review.test.ts, core/vite/md-plugin.ts, src/server.ts, core/editing/local-mode.regression.test.ts. Decision (a): `ReviewHub` sits beside `ApplyHub`, `job-hub.ts` not reused. Decision (b): `ReviewSessionOps` (`resolve` → `locate` → `checkDrift` → `finish` + `fallbackAvailable`), local implementation `createLocalSessionOps`. Both still to be transcribed into the LLD.
 
-- [ ] B1.3 Spawn persistent stream-json session (plan mode, stdin piped, replay) (deps: B1.2, est: ~1.5h)
+- [x] B1.3 Spawn persistent stream-json session (plan mode, stdin piped, replay) (deps: B1.2, est: ~1.5h)
   - why: propose must be multi-turn and read-only-enforced — the piped stdin is the missing in-channel, and plan mode is the real edit gate rather than a prompt instruction.
   - acceptance: R-3.3, R-3.7, R-4.7, R-8.3, R-8.7 — spawn `claude --print --input-format stream-json --output-format stream-json --replay-user-messages --permission-mode plan` with `stdio:['pipe','pipe','pipe']`; edit tools unavailable at the permission layer; user turns echo into the transcript; no file written during propose.
   - verify: start a session and observe the transcript stream; confirm no edit tool is available to the model; confirm zero disk writes across the whole propose phase.
-  - landed:
+  - landed: d942a0e — core/vite/routes/review.ts (`REVIEW_CLI_ARGS`, `defaultSpawnReviewSession`, `userTurnFrame`, `replayedUserText`, `user-turn` event), core/vite/routes/review.test.ts. Per spike 0.1 the no-write assertion is scoped to the target file, not the whole process: plan mode still lets the CLI write its own plan files under `~/.claude/plans/`. The opening turn is interim and is replaced by B2.1's `buildReviewPrompt`.
 
-- [ ] B1.4 Review status endpoint (deps: B1.2, est: ~30m)
+- [x] B1.4 Review status endpoint (deps: B1.2, est: ~30m)
   - why: without it a reloaded tab cannot discover an in-flight session before subscribing, and the abandonment timer (R-7.6) can reap a session whose only client is mid-reload. `GET /__vs/apply` already sets the precedent (`apply.ts:16`).
   - acceptance: R-8.9 — `GET /__vs/review` returns `{ running, startedAt, commentId }`.
   - verify: start a session, reload the tab, and confirm the client can tell an in-flight session exists before opening the `EventSource`.
-  - landed:
+  - landed: d942a0e — core/vite/routes/review.ts (`handleReviewRequest` GET on the bare path, via `hub.snapshot()`), core/vite/routes/review.test.ts. No host edit needed: both `md-plugin.ts` and `src/server.ts` already dispatch the bare `/__vs/review` path into the shared handler.
 
 ## Phase B — Propose
 
