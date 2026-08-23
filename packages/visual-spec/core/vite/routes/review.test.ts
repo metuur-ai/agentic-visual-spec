@@ -20,6 +20,7 @@ import type { CommentDocStore } from './comments';
 import {
   createLocalSessionOps,
   createReviewHub,
+  DEFAULT_IDLE_TIMEOUT_MS,
   defaultSpawnReviewSession,
   handleReviewRequest,
   replayedUserText,
@@ -60,6 +61,55 @@ function liveChild(): ReviewChild & { written: string[]; emit: (line: string) =>
   } as unknown as ReviewChild & { written: string[]; emit: (line: string) => void };
 }
 
+/**
+ * A child whose in-channel breaks *after* the session is under way — the dead-pipe half
+ * of the R-7.7 race. The opening turn goes through, so the failure lands where the
+ * requirement puts it: on a follow-up, against a session the hub still believes in.
+ */
+function brokenPipeChild(): ReviewChild {
+  const base = liveChild();
+  let turns = 0;
+  return {
+    ...base,
+    stdin: new Writable({
+      write(_chunk, _enc, cb) {
+        turns += 1;
+        if (turns > 1) throw new Error('write EPIPE');
+        cb();
+      },
+    }),
+  } as unknown as ReviewChild;
+}
+
+/**
+ * A hand-cranked scheduler. R-7.6's bound is fifteen minutes, so the tests drive the
+ * timer rather than waiting for it — the same reason `deps.now` exists.
+ */
+function fakeTimers() {
+  let pending: Array<{ id: number; fn: () => void; ms: number }> = [];
+  let seq = 0;
+  return {
+    setTimer: (fn: () => void, ms: number) => {
+      seq += 1;
+      pending.push({ id: seq, fn, ms });
+      return seq;
+    },
+    clearTimer: (handle: unknown) => {
+      pending = pending.filter((p) => p.id !== handle);
+    },
+    /** How many reap timers are armed right now (0 or 1 — the hub keeps at most one). */
+    armed: () => pending.length,
+    /** The delay of the armed timer, so the default bound is asserted, not assumed. */
+    delay: () => pending[0]?.ms,
+    /** The identity of the armed timer, so "re-armed" is distinguishable from "left alone". */
+    id: () => pending[0]?.id,
+    fire: () => {
+      const next = pending.shift();
+      next?.fn();
+    },
+  };
+}
+
 /** Collects everything written to an SSE response. */
 function fakeRes() {
   const ee = new EventEmitter();
@@ -75,6 +125,8 @@ function fakeRes() {
     res: res as unknown as import('node:http').ServerResponse,
     frames: () => chunks.map((c) => JSON.parse(c.replace(/^data: /, '').trim()) as ReviewEvent | ReviewSync),
     head: () => head,
+    /** The dropped tab: what Node emits when the client goes away (R-7.6). */
+    close: () => { res.writableEnded = true; ee.emit('close'); },
   };
 }
 
@@ -83,6 +135,12 @@ function deps(over: Partial<ReviewDeps> = {}): ReviewDeps {
 }
 
 const tick = () => new Promise((r) => setImmediate(r));
+
+/** Ticks until a condition holds — for hubs whose `begin` awaits real filesystem reads. */
+async function until(cond: () => boolean): Promise<void> {
+  for (let i = 0; i < 50 && !cond(); i += 1) await tick();
+  expect(cond()).toBe(true);
+}
 
 /* ================================================================== *
  * R-3.6 / R-3.5 — the event stream
@@ -721,5 +779,327 @@ describe('GET /__vs/review (R-8.9)', () => {
     const hub = createReviewHub(() => deps(), createRunLock());
     expect(get(hub, '/events')).toEqual({ streamed: true });
     expect(handleReviewRequest(hub, { method: 'POST', pathname: '', body: {}, sse: fakeRes().res })).toMatchObject({ status: 404 });
+  });
+});
+
+/* ================================================================== *
+ * B3.1 — iterative refinement (R-5.1…R-5.4)
+ * ================================================================== */
+/** A distinct patch per turn, so "the proposal changed" is visible rather than asserted. */
+const patchN = (n: number) => `diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n@@ -1 +1 @@\n-# heading\n+# heading v${n}\n`;
+
+describe('follow-up turns refine the proposal (R-5.1, R-5.2, R-5.3)', () => {
+  it('carries several turns inside one session, each answered by a whole new envelope', async () => {
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    const sub = fakeRes();
+    hub.subscribe(sub.res);
+    hub.start('c-1');
+    await tick();
+
+    child.emit(resultFrame({ ...ENVELOPE, patch: patchN(1) }));
+    await tick();
+    expect(hub.message('shorter please')).toEqual({ status: 200, json: { ok: true } });
+    child.emit(resultFrame({ ...ENVELOPE, patch: patchN(2) }));
+    await tick();
+    expect(hub.message('actually, name the audience')).toEqual({ status: 200, json: { ok: true } });
+    child.emit(resultFrame({ ...ENVELOPE, patch: patchN(3) }));
+    await tick();
+
+    // R-5.1: every turn went down the in-channel — the opening prompt plus the two
+    // follow-ups, in order, on the one live child.
+    expect(child.written).toHaveLength(3);
+    expect(child.written[1]).toBe(userTurnFrame('shorter please'));
+    expect(child.written[2]).toBe(userTurnFrame('actually, name the audience'));
+    // R-5.2 / R-5.3: and each one came back as a full envelope, not an amendment.
+    const patches = (sub.frames().filter((f) => f.type === 'proposal') as Array<{ proposal: Proposal }>).map((f) => f.proposal.patch);
+    expect(patches).toEqual([patchN(1), patchN(2), patchN(3)]);
+    // The session is still alive after three turns — it is not consumed by its first answer.
+    expect(hub.snapshot()).toMatchObject({ running: true, commentId: 'c-1' });
+  });
+
+  it('supersedes the previous proposal rather than accumulating them (R-6.2)', async () => {
+    // Which envelope is "the latest" is settled here, because approval applies exactly one.
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    const hist = fakeRes();
+    hub.subscribe(hist.res);
+    hub.start('c-1');
+    await tick();
+    child.emit(resultFrame({ ...ENVELOPE, patch: patchN(1) }));
+    await tick();
+    hub.message('shorter please');
+    child.emit(resultFrame({ ...ENVELOPE, patch: patchN(2) }));
+    await tick();
+
+    // A tab joining now replays both, and the *last* one is what approval means (R-6.2).
+    const late = fakeRes();
+    hub.subscribe(late.res);
+    const replayed = ((late.frames()[0] as ReviewSync).events.filter((e) => e.type === 'proposal') as Array<{ proposal: Proposal }>);
+    expect(replayed.map((p) => p.proposal.patch)).toEqual([patchN(1), patchN(2)]);
+  });
+
+  it('keeps the latest proposal when a later turn produces no envelope', async () => {
+    // A question ("why that approach?") answers in prose and pins nothing. It must not
+    // erase the proposal already on the table — approval would then have nothing to apply
+    // even though the user is looking at a patch.
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    hub.start('c-1');
+    await tick();
+    child.emit(resultFrame(ENVELOPE));
+    await tick();
+    hub.message('why that approach?');
+    child.emit(JSON.stringify({ type: 'result', result: 'Because the heading is the first thing read.' }));
+    await tick();
+
+    // Still an approvable proposal — `no-proposal` here would mean the prose turn cleared it.
+    expect(hub.approve()).toMatchObject({ status: 501, json: { code: 'not-implemented' } });
+  });
+});
+
+describe('the session says when it is waiting (R-5.4)', () => {
+  it('enters awaiting-input at the end of a turn and returns to proposing on the next one', async () => {
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    const sub = fakeRes();
+    hub.subscribe(sub.res);
+    hub.start('c-1');
+    await tick();
+    expect(hub.snapshot().phase).toBe('proposing');
+
+    child.emit(resultFrame(ENVELOPE));
+    await tick();
+    expect(hub.snapshot().phase).toBe('awaiting-input');
+    // Said out loud on the stream, not left as the absence of activity…
+    expect(sub.frames()).toContainEqual({ type: 'awaiting-input' });
+    // …and after the turn's own frames, so the proposal is on screen before the wait.
+    const frames = sub.frames();
+    expect(frames.findIndex((f) => f.type === 'awaiting-input')).toBeGreaterThan(frames.findIndex((f) => f.type === 'proposal'));
+
+    hub.message('shorter please');
+    expect(hub.snapshot().phase).toBe('proposing');
+    child.emit(resultFrame({ ...ENVELOPE, strategy: 'Shorter.' }));
+    await tick();
+    expect(hub.snapshot().phase).toBe('awaiting-input');
+    expect(sub.frames().filter((f) => f.type === 'awaiting-input')).toHaveLength(2);
+  });
+
+  it('emits one awaiting-input per turn, not one per prose result line', async () => {
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    const sub = fakeRes();
+    hub.subscribe(sub.res);
+    hub.start('c-1');
+    await tick();
+    child.emit(resultFrame(ENVELOPE));
+    child.emit(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'anything else?' }] } }));
+    await tick();
+    expect(sub.frames().filter((f) => f.type === 'awaiting-input')).toHaveLength(1);
+  });
+
+  it('applies nothing across a whole refine loop (R-5.4)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vs-review-refine-'));
+    try {
+      const target = join(dir, 'a.md');
+      writeFileSync(target, '# heading\n\nbody\n');
+      const before = readFileSync(target);
+      const store = memoryStore([rec('c-1')]);
+      const child = liveChild();
+      const hub = createReviewHub(() => ({ cwd: dir, comments: store, spawnSession: () => child, now: () => 1000 }), createRunLock());
+
+      hub.start('c-1');
+      // This hub locates its target on the real filesystem, so the opening turn — and with
+      // it the piped stdout — lands some ticks after `start` returns.
+      await until(() => child.written.length === 1);
+      for (const n of [1, 2, 3]) {
+        child.emit(resultFrame({ ...ENVELOPE, patch: patchN(n) }));
+        await until(() => hub.snapshot().phase === 'awaiting-input');
+        // …the patch is *described*, never run: the file is checked while the session waits.
+        expect(readFileSync(target)).toEqual(before);
+        hub.message(`turn ${n}`);
+      }
+      expect(readFileSync(target)).toEqual(before);
+      expect((await store.read()).comments[0]).toMatchObject({ status: 'open' });
+      expect((await store.read()).comments[0].result).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/* ================================================================== *
+ * B5.1 — abandonment, the dead-child race, ephemerality (R-7.3, R-7.5…R-7.8)
+ * ================================================================== */
+describe('an abandoned session releases the slot (R-7.6, R-7.8)', () => {
+  it('arms the bound when a session runs with nobody watching, at the 15-minute default', () => {
+    const timers = fakeTimers();
+    const hub = createReviewHub(() => deps({ spawnSession: () => liveChild(), ...timers }), createRunLock());
+    expect(timers.armed()).toBe(0); // nothing to reap before a session exists
+    hub.start('c-1');
+    expect(timers.armed()).toBe(1);
+    expect(timers.delay()).toBe(DEFAULT_IDLE_TIMEOUT_MS);
+    expect(DEFAULT_IDLE_TIMEOUT_MS).toBe(15 * 60_000);
+  });
+
+  it('terminates the child and frees the slot when the bound elapses', async () => {
+    const timers = fakeTimers();
+    const lock = createRunLock();
+    const child = liveChild();
+    let killed: string | undefined;
+    const watched = { ...child, kill: (sig?: string) => { killed = sig; } } as unknown as ReviewChild;
+    const hub = createReviewHub(() => deps({ spawnSession: () => watched, idleTimeoutMs: 1000, ...timers }), lock);
+    const sub = fakeRes();
+    hub.subscribe(sub.res);
+    hub.start('c-1');
+    await tick();
+    sub.close(); // the only tab goes away
+
+    expect(timers.delay()).toBe(1000);
+    timers.fire();
+
+    expect(killed).toBe('SIGKILL');
+    expect(lock.heldBy()).toBe(null);
+    expect(hub.snapshot()).toMatchObject({ running: false, phase: 'ended' });
+    // Reported as its own reason: nobody cancelled and nothing crashed. The dropped tab
+    // is gone by then, so the frame is read where a returning one would find it.
+    const rejoined = fakeRes();
+    hub.subscribe(rejoined.res);
+    expect((rejoined.frames()[0] as ReviewSync).events.at(-1)).toEqual({ type: 'ended', ok: false, reason: 'idle' });
+  });
+
+  it('does not reap a session someone is watching, and re-arms when the last tab drops', async () => {
+    const timers = fakeTimers();
+    const hub = createReviewHub(() => deps({ spawnSession: () => liveChild(), ...timers }), createRunLock());
+    const a = fakeRes();
+    const b = fakeRes();
+    hub.subscribe(a.res);
+    hub.start('c-1');
+    await tick();
+    expect(timers.armed()).toBe(0); // a client is watching
+
+    hub.subscribe(b.res);
+    a.close();
+    expect(timers.armed()).toBe(0); // the second tab still holds it open
+    b.close();
+    expect(timers.armed()).toBe(1); // …and now nobody does
+    hub.subscribe(a.res);
+    expect(timers.armed()).toBe(0); // a reconnecting tab cancels the reap
+  });
+
+  it('input restarts the bound rather than letting a stale one fire', async () => {
+    const timers = fakeTimers();
+    const hub = createReviewHub(() => deps({ spawnSession: () => liveChild(), ...timers }), createRunLock());
+    hub.start('c-1');
+    await tick();
+    const first = timers.id();
+    hub.message('still here');
+    expect(timers.armed()).toBe(1);
+    expect(timers.id()).not.toBe(first);
+  });
+
+  it('clears the bound on a normal exit, so no timer outlives the session', async () => {
+    const timers = fakeTimers();
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child, ...timers }), createRunLock());
+    hub.start('c-1');
+    await tick();
+    expect(timers.armed()).toBe(1);
+    hub.cancel();
+    await tick();
+    expect(timers.armed()).toBe(0);
+  });
+});
+
+describe('the dead-child race (R-7.7)', () => {
+  it('answers a follow-up turn on a broken in-channel as an ended session, not a crash', async () => {
+    const lock = createRunLock();
+    const hub = createReviewHub(() => deps({ spawnSession: () => brokenPipeChild() }), lock);
+    const sub = fakeRes();
+    hub.subscribe(sub.res);
+    hub.start('c-1');
+    await tick();
+
+    expect(hub.message('shorter please')).toEqual({
+      status: 409,
+      json: { error: 'the review session has ended', code: 'session-ended' },
+    });
+    // …and the slot went back rather than being wedged by the broken pipe (R-7.8).
+    expect(lock.heldBy()).toBe(null);
+    expect(sub.frames()).toContainEqual({ type: 'error', message: 'could not deliver the turn: write EPIPE' });
+  });
+
+  it('distinguishes a dead session from no session on both message and approve', async () => {
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    hub.start('c-1');
+    await tick();
+    child.emit(resultFrame(ENVELOPE));
+    await tick();
+    child.kill?.('SIGKILL');
+    await tick();
+    await tick();
+
+    // Same 409 either way, but a code the UI can act on: "your session died" ≠ "there
+    // was never one" — and approve does not fall through to the 501 write path.
+    for (const call of [() => hub.message('x'), () => hub.approve()]) {
+      expect(call()).toEqual({ status: 409, json: { error: 'the review session has ended', code: 'session-ended' } });
+    }
+    expect(createReviewHub(() => deps(), createRunLock()).message('x')).toMatchObject({ json: { code: 'no-session' } });
+  });
+});
+
+describe('with no session, only message/approve/cancel conflict (R-7.5)', () => {
+  const call = (hub: ReturnType<typeof createReviewHub>, method: string, pathname: string, body: Record<string, unknown> = {}) =>
+    handleReviewRequest(hub, { method, pathname, body, sse: fakeRes().res });
+
+  it('leaves start, the status endpoint and the event stream callable', () => {
+    const hub = createReviewHub(() => deps({ spawnSession: () => liveChild() }), createRunLock());
+    expect(call(hub, 'GET', '')).toEqual({ status: 200, json: { running: false, startedAt: null, commentId: null } });
+    expect(call(hub, 'GET', '/events')).toEqual({ streamed: true });
+    expect(call(hub, 'POST', '/start', { commentId: 'c-1' })).toEqual({ status: 200, json: { ok: true } });
+  });
+
+  it('still refuses the three that need one after a session has ended', async () => {
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
+    hub.start('c-1');
+    await tick();
+    hub.cancel();
+    for (const path of ['/message', '/approve', '/cancel']) {
+      expect(call(hub, 'POST', path, { text: 'x' })).toMatchObject({ status: 409, json: { code: 'session-ended' } });
+    }
+    // …while the status endpoint keeps answering with a snapshot (R-7.5, second sentence).
+    expect(call(hub, 'GET', '')).toMatchObject({ status: 200 });
+  });
+});
+
+describe('session state is memory-only (R-7.3)', () => {
+  it('does not survive a restart — a hub rebuilt over the same store starts blank', async () => {
+    const store = memoryStore([rec('c-1')]);
+    const lock = createRunLock();
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ comments: store, spawnSession: () => child }), lock);
+    hub.start('c-1');
+    await tick();
+    child.emit(resultFrame(ENVELOPE));
+    await tick();
+    expect(hub.approve()).toMatchObject({ status: 501 }); // there *is* a proposal in flight
+
+    // The process goes away mid-review: the child dies, and a new server builds new hubs.
+    child.kill?.('SIGKILL');
+    await tick();
+    await tick();
+    const restarted = createReviewHub(() => deps({ comments: store, spawnSession: () => liveChild() }), lock);
+
+    expect(restarted.snapshot()).toEqual({ running: false, phase: 'idle', commentId: null, startedAt: null });
+    // No proposal survived — the follow-on hub has nothing to approve, and says so as
+    // "no session" rather than "no proposal yet", because the session itself is gone.
+    expect(restarted.approve()).toMatchObject({ json: { code: 'no-session' } });
+    const sub = fakeRes();
+    restarted.subscribe(sub.res);
+    expect((sub.frames()[0] as ReviewSync).events).toEqual([]);
+    // …and nothing about the in-flight proposal was ever written to the sidecar (R-6.7).
+    expect((await store.read()).comments).toEqual([rec('c-1')]);
   });
 });

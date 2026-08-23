@@ -121,11 +121,11 @@ Source of truth: `docs/ears/inline-indicators-interactive-apply.md` (acceptance 
 
 ## Phase B — Refine
 
-- [ ] B3.1 Follow-up turns / iterative refinement (deps: B2.2, est: ~1h)
+- [x] B3.1 Follow-up turns / iterative refinement (deps: B2.2, est: ~1h)
   - why: the user must be able to steer the proposal until satisfied rather than accept or reject a single shot.
   - acceptance: R-5.1, R-5.2, R-5.3, R-5.4 — `POST /review/message {text}` delivers a turn to the child; an updated proposal streams back; multiple turns are supported; while awaiting input the session indicates waiting and applies nothing.
   - verify: send a refinement message → an updated `proposal` frame arrives whose patch differs from the first; no disk write between turns.
-  - landed:
+  - landed: core/vite/routes/review.ts (`isTurnEnd`, the `awaiting-input` phase transition, `message()` re-arming the session), core/vite/routes/review.test.ts. R-5.1/R-5.3 were already carried by B1.3's in-channel; what this story added is R-5.4 — the session now *says* it is waiting. `summarize()` cannot mark the turn boundary because it maps a `result` frame to a row only when it carries a prose `result` string, and envelope turns carry `structured_output` instead, so `isTurnEnd` reads that one field beside `replayedUserText` (a field accessor, not a second parser). **Latest proposal:** each turn's envelope overwrites the single `proposal` slot in the hub and no older one is kept, so "the latest proposal at approval time" (R-6.2) is a property of the storage rather than a selection B4.1 has to make; a turn that produces no envelope (a question answered in prose) leaves the previous one standing rather than clearing it.
 
 ## Phase B — Approve & write
 
@@ -155,11 +155,11 @@ Source of truth: `docs/ears/inline-indicators-interactive-apply.md` (acceptance 
 
 ## Phase B — Lifecycle & safety
 
-- [ ] B5.1 Cancel, ephemerality, slot release on every exit path (deps: B1.3, est: ~2h)
+- [x] B5.1 Cancel, ephemerality, slot release on every exit path (deps: B1.3, est: ~2h)
   - why: abandoning or crashing a review must be safe and must never wedge the single slot until a server restart. Unlike `runApply`'s single awaited promise, a review session is long-lived with turns arriving asynchronously, so there are many more ways to exit.
   - acceptance: R-7.1, R-7.2, R-7.3, R-7.4, R-7.5, R-7.6, R-7.7, R-7.8 — cancel SIGKILLs and leaves file + comment unchanged; state is memory-only; unexpected exit reports an error and changes nothing; an idle/abandoned session (no subscriber, no input for N minutes) terminates; `message`/`approve` after child death returns a status distinguishable from "no session"; the lock releases on cancel, close, error, timeout, abandonment, and completion. Per R-7.5, `start`, the status endpoint, and the event stream stay callable with no session.
   - verify: cancel mid-propose → no write, lock free; close the only tab → session self-terminates after the idle bound; kill the child then `POST /message` → distinct dead-session status; restart the server → no proposal survives; `GET /__vs/review` with no session returns a snapshot rather than a conflict.
-  - landed:
+  - landed: core/vite/routes/review.ts (`DEFAULT_IDLE_TIMEOUT_MS`, injected `setTimer`/`clearTimer`/`idleTimeoutMs` on `ReviewDeps`, the `armIdle`/`clearIdle` bound, `childAlive`, `deadSession()`, the `idle` end reason), core/vite/routes/review.test.ts. R-7.1/R-7.2/R-7.4/R-7.8 were already carried by the single `end()` from B1.2; this story added the two exits that were missing. **R-7.6:** the bound is armed only while a session runs *and* no client is subscribed — a subscribing tab clears it, the last tab closing arms it, and a delivered turn re-arms it, so an abandoned tab reaps the session after 15 minutes (the `apply.ts` ceiling) instead of wedging the slot until a restart. Timers are injected the way `now` is, so the tests drive the clock rather than sleeping. **R-7.7:** `childAlive` drops in the `close`/`error` handlers *before* `end()` releases the lock, and the stdin write is guarded, so a turn delivered into a broken pipe answers `session-ended` (distinct from `no-session`) and frees the slot rather than throwing. **R-7.3:** unchanged and now asserted — a hub rebuilt over the same store starts blank, replays no events, and nothing about an in-flight proposal ever reached the sidecar.
 
 ## Phase B — Review UI
 

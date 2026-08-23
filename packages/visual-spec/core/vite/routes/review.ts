@@ -52,8 +52,12 @@ import { conflictFor, type RunLock, sharedRunLock } from './run-lock';
  *  reach a review stream, so they are excluded rather than left as unreachable cases. */
 export type ReviewLogEvent = Exclude<ApplyEvent, { type: 'start' } | { type: 'done' }>;
 
-/** Why a session ended — the UI messages cancel differently from a crash. */
-export type ReviewEndReason = 'cancelled' | 'exit' | 'error';
+/**
+ * Why a session ended — the UI messages cancel differently from a crash, and `idle`
+ * differently from both: nobody asked for it, so it is neither the user's act nor a
+ * failure of the child (R-7.6).
+ */
+export type ReviewEndReason = 'cancelled' | 'exit' | 'error' | 'idle';
 
 /** A frame pushed to subscribers as it happens. */
 export type ReviewEvent =
@@ -145,6 +149,9 @@ export interface ReviewSessionOps {
 
 export type ReadTargetFile = (path: string) => Promise<string | null>;
 
+/** An opaque timer handle. Tests hand back whatever their fake scheduler uses. */
+export type TimerHandle = unknown;
+
 export interface ReviewDeps {
   /** Directory the session runs in — the project root, where the sidecar lives. */
   cwd: string;
@@ -154,7 +161,27 @@ export interface ReviewDeps {
   /** Override target reads for tests; defaults to reading from disk under `cwd`. */
   readTargetFile?: ReadTargetFile;
   now?: () => number;
+  /**
+   * R-7.6 — how long a session may sit with no subscribed client and no input before it
+   * is reaped. Same shape as `ApplyDeps.timeoutMs`, and the same 15-minute default: this
+   * is the review counterpart of apply's hard SIGKILL ceiling.
+   */
+  idleTimeoutMs?: number;
+  /** Timer injection, for the same reason `now` exists — tests must not sleep. */
+  setTimer?: (fn: () => void, ms: number) => TimerHandle;
+  clearTimer?: (handle: TimerHandle) => void;
 }
+
+/** The abandonment bound (R-7.6), matching the 15-minute ceiling `apply.ts` already uses. */
+export const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
+
+/** `unref` so a pending reap timer never keeps a dev server alive on its own. */
+const defaultSetTimer = (fn: () => void, ms: number): TimerHandle => {
+  const t = setTimeout(fn, ms);
+  (t as { unref?: () => void }).unref?.();
+  return t;
+};
+const defaultClearTimer = (handle: TimerHandle) => clearTimeout(handle as ReturnType<typeof setTimeout>);
 
 /** A session child. Same shape as the apply child plus the in-channel apply lacks. */
 export interface ReviewChild extends ClaudeChild {
@@ -247,6 +274,26 @@ export function replayedUserText(raw: string): string | null {
     .join('\n')
     .trim();
   return text || null;
+}
+
+/**
+ * Does this line close a turn? A `result` frame is the CLI's end-of-turn marker on a
+ * persistent stream-json session (spike 0.1: the process stays alive past it and answers
+ * the next turn), so it is the moment the session stops working and starts waiting —
+ * which is what R-5.4 asks to be visible.
+ *
+ * `summarize()` cannot answer this: it maps a `result` frame to a `log` row *only when it
+ * carries a prose `result` string*, and the envelope turns (spike 2.1) carry
+ * `structured_output` instead, so the turn boundary would be invisible on exactly the
+ * turns that matter. Like `replayedUserText`, this reads one field off one frame shape and
+ * hands everything else to the shared reader — a field accessor, not a second parser.
+ */
+export function isTurnEnd(raw: string): boolean {
+  try {
+    return (JSON.parse(raw) as { type?: unknown }).type === 'result';
+  } catch {
+    return false;
+  }
 }
 
 /** Read a target relative to `cwd`, returning null when it is gone. */
@@ -347,6 +394,12 @@ export interface ReviewHub {
  * bulk apply started meanwhile is refused with a body naming this holder — and vice
  * versa. Every terminal path below goes through `end()`, which is the only place the
  * lock is released.
+ *
+ * Those paths are cancel, child `close`, child `error`, a spawn that throws, a follow-up
+ * turn that cannot be delivered, and the abandonment bound (R-7.8). The last one is the
+ * only one nobody asks for: a browser tab that goes away takes its `EventSource` with it
+ * and nothing else would ever notice, so a session left with no subscriber and no input
+ * reaps itself rather than holding the single slot until the server restarts (R-7.6).
  */
 export function createReviewHub(
   getDeps: () => ReviewDeps,
@@ -360,8 +413,24 @@ export function createReviewHub(
   let child: ReviewChild | null = null;
   let located: LocatedTarget | null = null;
   let comment: ResolvedComment | null = null;
-  /** The latest envelope this session produced — what B4.1's approval applies. */
+  /**
+   * The latest envelope this session produced — what B4.1's approval applies.
+   *
+   * "Latest" is the whole point. Every turn's `result` frame carries a full envelope
+   * (spike 2.1), so a refinement does not amend the previous proposal, it *supersedes* it:
+   * this slot is overwritten on each `proposal` frame and nothing keeps the older ones.
+   * R-6.2 requires approval to apply "the latest proposal presented in the session at
+   * approval time", and this single, always-overwritten slot is that guarantee — there is
+   * no list for approval to pick the wrong element from.
+   */
   let proposal: Proposal | null = null;
+  /**
+   * R-7.7 — whether the child is still writable. `close`/`error` clear it *before* `end()`
+   * releases the slot, so a `message`/`approve` landing in that window is answered as a
+   * dead session rather than being written into a broken pipe.
+   */
+  let childAlive = false;
+  let idleTimer: TimerHandle | null = null;
   const subs = new Set<ServerResponse>();
   const ops = makeOps(getDeps);
 
@@ -375,10 +444,40 @@ export function createReviewHub(
 
   const running = () => phase === 'proposing' || phase === 'awaiting-input';
 
+  const clearIdle = () => {
+    if (idleTimer === null) return;
+    (getDeps().clearTimer ?? defaultClearTimer)(idleTimer);
+    idleTimer = null;
+  };
+
+  /**
+   * R-7.6. The bound is armed only while the session is running *and* nobody is watching:
+   * a subscribed tab is a live client, and a delivered turn is input. A dropped tab
+   * therefore starts the clock, and reconnecting or typing stops it — the slot cannot be
+   * wedged by a closed browser until a server restart.
+   */
+  const armIdle = () => {
+    clearIdle();
+    if (!running() || subs.size > 0) return;
+    const deps = getDeps();
+    idleTimer = (deps.setTimer ?? defaultSetTimer)(onIdle, deps.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
+  };
+
+  function onIdle() {
+    idleTimer = null;
+    if (!running()) return;
+    broadcast({ type: 'log', kind: 'system', text: 'No client and no input — ending the abandoned review session.' });
+    childAlive = false;
+    child?.kill?.('SIGKILL');
+    end(false, 'idle');
+  }
+
   /** The one exit. Every path that stops a session comes through here (R-7.8). */
   const end = (ok: boolean, reason: ReviewEndReason, exitCode?: number | null) => {
     if (phase === 'idle' || phase === 'ended') return;
     phase = 'ended';
+    clearIdle();
+    childAlive = false;
     child = null;
     located = null;
     comment = null;
@@ -415,17 +514,31 @@ export function createReviewHub(
           if (f.type === 'start' || f.type === 'done') continue; // apply-shaped, never emitted here
           broadcast(f);
         }
+        // R-5.4: the turn is over, so the session is waiting on the user — said out loud
+        // in the stream, after the turn's own frames, rather than left as the absence of
+        // activity. Nothing is applied here or anywhere else on this path: the phase is a
+        // statement about the session, not a trigger.
+        if (isTurnEnd(line) && phase === 'proposing') {
+          phase = 'awaiting-input';
+          broadcast({ type: 'awaiting-input' });
+          armIdle();
+        }
       }
     });
     c.stderr?.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8').trim();
       if (text) broadcast({ type: 'log', kind: 'error', text: text.slice(0, 1000) });
     });
+    // R-7.7: liveness drops before the slot does, on both death paths.
     c.on('error', (err) => {
+      childAlive = false;
       broadcast({ type: 'error', message: err.message.includes('ENOENT') ? 'claude CLI not found on PATH' : err.message });
       end(false, 'error');
     });
-    c.on('close', (code) => end(code === 0, 'exit', code));
+    c.on('close', (code) => {
+      childAlive = false;
+      end(code === 0, 'exit', code);
+    });
   };
 
   /** Resolve → locate → spawn. Any failure ends the session and frees the slot. */
@@ -449,6 +562,7 @@ export function createReviewHub(
       broadcast({ type: 'error', message: `Could not start claude: ${(err as Error).message}` });
       return end(false, 'error');
     }
+    childAlive = true;
     pipeOutput(child);
     // The opening turn: one comment, its anchor, and what the proposal must contain. The
     // arm is the ops implementation's, not a field on the request (R-3.8) — nothing above
@@ -466,7 +580,13 @@ export function createReviewHub(
       });
       frame(res, { type: 'sync', running: running(), phase, commentId, startedAt, events });
       subs.add(res);
-      res.on('close', () => subs.delete(res));
+      // R-7.6: a watching client suspends the abandonment bound; losing the last one
+      // starts it. Subscribing with no session is legal and simply arms nothing.
+      armIdle();
+      res.on('close', () => {
+        subs.delete(res);
+        armIdle();
+      });
     },
 
     start(id) {
@@ -479,6 +599,7 @@ export function createReviewHub(
       commentId = id;
       startedAt = (getDeps().now ?? Date.now)();
       broadcast({ type: 'review-start', commentId: id, startedAt });
+      armIdle();
       void begin(id).catch((err) => {
         broadcast({ type: 'error', message: (err as Error).message });
         end(false, 'error');
@@ -486,20 +607,35 @@ export function createReviewHub(
       return { status: 200, json: { ok: true } };
     },
 
+    // R-5.1 / R-5.3: a follow-up turn goes down the same in-channel the opening turn used,
+    // as many times as the user likes — the session is not consumed by its first answer.
     message(text) {
       const guard = noSession(phase);
       if (guard) return guard;
       if (!text) return { status: 400, json: { error: 'missing text' } };
-      if (!child?.stdin) return { status: 409, json: { error: 'the review session has no input channel', code: 'session-ended' } };
-      child.stdin.write(userTurnFrame(text));
+      if (!childAlive || !child?.stdin) return deadSession();
+      try {
+        child.stdin.write(userTurnFrame(text));
+      } catch (err) {
+        // The dead-child race, observed rather than inferred: the pipe broke under us
+        // (R-7.7). End the session so the slot goes back, and say so distinguishably.
+        childAlive = false;
+        broadcast({ type: 'error', message: `could not deliver the turn: ${(err as Error).message}` });
+        end(false, 'error');
+        return deadSession();
+      }
+      // R-5.2: the answer arrives as a whole new envelope on this turn's result frame, so
+      // the session is working again until that frame lands.
       phase = 'proposing';
+      armIdle();
       return { status: 200, json: { ok: true } };
     },
 
     approve() {
       const guard = noSession(phase);
       if (guard) return guard;
-      if (!located || !comment) return { status: 409, json: { error: 'the review session has ended', code: 'session-ended' } };
+      if (!childAlive) return deadSession();
+      if (!located || !comment) return deadSession();
       // Nothing to approve until a turn has produced an envelope: approval means "apply
       // this patch", and with no patch there is nothing that could be applied without
       // re-deriving the change — which is the defect the envelope exists to prevent.
@@ -518,6 +654,7 @@ export function createReviewHub(
     cancel() {
       const guard = noSession(phase);
       if (guard) return guard;
+      childAlive = false;
       child?.kill?.('SIGKILL');
       broadcast({ type: 'log', kind: 'system', text: 'Cancelling…' });
       end(false, 'cancelled');
@@ -537,8 +674,18 @@ export function createReviewHub(
  */
 function noSession(phase: ReviewPhase): RouteResult | null {
   if (phase === 'idle') return { status: 409, json: { error: 'no active review session', code: 'no-session' } };
-  if (phase === 'ended') return { status: 409, json: { error: 'the review session has ended', code: 'session-ended' } };
+  if (phase === 'ended') return deadSession();
   return null;
+}
+
+/**
+ * R-7.7 — the answer for a session whose child is gone, in the window before the phase
+ * catches up. It carries `session-ended` rather than `no-session` precisely so the UI can
+ * say "your session died" instead of "there was never one"; keeping the two bodies
+ * identical is what makes the window invisible to the client.
+ */
+function deadSession(): RouteResult {
+  return { status: 409, json: { error: 'the review session has ended', code: 'session-ended' } };
 }
 
 /* ------------------------------------------------------------------ *
