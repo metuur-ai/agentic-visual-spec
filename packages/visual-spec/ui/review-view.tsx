@@ -46,6 +46,9 @@ const ENDINGS: Record<ReviewEndReason, { tone: 'ok' | 'warn' | 'bad'; text: stri
   applied: { tone: 'ok', text: 'Approved and applied. The patch above is what landed.' },
   cancelled: { tone: 'warn', text: 'Cancelled. Nothing was written and the comment is still open.' },
   idle: { tone: 'warn', text: 'Ended after being left idle — nothing was written. Start the review again when you are ready.' },
+  // R-7.9 — its own sentence, because "idle" would tell a user who was mid-conversation
+  // something untrue and "failed" would tell them something worse.
+  expired: { tone: 'warn', text: 'Ended at its time limit — nothing was written. Start the review again to carry on.' },
   exit: { tone: 'bad', text: 'The review process exited before you approved. Nothing was written.' },
   error: { tone: 'bad', text: 'The review process failed. Nothing was written.' },
 };

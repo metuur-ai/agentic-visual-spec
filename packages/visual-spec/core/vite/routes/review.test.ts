@@ -22,6 +22,7 @@ import {
   createLocalSessionOps,
   createReviewHub,
   DEFAULT_IDLE_TIMEOUT_MS,
+  DEFAULT_LIFETIME_MS,
   defaultSpawnReviewSession,
   handleReviewRequest,
   replayedUserText,
@@ -84,12 +85,24 @@ function brokenPipeChild(): ReviewChild {
 }
 
 /**
- * A hand-cranked scheduler. R-7.6's bound is fifteen minutes, so the tests drive the
- * timer rather than waiting for it — the same reason `deps.now` exists.
+ * A hand-cranked scheduler. R-7.6's bound is fifteen minutes and R-7.9's is an hour, so
+ * the tests drive the timers rather than waiting for them — the same reason `deps.now`
+ * exists.
+ *
+ * A session arms two of them and they mean opposite things, so the fake tells them apart
+ * by their bound: the caller says which two it configured the hub with. `armed`/`delay`/
+ * `id`/`fire` are the abandonment timer (R-7.6) throughout; the ceiling (R-7.9) has its
+ * own accessors, and `total` is both, for asserting nothing outlives the session.
  */
-function fakeTimers() {
+function fakeTimers(idleMs: number = DEFAULT_IDLE_TIMEOUT_MS, lifetimeMs: number = DEFAULT_LIFETIME_MS) {
   let pending: Array<{ id: number; fn: () => void; ms: number }> = [];
   let seq = 0;
+  const of = (ms: number) => pending.filter((p) => p.ms === ms);
+  const run = (t?: { id: number; fn: () => void }) => {
+    if (!t) return;
+    pending = pending.filter((p) => p.id !== t.id);
+    t.fn();
+  };
   return {
     setTimer: (fn: () => void, ms: number) => {
       seq += 1;
@@ -100,15 +113,17 @@ function fakeTimers() {
       pending = pending.filter((p) => p.id !== handle);
     },
     /** How many reap timers are armed right now (0 or 1 — the hub keeps at most one). */
-    armed: () => pending.length,
+    armed: () => of(idleMs).length,
     /** The delay of the armed timer, so the default bound is asserted, not assumed. */
-    delay: () => pending[0]?.ms,
+    delay: () => of(idleMs)[0]?.ms,
     /** The identity of the armed timer, so "re-armed" is distinguishable from "left alone". */
-    id: () => pending[0]?.id,
-    fire: () => {
-      const next = pending.shift();
-      next?.fn();
-    },
+    id: () => of(idleMs)[0]?.id,
+    fire: () => run(of(idleMs)[0]),
+    /** The wall-clock ceiling (R-7.9) — `undefined` when the session has not armed one. */
+    ceiling: () => of(lifetimeMs)[0],
+    fireCeiling: () => run(of(lifetimeMs)[0]),
+    /** Every timer of either kind, so a terminal path can be shown to clear both. */
+    total: () => pending.length,
   };
 }
 
@@ -961,7 +976,7 @@ describe('an abandoned session releases the slot (R-7.6, R-7.8)', () => {
   });
 
   it('terminates the child and frees the slot when the bound elapses', async () => {
-    const timers = fakeTimers();
+    const timers = fakeTimers(1000);
     const lock = createRunLock();
     const child = liveChild();
     let killed: string | undefined;
@@ -1026,6 +1041,109 @@ describe('an abandoned session releases the slot (R-7.6, R-7.8)', () => {
     hub.cancel();
     await tick();
     expect(timers.armed()).toBe(0);
+    expect(timers.total()).toBe(0); // the ceiling went with it (R-7.9)
+  });
+});
+
+/* ================================================================== *
+ * B5.2 — the wall-clock ceiling (R-7.9)
+ * ================================================================== */
+describe('a session past its bounded lifetime is terminated (R-7.9, R-7.8)', () => {
+  it('ends a watched, actively-used session at the ceiling and frees the slot', async () => {
+    const timers = fakeTimers();
+    const lock = createRunLock();
+    const child = liveChild();
+    let killed: string | undefined;
+    const watched = { ...child, kill: (sig?: string) => { killed = sig; } } as unknown as ReviewChild;
+    const hub = createReviewHub(() => deps({ spawnSession: () => watched, ...timers }), lock);
+    // The case R-7.6 cannot reach: a tab is subscribed the whole time *and* turns keep
+    // arriving, so neither half of the abandonment conjunction is ever true.
+    const sub = fakeRes();
+    hub.subscribe(sub.res);
+    hub.start({ commentId: 'c-1' });
+    await tick();
+    for (const text of ['shorter', 'shorter still', 'and again']) {
+      expect(hub.message(text)).toMatchObject({ status: 200 });
+      await tick();
+    }
+    expect(timers.armed()).toBe(0); // the idle reaper is not armed and never will be
+
+    timers.fireCeiling();
+
+    expect(killed).toBe('SIGKILL');
+    expect(lock.heldBy()).toBe(null);
+    expect(hub.snapshot()).toMatchObject({ running: false, phase: 'ended' });
+    const ended = sub.frames().at(-1) as { type: string; ok: boolean; reason: string };
+    expect(ended).toEqual({ type: 'ended', ok: false, reason: 'expired' });
+    // Distinguishable from both neighbouring endings, which is the point of the value.
+    expect(ended.reason).not.toBe('idle');
+    expect(ended.reason).not.toBe('error');
+    // …and the slot is genuinely reusable, not merely reported free.
+    expect(hub.start({ commentId: 'c-1' })).toMatchObject({ status: 200 });
+  });
+
+  it('arms the ceiling once at start, at the one-hour default', () => {
+    const timers = fakeTimers();
+    const hub = createReviewHub(() => deps({ spawnSession: () => liveChild(), ...timers }), createRunLock());
+    expect(timers.ceiling()).toBeUndefined();
+    hub.start({ commentId: 'c-1' });
+    expect(timers.ceiling()?.ms).toBe(DEFAULT_LIFETIME_MS);
+    expect(DEFAULT_LIFETIME_MS).toBe(60 * 60_000);
+  });
+
+  it('is not pushed back by a subscriber, a turn, or a turn ending', async () => {
+    const timers = fakeTimers();
+    const child = liveChild();
+    const hub = createReviewHub(() => deps({ spawnSession: () => child, ...timers }), createRunLock());
+    hub.start({ commentId: 'c-1' });
+    await tick();
+    const armed = timers.ceiling()?.id;
+    expect(armed).toBeDefined();
+
+    const sub = fakeRes();
+    hub.subscribe(sub.res);
+    hub.message('again');
+    child.emit(JSON.stringify({ type: 'result', structured_output: null }));
+    await tick();
+    sub.close();
+
+    // The idle timer moved through all of that; the ceiling is the same one `start` set.
+    expect(timers.ceiling()?.id).toBe(armed);
+  });
+
+  it('does not fire against a session that already ended', async () => {
+    const timers = fakeTimers();
+    const lock = createRunLock();
+    const hub = createReviewHub(() => deps({ spawnSession: () => liveChild(), ...timers }), lock);
+    hub.start({ commentId: 'c-1' });
+    await tick();
+    hub.cancel();
+    await tick();
+    const before = hub.snapshot();
+
+    timers.fireCeiling(); // nothing armed, and nothing to do if it were
+
+    expect(hub.snapshot()).toEqual(before);
+    expect(lock.heldBy()).toBe(null);
+  });
+
+  it('leaves the abandonment bound to report abandonment (R-7.6 unchanged)', async () => {
+    const timers = fakeTimers();
+    const lock = createRunLock();
+    const hub = createReviewHub(() => deps({ spawnSession: () => liveChild(), ...timers }), lock);
+    const sub = fakeRes();
+    hub.subscribe(sub.res);
+    hub.start({ commentId: 'c-1' });
+    await tick();
+    sub.close();
+
+    expect(timers.armed()).toBe(1);
+    timers.fire();
+
+    const rejoined = fakeRes();
+    hub.subscribe(rejoined.res);
+    expect((rejoined.frames()[0] as ReviewSync).events.at(-1)).toEqual({ type: 'ended', ok: false, reason: 'idle' });
+    expect(timers.total()).toBe(0); // and the ceiling did not survive the reap
   });
 });
 

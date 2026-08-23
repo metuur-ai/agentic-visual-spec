@@ -77,8 +77,14 @@ export type ReviewLogEvent = Exclude<ApplyEvent, { type: 'start' } | { type: 'do
  * differently from both: nobody asked for it, so it is neither the user's act nor a
  * failure of the child (R-7.6). `applied` is the one successful ending: the patch landed,
  * so the session is over by completion rather than by any kind of stop (R-6.6).
+ *
+ * `expired` is the wall-clock ceiling (R-7.9), and it is a *fifth* value rather than a
+ * second use of `idle` because the two say opposite things about the user: `idle` means
+ * the session was left alone, `expired` means it was used for too long. Telling a user
+ * who was typing that they were idle is telling them something untrue, and telling them
+ * it errored is worse — nothing failed, the session simply ran out of its allowance.
  */
-export type ReviewEndReason = 'cancelled' | 'exit' | 'error' | 'idle' | 'applied';
+export type ReviewEndReason = 'cancelled' | 'exit' | 'error' | 'idle' | 'applied' | 'expired';
 
 /** A frame pushed to subscribers as it happens. */
 export type ReviewEvent =
@@ -252,6 +258,12 @@ export interface ReviewDeps {
    * is the review counterpart of apply's hard SIGKILL ceiling.
    */
   idleTimeoutMs?: number;
+  /**
+   * R-7.9 — the wall-clock ceiling on a whole session, measured from `start` and never
+   * extended. Deliberately *not* a variant of `idleTimeoutMs`: that one asks whether
+   * anyone is still there, this one does not ask anything.
+   */
+  lifetimeMs?: number;
   /** Timer injection, for the same reason `now` exists — tests must not sleep. */
   setTimer?: (fn: () => void, ms: number) => TimerHandle;
   clearTimer?: (handle: TimerHandle) => void;
@@ -259,6 +271,18 @@ export interface ReviewDeps {
 
 /** The abandonment bound (R-7.6), matching the 15-minute ceiling `apply.ts` already uses. */
 export const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
+
+/**
+ * The wall-clock ceiling (R-7.9). One hour: four idle bounds, which is long enough that a
+ * genuine refine-and-approve session never meets it — the spikes' turns are minutes, not
+ * hours — and short enough that a tab someone left open over lunch gives the shared
+ * `RunLock` back before the afternoon rather than at the next server restart.
+ *
+ * It is longer than apply's 15-minute SIGKILL on purpose. That bound is on a single
+ * unattended run; this one is on a conversation a human is part of, and a ceiling tuned
+ * to reap a *working* session would be a bug wearing a requirement's clothes.
+ */
+export const DEFAULT_LIFETIME_MS = 60 * 60_000;
 
 /** `unref` so a pending reap timer never keeps a dev server alive on its own. */
 const defaultSetTimer = (fn: () => void, ms: number): TimerHandle => {
@@ -524,10 +548,12 @@ export interface ReviewHub {
  * lock is released.
  *
  * Those paths are cancel, child `close`, child `error`, a spawn that throws, a follow-up
- * turn that cannot be delivered, and the abandonment bound (R-7.8). The last one is the
- * only one nobody asks for: a browser tab that goes away takes its `EventSource` with it
- * and nothing else would ever notice, so a session left with no subscriber and no input
- * reaps itself rather than holding the single slot until the server restarts (R-7.6).
+ * turn that cannot be delivered, the abandonment bound (R-7.6) and the wall-clock ceiling
+ * (R-7.9) — all of them R-7.8. The last two are the ones nobody asks for: a browser tab
+ * that goes away takes its `EventSource` with it and nothing else would ever notice, and a
+ * tab that stays open forever is invisible to the abandonment bound by construction, since
+ * that bound requires both no client and no input. Either way the single slot goes back
+ * instead of being held until the server restarts.
  */
 export function createReviewHub(
   getDeps: () => ReviewDeps,
@@ -570,6 +596,12 @@ export function createReviewHub(
   /** One approval at a time — see `approve()`. */
   let approving = false;
   let idleTimer: TimerHandle | null = null;
+  /**
+   * R-7.9. Armed once, by `start`, and never touched again until the session ends — no
+   * subscriber and no turn re-arms it. That is the entire difference between it and
+   * `idleTimer`, and it is what makes it a ceiling rather than a second reaper.
+   */
+  let lifetimeTimer: TimerHandle | null = null;
   const subs = new Set<ServerResponse>();
   /** The current session's operations. Null between sessions; set by `start`, never read
    *  outside one — every reader below is already behind a "there is a session" guard. */
@@ -613,11 +645,35 @@ export function createReviewHub(
     end(false, 'idle');
   }
 
+  const clearLifetime = () => {
+    if (lifetimeTimer === null) return;
+    (getDeps().clearTimer ?? defaultClearTimer)(lifetimeTimer);
+    lifetimeTimer = null;
+  };
+
+  /**
+   * R-7.9. Started at `start` and only there, because a ceiling that any activity could
+   * push back is not a ceiling: R-7.6's bound is a conjunction — no subscribed client
+   * *and* no input — so a tab left open by a user who never types satisfies neither half
+   * and the idle reaper can never fire. The shared `RunLock` is process-global and
+   * mutually exclusive with a bulk apply, so that one forgotten tab wedges the whole
+   * apply surface until the server restarts. This is the only bound that closes it.
+   */
+  function onExpired() {
+    lifetimeTimer = null;
+    if (!running()) return;
+    broadcast({ type: 'log', kind: 'system', text: 'The review session reached its time limit and was ended.' });
+    childAlive = false;
+    child?.kill?.('SIGKILL');
+    end(false, 'expired');
+  }
+
   /** The one exit. Every path that stops a session comes through here (R-7.8). */
   const end = (ok: boolean, reason: ReviewEndReason, exitCode?: number | null) => {
     if (phase === 'idle' || phase === 'ended') return;
     phase = 'ended';
     clearIdle();
+    clearLifetime();
     childAlive = false;
     child = null;
     located = null;
@@ -762,6 +818,9 @@ export function createReviewHub(
       ops = sessionOps;
       broadcast({ type: 'review-start', commentId: id, startedAt });
       armIdle();
+      // R-7.9: the ceiling, armed exactly once for this session. Nothing below re-arms it.
+      clearLifetime();
+      lifetimeTimer = (getDeps().setTimer ?? defaultSetTimer)(onExpired, getDeps().lifetimeMs ?? DEFAULT_LIFETIME_MS);
       void begin(request as ReviewStartRequest, sessionOps).catch((err) => {
         broadcast({ type: 'error', message: (err as Error).message });
         end(false, 'error');
