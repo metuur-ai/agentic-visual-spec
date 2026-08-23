@@ -15,6 +15,12 @@ export default defineConfig({
   },
   test: {
     globals: true,
+    // Several core suites drive real `git init`/`clone`/`commit` in temp dirs. On a
+    // warm machine each one takes well under a second, but when the whole suite runs
+    // in parallel they contend for CPU and blow the 5s/10s defaults — the same files
+    // pass when run alone. Raised so the timeouts catch hangs, not slow machines.
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
     // .tsx tests opt into jsdom per-file with a `// @vitest-environment jsdom`
     // docblock; the default stays `node` so the existing suite is untouched.
     include: ['core/**/*.test.ts', 'ui/**/*.test.ts', 'ui/**/*.test.tsx'],

@@ -25,6 +25,7 @@ import { useEffect, useRef, useState } from 'react';
 import { PatchView } from './patch-view';
 import type { Proposal, ReviewEndReason, ReviewSession } from './review-session';
 import { Spinner } from './spinner';
+import { Z } from '../core/app/lib/z-layers';
 
 /** What the session is doing, in the reader's words. */
 function phaseLabel(session: ReviewSession): string {
@@ -318,7 +319,7 @@ const scrim: React.CSSProperties = {
   background: 'rgba(15,23,42,0.45)',
   display: 'flex',
   justifyContent: 'flex-end',
-  zIndex: 60,
+  zIndex: Z.CHROME,
 };
 const panel: React.CSSProperties = {
   width: 'min(780px, 100vw)',

@@ -46,6 +46,7 @@ import { ReviewDrawer } from './review-view';
 import { IndicatorLayer } from './indicator-layer';
 import { MarkdownSurface } from './markdown-surface';
 import { useCollabDocument } from './use-collab-document';
+import { Z } from '../core/app/lib/z-layers';
 
 /**
  * WHY THE TWO MODES ARE A TOGGLE AND NOT ONE SURFACE.
@@ -743,7 +744,7 @@ const dialogScrim: React.CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
-  zIndex: 50,
+  zIndex: Z.MODAL,
 };
 
 const dialogCard: React.CSSProperties = {

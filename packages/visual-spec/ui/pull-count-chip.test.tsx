@@ -280,10 +280,14 @@ describe('a repository with more pull requests than the list renders (R-7.9)', (
 
 /*
  * R-8.1 … R-8.3. The chip's `owner/repo` is the served directory's `origin`; the count
- * is the configured collaboration repository. `POST /__vs/dir/pick` re-roots the first
- * at runtime while the second stays fixed — which is why the divergence is reached
- * here by making that request rather than by handing the component two repositories,
- * which would test a state the product cannot get into.
+ * is the configured collaboration repository.
+ *
+ * The divergence is reached here at startup, by a `--repo` naming a repository other
+ * than the one the served directory points at. That used to be reachable a second way
+ * — re-rooting the directory at runtime while the configuration stayed behind — but
+ * R-10.1 re-derives the repository on a root change, so the two now agree on the far
+ * side of a pick. Startup is what is left, and R-8.1 still holds there: nothing
+ * reconciles a `--repo` the user typed against the directory they launched in.
  */
 describe('naming the repository the count belongs to (R-8.1 / R-8.2)', () => {
   const OTHER_ORIGIN = { ...SERVED_ORIGIN, owner: 'acme', repo: 'website', url: 'git@github.com:acme/website.git' };
@@ -297,23 +301,9 @@ describe('naming the repository the count belongs to (R-8.1 / R-8.2)', () => {
     expect((screen.getByTestId('git-chip').textContent ?? '').match(/acme\/docs/g)).toHaveLength(1);
   });
 
-  it('names it once a root change has pointed the directory at another repository', async () => {
-    const impl = installFetch();
-    const { unmount } = render(<MainHeader file="docs/spec.md" />);
-    await screen.findByTestId('git-pull-count');
-    expect(screen.queryByTestId('git-pull-count-repo')).toBeNull();
-
-    // The real path: the folder picker, which re-roots the server and reloads the page.
-    // jsdom implements no navigation, so the reload is stood in for and asserted.
-    const reload = vi.fn();
-    Object.defineProperty(window, 'location', { configurable: true, value: { ...window.location, reload } });
-    fireEvent.click(screen.getByTitle(/Open a different directory/));
-    await waitFor(() => expect(impl.mock.calls.some(([u]) => String(u) === '/__vs/dir/pick')).toBe(true));
-    await waitFor(() => expect(reload).toHaveBeenCalled());
-
-    // The reload `ChangeDirButton` performs, as a remount against the re-rooted server.
-    // The configuration did not move — that is the whole point of R-8.3.
-    unmount();
+  it('names it where the served directory and the configured repository differ', async () => {
+    // A `--repo acme/docs` against a directory whose origin is `acme/website`. The
+    // configuration was named on the command line, so nothing re-derives it (R-8.3).
     installFetch({ git: OTHER_ORIGIN });
     render(<MainHeader file="docs/spec.md" />);
 

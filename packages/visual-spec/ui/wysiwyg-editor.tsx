@@ -25,6 +25,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { mapImages, markdownToInjectable, normalizeForStore } from './luthor-bridge';
 import { type TreeEntry, invalidateTree, rawUrl, useTree } from './use-tree';
 import { WorkflowSelect, loadWorkflow } from './workflow-select';
+import { Z } from '../core/app/lib/z-layers';
 
 /** Remembered upload destination (relative to the spec root), shared across files. */
 const UPLOAD_DIR_KEY = 'vs:uploadDir';
@@ -863,7 +864,7 @@ function CommentIcon() {
 }
 
 const wrap: React.CSSProperties = { flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', background: 'white', overflow: 'hidden' };
-const pickerBackdrop: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 60, display: 'grid', placeItems: 'center', background: 'rgba(15,23,42,0.35)' };
+const pickerBackdrop: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: Z.MODAL, display: 'grid', placeItems: 'center', background: 'rgba(15,23,42,0.35)' };
 const pickerCard: React.CSSProperties = { width: 560, maxWidth: 'calc(100vw - 32px)', maxHeight: 'calc(100vh - 80px)', display: 'flex', flexDirection: 'column', padding: 16, borderRadius: 12, background: 'white', boxShadow: '0 20px 50px rgba(0,0,0,0.28)', font: 'system-ui' };
 const pickerClose: React.CSSProperties = { border: 'none', background: 'transparent', color: '#64748b', cursor: 'pointer', fontSize: 15 };
 const tabRow: React.CSSProperties = { display: 'inline-flex', gap: 2, padding: 2, marginBottom: 14, background: '#f1f5f9', border: '1px solid #e5e7eb', borderRadius: 9, alignSelf: 'flex-start' };
@@ -886,7 +887,7 @@ const pickerName: React.CSSProperties = { font: '11px ui-monospace, "SF Mono", m
 const commentPill: React.CSSProperties = {
   position: 'fixed',
   transform: 'translateX(-50%)',
-  zIndex: 40,
+  zIndex: Z.FLOATING,
   display: 'inline-flex',
   alignItems: 'center',
   gap: 6,
@@ -901,7 +902,7 @@ const commentPill: React.CSSProperties = {
 };
 const composer: React.CSSProperties = {
   position: 'fixed',
-  zIndex: 41,
+  zIndex: Z.FLOATING + 1,
   width: 300,
   maxWidth: 'calc(100vw - 24px)',
   padding: 12,

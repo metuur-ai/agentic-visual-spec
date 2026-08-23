@@ -367,6 +367,21 @@ describe('the branch at the point of apply (R-4.1 / R-4.2)', () => {
       expect(vi.mocked(fetch).mock.calls.some(([u]) => String(u) === '/__vs/apply/start')).toBe(true),
     );
   });
+
+  /*
+   * The scope chooser is the last screen before an agent edits files, so it is the only
+   * place where "this writes without showing you first" is still actionable. Stated
+   * afterwards it is not a warning, it is an explanation of what already happened.
+   */
+  it('says the run writes directly, and names the path that proposes first', async () => {
+    await openScopeChooser(REMOTE_GITHUB);
+    const note = await screen.findByTestId('scope-direct-write');
+    const text = (note.textContent ?? '').replace(/\s+/g, ' ');
+    expect(text).toContain('Writes straight to your files');
+    expect(text).toContain('no diff to approve');
+    // The alternative is only useful if it is named — otherwise the note is a dead end.
+    expect(text).toContain('Review & apply');
+  });
 });
 
 /*

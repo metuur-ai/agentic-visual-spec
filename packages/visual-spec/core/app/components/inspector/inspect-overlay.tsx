@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from 'react';
 import { collectRange, collectSection, headingBlockOf } from '../../lib/inspector/blocks';
 import { type FindOptions, type SourceLoc, findSurfaceSource } from '../../lib/inspector/fiber';
 import { toSelected, useInspector } from './inspector-provider';
+import { Z } from '../../lib/z-layers';
 
 type Rect = { top: number; left: number; width: number; height: number };
 
@@ -136,7 +137,7 @@ export function InspectOverlay({
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 2147483000 }}>
+    <div style={{ position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: Z.INSPECT_OVERLAY }}>
       {hoverRect ? <Frame rect={hoverRect} kind="hover" /> : null}
       {selRects.map((r, i) => (
         // eslint-disable-next-line react/no-array-index-key

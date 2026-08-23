@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { Z } from '../core/app/lib/z-layers';
 
 function HelpIcon({ size = 13 }: { size?: number }) {
   return (
@@ -281,7 +282,7 @@ function Kbd({ children }: { children: React.ReactNode }) {
 const DISPLAY = "'Bricolage Grotesque', system-ui, sans-serif";
 
 const helpLink: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 5, padding: '6px 11px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#475569', cursor: 'pointer', font: '13px system-ui', fontWeight: 600 };
-const backdrop: React.CSSProperties = { position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)', backdropFilter: 'blur(2px)', display: 'grid', placeItems: 'center', zIndex: 100, padding: 24 };
+const backdrop: React.CSSProperties = { position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)', backdropFilter: 'blur(2px)', display: 'grid', placeItems: 'center', zIndex: Z.MODAL, padding: 24 };
 const sheet: React.CSSProperties = { width: 'min(720px, 100%)', maxHeight: '90vh', display: 'flex', flexDirection: 'column', background: 'white', borderRadius: 16, boxShadow: '0 24px 80px rgba(0,0,0,0.35)', overflow: 'hidden', font: '13px system-ui' };
 const sheetHeader: React.CSSProperties = { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16, padding: '20px 24px', borderBottom: '1px solid #f1f5f9', background: 'linear-gradient(180deg, #ffffff 0%, #fbfaff 100%)' };
 const title: React.CSSProperties = { font: `700 20px ${DISPLAY}`, letterSpacing: '-0.02em', color: '#4f46e5' };

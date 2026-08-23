@@ -216,7 +216,7 @@ directory has no recognised `origin` as well as when the two names disagree.
 | --- | --- |
 | R-8.1 | WHERE the chip does not already name the `origin` of the served directory as the configured collaboration repository — because the two differ, or because the served directory has no recognised `origin` — THE SYSTEM SHALL name the repository the count belongs to. |
 | R-8.2 | WHEN the configured collaboration repository matches the `origin` of the served directory, THE SYSTEM SHALL NOT add that naming. |
-| R-8.3 | THE SYSTEM SHALL NOT resolve the difference by changing either repository. |
+| R-8.3 | THE SYSTEM SHALL NOT resolve the difference by changing either repository, EXCEPT at the moment the served directory is re-rooted (Unit 10). |
 | R-8.4 | THE SYSTEM SHALL name the collaboration repository on every surface that lists its pull requests or offers to check one out, and SHALL NOT refer to it only as the repository of the served directory. |
 
 **Note on R-8.4:** R-8.1 was written about the count, and the disclosure stopped where
@@ -249,3 +249,39 @@ branch to name and naming one would be false.
 | R-9.2 | THE SYSTEM SHALL NOT present a branch name for a mounted pull request tree. |
 | R-9.3 | THE SYSTEM SHALL present the mounted tree as read-only. |
 | R-9.4 | THE SYSTEM SHALL derive this from the state the review surface already holds, and SHALL NOT read git or the network to obtain it. |
+
+## Unit 10: The collaboration repository follows the served directory
+
+**Why:** Everything else already moves. When the served directory is changed at
+runtime, the documents follow it — the stores are built from a getter over the
+content directory — and so do the worktrees, which are rooted at
+`<baseDir>/.visual-spec/worktrees/`. The configured collaboration repository is the
+only piece of state that stays behind. Unit 8 named that divergence so a reader
+could see it; this unit removes it at the point it is created, which is the one
+moment where changing a repository is not a silent reconciliation but the plain
+meaning of the user's action.
+
+The inference already exists and already runs — at startup, guarded by "no repository
+was named". Re-rooting is the same question asked again about a different directory,
+so it takes the same answer. A `--repo` given at startup was an answer about the
+directory the process was launched in; once the user names a different directory on
+screen, the screen is the more recent statement of intent and wins.
+
+Two things do not survive the move. A base branch is an assertion about the previous
+repository — `develop` need not exist in the new one — so it is re-derived rather than
+carried. And a session that began before the move is holding a repository that is no
+longer configured: the header is not enough, because a second browser tab is never
+told to reload, and its next comment or apply would resolve through the new
+configuration and write to a repository the reviewer never chose. Pull request numbers
+are not distinctive — pull request 42 exists in most repositories — so nothing
+downstream would catch it.
+
+| ID | EARS statement |
+| --- | --- |
+| R-10.1 | WHEN the served directory is re-rooted, THE SYSTEM SHALL re-derive the collaboration repository from the new directory's `origin`. |
+| R-10.2 | THE re-derived repository SHALL take precedence over a collaboration repository named at startup. |
+| R-10.3 | WHERE the new directory names no GitHub repository, THE SYSTEM SHALL disable collaboration and SHALL state which of the following is the case: it is not a git repository, it has no remote, or its remote is not a GitHub host. |
+| R-10.4 | WHERE the new directory names a GitHub repository for which no credential is available, THE SYSTEM SHALL disable collaboration and SHALL state that the credential is missing, and SHALL NOT report the repository as unrecognised. |
+| R-10.5 | THE SYSTEM SHALL re-derive the base branch from the new repository's default branch, and SHALL NOT carry over a base branch named at startup. |
+| R-10.6 | WHEN the collaboration repository is re-derived, THE SYSTEM SHALL invalidate in-flight review and collaboration sessions bound to the previous repository, and SHALL NOT service a request whose repository was resolved from a configuration that has since changed. |
+| R-10.7 | THE SYSTEM SHALL surface the disabled state and its reason on the collaboration indicator, and SHALL NOT fail silently. |

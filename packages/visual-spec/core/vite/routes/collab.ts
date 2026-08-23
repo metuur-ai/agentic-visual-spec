@@ -30,7 +30,13 @@
  * `@lyfie/luthor`, no react (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
  */
 import type { ResolvedCollaborationConfig, ResolvedVisualSpecConfig } from '../../config';
-import { type CollaborationPreflight, credentialFingerprint, preflightCollaboration } from '../../collaboration/credentials';
+import type { RebindFailure } from '../../collaboration/open';
+import {
+  type CollaborationPreflight,
+  type PreflightFailureReason,
+  credentialFingerprint,
+  preflightCollaboration,
+} from '../../collaboration/credentials';
 import { githubCommentStore } from '../../collaboration/comment-projection';
 import {
   createGitHubAdapter,
@@ -79,8 +85,16 @@ export type CollabRouteResult = { status: number; json: unknown; streamed?: bool
  * R-7.8 — availability
  * ------------------------------------------------------------------ */
 
-/** Why collaboration is off, beyond the preflight's own reasons. */
-export type CollabUnavailableReason = 'not-configured' | 'no_credential' | 'executor_unavailable' | 'missing_scope' | 'preflight_failed';
+/**
+ * Why collaboration is off.
+ *
+ * The separator tracks provenance and is not an inconsistency. Hyphenated codes are
+ * this layer's own: collaboration was never configured, or the served directory names
+ * no GitHub repository (R-10.3). Underscored codes are `PreflightFailureReason`,
+ * referenced rather than restated so the two cannot drift — they are the credential
+ * preflight's vocabulary, quoted here.
+ */
+export type CollabUnavailableReason = 'not-configured' | RebindFailure | PreflightFailureReason;
 
 /**
  * R-7.8 — the single object the UI reads to decide whether to render collaboration
@@ -119,6 +133,27 @@ const NOT_CONFIGURED: CollabAvailability = {
     'Collaboration is not configured. On the CLI, restart with `--repo <owner>/<name>` (optionally `--base-branch <branch>`); ' +
     'under Vite, pass `config: { collaboration: { owner, repo } }` to `visualSpecMarkdown()` in vite.config.ts. Local mode is unaffected.',
   missingScopes: [],
+};
+
+/**
+ * R-10.3 / R-10.7 — what the UI is told when the SERVED DIRECTORY is why collaboration
+ * is off, rather than the configuration.
+ *
+ * Kept apart from `NOT_CONFIGURED` because "you never named a repository" and "the
+ * directory you just switched to has none" are different facts with different fixes, and
+ * R-10.7 forbids letting the second one arrive as the first — or as nothing at all.
+ *
+ * The missing-credential case is deliberately absent: there a GitHub repository WAS
+ * derived, so the preflight answers for it with `no_credential`, which is exactly what
+ * R-10.4 means by not reporting the repository as unrecognised.
+ */
+const REROOTED_UNAVAILABLE: Record<RebindFailure, string> = {
+  'not-a-repo':
+    'Collaboration is off: the directory being served is not a git repository, so there is no repository to collaborate on.',
+  'no-remote':
+    'Collaboration is off: the directory being served is a git repository with no remote, so no GitHub repository could be derived from it.',
+  'remote-not-github':
+    "Collaboration is off: this directory's git remote is not a GitHub host, and collaboration is GitHub-only.",
 };
 
 /* ------------------------------------------------------------------ *
@@ -264,6 +299,14 @@ export type CollabDeps = {
   jobs: JobHubRegistry;
   /** Read per request, so a runtime re-root takes effect on the next call. */
   config: () => ResolvedVisualSpecConfig;
+  /**
+   * R-10.7 — why the served directory yields no collaboration repository, or `null`.
+   * Both hosts already compute this in `setRoot` (R-10.3); without a way in, it reached
+   * the server log and nothing else, and the browser saw collaboration go quiet with no
+   * statement of why. A thunk for the same reason `config` is one: a re-root changes it.
+   * Absent means "no host verdict", which reads as the startup answer.
+   */
+  unavailable?: () => RebindFailure | null;
   /** Where collaboration documents are cached locally (task 3.1). */
   documents: () => CollaborationStore;
   /**
@@ -321,11 +364,50 @@ export type CollabDeps = {
   now?: () => string;
 };
 
+/** R-10.9 — the header carrying the root epoch, in both directions. */
+export const ROOT_EPOCH_HEADER = 'x-vs-root-epoch';
+
+/**
+ * R-10.9 — read `x-vs-root-epoch` off an incoming request. Exported so both hosts parse
+ * it the same way rather than each writing its own `Number(...)` (R-7.6).
+ *
+ * Anything that is not a non-negative integer reads as `undefined`, i.e. "no epoch
+ * claimed", and the request proceeds. The alternative — refusing on a malformed header —
+ * would turn a client-side formatting bug into a write outage, and a garbled header is
+ * not evidence that the tab is stale. The values this compares are only ever produced by
+ * `CollabRouter.rootEpoch`.
+ */
+export function parseClientRootEpoch(raw: string | string[] | undefined): number | undefined {
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (value === undefined || value === '') return undefined;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
 export interface CollabRouter {
   /** Handle one request whose path starts with `/__vs/collab`. */
   handle(req: CollabRequest): Promise<CollabRouteResult>;
   /** R-7.8 — the availability snapshot, also served at `GET /__vs/collab`. */
   availability(): Promise<CollabAvailability>;
+  /**
+   * R-10.6 — the served directory was re-rooted, so the collaboration repository has
+   * been re-derived. Every host's `setRoot` calls this, in the same breath as it
+   * reassigns the config the router reads.
+   *
+   * Two things happen. The held review sources and availability snapshots are dropped:
+   * each is an assertion about a repository the server no longer serves. And the root
+   * epoch advances, which is what lets a request that already resolved its repository —
+   * and is still awaiting GitHub before it writes — be refused instead of committing to
+   * a repository nobody chose. Pull request 42 exists in most repositories, so nothing
+   * downstream would have caught it.
+   */
+  rerooted(): void;
+  /**
+   * R-10.9 — the current root epoch, for the host to stamp onto every collab response as
+   * `x-vs-root-epoch`. Monotonic, advanced by `rerooted()`; the value itself carries no
+   * meaning beyond "different means the directory changed under you".
+   */
+  rootEpoch(): number;
   /** Abort every running job and drop every hub. Call on server shutdown. */
   dispose(): void;
 }
@@ -336,6 +418,20 @@ export type CollabRequest = {
   pathname: string;
   query: Record<string, string>;
   body: Record<string, unknown>;
+  /**
+   * R-10.9 — the root epoch the client last saw, from the `x-vs-root-epoch` request
+   * header. `undefined` when the client did not send one, which is the honest answer for
+   * a page that has not yet read a response and for any non-browser caller; such a
+   * request is not refused, because a client with no epoch cannot be holding a stale one.
+   *
+   * This is what R-10.6's in-flight check cannot see. That one compares the epoch across
+   * a single request's own awaits, so it catches a re-root that lands mid-request and
+   * nothing else. A browser tab left open across a re-root resolves a *fresh* request
+   * against the new configuration, agrees with itself the whole way through, and writes
+   * to a repository its reviewer never chose. The epoch has to cross the wire for that
+   * one to be visible.
+   */
+  clientRootEpoch?: number;
   /** The response, for `GET /:id/events`. Absent on every other route. */
   sse?: SseSink;
 };
@@ -1059,10 +1155,22 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
     return snapshot;
   }
 
+  /**
+   * There is no configured repository. R-10.7 — say WHICH nothing this is, because the
+   * host's re-root verdict is the only thing that distinguishes "never configured" from
+   * "the directory you just switched to has no usable repository".
+   */
+  function unconfigured(): CollabAvailability {
+    const reason = deps.unavailable?.() ?? null;
+    return reason
+      ? { available: false, reason, message: REROOTED_UNAVAILABLE[reason], missingScopes: [] }
+      : NOT_CONFIGURED;
+  }
+
   /** R-7.8 — the snapshot the UI reads, which is always about the configured repository. */
   async function availability(): Promise<CollabAvailability> {
     const repo = deps.config().collaboration;
-    if (!repo) return NOT_CONFIGURED;
+    if (!repo) return unconfigured();
     return availabilityFor(repo);
   }
 
@@ -1091,6 +1199,46 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   const REVIEW_OPERATIONS: ReadonlySet<CollabOperation> = new Set<CollabOperation>(['read', 'comment', 'reply', 'open']);
 
   /**
+   * R-10.6 — monotonic, advanced by `rerooted()` and by nothing else. A request reads it
+   * when it resolves its repository and reads it again before it is allowed to act; the
+   * two disagreeing means the configuration the repository came from is gone.
+   */
+  let rootEpoch = 0;
+  const STALE_ROOT: CollabRouteResult = {
+    status: 409,
+    json: {
+      error:
+        'the served directory changed while this request was in flight, so its repository is no longer the configured one — reload and try again',
+      reason: 'root-changed',
+    },
+  };
+  /**
+   * R-10.9 — the same fact as `STALE_ROOT` seen from the other side: not "the directory
+   * changed under this request" but "the directory changed under the page that sent it".
+   * A separate reason code because the remedies differ. `root-changed` is a race and
+   * retrying works; `stale-tab` means this tab has been describing the wrong repository
+   * since before the request was made, and only a reload fixes it.
+   */
+  const STALE_TAB: CollabRouteResult = {
+    status: 409,
+    json: {
+      error:
+        'this tab was opened against a different served directory — its review session belongs to a repository this server no longer serves; reload the page',
+      reason: 'stale-tab',
+    },
+  };
+
+  /**
+   * R-10.9 — writes only. A stale tab reading is showing its user a stale-but-harmless
+   * view, and refusing it would replace that with an error page for a condition a reload
+   * already resolves. A stale tab *writing* posts a comment, a reply, or a pull request
+   * into a repository chosen by a directory nobody is looking at any more, and no
+   * downstream check catches it: the document, the branch and pull request 42 all exist
+   * in most repositories, so the write succeeds and looks ordinary.
+   */
+  const MUTATING_METHODS: ReadonlySet<string> = new Set(['POST', 'PATCH', 'PUT', 'DELETE']);
+
+  /**
    * Availability + authorization in one step, because no GitHub-touching route may skip
    * either. Resolves to the enabled context or to the response to send instead.
    *
@@ -1106,11 +1254,14 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
     documentId: string | null,
     requested: RepoRef | null = null,
   ): Promise<{ ok: true; repo: ResolvedCollaborationConfig; login: string } | { ok: false; result: CollabRouteResult }> {
+    const epoch = rootEpoch;
     const configured = deps.config().collaboration;
     // R-W5.1 — with no collaboration configured there is no credential and no session to
     // review anything with, whatever the request named. Local mode answers exactly as it
     // did before this feature existed.
-    if (!configured) return { ok: false, result: { status: 503, json: NOT_CONFIGURED } };
+    // R-10.7 — the same statement `GET /__vs/collab` makes, so a refusal and the snapshot
+    // that explains it never tell two different stories about the same directory.
+    if (!configured) return { ok: false, result: { status: 503, json: unconfigured() } };
 
     /*
      * `baseBranch` stays the configured one for a named repository, and is never read on
@@ -1144,6 +1295,15 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
     if (!state.available) return { ok: false, result: { status: 503, json: state } };
     const verdict = await authorize(op, { documentId, login: state.login, repo });
     if (!verdict.ok) return { ok: false, result: { status: verdict.status, json: { error: verdict.error } } };
+    /*
+     * R-10.6 — LAST POINT BEFORE A HANDLER ACTS. `repo` above was read from
+     * `deps.config()`, and the two awaits since then (the availability preflight, the
+     * authorizer) each talk to GitHub, so a re-root landing in that window leaves this
+     * request holding the repository the server was configured for and no longer is.
+     * Every GitHub-touching route passes through here, which is why the comment POSTs
+     * and the apply/resolve paths are covered by one check rather than eleven.
+     */
+    if (rootEpoch !== epoch) return { ok: false, result: STALE_ROOT };
     return { ok: true, repo, login: state.login };
   }
 
@@ -1247,6 +1407,15 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   async function handle(req: CollabRequest): Promise<CollabRouteResult> {
     const { method, body } = req;
     try {
+      /*
+       * R-10.9 — before the path is even parsed, because a stale tab's write is wrong
+       * whatever it names. Checked only when the client sent an epoch: a caller that sent
+       * none cannot be holding a stale one, and refusing it would break every non-browser
+       * client for a condition none of them can be in.
+       */
+      if (req.clientRootEpoch !== undefined && req.clientRootEpoch !== rootEpoch && MUTATING_METHODS.has(method)) {
+        return STALE_TAB;
+      }
       /*
        * R-W3.1 / R-W3.2 — which repository is this request about, before anything else is
        * decided. The answer is one of three: a repository the request named, `null` for
@@ -2306,6 +2475,13 @@ export function createCollabRoutes(deps: CollabDeps): CollabRouter {
   return {
     handle,
     availability,
+    /* R-10.6 — see `CollabRouter.rerooted`. Held state first, then the epoch. */
+    rerooted() {
+      reviews.clear();
+      cache.clear();
+      rootEpoch += 1;
+    },
+    rootEpoch: () => rootEpoch,
     dispose() {
       deps.jobs.disposeAll();
     },

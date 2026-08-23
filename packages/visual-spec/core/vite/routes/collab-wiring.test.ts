@@ -127,9 +127,17 @@ const settled = async (): Promise<void> => {
   for (let i = 0; i < 40; i += 1) await Promise.resolve();
 };
 
+/** A path that is not on the branch yet — what `getFile` sees before a first commit. */
+const ABSENT: Partial<GhResult> = {
+  stdout: fixture('error-not-found.json'),
+  stderr: 'gh: Not Found (HTTP 404)',
+  exitCode: 1,
+};
+
 const CREATE_OK: Array<Partial<GhResult>> = [
   { stdout: fixture('git-ref.json') }, // getBranch(main)
   { stdout: fixture('create-ref.json') }, // createBranch
+  ABSENT, // getFile — read-before-write, the document is new
   { stdout: fixture('contents-put.json') }, // commitFile
   { stdout: fixture('pull-create.json') }, // createPullRequest
 ];
@@ -185,6 +193,7 @@ describe('7.2 routes run 8.2 job bodies (integration)', () => {
     expect(h.endpoints()).toEqual([
       '/repos/acme/docs/git/ref/heads/main',
       '/repos/acme/docs/git/refs',
+      '/repos/acme/docs/contents/documents/doc-1.json?ref=visual-spec/doc-1',
       '/repos/acme/docs/contents/documents/doc-1.json',
       '/repos/acme/docs/pulls',
     ]);

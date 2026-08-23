@@ -38,10 +38,11 @@ import { createApplyHub } from '../core/vite/routes/apply';
 import { createReviewHub, handleReviewRequest } from '../core/vite/routes/review';
 import { sharedRunLock } from '../core/vite/routes/run-lock';
 import { createReviewSessionOpsSelector } from '../core/collaboration/review-session-collab';
-import { createCollabRoutes } from '../core/vite/routes/collab';
+import { createCollabRoutes, parseClientRootEpoch, ROOT_EPOCH_HEADER } from '../core/vite/routes/collab';
 import { createCollabWiring } from '../core/vite/routes/collab-wiring';
 import { createJobHubRegistry } from '../core/collaboration/job-hub';
 import { fsCollaborationStore } from '../core/collaboration/record-store';
+import { type RebindFailure, rebindCollaboration } from '../core/collaboration/open';
 import { type VisualSpecConfig, resolveConfig } from '../core/config';
 import { MAX_UPLOAD_BYTES, saveUploadedAsset } from '../core/vite/routes/upload';
 
@@ -152,6 +153,12 @@ export type ServeOptions = {
   assetsDir?: string;
   /** visual-spec.config.ts contents. Omitting `collaboration` keeps collaboration off (R-9.19). */
   config?: VisualSpecConfig;
+  /**
+   * `--no-collab`. Kept as its own flag rather than inferred from an absent `config`,
+   * because R-10.1 re-derives collaboration from the origin on every re-root: without it
+   * the opt-out would survive only until the user changed directory.
+   */
+  noCollab?: boolean;
   port: number;
   host?: string;
 };
@@ -185,7 +192,11 @@ export function createVisualSpecServer(opts: ServeOptions) {
   // the prefix off the path and hand the request to `collab.handle`. With no
   // `collaboration` block configured this stays inert and reports itself unavailable
   // (R-7.8 / R-9.19) — local mode is untouched (R-7.2).
-  const collabConfig = resolveConfig(opts.config);
+  // `let`: R-10.1 re-derives this in `setRoot`. Every reader below already takes it
+  // through a `config: () => collabConfig` getter, so the reassignment propagates.
+  let collabConfig = resolveConfig(opts.config);
+  /** R-10.3 — why the current directory has no collaboration repository, for R-10.7. */
+  let collabUnavailable: RebindFailure | null = null;
   const collabJobs = createJobHubRegistry();
   // The 8.2 job bodies and the interval poller, built once in shared code so both hosts
   // are identical (R-7.6). With no `collaboration` block this constructs no adapter at
@@ -199,6 +210,9 @@ export function createVisualSpecServer(opts: ServeOptions) {
   const collab = createCollabRoutes({
     jobs: collabJobs,
     config: () => collabConfig,
+    // R-10.7 — the re-root verdict, so the browser is told why collaboration went off
+    // rather than only this process's stdout.
+    unavailable: () => collabUnavailable,
     documents: () => fsCollaborationStore(contentDir),
     // A thunk, like every other store above: PR worktrees are mounted under whatever
     // directory is being served *now*, so a runtime re-root moves them with it.
@@ -207,15 +221,46 @@ export function createVisualSpecServer(opts: ServeOptions) {
     authorize: collabWiring.authorize,
   });
 
-  /** Re-root every store at a new directory (comments follow to <dir>/…json). */
-  const setRoot = (dir: string) => {
+  /**
+   * Re-root every store at a new directory (comments follow to <dir>/…json).
+   *
+   * R-10.1 — the collaboration repository moves with the directory. It was the one piece
+   * of startup state a re-root left behind, which is how comments written against
+   * directory B could reach the repository that directory A named. Re-derivation wins
+   * over an explicit `--repo` (R-10.2) for the same reason: the flag described the
+   * directory the server is no longer serving.
+   */
+  const setRoot = async (dir: string) => {
     contentDir = resolve(dir);
     surfaces = mdSurfaceStore(contentDir);
     tree = treeStore(contentDir);
     specsRoot = contentDir;
     commentsPath = join(contentDir, 'visual-spec-comments.json');
     comments = fileCommentStore(commentsPath);
+    // Cleared outside the guard on purpose. Under `--no-collab` nothing below reassigns
+    // it, so a reason held from the previous directory would outlive the directory it
+    // described and R-10.7 would explain the new one with the old one's verdict. Today no
+    // startup path leaves a reason here for a `--no-collab` run to strand — this keeps
+    // that a property of the reset rather than of the caller.
+    collabUnavailable = null;
+    if (!opts.noCollab) {
+      const rebound = await rebindCollaboration(contentDir);
+      collabConfig = resolveConfig({ ...opts.config, collaboration: rebound.ok ? rebound.collaboration : undefined });
+      collabUnavailable = rebound.ok ? null : rebound.reason;
+    }
+    // R-10.6 — announced in the same synchronous breath as the reassignment above, so no
+    // request can observe the new configuration without the router having advanced. A
+    // second browser tab is never told to reload, and its next comment or apply would
+    // otherwise resolve through this configuration and write to a repository its reviewer
+    // never chose. Called unconditionally: `baseDir` moved even under `--no-collab`, and
+    // the held review sources are checkouts of the directory that is no longer served.
+    collab.rerooted();
     console.log(`\n  visual-spec → switched directory\n  ➜  dir:      ${contentDir}\n  ➜  comments: ${commentsPath}\n`);
+    console.log(
+      collabConfig.collaboration
+        ? `  ➜  collab:   ${collabConfig.collaboration.owner}/${collabConfig.collaboration.repo} (from origin)\n`
+        : `  ➜  collab:   off — ${collabUnavailable ?? 'not-configured'}\n`,
+    );
   };
 
   const server = createServer((req, res) => {
@@ -335,7 +380,7 @@ export function createVisualSpecServer(opts: ServeOptions) {
             } catch {
               return sendJson(res, 400, { error: `Directory not found: ${picked.path}` });
             }
-            setRoot(picked.path);
+            await setRoot(picked.path);
             return sendJson(res, 200, { root: specsRoot, comments: commentsPath });
           }
           return sendJson(res, 404, { error: `no route: ${method} /__vs/dir${sub}` });
@@ -414,7 +459,17 @@ export function createVisualSpecServer(opts: ServeOptions) {
           const sub = url.pathname.slice('/__vs/collab'.length);
           const query = Object.fromEntries(url.searchParams.entries());
           const body = await readJsonBody(req);
-          const r = await collab.handle({ method, pathname: sub, query, body, sse: res });
+          // R-10.9 — stamped before `handle` runs, so the SSE path gets it too: the hub
+          // writes its own head, and `writeHead` merges what `setHeader` already set.
+          res.setHeader(ROOT_EPOCH_HEADER, String(collab.rootEpoch()));
+          const r = await collab.handle({
+            method,
+            pathname: sub,
+            query,
+            body,
+            clientRootEpoch: parseClientRootEpoch(req.headers[ROOT_EPOCH_HEADER]),
+            sse: res,
+          });
           if (r.streamed) return; // SSE: the hub already wrote the head and the sync frame
           return sendJson(res, r.status, r.json);
         }
