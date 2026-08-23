@@ -94,7 +94,7 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 | --- | --- |
 | R-6.1 | THE SYSTEM SHALL apply changes to disk only after the user explicitly approves the proposal. |
 | R-6.2 | THE SYSTEM SHALL emit each proposal as a machine-applicable patch, and WHEN the user approves, THE SYSTEM SHALL write by applying that exact patch — not by re-deriving the change from the comment. |
-| R-6.3 | IF the approved patch does not apply cleanly to the current content, THE SYSTEM SHALL surface the drift and require re-approval rather than writing. |
+| R-6.3 | IF the approved patch does not apply cleanly to the current content, THE SYSTEM SHALL surface the drift and require re-approval rather than writing, and SHALL re-establish the comparison state so that a subsequent proposal can be approved. |
 | R-6.4 | WHERE the comment is local, WHEN an approved change is applied, THE SYSTEM SHALL set the comment `status` to `applied` and write a non-empty `result` summary in the same update. |
 | R-6.5 | WHEN an approved change is applied, THE SYSTEM SHALL cause the displayed document and the sidebar to refresh to reflect the change. |
 | R-6.6 | WHEN a review session completes (applied or cancelled), THE SYSTEM SHALL end the session and release the shared single-session lock. |
