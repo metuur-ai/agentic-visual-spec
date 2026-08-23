@@ -10,18 +10,17 @@ Source of truth: `docs/ears/inline-indicators-interactive-apply.md` (acceptance 
 
 ## Phase 0: De-risk
 
-- [ ] 0.1 Transport spike — persistent stream-json multi-turn + plan-mode no-write (est: ~4h)
+- [x] 0.1 Transport spike — persistent stream-json multi-turn + plan-mode no-write (est: ~4h)
   - why: the multi-turn transport is documented-but-unverified against the bare CLI; proving it decides whether the Agent-SDK rejection stands (LLD Key Decisions).
   - acceptance: a **retained** script spawns `claude --print --input-format stream-json --output-format stream-json --permission-mode plan`, writes two user messages, and confirms (a) the process survives its first `result` frame, (b) the second message is answered, (c) no file is written.
   - verify: record the three outcomes and the script path in the LLD Key Decisions block.
-  - note: reported passed on all three checks on 2026-08-22, but the script was not retained — treat as unreproduced and re-run before relying on it. It covers the **transport only**; it does not touch mid-session permission escalation (that is 0.2).
-  - landed:
+  - landed: re-run 2026-08-22, PASS 3/3 — .devlocal/spikes/0.1-transport.mjs (script retained; outcomes recorded in the LLD)
 
-- [ ] 0.2 Escalation spike — can a plan-mode session be lifted to write mid-process? (est: ~3h) — **only if B4.3 is pursued**
+- [x] 0.2 Escalation spike — can a plan-mode session be lifted to write mid-process? (est: ~3h) — **only if B4.3 is pursued**
   - why: `--permission-mode` is a spawn-time flag (`acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`) with no documented mid-session change; the only candidate is an undocumented control frame on the stream-json stdin channel. B4.3 rests entirely on this and 0.1 never tested it.
   - acceptance: a **retained** script starts a session under `--permission-mode plan`, sends an approval turn, and either writes a file in-session or demonstrates it cannot.
   - verify: record the outcome and the script path in the LLD. If it fails, B4.3 is out of scope — patch application (B4.1) is already the specified default, so failing here costs nothing.
-  - landed:
+  - landed: run 2026-08-22, PASS — .devlocal/spikes/0.2-escalation.mjs. A mechanism exists: undocumented `control_request` subtype `set_permission_mode`. B4.4 is viable but the capability is version-pinned and unsupported; B4.1's patch apply stays the standing write path.
 
 ---
 
@@ -81,17 +80,17 @@ Source of truth: `docs/ears/inline-indicators-interactive-apply.md` (acceptance 
 
 ## Phase B — Session infrastructure
 
-- [ ] B1.1 Shared RunLock + wire into ApplyHub (est: ~1h) (mutex: apply-hub)
+- [x] B1.1 Shared RunLock + wire into ApplyHub (est: ~1h) (mutex: apply-hub)
   - why: the two hubs otherwise hold independent private `running` flags (`apply.ts:253`) and could run concurrently, racing the sidecar; one shared lock is what makes review⇄apply mutual exclusion true rather than nominal.
   - acceptance: R-3.4, R-8.4, R-8.5 — a shared `RunLock` module both hubs consult; `ApplyHub.start` acquires it and 409s if held, with a body naming which holder rejected; bulk-apply behavior otherwise unchanged.
   - verify: hold the lock, then `POST /apply/start` → 409 identifying the holder; release → apply proceeds; existing apply tests pass; the `spawnClaude(buildApplyPrompt(open), deps.cwd)` line pinned at `local-mode.regression.test.ts:423-425` is byte-unchanged.
-  - landed:
+  - landed: 3ec5aa0 — core/vite/routes/run-lock.ts, core/vite/routes/run-lock.test.ts, core/vite/routes/apply.ts, core/editing/local-mode.regression.test.ts
 
-- [ ] B1.2 ReviewHub + `/__vs/review/*` routes + SSE, and the two architecture calls (deps: B1.1, est: ~3h) (mutex: server-routes)
+- [x] B1.2 ReviewHub + `/__vs/review/*` routes + SSE, and the two architecture calls (deps: B1.1, est: ~3h) (mutex: server-routes)
   - why: the interactive flow needs the ephemeral session container and the in-channel the one-shot apply lacks. Two decisions must land **here** rather than be discovered later — deferring them means rewriting the hub once Phase C starts.
   - acceptance: R-3.5, R-3.6, R-8.1, R-8.2, R-8.6 — a single-session in-memory hub; `events` (SSE, `sync` replay first frame) / `start` / `message` / `approve` / `cancel` registered in **both** `md-plugin.ts` and `server.ts`; output parsed by the shared `summarize()` reader extracted from `apply.ts:85-138`. Plus, recorded in the LLD: **(a)** whether `ReviewHub` sits beside `ApplyHub` or reuses `core/collaboration/job-hub.ts` (which already runs long-lived jobs with an event stream), and **(b)** a narrow session interface — `resolve` → `locate` → `checkDrift` → `finish` — with a local implementation now and a collab implementation in Phase C, so the local/collab difference lives in two implementations rather than five `if (mode === 'collab')` sites.
   - verify: subscribe to `/__vs/review/events` in dev and prod builds; first frame is a `sync` snapshot; routes resolve in both servers; both decisions are written into the LLD before the task closes.
-  - landed:
+  - landed: ce466db — core/vite/routes/review.ts, core/vite/routes/review.test.ts, core/vite/md-plugin.ts, src/server.ts, core/editing/local-mode.regression.test.ts. Decision (a): `ReviewHub` sits beside `ApplyHub`, `job-hub.ts` not reused. Decision (b): `ReviewSessionOps` (`resolve` → `locate` → `checkDrift` → `finish` + `fallbackAvailable`), local implementation `createLocalSessionOps`. Both still to be transcribed into the LLD.
 
 - [ ] B1.3 Spawn persistent stream-json session (plan mode, stdin piped, replay) (deps: B1.2, est: ~1.5h)
   - why: propose must be multi-turn and read-only-enforced — the piped stdin is the missing in-channel, and plan mode is the real edit gate rather than a prompt instruction.

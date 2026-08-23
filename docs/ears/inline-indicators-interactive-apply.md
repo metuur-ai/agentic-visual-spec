@@ -51,7 +51,7 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 | R-3.4 | WHILE a review session is active, IF the user attempts to start another review session or a bulk apply, THE SYSTEM SHALL reject the new request with a conflict response. |
 | R-3.5 | WHILE a review session is active, THE SYSTEM SHALL stream session events to subscribed clients over the review SSE endpoint. |
 | R-3.6 | WHEN a client subscribes to the review event stream, THE SYSTEM SHALL first send a snapshot of the current session state and prior events. |
-| R-3.7 | WHILE in the propose phase, THE SYSTEM SHALL run the `claude` CLI process in a permission mode that makes file-editing tools unavailable (enforced at the permission layer, not by prompt instruction). |
+| R-3.7 | WHILE in the propose phase, THE SYSTEM SHALL run the `claude` CLI process in a permission mode that blocks edits to the workspace, enforced at the permission layer rather than by prompt instruction. |
 | R-3.8 | WHEN a review session starts, THE SYSTEM SHALL determine the comment's origin (local or collaborative) and select the corresponding prompt mode and approval path from it. |
 | R-3.9 | THE SYSTEM SHALL offer the interactive review session for single comments only, and SHALL NOT gate the bulk apply flow behind a proposal or approval step. |
 
