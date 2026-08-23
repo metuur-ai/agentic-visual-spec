@@ -184,7 +184,7 @@ describe('GET /__vs/review/events (R-3.5, R-3.6)', () => {
   it('replays the session so far to a tab that joins mid-session, then streams live', async () => {
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
 
     const late = fakeRes();
@@ -210,7 +210,7 @@ describe('session output parsing (R-8.6)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
     const sub = fakeRes();
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
 
     child.emit(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: 'a.md' } }] } }));
@@ -235,7 +235,7 @@ describe('the shared RunLock (R-3.4, R-8.5)', () => {
     const review = createReviewHub(() => deps({ spawnSession: () => child }), lock);
     const apply = createApplyHub(() => ({ cwd: '/tmp', comments: memoryStore([rec('c-1')]) }), lock);
 
-    expect(review.start('c-1').status).toBe(200);
+    expect(review.start({ commentId: 'c-1' }).status).toBe(200);
     expect(lock.heldBy()).toBe('review');
     expect(apply.start()).toEqual({ status: 409, json: { error: 'a review session is already running', holder: 'review' } });
   });
@@ -244,14 +244,14 @@ describe('the shared RunLock (R-3.4, R-8.5)', () => {
     const lock = createRunLock();
     lock.acquire('apply');
     const review = createReviewHub(() => deps(), lock);
-    expect(review.start('c-1')).toEqual({ status: 409, json: { error: 'an apply is already running', holder: 'apply' } });
+    expect(review.start({ commentId: 'c-1' })).toEqual({ status: 409, json: { error: 'an apply is already running', holder: 'apply' } });
   });
 
   it('a second review start is refused while the first holds the slot', () => {
     const lock = createRunLock();
     const hub = createReviewHub(() => deps({ spawnSession: () => liveChild() }), lock);
-    expect(hub.start('c-1').status).toBe(200);
-    expect(hub.start('c-2')).toEqual({ status: 409, json: { error: 'a review session is already running', holder: 'review' } });
+    expect(hub.start({ commentId: 'c-1' }).status).toBe(200);
+    expect(hub.start({ commentId: 'c-2' })).toEqual({ status: 409, json: { error: 'a review session is already running', holder: 'review' } });
   });
 
   it('releases the slot on cancel, on child exit, and on a failed start', async () => {
@@ -259,13 +259,13 @@ describe('the shared RunLock (R-3.4, R-8.5)', () => {
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), lock);
 
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     expect(hub.cancel().status).toBe(200);
     expect(lock.heldBy()).toBe(null);
 
     const c2 = liveChild();
     const hub2 = createReviewHub(() => deps({ spawnSession: () => c2 }), lock);
-    hub2.start('c-1');
+    hub2.start({ commentId: 'c-1' });
     await tick();
     c2.kill?.('SIGKILL');
     await tick();
@@ -274,7 +274,7 @@ describe('the shared RunLock (R-3.4, R-8.5)', () => {
 
     // No comment with that id → the session never begins, and must not wedge the slot.
     const hub3 = createReviewHub(() => deps(), lock);
-    hub3.start('nope');
+    hub3.start({ commentId: 'nope' });
     await tick();
     await tick();
     expect(lock.heldBy()).toBe(null);
@@ -320,7 +320,7 @@ describe('the /__vs/review route surface (R-8.1)', () => {
   it('distinguishes an ended session from no session at all (R-7.7)', async () => {
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     child.kill?.('SIGKILL');
     await tick();
@@ -352,7 +352,7 @@ describe('both hosts register the review routes (R-8.2)', () => {
 describe('createLocalSessionOps', () => {
   it('resolves the comment from the sidecar and locates its file', async () => {
     const ops = createLocalSessionOps(() => deps());
-    const c = await ops.resolve('c-1');
+    const c = await ops.resolve({ commentId: 'c-1' });
     expect(c).toMatchObject({ id: 'c-1', comment: 'make it clearer', path: 'a.md' });
     const located = await ops.locate(c!);
     expect(located).toMatchObject({ path: 'a.md' });
@@ -361,14 +361,14 @@ describe('createLocalSessionOps', () => {
 
   it('returns null for an unknown comment and for a missing file', async () => {
     const ops = createLocalSessionOps(() => deps({ readTargetFile: async () => null }));
-    expect(await ops.resolve('nope')).toBe(null);
+    expect(await ops.resolve({ commentId: 'nope' })).toBe(null);
     expect(await ops.locate({ id: 'c-1', comment: 'x', workflow: 'w', path: 'gone.md' })).toBe(null);
   });
 
   it('reports drift when the pinned target changes, and no drift when it does not', async () => {
     let content = 'hello\n';
     const ops = createLocalSessionOps(() => deps({ readTargetFile: async () => content }));
-    const located = (await ops.locate((await ops.resolve('c-1'))!))!;
+    const located = (await ops.locate((await ops.resolve({ commentId: 'c-1' }))!))!;
     expect(await ops.checkDrift(located)).toEqual({ drifted: false });
     content = 'hello there\n';
     expect(await ops.checkDrift(located)).toEqual({ drifted: true, reason: 'a.md changed since the proposal' });
@@ -377,7 +377,7 @@ describe('createLocalSessionOps', () => {
   it('finishes by flipping only the target comment to applied with a result', async () => {
     const store = memoryStore([rec('c-1'), rec('c-2')]);
     const ops = createLocalSessionOps(() => deps({ comments: store }));
-    await ops.finish((await ops.resolve('c-1'))!, { result: 'Rewrote the paragraph.' });
+    await ops.finish((await ops.resolve({ commentId: 'c-1' }))!, { result: 'Rewrote the paragraph.' });
     const doc = await store.read();
     expect(doc.comments.find((c) => c.id === 'c-1')).toMatchObject({ status: 'applied', result: 'Rewrote the paragraph.' });
     expect(doc.comments.find((c) => c.id === 'c-2')).toMatchObject({ status: 'open' });
@@ -429,7 +429,7 @@ describe('the review session transport (R-3.3, R-8.3)', () => {
   it('writes an opening turn down the in-channel when a session starts', async () => {
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     expect(child.written).toHaveLength(1);
     const frame = JSON.parse(child.written[0]) as { type: string; message: { role: string; content: Array<{ type: string; text: string }> } };
@@ -443,7 +443,7 @@ describe('the review session transport (R-3.3, R-8.3)', () => {
   it('sends follow-up turns in the frame shape the CLI accepts on stdin', async () => {
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     hub.message('shorter please');
     // Newline-delimited: the CLI reads one JSON frame per line.
@@ -459,7 +459,7 @@ describe('the review session transport (R-3.3, R-8.3)', () => {
     const sub = fakeRes();
     const hub = createReviewHub(() => deps({ spawnSession: () => { throw new Error('spawn EACCES'); } }), lock);
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     await tick();
     expect(sub.frames()).toContainEqual({ type: 'error', message: 'Could not start claude: spawn EACCES' });
@@ -473,7 +473,7 @@ describe('follow-up turns appear in the transcript (R-8.7)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
     const sub = fakeRes();
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     hub.message('shorter please');
 
@@ -504,7 +504,7 @@ describe('follow-up turns appear in the transcript (R-8.7)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
     const sub = fakeRes();
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     child.emit(JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1' }] } }));
     await tick();
@@ -520,7 +520,7 @@ describe('a re-init frame is a new turn, not a new session (spike 0.1)', () => {
     // would reset the hub mid-refine and drop the transcript.
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     child.emit(JSON.stringify({ type: 'system', subtype: 'init', session_id: 's-1' }));
     child.emit(JSON.stringify({ type: 'result', result: 'first proposal', session_id: 's-1' }));
@@ -551,7 +551,7 @@ describe('propose writes nothing to the workspace (R-4.7, R-3.7)', () => {
       () => ({ cwd: dir, comments: store, spawnSession: () => child, now: () => 1000 }),
       createRunLock(),
     );
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     child.emit(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'I would rewrite the heading' }] } }));
     await tick();
@@ -606,7 +606,7 @@ describe('the proposal envelope reaches subscribers (R-4.1–R-4.6)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
     const sub = fakeRes();
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
 
     child.emit(resultFrame(ENVELOPE));
@@ -622,7 +622,7 @@ describe('the proposal envelope reaches subscribers (R-4.1–R-4.6)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
     const sub = fakeRes();
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
 
     child.emit(resultFrame(ENVELOPE));
@@ -642,7 +642,7 @@ describe('the proposal envelope reaches subscribers (R-4.1–R-4.6)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
     const sub = fakeRes();
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
 
     // A plain prose result, which is what a session without the schema would produce.
@@ -656,7 +656,7 @@ describe('the proposal envelope reaches subscribers (R-4.1–R-4.6)', () => {
   it('refuses an approval with no proposal, and does not re-derive once there is one', async () => {
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     expect(await hub.approve()).toMatchObject({ status: 409, json: { code: 'no-proposal' } });
 
@@ -676,7 +676,7 @@ describe('POST /review/start begins propose (R-3.1, R-3.2, R-3.8)', () => {
   it('opens the session with the real review prompt, not a placeholder', async () => {
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
 
     const frame = JSON.parse(child.written[0] as string) as { message: { content: Array<{ text: string }> } };
@@ -699,7 +699,7 @@ describe('POST /review/start begins propose (R-3.1, R-3.2, R-3.8)', () => {
     };
     const child = liveChild();
     const hub = createReviewHub(() => deps({ comments: memoryStore([anchored]), spawnSession: () => child }), createRunLock());
-    hub.start('c-9');
+    hub.start({ commentId: 'c-9' });
     await tick();
 
     const text = (JSON.parse(child.written[0] as string) as { message: { content: Array<{ text: string }> } }).message.content[0].text;
@@ -717,7 +717,7 @@ describe('POST /review/start begins propose (R-3.1, R-3.2, R-3.8)', () => {
       promptMode: { mode: 'collab', documentPath: 'docs/x.json' },
     });
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock(), collabOps);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
 
     const text = (JSON.parse(child.written[0] as string) as { message: { content: Array<{ text: string }> } }).message.content[0].text;
@@ -742,7 +742,7 @@ describe('POST /review/start begins propose (R-3.1, R-3.2, R-3.8)', () => {
       const child = liveChild();
       const hub = createReviewHub(() => ({ cwd: dir, comments: store, spawnSession: () => child, now: () => 1000 }), createRunLock());
 
-      expect(hub.start('c-1')).toEqual({ status: 200, json: { ok: true } });
+      expect(hub.start({ commentId: 'c-1' })).toEqual({ status: 200, json: { ok: true } });
       await tick();
       child.emit(resultFrame(ENVELOPE));
       await tick();
@@ -771,7 +771,7 @@ describe('GET /__vs/review (R-8.9)', () => {
   it('reports the in-flight session so a reloaded tab can find it before subscribing', async () => {
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     expect(get(hub)).toEqual({ status: 200, json: { running: true, startedAt: 1000, commentId: 'c-1' } });
   });
@@ -779,7 +779,7 @@ describe('GET /__vs/review (R-8.9)', () => {
   it('stays a 200 snapshot once the session ends rather than a conflict (R-7.5)', async () => {
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     hub.cancel();
     await tick();
@@ -812,7 +812,7 @@ describe('follow-up turns refine the proposal (R-5.1, R-5.2, R-5.3)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
     const sub = fakeRes();
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
 
     child.emit(resultFrame({ ...ENVELOPE, patch: patchN(1) }));
@@ -842,7 +842,7 @@ describe('follow-up turns refine the proposal (R-5.1, R-5.2, R-5.3)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
     const hist = fakeRes();
     hub.subscribe(hist.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     child.emit(resultFrame({ ...ENVELOPE, patch: patchN(1) }));
     await tick();
@@ -863,7 +863,7 @@ describe('follow-up turns refine the proposal (R-5.1, R-5.2, R-5.3)', () => {
     // even though the user is looking at a patch.
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     child.emit(resultFrame(ENVELOPE));
     await tick();
@@ -882,7 +882,7 @@ describe('the session says when it is waiting (R-5.4)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
     const sub = fakeRes();
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     expect(hub.snapshot().phase).toBe('proposing');
 
@@ -908,7 +908,7 @@ describe('the session says when it is waiting (R-5.4)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
     const sub = fakeRes();
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     child.emit(resultFrame(ENVELOPE));
     child.emit(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'anything else?' }] } }));
@@ -926,7 +926,7 @@ describe('the session says when it is waiting (R-5.4)', () => {
       const child = liveChild();
       const hub = createReviewHub(() => ({ cwd: dir, comments: store, spawnSession: () => child, now: () => 1000 }), createRunLock());
 
-      hub.start('c-1');
+      hub.start({ commentId: 'c-1' });
       // This hub locates its target on the real filesystem, so the opening turn — and with
       // it the piped stdout — lands some ticks after `start` returns.
       await until(() => child.written.length === 1);
@@ -954,7 +954,7 @@ describe('an abandoned session releases the slot (R-7.6, R-7.8)', () => {
     const timers = fakeTimers();
     const hub = createReviewHub(() => deps({ spawnSession: () => liveChild(), ...timers }), createRunLock());
     expect(timers.armed()).toBe(0); // nothing to reap before a session exists
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     expect(timers.armed()).toBe(1);
     expect(timers.delay()).toBe(DEFAULT_IDLE_TIMEOUT_MS);
     expect(DEFAULT_IDLE_TIMEOUT_MS).toBe(15 * 60_000);
@@ -969,7 +969,7 @@ describe('an abandoned session releases the slot (R-7.6, R-7.8)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => watched, idleTimeoutMs: 1000, ...timers }), lock);
     const sub = fakeRes();
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     sub.close(); // the only tab goes away
 
@@ -992,7 +992,7 @@ describe('an abandoned session releases the slot (R-7.6, R-7.8)', () => {
     const a = fakeRes();
     const b = fakeRes();
     hub.subscribe(a.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     expect(timers.armed()).toBe(0); // a client is watching
 
@@ -1008,7 +1008,7 @@ describe('an abandoned session releases the slot (R-7.6, R-7.8)', () => {
   it('input restarts the bound rather than letting a stale one fire', async () => {
     const timers = fakeTimers();
     const hub = createReviewHub(() => deps({ spawnSession: () => liveChild(), ...timers }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     const first = timers.id();
     hub.message('still here');
@@ -1020,7 +1020,7 @@ describe('an abandoned session releases the slot (R-7.6, R-7.8)', () => {
     const timers = fakeTimers();
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child, ...timers }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     expect(timers.armed()).toBe(1);
     hub.cancel();
@@ -1035,7 +1035,7 @@ describe('the dead-child race (R-7.7)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => brokenPipeChild() }), lock);
     const sub = fakeRes();
     hub.subscribe(sub.res);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
 
     expect(hub.message('shorter please')).toEqual({
@@ -1050,7 +1050,7 @@ describe('the dead-child race (R-7.7)', () => {
   it('distinguishes a dead session from no session on both message and approve', async () => {
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     child.emit(resultFrame(ENVELOPE));
     await tick();
@@ -1081,7 +1081,7 @@ describe('with no session, only message/approve/cancel conflict (R-7.5)', () => 
   it('still refuses the three that need one after a session has ended', async () => {
     const child = liveChild();
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     hub.cancel();
     for (const path of ['/message', '/approve', '/cancel']) {
@@ -1098,7 +1098,7 @@ describe('session state is memory-only (R-7.3)', () => {
     const lock = createRunLock();
     const child = liveChild();
     const hub = createReviewHub(() => deps({ comments: store, spawnSession: () => child }), lock);
-    hub.start('c-1');
+    hub.start({ commentId: 'c-1' });
     await tick();
     child.emit(resultFrame(ENVELOPE));
     await tick();
@@ -1186,7 +1186,7 @@ async function proposed(repo: ReturnType<typeof scratchRepo>, patch: string, sto
     lock,
   );
   hub.subscribe(sub.res);
-  hub.start('c-1');
+  hub.start({ commentId: 'c-1' });
   await until(() => child.written.length > 0);
   child.emit(resultFrame({ ...ENVELOPE, patch }));
   await until(() => hub.snapshot().phase === 'awaiting-input');

@@ -24,6 +24,8 @@ import { handleFilesRequest } from './routes/files';
 import { handleGitRequest } from './routes/git';
 import { createApplyHub } from './routes/apply';
 import { createReviewHub, handleReviewRequest } from './routes/review';
+import { sharedRunLock } from './routes/run-lock';
+import { createReviewSessionOpsSelector } from '../collaboration/review-session-collab';
 import { createCollabRoutes } from './routes/collab';
 import { createCollabWiring } from './routes/collab-wiring';
 import { collaborationFromOrigin } from '../collaboration/open';
@@ -372,7 +374,14 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       // Interactive review sessions (R-8.1). Same shared-lock slot as the apply hub —
       // `sharedRunLock` by default — so one of the two runs at a time. The host does
       // nothing but slice the prefix and hand the request to the shared handler (R-8.2).
-      const reviewHub = createReviewHub(() => ({ cwd: specsRoot, comments }));
+      // The third argument is the local/collab arm selector (EARS Unit 9). It is passed
+      // rather than defaulted so a collaborative start reaches the collaborative
+      // implementation; `review.ts` itself neither imports it nor knows it exists.
+      const reviewHub = createReviewHub(
+        () => ({ cwd: specsRoot, comments }),
+        sharedRunLock,
+        createReviewSessionOpsSelector({ documents: () => fsCollaborationStore(specsRoot) }),
+      );
       server.middlewares.use('/__vs/review', (req, res) => {
         void (async () => {
           try {

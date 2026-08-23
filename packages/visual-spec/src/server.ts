@@ -36,6 +36,8 @@ import { handleFilesRequest } from '../core/vite/routes/files';
 import { handleGitRequest } from '../core/vite/routes/git';
 import { createApplyHub } from '../core/vite/routes/apply';
 import { createReviewHub, handleReviewRequest } from '../core/vite/routes/review';
+import { sharedRunLock } from '../core/vite/routes/run-lock';
+import { createReviewSessionOpsSelector } from '../core/collaboration/review-session-collab';
 import { createCollabRoutes } from '../core/vite/routes/collab';
 import { createCollabWiring } from '../core/vite/routes/collab-wiring';
 import { createJobHubRegistry } from '../core/collaboration/job-hub';
@@ -170,7 +172,14 @@ export function createVisualSpecServer(opts: ServeOptions) {
   const applyHub = createApplyHub(() => ({ cwd: contentDir, comments }));
   // Interactive review sessions (R-8.1), sharing the apply hub's single slot through
   // `sharedRunLock`. Same thunk discipline, and the same handler the Vite host uses.
-  const reviewHub = createReviewHub(() => ({ cwd: contentDir, comments }));
+  // The third argument is the local/collab arm selector (EARS Unit 9). It is passed
+  // rather than defaulted so a collaborative start reaches the collaborative
+  // implementation; `review.ts` itself neither imports it nor knows it exists.
+  const reviewHub = createReviewHub(
+    () => ({ cwd: contentDir, comments }),
+    sharedRunLock,
+    createReviewSessionOpsSelector({ documents: () => fsCollaborationStore(contentDir) }),
+  );
   // Collaboration (R-7.1). One job registry per server, never module-level. The route
   // layer is shared with the Vite host verbatim (R-7.6): both hosts do nothing but slice
   // the prefix off the path and hand the request to `collab.handle`. With no

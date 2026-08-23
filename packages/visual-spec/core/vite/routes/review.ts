@@ -30,7 +30,24 @@
  * fallback exists at all. Threading a `mode` string through the route body, the hub and
  * the write path produces `if (mode === 'collab')` at five sites. `ReviewSessionOps`
  * below is that difference, named once; the hub calls it and never asks which arm it
- * holds. Two members, two implementations, no registry — Phase C adds the second one.
+ * holds. Two members, two implementations, no registry.
+ *
+ * WHAT THE SECOND IMPLEMENTATION COST THIS MODULE, exactly. Nothing in the control flow:
+ * there is no `if` anywhere below that asks which arm is running, and the collaborative
+ * implementation lives in `core/collaboration/`, which this module does not import and
+ * `local-mode.regression.test.ts` (R-10.5) forbids it to. What it did cost is three
+ * widenings of the seam, each because the interface as first written could only describe
+ * an arm whose comment came from the same store the hub already had:
+ *
+ *   1. `resolve` takes the whole start request, not an id. A comment that exists only in
+ *      a client's projection has to arrive with the request (R-8.8).
+ *   2. `makeOps` runs per session, not per hub. The request is what says which arm, and
+ *      one hub serves both.
+ *   3. `finish` returns frames to broadcast, and `admitPatch` may refuse a write. An arm
+ *      whose completion means something else, and whose writes are confined to one file,
+ *      needed somewhere to say so that was not a branch here.
+ *
+ * All three are additive and the hub reads none of their contents.
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -84,6 +101,13 @@ export type ReviewEvent =
    * could arrive dressed as this frame.
    */
   | { type: 'applied'; commentId: string; path: string; result: string }
+  /**
+   * A terminal handoff a session arm may ask for on completion, naming the document it
+   * finished with. The hub does not construct this frame and does not know which arm
+   * produces it: `finish()` returns the frames it wants broadcast and the hub broadcasts
+   * them, which is why adding a second terminal outcome needed no branch here.
+   */
+  | { type: 'ready-to-publish'; documentPath: string }
   | { type: 'ended'; ok: boolean; reason: ReviewEndReason; exitCode?: number | null };
 
 /** Where a session is in its lifecycle. */
@@ -122,13 +146,34 @@ export type ResolvedComment = {
   snippet?: string;
   endSnippet?: string;
   heading?: string | null;
+  /**
+   * The collaborative anchor, when the session has one. The hub never reads it — it exists
+   * so the prompt can render it (`review-prompt.ts` already takes this shape) and so the
+   * arm that produced it can read its own anchor back out of the resolved comment.
+   */
+  collab?: { nodeId?: string };
 };
+
+/**
+ * Everything the client sent to start a session, kept opaque.
+ *
+ * `commentId` is the one field the hub itself uses, for the status snapshot and the
+ * `review-start` frame. Everything else travels through untouched to `ops.resolve`,
+ * because what an arm needs to identify its comment is the arm's business: the local one
+ * needs nothing but the id, and a comment that exists only in a client's projection needs
+ * the projection to come with it (R-8.8). Widening this to an opaque record is what let
+ * the second arm arrive without the hub learning anything about it.
+ */
+export type ReviewStartRequest = { commentId: string; [key: string]: unknown };
 
 /** The located target plus the state pinned at propose time, which `checkDrift` compares. */
 export type LocatedTarget = { path: string; startLine?: number; pin: string | null };
 
 /** Drift is a yes/no with a sentence the UI can show; the reason differs per arm. */
 export type DriftCheck = { drifted: false } | { drifted: true; reason: string };
+
+/** Whether an arm allows this patch to be written at all. */
+export type PatchAdmission = { ok: true } | { ok: false; reason: string };
 
 /** What the session records when it completes. */
 export type ReviewOutcome = { result: string };
@@ -139,14 +184,33 @@ export type ReviewOutcome = { result: string };
  * not change.
  */
 export interface ReviewSessionOps {
-  /** Comment source. Local reads the sidecar; collab is handed the projected record. */
-  resolve(commentId: string): Promise<ResolvedComment | null>;
+  /**
+   * Comment source. Local reads the sidecar by id; the other arm is handed its record on
+   * the request, which is why this takes the whole start payload rather than an id.
+   */
+  resolve(request: ReviewStartRequest): Promise<ResolvedComment | null>;
   /** Target resolution. Local is path + snippet/heading; collab is an exact node lookup. */
   locate(comment: ResolvedComment): Promise<LocatedTarget | null>;
   /** Staleness. Local compares the pinned target bytes; collab compares the branch head. */
   checkDrift(located: LocatedTarget): Promise<DriftCheck>;
-  /** Terminal state. Local flips the comment to `applied`; collab writes no status at all. */
-  finish(comment: ResolvedComment, outcome: ReviewOutcome): Promise<void>;
+  /**
+   * Which files this arm allows the approved patch to touch, checked before anything is
+   * written. Optional: an arm with no confinement rule omits it and every patch is
+   * admitted, which is the local answer — the patch is a diff over the workspace the user
+   * is already editing directly.
+   *
+   * It exists because an arm whose confinement is a *requirement* cannot rest it on the
+   * prompt. The prompt shapes what a model proposes; this decides what the server writes.
+   */
+  admitPatch?(patch: string): PatchAdmission;
+  /**
+   * Terminal state. Local flips the comment to `applied`; collab writes no status at all.
+   *
+   * The returned frames are broadcast as-is. That is how an arm gets a terminal signal of
+   * its own without the hub gaining a branch: it returns the frame it wants and the hub
+   * neither builds it nor reads it.
+   */
+  finish(comment: ResolvedComment, outcome: ReviewOutcome): Promise<ReviewEvent[] | void>;
   /** Whether the scoped re-derive pass exists as a fallback. Local yes, collab no. */
   readonly fallbackAvailable: boolean;
   /**
@@ -394,9 +458,9 @@ export function createLocalSessionOps(getDeps: () => ReviewDeps): ReviewSessionO
     // The sidecar only ever holds local comments, so a comment resolved from it is local
     // by construction — this is the origin, not a guess at it (R-3.8).
     promptMode: { mode: 'local' },
-    async resolve(commentId) {
+    async resolve(request) {
       const doc = await getDeps().comments.read();
-      const c = doc.comments.find((r) => r.id === commentId);
+      const c = doc.comments.find((r) => r.id === request.commentId);
       if (!c) return null;
       return {
         id: c.id,
@@ -442,7 +506,7 @@ export function createLocalSessionOps(getDeps: () => ReviewDeps): ReviewSessionO
 export interface ReviewHub {
   /** Attach an SSE subscriber (writes headers + a `sync` snapshot, then streams). */
   subscribe(res: ServerResponse): void;
-  start(commentId: string | undefined): RouteResult;
+  start(request: ReviewStartRequest | null): RouteResult;
   message(text: string | undefined): RouteResult;
   /** Async because it writes: the patch application is a real subprocess (R-6.2). */
   approve(): Promise<RouteResult>;
@@ -468,7 +532,16 @@ export interface ReviewHub {
 export function createReviewHub(
   getDeps: () => ReviewDeps,
   lock: RunLock = sharedRunLock,
-  makeOps: (getDeps: () => ReviewDeps) => ReviewSessionOps = createLocalSessionOps,
+  /**
+   * Which operations this session runs on, chosen per session from the start request.
+   *
+   * It is per session rather than per hub because the request is what says which kind of
+   * comment is being reviewed, and the hub has exactly one slot shared by both kinds.
+   * Binding it once at construction — as this did while there was only one arm — would
+   * have forced the choice to be made where the hub could see it. The hub still never
+   * asks: it calls the selector, holds what it gets, and reads only the interface.
+   */
+  makeOps: (getDeps: () => ReviewDeps, request: ReviewStartRequest) => ReviewSessionOps = createLocalSessionOps,
 ): ReviewHub {
   let events: ReviewEvent[] = [];
   let phase: ReviewPhase = 'idle';
@@ -498,7 +571,9 @@ export function createReviewHub(
   let approving = false;
   let idleTimer: TimerHandle | null = null;
   const subs = new Set<ServerResponse>();
-  const ops = makeOps(getDeps);
+  /** The current session's operations. Null between sessions; set by `start`, never read
+   *  outside one — every reader below is already behind a "there is a session" guard. */
+  let ops: ReviewSessionOps | null = null;
 
   const frame = (res: ServerResponse, f: ReviewEvent | ReviewSync) => {
     if (!res.writableEnded) res.write(`data: ${JSON.stringify(f)}\n\n`);
@@ -548,6 +623,7 @@ export function createReviewHub(
     located = null;
     comment = null;
     proposal = null;
+    ops = null;
     broadcast({ type: 'ended', ok, reason, ...(exitCode !== undefined ? { exitCode } : {}) });
     lock.release('review');
   };
@@ -616,19 +692,20 @@ export function createReviewHub(
    */
   const onDrift = async (reason: string): Promise<RouteResult> => {
     broadcast({ type: 'drift', message: reason });
-    if (comment) located = (await ops.locate(comment)) ?? located;
+    if (comment && ops) located = (await ops.locate(comment)) ?? located;
     return { status: 409, json: { error: reason, code: 'drift' } };
   };
 
   /** Resolve → locate → spawn. Any failure ends the session and frees the slot. */
-  const begin = async (id: string) => {
+  const begin = async (request: ReviewStartRequest, sessionOps: ReviewSessionOps) => {
     const deps = getDeps();
-    const resolved = await ops.resolve(id);
+    const id = request.commentId;
+    const resolved = await sessionOps.resolve(request);
     if (!resolved) {
       broadcast({ type: 'error', message: `no comment with id ${id}` });
       return end(false, 'error');
     }
-    const target = await ops.locate(resolved);
+    const target = await sessionOps.locate(resolved);
     if (!target) {
       broadcast({ type: 'error', message: `could not locate the target of ${id}` });
       return end(false, 'error');
@@ -646,7 +723,7 @@ export function createReviewHub(
     // The opening turn: one comment, its anchor, and what the proposal must contain. The
     // arm is the ops implementation's, not a field on the request (R-3.8) — nothing above
     // this line knows whether the session is local or collaborative.
-    child.stdin?.write(userTurnFrame(buildReviewPrompt(resolved, ops.promptMode)));
+    child.stdin?.write(userTurnFrame(buildReviewPrompt(resolved, sessionOps.promptMode)));
   };
 
   return {
@@ -668,7 +745,8 @@ export function createReviewHub(
       });
     },
 
-    start(id) {
+    start(request) {
+      const id = request?.commentId;
       if (!id) return { status: 400, json: { error: 'missing commentId' } };
       // R-3.4 / R-8.5: one slot for review and bulk apply together, and the 409 names
       // which of the two holds it.
@@ -677,9 +755,14 @@ export function createReviewHub(
       phase = 'proposing';
       commentId = id;
       startedAt = (getDeps().now ?? Date.now)();
+      // The arm is chosen here and nowhere else, from the request the client sent. What
+      // makes it a choice rather than a branch is that the result is only ever used
+      // through `ReviewSessionOps` — nothing below reads which one came back.
+      const sessionOps = makeOps(getDeps, request as ReviewStartRequest);
+      ops = sessionOps;
       broadcast({ type: 'review-start', commentId: id, startedAt });
       armIdle();
-      void begin(id).catch((err) => {
+      void begin(request as ReviewStartRequest, sessionOps).catch((err) => {
         broadcast({ type: 'error', message: (err as Error).message });
         end(false, 'error');
       });
@@ -720,7 +803,8 @@ export function createReviewHub(
       const guard = noSession(phase);
       if (guard) return guard;
       if (!childAlive) return deadSession();
-      if (!located || !comment) return deadSession();
+      if (!located || !comment || !ops) return deadSession();
+      const sessionOps = ops;
       // Nothing to approve until a turn has produced an envelope: approval means "apply
       // this patch", and with no patch there is nothing that could be applied without
       // re-deriving the change — which is the defect the envelope exists to prevent.
@@ -740,9 +824,18 @@ export function createReviewHub(
         // under this proposal" without spawning anything, so the common drift case costs a
         // read rather than a subprocess. The patch refusing to apply (below) is the
         // primary, unfakeable signal; this one just runs first.
-        const d = await ops.checkDrift(target);
+        const d = await sessionOps.checkDrift(target);
         if (d.drifted) return await onDrift(d.reason);
         if (phase === 'ended') return deadSession();
+
+        // What this arm allows to be written, decided before anything is. A refusal is
+        // not drift — the file did not move, the patch reaches somewhere it may not go —
+        // so it is reported as its own refusal rather than as a re-approval prompt.
+        const admitted = sessionOps.admitPatch?.(patch) ?? { ok: true as const };
+        if (!admitted.ok) {
+          broadcast({ type: 'error', message: admitted.reason });
+          return { status: 409, json: { error: admitted.reason, code: 'patch-refused' } };
+        }
 
         const deps = getDeps();
         const applied = await applyPatch(deps.execGit ?? defaultExecGit, deps.cwd, patch);
@@ -756,10 +849,12 @@ export function createReviewHub(
         // This is deliberately NOT the bulk pass's post-run sweep (`apply.ts`), which
         // stamps every resultless applied record in the whole store.
         const result = (strategy ? `Applied the approved patch: ${strategy}` : 'Applied the approved patch.').slice(0, 500);
-        await ops.finish(approved, { result });
+        const extra = (await sessionOps.finish(approved, { result })) ?? [];
 
         // R-6.5: the client's cue that the document and the sidebar are stale.
         broadcast({ type: 'applied', commentId: approved.id, path: approved.path, result });
+        // Whatever else this arm's completion means. The hub does not read these.
+        for (const f of extra) broadcast(f);
         // R-6.6: the session is over — the child goes, the slot goes back.
         childAlive = false;
         child?.kill?.('SIGKILL');
@@ -843,7 +938,10 @@ export function handleReviewRequest(hub: ReviewHub, req: ReviewRequest): ReviewR
   }
   if (req.method === 'POST' && sub === '/start') {
     const id = typeof req.body.commentId === 'string' ? req.body.commentId : undefined;
-    return hub.start(id);
+    // R-8.8 — the body travels whole. `commentId` is validated because the hub uses it;
+    // everything else is the session arm's to read and validate, and typing it here would
+    // mean this handler knowing what kinds of session exist.
+    return hub.start(id ? ({ ...req.body, commentId: id } as ReviewStartRequest) : null);
   }
   if (req.method === 'POST' && sub === '/message') {
     const text = typeof req.body.text === 'string' ? req.body.text : undefined;
