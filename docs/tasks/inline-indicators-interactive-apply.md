@@ -161,6 +161,12 @@ Source of truth: `docs/ears/inline-indicators-interactive-apply.md` (acceptance 
   - verify: cancel mid-propose → no write, lock free; close the only tab → session self-terminates after the idle bound; kill the child then `POST /message` → distinct dead-session status; restart the server → no proposal survives; `GET /__vs/review` with no session returns a snapshot rather than a conflict.
   - landed: core/vite/routes/review.ts (`DEFAULT_IDLE_TIMEOUT_MS`, injected `setTimer`/`clearTimer`/`idleTimeoutMs` on `ReviewDeps`, the `armIdle`/`clearIdle` bound, `childAlive`, `deadSession()`, the `idle` end reason), core/vite/routes/review.test.ts. R-7.1/R-7.2/R-7.4/R-7.8 were already carried by the single `end()` from B1.2; this story added the two exits that were missing. **R-7.6:** the bound is armed only while a session runs *and* no client is subscribed — a subscribing tab clears it, the last tab closing arms it, and a delivered turn re-arms it, so an abandoned tab reaps the session after 15 minutes (the `apply.ts` ceiling) instead of wedging the slot until a restart. Timers are injected the way `now` is, so the tests drive the clock rather than sleeping. **R-7.7:** `childAlive` drops in the `close`/`error` handlers *before* `end()` releases the lock, and the stdin write is guarded, so a turn delivered into a broken pipe answers `session-ended` (distinct from `no-session`) and frees the slot rather than throwing. **R-7.3:** unchanged and now asserted — a hub rebuilt over the same store starts blank, replays no events, and nothing about an in-flight proposal ever reached the sidecar.
 
+- [ ] B5.2 Wall-clock session ceiling (deps: B5.1, est: ~40m)
+  - why: R-7.6's bound is a conjunction — no subscriber **and** no input — so a session with a tab open and a silent user holds the shared `RunLock` forever, and because the lock is global that blocks bulk apply too. The idle reaper cannot close this; it needs an unconditional ceiling.
+  - acceptance: R-7.9 — a session running past a bounded lifetime is terminated and the lock released, regardless of subscribers or input. Reuse the injected timer seam `B5.1` already added; give the end a reason distinguishable from `idle` and from a crash.
+  - verify: with a subscriber attached and turns arriving steadily, advance the injected clock past the ceiling → the session ends, the lock frees, and the frame reason is neither `idle` nor `error`.
+  - landed:
+
 ## Phase B — Review UI
 
 - [x] B6.1 Per-comment review entry point (deps: B2.2, est: ~1h)

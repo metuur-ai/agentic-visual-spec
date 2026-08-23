@@ -70,6 +70,7 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 | R-4.5 | WHILE producing a proposal, THE SYSTEM SHALL present the expected changes as a diff before any changes are applied, and that diff SHALL be the applicable patch referenced by R-6.2 rather than a separate narration of it. |
 | R-4.6 | WHILE producing a proposal, THE SYSTEM SHALL present an estimate of the impact on surrounding content or related files. |
 | R-4.7 | THE SYSTEM SHALL produce the proposal without writing to any target file. |
+| R-4.8 | WHILE presenting a proposal for approval, THE SYSTEM SHALL render the patch as a per-file, per-line diff in which each line's effect on the file is distinguishable without relying on colour. |
 
 ---
 
@@ -98,9 +99,10 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 | R-6.4 | WHERE the comment is local, WHEN an approved change is applied, THE SYSTEM SHALL set the comment `status` to `applied` and write a non-empty `result` summary in the same update. |
 | R-6.5 | WHEN an approved change is applied, THE SYSTEM SHALL cause the displayed document and the sidebar to refresh to reflect the change. |
 | R-6.6 | WHEN a review session completes (applied or cancelled), THE SYSTEM SHALL end the session and release the shared single-session lock. |
-| R-6.7 | THE SYSTEM SHALL keep `CommentStatus` a two-value union of `open` and `applied`, and SHALL NOT persist an in-progress proposal, transcript, or intermediate status to the comment sidecar or to a GitHub comment body. |
+| R-6.7 | THE SYSTEM SHALL keep `CommentStatus` a two-value union of `open` and `applied`, SHALL reject a comment status outside that union at the write boundary, and SHALL NOT persist an in-progress proposal, transcript, or intermediate status to the comment sidecar or to a GitHub comment body. |
 | R-6.8 | IF the system writes by any path that re-derives the change rather than applying the approved patch, THE SYSTEM SHALL NOT represent the result to the user as the approved diff, and SHALL surface that the applied change was regenerated. |
 | R-6.9 | WHEN a single-comment approval is applied, THE SYSTEM SHALL confine every comment-record mutation to that comment, and SHALL NOT modify the `status` or `result` of any other record. |
+| R-6.10 | WHEN a scoped bulk apply completes, THE SYSTEM SHALL confine every comment-record mutation to the comments named in that run. |
 
 ---
 
@@ -118,6 +120,7 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 | R-7.6 | WHILE a review session is active with no subscribed client and no input for a bounded idle period, THE SYSTEM SHALL terminate the process and release the shared single-session lock. |
 | R-7.7 | WHEN a `message` or `approve` request arrives after the process has died but before the session slot is released, THE SYSTEM SHALL respond with a status distinguishable from "no active session". |
 | R-7.8 | WHEN the process terminates for any reason (cancel, crash, idle timeout, completion), THE SYSTEM SHALL release the shared single-session lock. |
+| R-7.9 | WHILE a review session has been running for longer than a bounded lifetime, THE SYSTEM SHALL terminate it and release the shared single-session lock, regardless of whether a client is subscribed or input is arriving. |
 
 ---
 
