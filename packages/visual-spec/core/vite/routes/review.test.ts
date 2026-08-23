@@ -6,6 +6,7 @@
  * `/__vs/review`), R-8.2 (both hosts register them), R-8.6 (the apply stream-json reader,
  * not a second one).
  */
+import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -33,6 +34,7 @@ import {
   userTurnFrame,
 } from './review';
 import { createRunLock } from './run-lock';
+import { defaultExecGit } from '../../git-context';
 
 const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -130,8 +132,23 @@ function fakeRes() {
   };
 }
 
+/**
+ * The default `git` for a session test: one that refuses the patch. No test in this file
+ * may reach the real `git` by accident — an approval applies a patch, and a patch applied
+ * against whatever `cwd` happens to be is a write to somebody's machine. The real
+ * executor is used only by the suite below that builds a repository to be written to.
+ */
+const refusingGit = async () => ({ stdout: '', exitCode: 1 });
+
 function deps(over: Partial<ReviewDeps> = {}): ReviewDeps {
-  return { cwd: '/tmp', comments: memoryStore([rec('c-1')]), readTargetFile: async () => 'hello\n', now: () => 1000, ...over };
+  return {
+    cwd: '/tmp',
+    comments: memoryStore([rec('c-1')]),
+    readTargetFile: async () => 'hello\n',
+    now: () => 1000,
+    execGit: refusingGit,
+    ...over,
+  };
 }
 
 const tick = () => new Promise((r) => setImmediate(r));
@@ -280,7 +297,7 @@ describe('the /__vs/review route surface (R-8.1)', () => {
     await tick();
     expect(call(hub, 'POST', '/message', { text: 'shorter please' })).toEqual({ status: 200, json: { ok: true } });
     expect(child.written.join('')).toContain('shorter please');
-    expect((call(hub, 'POST', '/approve') as { status: number }).status).toBe(409);
+    expect(((await call(hub, 'POST', '/approve')) as { status: number }).status).toBe(409);
     expect(call(hub, 'POST', '/cancel')).toEqual({ status: 200, json: { ok: true } });
   });
 
@@ -290,10 +307,10 @@ describe('the /__vs/review route surface (R-8.1)', () => {
     expect(call(hub, 'POST', '/start', {})).toMatchObject({ status: 400 });
   });
 
-  it('message/approve/cancel with no session conflict rather than starting work (R-7.5)', () => {
+  it('message/approve/cancel with no session conflict rather than starting work (R-7.5)', async () => {
     const hub = createReviewHub(() => deps(), createRunLock());
     for (const path of ['/message', '/approve', '/cancel']) {
-      expect(call(hub, 'POST', path, { text: 'x' })).toEqual({
+      expect(await call(hub, 'POST', path, { text: 'x' })).toEqual({
         status: 409,
         json: { error: 'no active review session', code: 'no-session' },
       });
@@ -641,13 +658,14 @@ describe('the proposal envelope reaches subscribers (R-4.1–R-4.6)', () => {
     const hub = createReviewHub(() => deps({ spawnSession: () => child }), createRunLock());
     hub.start('c-1');
     await tick();
-    expect(hub.approve()).toMatchObject({ status: 409, json: { code: 'no-proposal' } });
+    expect(await hub.approve()).toMatchObject({ status: 409, json: { code: 'no-proposal' } });
 
     child.emit(resultFrame(ENVELOPE));
     await tick();
-    // The write is B4.1. What must not happen in the meantime is a write that re-derives
-    // the change and presents it as the approved diff (R-6.2, R-6.8).
-    expect(hub.approve()).toMatchObject({ status: 501, json: { code: 'not-implemented' } });
+    // …and with one, approval applies *that patch*. Nothing on this path re-derives the
+    // change (R-6.2, R-6.8): the write below is a `git apply`, so a target the patch does
+    // not fit answers `drift` rather than quietly regenerating something that does.
+    expect(await hub.approve()).toMatchObject({ status: 409, json: { code: 'drift' } });
   });
 });
 
@@ -854,7 +872,7 @@ describe('follow-up turns refine the proposal (R-5.1, R-5.2, R-5.3)', () => {
     await tick();
 
     // Still an approvable proposal — `no-proposal` here would mean the prose turn cleared it.
-    expect(hub.approve()).toMatchObject({ status: 501, json: { code: 'not-implemented' } });
+    expect(await hub.approve()).toMatchObject({ status: 409, json: { code: 'drift' } });
   });
 });
 
@@ -1043,7 +1061,7 @@ describe('the dead-child race (R-7.7)', () => {
     // Same 409 either way, but a code the UI can act on: "your session died" ≠ "there
     // was never one" — and approve does not fall through to the 501 write path.
     for (const call of [() => hub.message('x'), () => hub.approve()]) {
-      expect(call()).toEqual({ status: 409, json: { error: 'the review session has ended', code: 'session-ended' } });
+      expect(await call()).toEqual({ status: 409, json: { error: 'the review session has ended', code: 'session-ended' } });
     }
     expect(createReviewHub(() => deps(), createRunLock()).message('x')).toMatchObject({ json: { code: 'no-session' } });
   });
@@ -1067,7 +1085,7 @@ describe('with no session, only message/approve/cancel conflict (R-7.5)', () => 
     await tick();
     hub.cancel();
     for (const path of ['/message', '/approve', '/cancel']) {
-      expect(call(hub, 'POST', path, { text: 'x' })).toMatchObject({ status: 409, json: { code: 'session-ended' } });
+      expect(await call(hub, 'POST', path, { text: 'x' })).toMatchObject({ status: 409, json: { code: 'session-ended' } });
     }
     // …while the status endpoint keeps answering with a snapshot (R-7.5, second sentence).
     expect(call(hub, 'GET', '')).toMatchObject({ status: 200 });
@@ -1084,7 +1102,7 @@ describe('session state is memory-only (R-7.3)', () => {
     await tick();
     child.emit(resultFrame(ENVELOPE));
     await tick();
-    expect(hub.approve()).toMatchObject({ status: 501 }); // there *is* a proposal in flight
+    expect(await hub.approve()).toMatchObject({ json: { code: 'drift' } }); // there *is* a proposal in flight
 
     // The process goes away mid-review: the child dies, and a new server builds new hubs.
     child.kill?.('SIGKILL');
@@ -1095,11 +1113,293 @@ describe('session state is memory-only (R-7.3)', () => {
     expect(restarted.snapshot()).toEqual({ running: false, phase: 'idle', commentId: null, startedAt: null });
     // No proposal survived — the follow-on hub has nothing to approve, and says so as
     // "no session" rather than "no proposal yet", because the session itself is gone.
-    expect(restarted.approve()).toMatchObject({ json: { code: 'no-session' } });
+    expect(await restarted.approve()).toMatchObject({ json: { code: 'no-session' } });
     const sub = fakeRes();
     restarted.subscribe(sub.res);
     expect((sub.frames()[0] as ReviewSync).events).toEqual([]);
     // …and nothing about the in-flight proposal was ever written to the sidecar (R-6.7).
     expect((await store.read()).comments).toEqual([rec('c-1')]);
+  });
+});
+
+/* ================================================================== *
+ * B4.1 / B4.2 / B4.3 — approval applies the approved patch
+ * ================================================================== *
+ *
+ * The whole feature exists for these tests. A proposal produced in plan mode describes a
+ * change the model never made; if approval re-derives that change, the user approves run A
+ * and receives run B and nothing detects it. So the assertions here are about *bytes*:
+ * what is on disk after approval must be what the approved patch says, and a re-derived
+ * change of the same comment must be visibly different — otherwise the first assertion
+ * proves nothing.
+ *
+ * These run against a real temporary git repository (the pattern `review-prompt.test.ts`
+ * uses for `git apply --check`) and the real `defaultExecGit`, because a faked patcher
+ * would be asserting the fake.
+ */
+const BEFORE = '# heading\n\nThe widget is fast.\n\nIt has three modes.\n';
+
+/** What the user read and approved. */
+const APPROVED_PATCH =
+  'diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n@@ -1,5 +1,5 @@\n-# heading\n+# heading for reviewers\n \n The widget is fast.\n \n It has three modes.\n';
+const APPROVED_BYTES = '# heading for reviewers\n\nThe widget is fast.\n\nIt has three modes.\n';
+
+/**
+ * A second, equally plausible answer to the same comment — the negative control. This is
+ * what a fresh run *would* have produced: same intent, different bytes. If approval ever
+ * re-derives, the file ends up here instead, and the test above catches it.
+ */
+const REDERIVED_PATCH =
+  'diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n@@ -1,5 +1,5 @@\n-# heading\n+# Heading (for reviewers)\n \n The widget is fast.\n \n It has three modes.\n';
+const REDERIVED_BYTES = '# Heading (for reviewers)\n\nThe widget is fast.\n\nIt has three modes.\n';
+
+/** A scratch repository with one committed target file. */
+function scratchRepo(content = BEFORE) {
+  const dir = mkdtempSync(join(tmpdir(), 'vs-review-approve-'));
+  writeFileSync(join(dir, 'a.md'), content);
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' });
+  git('init', '-q');
+  git('add', '-A');
+  git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
+  return {
+    dir,
+    read: () => readFileSync(join(dir, 'a.md'), 'utf8'),
+    write: (text: string) => writeFileSync(join(dir, 'a.md'), text),
+    dispose: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+/** A session parked at `awaiting-input` with `patch` on the table, over a real repo. */
+async function proposed(repo: ReturnType<typeof scratchRepo>, patch: string, store?: CommentDocStore, lock = createRunLock()) {
+  const child = liveChild();
+  const sub = fakeRes();
+  const hub = createReviewHub(
+    () => ({
+      cwd: repo.dir,
+      comments: store ?? memoryStore([rec('c-1')]),
+      spawnSession: () => child,
+      // The real filesystem and the real `git`: the pin and the write are the ones that ship.
+      readTargetFile: undefined,
+      execGit: defaultExecGit,
+      now: () => 1000,
+    }),
+    lock,
+  );
+  hub.subscribe(sub.res);
+  hub.start('c-1');
+  await until(() => child.written.length > 0);
+  child.emit(resultFrame({ ...ENVELOPE, patch }));
+  await until(() => hub.snapshot().phase === 'awaiting-input');
+  return { hub, child, sub, lock };
+}
+
+describe('POST /review/approve applies the approved patch (B4.1, R-6.1, R-6.2)', () => {
+  it('the bytes on disk after approval are exactly what the approved patch says', async () => {
+    const repo = scratchRepo();
+    try {
+      const { hub } = await proposed(repo, APPROVED_PATCH);
+      expect(repo.read()).toBe(BEFORE); // nothing written before the approval (R-6.1)
+
+      expect(await hub.approve()).toMatchObject({ status: 200, json: { ok: true, commentId: 'c-1' } });
+      expect(repo.read()).toBe(APPROVED_BYTES);
+    } finally {
+      repo.dispose();
+    }
+  });
+
+  it('and a re-derived change of the same comment lands different bytes — the check is not vacuous', async () => {
+    // The negative control. Both patches address the same comment and both apply cleanly;
+    // they differ only in what they write. If approval regenerated the change instead of
+    // replaying it, the assertion above would still pass while the user got this file.
+    const repo = scratchRepo();
+    try {
+      const { hub } = await proposed(repo, REDERIVED_PATCH);
+      expect(await hub.approve()).toMatchObject({ status: 200 });
+      expect(repo.read()).toBe(REDERIVED_BYTES);
+      expect(REDERIVED_BYTES).not.toBe(APPROVED_BYTES);
+    } finally {
+      repo.dispose();
+    }
+  });
+
+  it('spawns nothing to write — the approval consults the patch, never the model', async () => {
+    const repo = scratchRepo();
+    try {
+      const { hub, child } = await proposed(repo, APPROVED_PATCH);
+      const turnsBefore = child.written.length;
+      await hub.approve();
+      // No new turn was pushed at the session, and no second session was started: the only
+      // subprocess an approval runs is `git apply`.
+      expect(child.written.length).toBe(turnsBefore);
+    } finally {
+      repo.dispose();
+    }
+  });
+
+  it('flips the comment to `applied` with a non-empty result in one update (R-6.4)', async () => {
+    const repo = scratchRepo();
+    const store = memoryStore([rec('c-1')]);
+    try {
+      const { hub } = await proposed(repo, APPROVED_PATCH, store);
+      await hub.approve();
+      const [applied] = (await store.read()).comments;
+      expect(applied.status).toBe('applied');
+      expect(applied.result).toBeTruthy();
+      expect(applied.result).toContain(ENVELOPE.strategy);
+    } finally {
+      repo.dispose();
+    }
+  });
+
+  it('touches no other comment record (R-6.9)', async () => {
+    // The guard for `apply.ts`'s post-run sweep, which stamps `Applied successfully.` onto
+    // EVERY resultless applied comment in the store rather than the run's own ids. A
+    // single-comment approval that inherited that behaviour would silently rewrite the
+    // history of comments the user never approved.
+    const repo = scratchRepo();
+    const untouched: CommentRecord[] = [
+      { ...rec('c-2', 'b.md'), status: 'applied' }, // applied, deliberately with NO result
+      { ...rec('c-3', 'c.md'), status: 'applied', result: 'done by hand' },
+      rec('c-4', 'd.md'),
+    ];
+    const store = memoryStore([rec('c-1'), ...untouched]);
+    try {
+      const { hub } = await proposed(repo, APPROVED_PATCH, store);
+      await hub.approve();
+      const after = (await store.read()).comments;
+      expect(after.filter((c) => c.id !== 'c-1')).toEqual(untouched);
+      expect(after.find((c) => c.id === 'c-2')?.result).toBeUndefined();
+    } finally {
+      repo.dispose();
+    }
+  });
+
+  it('announces the write, ends the session and releases the shared slot (R-6.5, R-6.6)', async () => {
+    const repo = scratchRepo();
+    try {
+      const { hub, sub, lock } = await proposed(repo, APPROVED_PATCH);
+      await hub.approve();
+
+      // R-6.5: the frame a client turns into `vs:source-changed` + `vs:comments-changed`.
+      expect(sub.frames()).toContainEqual({
+        type: 'applied',
+        commentId: 'c-1',
+        path: 'a.md',
+        result: `Applied the approved patch: ${ENVELOPE.strategy}`,
+      });
+      // R-6.6: over, and distinguishable from a cancel or a crash.
+      expect(sub.frames()).toContainEqual({ type: 'ended', ok: true, reason: 'applied' });
+      expect(hub.snapshot().running).toBe(false);
+      expect(lock.heldBy()).toBe(null);
+    } finally {
+      repo.dispose();
+    }
+  });
+
+  it('refuses a second approval rather than applying the patch onto its own result', async () => {
+    const repo = scratchRepo();
+    try {
+      const { hub } = await proposed(repo, APPROVED_PATCH);
+      const [first, second] = await Promise.all([hub.approve(), hub.approve()]);
+      expect([first.status, second.status].sort()).toEqual([200, 409]);
+      expect(repo.read()).toBe(APPROVED_BYTES);
+    } finally {
+      repo.dispose();
+    }
+  });
+});
+
+describe('the drift gate (B4.2, R-6.3)', () => {
+  it('a target modified between propose and approve drifts, and nothing is written', async () => {
+    const repo = scratchRepo();
+    const store = memoryStore([rec('c-1')]);
+    try {
+      const { hub, sub } = await proposed(repo, APPROVED_PATCH, store);
+      const moved = '# heading\n\nThe widget is quick.\n\nIt has three modes.\n';
+      repo.write(moved);
+
+      expect(await hub.approve()).toMatchObject({ status: 409, json: { code: 'drift' } });
+      expect(sub.frames().some((f) => f.type === 'drift')).toBe(true);
+      // Nothing written: not the file…
+      expect(repo.read()).toBe(moved);
+      // …and not the comment.
+      expect((await store.read()).comments).toEqual([rec('c-1')]);
+      // The session survives, because R-6.3 asks for re-approval rather than a failure.
+      expect(hub.snapshot().running).toBe(true);
+    } finally {
+      repo.dispose();
+    }
+  });
+
+  it('a patch that no longer fits is refused by `git apply` itself, not only by the pin', async () => {
+    // The unfakeable half. The pin is bypassed here by re-locating first, so the ONLY
+    // thing standing between a stale patch and the file is the patcher refusing it.
+    const repo = scratchRepo();
+    try {
+      const { hub, child, sub } = await proposed(repo, APPROVED_PATCH);
+      repo.write('# something else entirely\n');
+      // A fresh turn re-pins the target… but still carries the stale patch.
+      hub.message('any update?');
+      child.emit(resultFrame({ ...ENVELOPE, patch: APPROVED_PATCH }));
+      await until(() => hub.snapshot().phase === 'awaiting-input');
+
+      expect(await hub.approve()).toMatchObject({ status: 409, json: { code: 'drift' } });
+      expect(sub.frames().filter((f) => f.type === 'drift')).not.toHaveLength(0);
+      expect(repo.read()).toBe('# something else entirely\n');
+    } finally {
+      repo.dispose();
+    }
+  });
+
+  it('re-approval succeeds once a fresh proposal is produced against the new content', async () => {
+    const repo = scratchRepo();
+    try {
+      const { hub, child } = await proposed(repo, APPROVED_PATCH);
+      const moved = '# heading\n\nThe widget is quick.\n\nIt has three modes.\n';
+      repo.write(moved);
+      expect(await hub.approve()).toMatchObject({ json: { code: 'drift' } });
+
+      // The user refines; the next turn's envelope is written against the file as it is now.
+      hub.message('the file changed — try again');
+      const fresh =
+        'diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n@@ -1,5 +1,5 @@\n-# heading\n+# heading for reviewers\n \n The widget is quick.\n \n It has three modes.\n';
+      child.emit(resultFrame({ ...ENVELOPE, patch: fresh }));
+      await until(() => hub.snapshot().phase === 'awaiting-input');
+
+      expect(await hub.approve()).toMatchObject({ status: 200 });
+      expect(repo.read()).toBe('# heading for reviewers\n\nThe widget is quick.\n\nIt has three modes.\n');
+    } finally {
+      repo.dispose();
+    }
+  });
+});
+
+describe('no re-deriving write exists to mislabel (B4.3, R-6.8)', () => {
+  /*
+   * R-6.8 is about a write that re-derives the change being presented as the approved
+   * diff. The scoped `/apply/start {ids:[id]}` fallback is the only such path, and it is
+   * deliberately NOT wired into the review hub: with `git apply` there is no edit a patch
+   * cannot express, so the fallback would buy nothing and cost the exact defect this
+   * feature exists to remove. R-6.8 is therefore satisfied by construction rather than by
+   * a label, and this test is what keeps it that way — wire the fallback in and it fails,
+   * which is the moment the labelling has to be built.
+   */
+  const source = () => readFileSync(resolve(pkgRoot, 'core/vite/routes/review.ts'), 'utf8');
+  /** Code only: the module's prose names the bulk pass precisely in order to reject it. */
+  const code = () => source().replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '');
+
+  it('the review hub never starts a bulk apply run', () => {
+    expect(code()).not.toMatch(/apply\/start|createApplyHub|runApply|buildApplyPrompt/);
+  });
+
+  it('the only write on the review path is the patch application', () => {
+    const text = code();
+    // The write is a `git apply` of the proposal's own patch, and the store update that
+    // records it. Nothing else in this module writes anything.
+    expect(text).toContain("await exec(['-C', cwd, 'apply', file])");
+    expect(text).toMatch(/applyPatch\(deps\.execGit \?\? defaultExecGit, deps\.cwd, patch\)/);
+    // Partial application would not be the approved diff; `git apply` is all-or-nothing
+    // only while nothing asks it for the other behaviour.
+    expect(text).not.toContain('--reject');
   });
 });

@@ -386,7 +386,7 @@ export function createVisualSpecServer(opts: ServeOptions) {
         // Interactive review sessions (R-8.1). The host slices the prefix and hands the
         // request to the shared handler — no review logic lives here (R-8.2).
         if (url.pathname === '/__vs/review' || url.pathname.startsWith('/__vs/review/')) {
-          const r = handleReviewRequest(reviewHub, {
+          const r = await handleReviewRequest(reviewHub, {
             method,
             pathname: url.pathname.slice('/__vs/review'.length),
             body: await readJsonBody(req),

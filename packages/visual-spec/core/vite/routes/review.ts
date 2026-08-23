@@ -3,7 +3,8 @@
  *
  * A review session is the *single-comment* counterpart to `routes/apply.ts`: the
  * user asks for one comment to be applied, gets a proposal back, refines it over
- * several turns, and only then authorises the write. Nothing here writes to disk.
+ * several turns, and only then authorises the write. The one write is `POST /approve`, and
+ * it writes by applying the approved patch — never by re-running the model.
  *
  *   GET  /__vs/review         → { running, startedAt, commentId } status snapshot
  *   GET  /__vs/review/events  → text/event-stream: a `sync` snapshot, then live frames
@@ -33,10 +34,12 @@
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
-import { isAbsolute, resolve as resolvePath } from 'node:path';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { setStatus } from '../../editing/comment-doc';
+import { defaultExecGit, type GitExecutor } from '../../git-context';
 import {
   buildReviewPrompt,
   type Proposal,
@@ -55,9 +58,10 @@ export type ReviewLogEvent = Exclude<ApplyEvent, { type: 'start' } | { type: 'do
 /**
  * Why a session ended — the UI messages cancel differently from a crash, and `idle`
  * differently from both: nobody asked for it, so it is neither the user's act nor a
- * failure of the child (R-7.6).
+ * failure of the child (R-7.6). `applied` is the one successful ending: the patch landed,
+ * so the session is over by completion rather than by any kind of stop (R-6.6).
  */
-export type ReviewEndReason = 'cancelled' | 'exit' | 'error' | 'idle';
+export type ReviewEndReason = 'cancelled' | 'exit' | 'error' | 'idle' | 'applied';
 
 /** A frame pushed to subscribers as it happens. */
 export type ReviewEvent =
@@ -69,6 +73,17 @@ export type ReviewEvent =
   | { type: 'proposal'; proposal: Proposal }
   | { type: 'awaiting-input' }
   | { type: 'drift'; message: string }
+  /**
+   * The approved patch landed. R-6.5's server half: this frame is what tells a client the
+   * document and the sidebar are now stale, and the review view turns it into the existing
+   * `vs:source-changed` / `vs:comments-changed` events (B6.2).
+   *
+   * R-6.8's server half too, by what it does *not* say: it reports the comment that was
+   * applied and the result recorded, and nothing on this path produces it except a real
+   * `git apply` of the approved patch. There is no second, re-deriving writer whose output
+   * could arrive dressed as this frame.
+   */
+  | { type: 'applied'; commentId: string; path: string; result: string }
   | { type: 'ended'; ok: boolean; reason: ReviewEndReason; exitCode?: number | null };
 
 /** Where a session is in its lifecycle. */
@@ -160,6 +175,12 @@ export interface ReviewDeps {
   spawnSession?: ReviewSpawn;
   /** Override target reads for tests; defaults to reading from disk under `cwd`. */
   readTargetFile?: ReadTargetFile;
+  /**
+   * How the approved patch is applied (R-6.2). The same `git` seam `core/git-context.ts`
+   * already owns — injectable there so a test can drive `ENOENT`, injectable here for the
+   * same reason. Note that this is the *only* writer on the review path.
+   */
+  execGit?: GitExecutor;
   now?: () => number;
   /**
    * R-7.6 — how long a session may sit with no subscribed client and no input before it
@@ -312,6 +333,48 @@ function pinOf(content: string | null): string | null {
   return content === null ? null : createHash('sha256').update(content).digest('hex');
 }
 
+/* ------------------------------------------------------------------ *
+ * The write (R-6.1, R-6.2, R-6.3)
+ * ------------------------------------------------------------------ */
+
+/** Either the approved patch landed, or it did not and the reason is showable. */
+export type PatchApplication = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Apply the approved patch — the whole write path of a review session.
+ *
+ * WHY THIS RATHER THAN A SECOND MODEL RUN. The proposal *is* the patch, so approving it
+ * and applying it are the same act on the same bytes. Re-deriving the change — spawning a
+ * fresh run over the comment, as the bulk pass does — would mean the user approves run A
+ * and receives run B, with nothing able to notice. `git apply` of the exact `patch` field
+ * the user read makes the approved artifact and the applied artifact one object.
+ *
+ * `git apply` is all-or-nothing: without `--reject` it validates every hunk before it
+ * writes anything, so a patch that no longer fits leaves the tree untouched and exits
+ * non-zero. That single exit code is therefore both the write and R-6.3's drift signal,
+ * and there is no partially-applied state in between to reconcile.
+ *
+ * The patch goes via a temp file because `GitExecutor` deliberately spawns with stdin
+ * `'ignore'` — the file is written outside `cwd` so a patch application can never see it.
+ */
+export async function applyPatch(exec: GitExecutor, cwd: string, patch: string): Promise<PatchApplication> {
+  const dir = await mkdtemp(join(tmpdir(), 'vs-review-apply-'));
+  try {
+    const file = join(dir, 'approved.patch');
+    // git rejects a patch with no trailing newline ("corrupt patch"); the model's field
+    // is prose-adjacent enough that the one it omits is the one it will omit.
+    await writeFile(file, patch.endsWith('\n') ? patch : `${patch}\n`, 'utf8');
+    const run = await exec(['-C', cwd, 'apply', file]);
+    if (run.exitCode === 0) return { ok: true };
+    // The reason stays generic on purpose: `GitExecutor` discards stderr (R-1.11 there),
+    // and git writes absolute paths into it. What the user needs is that the patch no
+    // longer fits, which is exactly what re-approval is for.
+    return { ok: false, reason: 'the approved patch no longer applies cleanly to the current content' };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 /**
  * The local arm. The comment comes from the sidecar, the target is the file it names,
  * drift is that file's bytes changing between propose and approve, the terminal state is
@@ -381,7 +444,8 @@ export interface ReviewHub {
   subscribe(res: ServerResponse): void;
   start(commentId: string | undefined): RouteResult;
   message(text: string | undefined): RouteResult;
-  approve(): RouteResult;
+  /** Async because it writes: the patch application is a real subprocess (R-6.2). */
+  approve(): Promise<RouteResult>;
   cancel(): RouteResult;
   snapshot(): { running: boolean; startedAt: number | null; commentId: string | null; phase: ReviewPhase };
 }
@@ -430,6 +494,8 @@ export function createReviewHub(
    * dead session rather than being written into a broken pipe.
    */
   let childAlive = false;
+  /** One approval at a time — see `approve()`. */
+  let approving = false;
   let idleTimer: TimerHandle | null = null;
   const subs = new Set<ServerResponse>();
   const ops = makeOps(getDeps);
@@ -541,6 +607,19 @@ export function createReviewHub(
     });
   };
 
+  /**
+   * R-6.3 — an approval that must not write. The session deliberately stays alive: the
+   * requirement is *re-approval*, so the user refines against the file as it is now and
+   * approves that. The pin is re-taken here for the same reason — leaving the propose-time
+   * pin standing would make every later approval drift against a file the next proposal
+   * was written for, and re-approval could never succeed.
+   */
+  const onDrift = async (reason: string): Promise<RouteResult> => {
+    broadcast({ type: 'drift', message: reason });
+    if (comment) located = (await ops.locate(comment)) ?? located;
+    return { status: 409, json: { error: reason, code: 'drift' } };
+  };
+
   /** Resolve → locate → spawn. Any failure ends the session and frees the slot. */
   const begin = async (id: string) => {
     const deps = getDeps();
@@ -631,7 +710,13 @@ export function createReviewHub(
       return { status: 200, json: { ok: true } };
     },
 
-    approve() {
+    /**
+     * R-6.1/R-6.2 — the only write on this path, and it writes by applying the patch the
+     * user just read. Nothing here re-derives anything: no process is spawned, no prompt
+     * is built, the model is not consulted. The bytes that land are the bytes of
+     * `proposal.patch`.
+     */
+    async approve() {
       const guard = noSession(phase);
       if (guard) return guard;
       if (!childAlive) return deadSession();
@@ -640,15 +725,49 @@ export function createReviewHub(
       // this patch", and with no patch there is nothing that could be applied without
       // re-deriving the change — which is the defect the envelope exists to prevent.
       if (!proposal) return { status: 409, json: { error: 'no proposal to approve yet', code: 'no-proposal' } };
-      // Drift is checked before anything is authorised, so a stale proposal cannot land.
-      const pinned = located;
-      void ops.checkDrift(pinned).then((d) => {
-        if (d.drifted) broadcast({ type: 'drift', message: d.reason });
-      });
-      // The write itself — `git apply` of `proposal.patch` through the GitExecutor — is
-      // B4.1. Refusing here is deliberate: the one thing that must never happen in the
-      // meantime is a write that re-derives the change and calls it the approved diff.
-      return { status: 501, json: { error: 'applying an approved patch is not implemented yet', code: 'not-implemented' } };
+      // Approval is now asynchronous, so two clicks can overlap. One approval, one write:
+      // the second is refused rather than applying the same patch onto its own result.
+      if (approving) return { status: 409, json: { error: 'an approval is already in flight', code: 'approving' } };
+      approving = true;
+      // Everything the write needs, read once: `end()` clears these, and the awaits below
+      // give the session several chances to end underneath us.
+      const target = located;
+      const approved = comment;
+      const patch = proposal.patch;
+      const strategy = proposal.strategy.trim();
+      try {
+        // R-6.3, cheap half. The SHA pin taken at propose time answers "did the file move
+        // under this proposal" without spawning anything, so the common drift case costs a
+        // read rather than a subprocess. The patch refusing to apply (below) is the
+        // primary, unfakeable signal; this one just runs first.
+        const d = await ops.checkDrift(target);
+        if (d.drifted) return await onDrift(d.reason);
+        if (phase === 'ended') return deadSession();
+
+        const deps = getDeps();
+        const applied = await applyPatch(deps.execGit ?? defaultExecGit, deps.cwd, patch);
+        // R-6.3, primary half. `git apply` refused, so nothing was written and the user is
+        // asked to approve again against a fresh proposal rather than being given a stale
+        // change silently reconciled into a different one.
+        if (!applied.ok) return await onDrift(applied.reason);
+
+        // R-6.4 — `applied` and a non-empty result in the same update. R-6.9 — `setStatus`
+        // rewrites exactly the one record, so no other comment's status or result moves.
+        // This is deliberately NOT the bulk pass's post-run sweep (`apply.ts`), which
+        // stamps every resultless applied record in the whole store.
+        const result = (strategy ? `Applied the approved patch: ${strategy}` : 'Applied the approved patch.').slice(0, 500);
+        await ops.finish(approved, { result });
+
+        // R-6.5: the client's cue that the document and the sidebar are stale.
+        broadcast({ type: 'applied', commentId: approved.id, path: approved.path, result });
+        // R-6.6: the session is over — the child goes, the slot goes back.
+        childAlive = false;
+        child?.kill?.('SIGKILL');
+        end(true, 'applied');
+        return { status: 200, json: { ok: true, commentId: approved.id, result } };
+      } finally {
+        approving = false;
+      }
     },
 
     cancel() {
@@ -708,7 +827,7 @@ export type ReviewRequest = {
  * path and call this, exactly as they do for `/__vs/collab` — so neither host owns any
  * review logic of its own and R-8.2 is one registration, twice.
  */
-export function handleReviewRequest(hub: ReviewHub, req: ReviewRequest): ReviewRouteResult {
+export function handleReviewRequest(hub: ReviewHub, req: ReviewRequest): ReviewRouteResult | Promise<ReviewRouteResult> {
   const sub = req.pathname === '/' ? '' : req.pathname;
   // R-8.9. A tab that reloads mid-session has to learn a session exists *before* it opens
   // an `EventSource` — the `sync` frame answers the same question but only to a client

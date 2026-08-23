@@ -378,7 +378,7 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
           try {
             const url = new URL(req.url ?? '', 'http://localhost');
             const body = await readJsonBody(req);
-            const r = handleReviewRequest(reviewHub, {
+            const r = await handleReviewRequest(reviewHub, {
               method: req.method ?? 'GET',
               pathname: url.pathname,
               body,
