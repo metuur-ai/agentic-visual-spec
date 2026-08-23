@@ -200,6 +200,32 @@ describe('runApply', () => {
     expect(c1?.result).toBeTruthy();
   });
 
+  it('the result stamp is confined to the run: an unrelated applied comment keeps its empty result', async () => {
+    // A scoped run over c-1 only. c-9 was applied by some earlier run and carries no
+    // result; it is not in `ids`, so nothing about this run may touch it.
+    const untouched = rec('c-9', 'applied');
+    const mem = memoryStore([rec('c-1'), untouched]);
+    const events: ApplyEvent[] = [];
+    await runApply(
+      {
+        cwd: '/tmp',
+        comments: mem.store,
+        now: () => 1000,
+        spawnClaude: () => fakeChild([], 0, () => mem.set([rec('c-1', 'applied'), untouched])),
+      },
+      (e) => events.push(e),
+      undefined,
+      ['c-1'],
+    );
+
+    const stored = await mem.store.read();
+    // The run's own comment still gets its server-generated result (R-1.5).
+    expect(stored.comments.find((c) => c.id === 'c-1')?.result).toBeTruthy();
+    // The bystander is byte-identical to how it was seeded.
+    expect(stored.comments.find((c) => c.id === 'c-9')).toEqual(untouched);
+    expect(stored.comments.find((c) => c.id === 'c-9')?.result).toBeUndefined();
+  });
+
   it('does not overwrite an existing result when the agent already set one', async () => {
     const withResult: CommentRecord = { ...rec('c-1', 'applied'), result: 'Agent-written result.' };
     const mem = memoryStore([{ ...rec('c-1'), status: 'open' }]);

@@ -214,8 +214,14 @@ export async function runApply(deps: ApplyDeps, emit: (e: ApplyEvent) => void, s
 
   // R-1.5: stamp a server-generated result on any applied comment that lacks one,
   // so the run never fails because the agent omitted the result field.
+  //
+  // Scoped to THIS run's comment set (`open`, already derived from `ids`). Filtering the
+  // whole store instead made a scoped run rewrite records it was never asked about: any
+  // comment left `applied` with no result by an earlier run — or by a hand edit — picked
+  // up this run's stamp. The run may only speak for the comments it was given.
+  const inRun = new Set(open.map((c) => c.id));
   const needsResult = after.comments.filter(
-    (c) => c.status === 'applied' && !c.result,
+    (c) => inRun.has(c.id) && c.status === 'applied' && !c.result,
   );
   if (needsResult.length > 0) {
     let patched = after;
