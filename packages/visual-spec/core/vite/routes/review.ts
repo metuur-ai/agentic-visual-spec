@@ -5,6 +5,7 @@
  * user asks for one comment to be applied, gets a proposal back, refines it over
  * several turns, and only then authorises the write. Nothing here writes to disk.
  *
+ *   GET  /__vs/review         → { running, startedAt, commentId } status snapshot
  *   GET  /__vs/review/events  → text/event-stream: a `sync` snapshot, then live frames
  *   POST /__vs/review/start   → begin a session (409 if the shared lock is held)
  *   POST /__vs/review/message → deliver a follow-up turn to the running session
@@ -30,6 +31,7 @@
  * below is that difference, named once; the hub calls it and never asks which arm it
  * holds. Two members, two implementations, no registry — Phase C adds the second one.
  */
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
@@ -50,6 +52,8 @@ export type ReviewEndReason = 'cancelled' | 'exit' | 'error';
 export type ReviewEvent =
   | ReviewLogEvent
   | { type: 'review-start'; commentId: string; startedAt: number }
+  /** A turn the user sent, echoed back by `--replay-user-messages` (R-8.7). */
+  | { type: 'user-turn'; text: string }
   | { type: 'awaiting-input' }
   | { type: 'drift'; message: string }
   | { type: 'ended'; ok: boolean; reason: ReviewEndReason; exitCode?: number | null };
@@ -118,7 +122,7 @@ export interface ReviewDeps {
   /** Directory the session runs in — the project root, where the sidecar lives. */
   cwd: string;
   comments: CommentDocStore;
-  /** Override the child for tests; absent means the transport is not wired yet. */
+  /** Override the child for tests; defaults to the real persistent `claude` session. */
   spawnSession?: ReviewSpawn;
   /** Override target reads for tests; defaults to reading from disk under `cwd`. */
   readTargetFile?: ReadTargetFile;
@@ -130,8 +134,85 @@ export interface ReviewChild extends ClaudeChild {
   stdin?: NodeJS.WritableStream | null;
 }
 
-/** Injected the way `apply.ts` injects `spawnClaude`. The real spawn lands in B1.3. */
+/** Injected the way `apply.ts` injects `spawnClaude`. */
 export type ReviewSpawn = (comment: ResolvedComment, cwd: string) => ReviewChild;
+
+/* ------------------------------------------------------------------ *
+ * The transport (R-3.3, R-3.7, R-8.3)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The CLI invocation a review session runs, spelled out so a test can assert it rather
+ * than infer it. Each flag is load-bearing:
+ *
+ * - `--print` + `--input-format stream-json` + `--output-format stream-json` (R-3.3):
+ *   a persistent process reading turns off stdin and emitting frames on stdout. Spike 0.1
+ *   confirmed the process survives its first `result` frame and answers a second turn on
+ *   the same session id, which is the whole basis for the multi-turn refine phase.
+ * - `--replay-user-messages` (R-8.7): the CLI echoes each delivered turn back on stdout,
+ *   so the user's own words land in the same ordered stream as the model's — one log,
+ *   not a client-side interleave of two sources.
+ * - `--permission-mode plan` (R-3.7, R-4.7): the edit gate, enforced at the permission
+ *   layer instead of by asking the model nicely. NOTE, from spike 0.1: plan mode is
+ *   *workspace*-scoped, not a process-wide no-write — the CLI still writes its own plan
+ *   files under `~/.claude/plans/`. The invariant to assert is that the target file and
+ *   the served directory are unchanged, never that zero writes happened anywhere.
+ * - `--verbose`: `--print` with stream-json output requires it.
+ *
+ * `ExitPlanMode` is not available in `--print` sessions (spike 0.1), so nothing here
+ * depends on the model calling it; approval is a server-side act (B4.1).
+ */
+export const REVIEW_CLI_ARGS: readonly string[] = [
+  '--print',
+  '--input-format',
+  'stream-json',
+  '--output-format',
+  'stream-json',
+  '--replay-user-messages',
+  '--permission-mode',
+  'plan',
+  '--verbose',
+];
+
+/**
+ * Spawn the persistent session. The one difference from `defaultSpawnClaude` that matters
+ * is `stdio[0]`: apply passes `'ignore'` because print mode takes its prompt as an
+ * argument and must never block on stdin, whereas a review session's stdin *is* the
+ * in-channel every follow-up turn travels down (R-8.3).
+ */
+export const defaultSpawnReviewSession: ReviewSpawn = (_comment, cwd) =>
+  spawn('claude', [...REVIEW_CLI_ARGS], { cwd, env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+
+/** One turn, in the frame shape spike 0.1 verified the CLI accepts on stdin. */
+export function userTurnFrame(text: string): string {
+  return `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } })}\n`;
+}
+
+/**
+ * `--replay-user-messages` echoes a delivered turn back as a `user` frame. `summarize()`
+ * reads `user` frames only for `tool_result` blocks (its `agent-done` lane), so the echoed
+ * text would fall on the floor and R-8.7's single ordered log would be missing half its
+ * turns. This pulls out that one field and hands every other frame shape to the shared
+ * reader untouched — it is a field accessor, not a second parser.
+ */
+export function replayedUserText(raw: string): string | null {
+  let ev: Record<string, unknown>;
+  try {
+    ev = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (ev.type !== 'user') return null;
+  const content = (ev.message as { content?: unknown } | undefined)?.content;
+  if (typeof content === 'string') return content.trim() || null;
+  if (!Array.isArray(content)) return null;
+  const text = (content as Array<Record<string, unknown>>)
+    .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+    .map((b) => String(b.text))
+    .join('\n')
+    .trim();
+  return text || null;
+}
 
 /** Read a target relative to `cwd`, returning null when it is gone. */
 function fsReader(cwd: string): ReadTargetFile {
@@ -272,6 +353,10 @@ export function createReviewHub(
         const line = buf.slice(0, nl).trim();
         buf = buf.slice(nl + 1);
         if (!line) continue;
+        // R-8.7: the replayed turn goes into the log at the position the CLI echoed it,
+        // ahead of whatever the same line yields through the shared reader.
+        const echoed = replayedUserText(line);
+        if (echoed) broadcast({ type: 'user-turn', text: echoed.slice(0, 2000) });
         for (const f of summarize(line)) {
           if (f.type === 'start' || f.type === 'done') continue; // apply-shaped, never emitted here
           broadcast(f);
@@ -304,18 +389,17 @@ export function createReviewHub(
     }
     comment = resolved;
     located = target;
-    // The transport itself is B1.3; until it is injected there is nothing to talk to.
-    if (!deps.spawnSession) {
-      broadcast({ type: 'error', message: 'review transport is not wired yet' });
-      return end(false, 'error');
-    }
     try {
-      child = deps.spawnSession(resolved, deps.cwd);
+      child = (deps.spawnSession ?? defaultSpawnReviewSession)(resolved, deps.cwd);
     } catch (err) {
       broadcast({ type: 'error', message: `Could not start claude: ${(err as Error).message}` });
       return end(false, 'error');
     }
     pipeOutput(child);
+    // The opening turn. The proposal prompt proper — interpretation, strategy, the
+    // applicable patch, the pinned envelope — is B2.1's `buildReviewPrompt`; this states
+    // the comment and its target so the transport is exercisable end to end before then.
+    child.stdin?.write(userTurnFrame(openingTurn(resolved)));
   };
 
   return {
@@ -353,7 +437,7 @@ export function createReviewHub(
       if (guard) return guard;
       if (!text) return { status: 400, json: { error: 'missing text' } };
       if (!child?.stdin) return { status: 409, json: { error: 'the review session has no input channel', code: 'session-ended' } };
-      child.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: text } })}\n`);
+      child.stdin.write(userTurnFrame(text));
       phase = 'proposing';
       return { status: 200, json: { ok: true } };
     },
@@ -384,6 +468,12 @@ export function createReviewHub(
       return { running: running(), startedAt, commentId, phase };
     },
   };
+}
+
+/** Interim opening turn — replaced by `buildReviewPrompt` in B2.1. */
+function openingTurn(c: ResolvedComment): string {
+  const where = c.startLine !== undefined ? `${c.path}:${c.startLine}` : c.path;
+  return `A reviewer left this comment on ${where}:\n\n${c.comment}\n\nRead the file and propose how you would address it. Do not edit anything yet.`;
 }
 
 /**
@@ -419,6 +509,14 @@ export type ReviewRequest = {
  */
 export function handleReviewRequest(hub: ReviewHub, req: ReviewRequest): ReviewRouteResult {
   const sub = req.pathname === '/' ? '' : req.pathname;
+  // R-8.9. A tab that reloads mid-session has to learn a session exists *before* it opens
+  // an `EventSource` — the `sync` frame answers the same question but only to a client
+  // that has already subscribed, and R-7.6's abandonment timer counts subscribers. Shape
+  // mirrors `GET /__vs/apply`, plus the comment id, since a review is about one comment.
+  if (req.method === 'GET' && sub === '') {
+    const s = hub.snapshot();
+    return { status: 200, json: { running: s.running, startedAt: s.startedAt, commentId: s.commentId } };
+  }
   if (req.method === 'GET' && sub === '/events') {
     hub.subscribe(req.sse);
     return { streamed: true };
