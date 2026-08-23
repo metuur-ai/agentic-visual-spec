@@ -147,9 +147,12 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 | ID | EARS statement |
 | --- | --- |
 | R-9.1 | WHERE a review session targets a collaborative comment, THE SYSTEM SHALL treat the review conversation as the source of truth and SHALL NOT read, edit, or trust the local comment sidecar. |
-| R-9.2 | WHERE a review session targets a collaborative comment, THE SYSTEM SHALL locate the target by its node id, with no snippet or line-number fallback. |
+| R-9.2 | WHERE a collaborative comment carries a node id, THE SYSTEM SHALL locate the target by exact node-id lookup, with no snippet or line-number fallback. |
 | R-9.3 | IF a collaborative comment carries no node id, THE SYSTEM SHALL treat it as being about the document as a whole. |
-| R-9.4 | WHERE a review session targets a collaborative comment, THE SYSTEM SHALL confine every write to the canonical JSON document at the supplied document path, and SHALL NOT edit the generated Markdown. |
+| R-9.4 | WHERE a review session targets a collaborative comment, THE SYSTEM SHALL confine every write to the document at the supplied document path. |
+| R-9.12 | IF the branch head cannot be read at approval time, THE SYSTEM SHALL NOT treat that as drift, and SHALL compare against the last head it observed. |
+| R-9.13 | IF a proposal's patch reaches any path other than the supplied document path, THE SYSTEM SHALL refuse it before writing, with an outcome distinguishable from drift. |
+| R-9.14 | IF the resolution reply cannot be posted after an approved change has been written, THE SYSTEM SHALL report the reply failure and SHALL NOT report the write as having failed. |
 | R-9.5 | WHEN an approved collaborative change is applied, THE SYSTEM SHALL NOT write `status` or `result` to any file. |
 | R-9.6 | WHEN an approved collaborative change is applied, THE SYSTEM SHALL emit a ready-to-publish signal identifying the document, and SHALL NOT publish. |
 | R-9.7 | THE SYSTEM SHALL pin the branch head at propose time, and IF the head has moved, or the target node no longer exists in the canonical document, at approval time, THE SYSTEM SHALL surface the drift and require re-approval rather than writing. |
