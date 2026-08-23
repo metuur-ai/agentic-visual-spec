@@ -618,6 +618,7 @@ describe('R-10.5 — local mode requires no GitHub connectivity', () => {
     'apply-prompt.ts',
     '../vite/routes/comments.ts',
     '../vite/routes/apply.ts',
+    '../vite/routes/run-lock.ts',
     '../vite/tree-store.ts',
     '../vite/surface-store.ts',
     '../app/lib/use-comments.ts',

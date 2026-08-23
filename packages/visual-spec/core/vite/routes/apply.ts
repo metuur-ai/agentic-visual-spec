@@ -20,6 +20,7 @@ import type { ServerResponse } from 'node:http';
 import { setStatus } from '../../editing/comment-doc';
 import { buildApplyPrompt } from '../../editing/apply-prompt';
 import type { CommentDocStore } from './comments';
+import { conflictFor, type RunLock, sharedRunLock } from './run-lock';
 
 /** Category of a streamed activity row — drives the icon + styling in the UI. */
 export type ApplyLogKind = 'system' | 'tool' | 'assistant' | 'result' | 'error';
@@ -247,8 +248,13 @@ export interface ApplyHub {
 /**
  * Build the hub. `getDeps` is a thunk so the hub always runs against the current
  * directory even after a runtime "change directory" (the deps are mutable lets).
+ *
+ * `lock` is the shared run lock (R-8.5). It defaults to the process-wide instance,
+ * so every existing caller keeps today's behaviour; tests inject their own to stay
+ * isolated. The lock — not the private `running` flag — is what makes apply and a
+ * review session mutually exclusive, because a second hub would get its own flag.
  */
-export function createApplyHub(getDeps: () => ApplyDeps): ApplyHub {
+export function createApplyHub(getDeps: () => ApplyDeps, lock: RunLock = sharedRunLock): ApplyHub {
   let events: ApplyEvent[] = []; // the current/last run — replayed to new subscribers
   let running = false;
   let startedAt: number | null = null;
@@ -277,7 +283,9 @@ export function createApplyHub(getDeps: () => ApplyDeps): ApplyHub {
       res.on('close', () => subs.delete(res));
     },
     start(ids) {
-      if (running) return { status: 409, json: { error: 'an apply is already running' } };
+      // R-8.4/R-8.5: the shared lock is the gate, so a running *review* refuses this
+      // start too — and the 409 body names which holder rejected it.
+      if (!lock.acquire('apply')) return conflictFor(lock.heldBy() ?? 'apply');
       running = true;
       events = [];
       startedAt = null;
@@ -290,6 +298,7 @@ export function createApplyHub(getDeps: () => ApplyDeps): ApplyHub {
         .finally(() => {
           running = false;
           abort = null;
+          lock.release('apply');
         });
       return { status: 200, json: { ok: true } };
     },

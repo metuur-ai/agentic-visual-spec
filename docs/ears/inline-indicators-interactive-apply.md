@@ -47,11 +47,13 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 | --- | --- |
 | R-3.1 | WHEN the user selects Apply Comment on a single comment, THE SYSTEM SHALL start an interactive review session for that comment and SHALL NOT modify any file on disk at that time. |
 | R-3.2 | WHILE a review session is in its propose phase, THE SYSTEM SHALL keep the target comment in `status === 'open'`. |
-| R-3.3 | THE SYSTEM SHALL run the review session as a persistent Cloud CLI process using stream-json input and output. |
+| R-3.3 | THE SYSTEM SHALL run the review session as a persistent `claude` CLI process using stream-json input and output. |
 | R-3.4 | WHILE a review session is active, IF the user attempts to start another review session or a bulk apply, THE SYSTEM SHALL reject the new request with a conflict response. |
 | R-3.5 | WHILE a review session is active, THE SYSTEM SHALL stream session events to subscribed clients over the review SSE endpoint. |
 | R-3.6 | WHEN a client subscribes to the review event stream, THE SYSTEM SHALL first send a snapshot of the current session state and prior events. |
-| R-3.7 | WHILE in the propose phase, THE SYSTEM SHALL run the Cloud CLI process in a permission mode that makes file-editing tools unavailable (enforced at the permission layer, not by prompt instruction). |
+| R-3.7 | WHILE in the propose phase, THE SYSTEM SHALL run the `claude` CLI process in a permission mode that makes file-editing tools unavailable (enforced at the permission layer, not by prompt instruction). |
+| R-3.8 | WHEN a review session starts, THE SYSTEM SHALL determine the comment's origin (local or collaborative) and select the corresponding prompt mode and approval path from it. |
+| R-3.9 | THE SYSTEM SHALL offer the interactive review session for single comments only, and SHALL NOT gate the bulk apply flow behind a proposal or approval step. |
 
 ---
 
@@ -65,7 +67,7 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 | R-4.2 | WHILE producing a proposal, THE SYSTEM SHALL present the proposed implementation strategy and the reasoning behind it. |
 | R-4.3 | WHILE producing a proposal, THE SYSTEM SHALL present any assumptions or ambiguities it identified. |
 | R-4.4 | WHERE the model identifies more than one implementation option, THE SYSTEM SHALL present those alternatives to the user (faithful surfacing, not forced generation). |
-| R-4.5 | WHILE producing a proposal, THE SYSTEM SHALL present the expected changes as a diff before any changes are applied. |
+| R-4.5 | WHILE producing a proposal, THE SYSTEM SHALL present the expected changes as a diff before any changes are applied, and that diff SHALL be the applicable patch referenced by R-6.2 rather than a separate narration of it. |
 | R-4.6 | WHILE producing a proposal, THE SYSTEM SHALL present an estimate of the impact on surrounding content or related files. |
 | R-4.7 | THE SYSTEM SHALL produce the proposal without writing to any target file. |
 
@@ -77,7 +79,7 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 
 | ID | EARS statement |
 | --- | --- |
-| R-5.1 | WHEN the user submits a follow-up message during a review session, THE SYSTEM SHALL deliver it to the running Cloud CLI process as a new turn. |
+| R-5.1 | WHEN the user submits a follow-up message during a review session, THE SYSTEM SHALL deliver it to the running `claude` CLI process as a new turn. |
 | R-5.2 | WHEN the model responds to a follow-up, THE SYSTEM SHALL stream an updated proposal reflecting that input. |
 | R-5.3 | THE SYSTEM SHALL allow the user to ask questions, refine the request, or redirect the implementation across multiple turns within one session. |
 | R-5.4 | WHILE awaiting user input, THE SYSTEM SHALL indicate that the session is waiting and SHALL NOT apply changes. |
@@ -91,11 +93,14 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 | ID | EARS statement |
 | --- | --- |
 | R-6.1 | THE SYSTEM SHALL apply changes to disk only after the user explicitly approves the proposal. |
-| R-6.2 | WHEN the user approves, THE SYSTEM SHALL apply the change corresponding to the specific proposal the user approved (the latest proposal presented in the session at approval time). |
-| R-6.3 | IF the target content has changed since the approved proposal was produced (anchor drift or file modified), THE SYSTEM SHALL surface the drift and require re-approval rather than applying a stale diff. |
-| R-6.4 | WHEN an approved change is applied, THE SYSTEM SHALL set the comment `status` to `applied` and write a non-empty `result` summary in the same update. |
+| R-6.2 | THE SYSTEM SHALL emit each proposal as a machine-applicable patch, and WHEN the user approves, THE SYSTEM SHALL write by applying that exact patch — not by re-deriving the change from the comment. |
+| R-6.3 | IF the approved patch does not apply cleanly to the current content, THE SYSTEM SHALL surface the drift and require re-approval rather than writing. |
+| R-6.4 | WHERE the comment is local, WHEN an approved change is applied, THE SYSTEM SHALL set the comment `status` to `applied` and write a non-empty `result` summary in the same update. |
 | R-6.5 | WHEN an approved change is applied, THE SYSTEM SHALL cause the displayed document and the sidebar to refresh to reflect the change. |
 | R-6.6 | WHEN a review session completes (applied or cancelled), THE SYSTEM SHALL end the session and release the shared single-session lock. |
+| R-6.7 | THE SYSTEM SHALL keep `CommentStatus` a two-value union of `open` and `applied`, and SHALL NOT persist an in-progress proposal, transcript, or intermediate status to the comment sidecar or to a GitHub comment body. |
+| R-6.8 | IF the system writes by any path that re-derives the change rather than applying the approved patch, THE SYSTEM SHALL NOT represent the result to the user as the approved diff, and SHALL surface that the applied change was regenerated. |
+| R-6.9 | WHEN a single-comment approval is applied, THE SYSTEM SHALL confine every comment-record mutation to that comment, and SHALL NOT modify the `status` or `result` of any other record. |
 
 ---
 
@@ -105,11 +110,11 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 
 | ID | EARS statement |
 | --- | --- |
-| R-7.1 | WHEN the user cancels a review session, THE SYSTEM SHALL terminate the Cloud CLI process and leave the target file unchanged. |
+| R-7.1 | WHEN the user cancels a review session, THE SYSTEM SHALL terminate the `claude` CLI process and leave the target file unchanged. |
 | R-7.2 | WHEN a review session is cancelled without approval, THE SYSTEM SHALL keep the target comment in `status === 'open'`. |
 | R-7.3 | THE SYSTEM SHALL hold review-session state in memory only and SHALL NOT persist an in-progress proposal or transcript across a server restart. |
-| R-7.4 | IF the Cloud CLI process exits unexpectedly during a review session, THE SYSTEM SHALL end the session, leave the file and comment unchanged, and report an error to subscribed clients. |
-| R-7.5 | WHEN a review endpoint is requested with no active session, THE SYSTEM SHALL respond with a conflict/no-op rather than starting work. |
+| R-7.4 | IF the `claude` CLI process exits unexpectedly during a review session, THE SYSTEM SHALL end the session, leave the file and comment unchanged, and report an error to subscribed clients. |
+| R-7.5 | WHEN the message, approve, or cancel endpoint is requested with no active session, THE SYSTEM SHALL respond with a conflict/no-op rather than starting work. The start, status, and event-stream endpoints are legitimately callable with no session. |
 | R-7.6 | WHILE a review session is active with no subscribed client and no input for a bounded idle period, THE SYSTEM SHALL terminate the process and release the shared single-session lock. |
 | R-7.7 | WHEN a `message` or `approve` request arrives after the process has died but before the session slot is released, THE SYSTEM SHALL respond with a status distinguishable from "no active session". |
 | R-7.8 | WHEN the process terminates for any reason (cancel, crash, idle timeout, completion), THE SYSTEM SHALL release the shared single-session lock. |
@@ -124,8 +129,31 @@ Requirements are grouped by unit of work. Keywords: `THE SYSTEM SHALL` (always-o
 | --- | --- |
 | R-8.1 | THE SYSTEM SHALL expose review endpoints under the `/__vs/review` namespace for subscribe (SSE), start, message, approve, and cancel. |
 | R-8.2 | THE SYSTEM SHALL register the review routes in both the Vite dev server and the standalone production server. |
-| R-8.3 | THE SYSTEM SHALL spawn the review Cloud CLI process with its standard input piped so follow-up turns can be written to it. |
+| R-8.3 | THE SYSTEM SHALL spawn the review `claude` CLI process with its standard input piped so follow-up turns can be written to it. |
 | R-8.4 | THE SYSTEM SHALL leave the existing bulk apply behavior and endpoints unchanged, except for honoring the shared single-session lock. |
 | R-8.5 | THE SYSTEM SHALL enforce, via the shared single-session lock, that a review session and a bulk apply cannot run at the same time, rejecting the second with a conflict response that identifies the current holder. |
 | R-8.6 | WHERE the review process streams output, THE SYSTEM SHALL parse it with the existing stream-json reader used by the apply flow. |
 | R-8.7 | WHEN a follow-up turn is delivered to the process, THE SYSTEM SHALL cause that user turn to appear in the streamed transcript so the client renders a single ordered log. |
+| R-8.8 | WHERE a review session is started for a collaborative comment, THE SYSTEM SHALL accept on the start request everything needed to run the session — the canonical document path and the projected comment record (identifier, node id, text, workflow) — and SHALL NOT depend on resolving the comment from the local sidecar. |
+| R-8.9 | THE SYSTEM SHALL expose a review status endpoint reporting whether a session is running and which comment it targets, so a reconnecting client can discover an in-flight session before subscribing. |
+| R-8.10 | THE SYSTEM SHALL provide a per-comment action that starts a review session for that comment, distinct from the existing bulk apply scope chooser. |
+
+---
+
+## Unit 9: Collaborative (PR-sourced) review sessions
+
+**Why:** A reviewer commenting on a collaborative document gets the same propose-refine-approve loop as a local commenter, but their edit target, their resolution record, and their end state are all different — the canonical document on the branch, the review conversation, and a human-initiated publish.
+
+| ID | EARS statement |
+| --- | --- |
+| R-9.1 | WHERE a review session targets a collaborative comment, THE SYSTEM SHALL treat the review conversation as the source of truth and SHALL NOT read, edit, or trust the local comment sidecar. |
+| R-9.2 | WHERE a review session targets a collaborative comment, THE SYSTEM SHALL locate the target by its node id, with no snippet or line-number fallback. |
+| R-9.3 | IF a collaborative comment carries no node id, THE SYSTEM SHALL treat it as being about the document as a whole. |
+| R-9.4 | WHERE a review session targets a collaborative comment, THE SYSTEM SHALL confine every write to the canonical JSON document at the supplied document path, and SHALL NOT edit the generated Markdown. |
+| R-9.5 | WHEN an approved collaborative change is applied, THE SYSTEM SHALL NOT write `status` or `result` to any file. |
+| R-9.6 | WHEN an approved collaborative change is applied, THE SYSTEM SHALL emit a ready-to-publish signal identifying the document, and SHALL NOT publish. |
+| R-9.7 | THE SYSTEM SHALL pin the branch head at propose time, and IF the head has moved, or the target node no longer exists in the canonical document, at approval time, THE SYSTEM SHALL surface the drift and require re-approval rather than writing. |
+| R-9.10 | WHEN an approved collaborative change is applied, THE SYSTEM SHALL record what was applied as a reply on the review conversation. |
+| R-9.11 | THE SYSTEM SHALL continue to project collaborative comments with `status` of `open` regardless of remote resolution state, and SHALL NOT derive local apply status from the remote resolution flag. |
+| R-9.8 | THE SYSTEM SHALL leave the existing clipboard handoff on the collaborative surface available and unchanged as a manual path. |
+| R-9.9 | WHEN a collaborative review session is cancelled or fails, THE SYSTEM SHALL leave the canonical document unchanged. |
