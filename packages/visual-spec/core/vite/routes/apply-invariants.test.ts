@@ -122,7 +122,9 @@ describe('R-3.9 — bulk apply has no proposal or approval step', () => {
       (e) => events.push(e),
     );
 
-    const shipped = ['start', 'log', 'agent-start', 'agent-done', 'done', 'error'];
+    // `diff` is on this list and is *not* a proposal frame: it is emitted after the edits
+    // are already on disk, so it can only ever report, never gate.
+    const shipped = ['start', 'log', 'agent-start', 'agent-done', 'diff', 'done', 'error'];
     expect([...new Set(events.map((e) => e.type))].every((t) => shipped.includes(t))).toBe(true);
     expect(events.at(-1)?.type).toBe('done');
   });
@@ -133,10 +135,13 @@ describe('R-3.9 — bulk apply has no proposal or approval step', () => {
 
   it('the RunLock is the only coupling between apply.ts and the review path', () => {
     // `run-lock.ts` — and nothing else from the review side — may be imported here.
+    // `diff` is a pure text-formatting library: it renders the post-hoc patch and gives
+    // apply.ts no access to the review path's proposal machinery.
     const imports = [...applySrc.matchAll(/^import .*? from '([^']+)';$/gm)].map((m) => m[1]);
     expect(imports).toEqual([
       'node:child_process',
       'node:http',
+      'diff',
       '../../editing/comment-doc',
       '../../editing/apply-prompt',
       './comments',

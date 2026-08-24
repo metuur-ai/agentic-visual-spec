@@ -26,7 +26,7 @@ import { pickDirectoryNative } from '../core/vite/native-pick';
 import { GUARD_NOT_RUN, attestGuardRan, guardRan } from '../core/vite/guard-attestation';
 import { checkRequest } from '../core/vite/request-guard';
 import type { SurfaceStore } from '../core/vite/surface-store';
-import { type TreeStore, treeStore } from '../core/vite/tree-store';
+import { snapshotReader, type TreeStore, treeStore } from '../core/vite/tree-store';
 import {
   type CommentDocStore,
   fileCommentStore,
@@ -176,7 +176,9 @@ export function createVisualSpecServer(opts: ServeOptions) {
   // The apply job is shared across every connected browser: one run at a time,
   // many SSE subscribers. The thunk reads the current (mutable) dir + store so a
   // runtime "change directory" re-roots the next run too.
-  const applyHub = createApplyHub(() => ({ cwd: contentDir, comments }));
+  // `tree` is read inside the thunk, not captured: a runtime re-root swaps the
+  // store, and the snapshot must come from the directory the run actually uses.
+  const applyHub = createApplyHub(() => ({ cwd: contentDir, comments, readSnapshot: snapshotReader(tree) }));
   // Interactive review sessions (R-8.1), sharing the apply hub's single slot through
   // `sharedRunLock`. Same thunk discipline, and the same handler the Vite host uses.
   // The third argument is the local/collab arm selector (EARS Unit 9). It is passed

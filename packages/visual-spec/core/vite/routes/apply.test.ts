@@ -281,3 +281,121 @@ describe('createApplyHub', () => {
     expect(hub.cancel().status).toBe(409);
   });
 });
+
+describe('runApply — diff audit', () => {
+  /** A fake disk: `readSnapshot` reads it live, so a run can mutate it mid-flight. */
+  function disk(files: Record<string, string | null>) {
+    return {
+      files,
+      read: async (p: string) => files[p] ?? null,
+    };
+  }
+
+  /** Run one apply where the child rewrites `files` as it closes. */
+  async function runWith(
+    comments: CommentRecord[],
+    files: Record<string, string | null>,
+    after: () => void,
+    lines: string[] = [],
+  ): Promise<ApplyEvent[]> {
+    const mem = memoryStore(comments);
+    const d = disk(files);
+    const events: ApplyEvent[] = [];
+    await runApply(
+      { cwd: '/tmp', comments: mem.store, readSnapshot: d.read, spawnClaude: () => fakeChild(lines, 0, after) },
+      (e) => events.push(e),
+    );
+    return events;
+  }
+
+  it('emits a unified diff for a file the run changed', async () => {
+    const files: Record<string, string | null> = { 'a.md': 'one\n' };
+    const events = await runWith([rec('c1')], files, () => { files['a.md'] = 'two\n'; });
+    const diff = events.find((e) => e.type === 'diff');
+    expect(diff).toBeDefined();
+    expect(diff).toMatchObject({ type: 'diff', path: 'a.md' });
+    const patch = (diff as { patch: string }).patch;
+    expect(patch).toContain('-one');
+    expect(patch).toContain('+two');
+  });
+
+  it('puts every diff before done, so the terminal frame stays terminal', async () => {
+    const files: Record<string, string | null> = { 'a.md': 'one\n' };
+    const events = await runWith([rec('c1')], files, () => { files['a.md'] = 'two\n'; });
+    const lastDiff = events.map((e) => e.type).lastIndexOf('diff');
+    const done = events.map((e) => e.type).indexOf('done');
+    expect(lastDiff).toBeGreaterThanOrEqual(0);
+    expect(lastDiff).toBeLessThan(done);
+  });
+
+  it('stays silent for a file the run left untouched', async () => {
+    const files: Record<string, string | null> = { 'a.md': 'same\n' };
+    const events = await runWith([rec('c1')], files, () => {});
+    expect(events.filter((e) => e.type === 'diff')).toEqual([]);
+  });
+
+  it('diffs a created file against empty rather than skipping it', async () => {
+    const files: Record<string, string | null> = {};
+    const events = await runWith([rec('c1')], files, () => { files['a.md'] = 'new\n'; });
+    const diff = events.find((e) => e.type === 'diff') as { patch: string } | undefined;
+    expect(diff?.patch).toContain('+new');
+  });
+
+  it('emits no diff frames at all when the host wires no reader', async () => {
+    const mem = memoryStore([rec('c1')]);
+    const events: ApplyEvent[] = [];
+    await runApply(
+      { cwd: '/tmp', comments: mem.store, spawnClaude: () => fakeChild([], 0, () => {}) },
+      (e) => events.push(e),
+    );
+    expect(events.filter((e) => e.type === 'diff')).toEqual([]);
+  });
+
+  it('never reads a folder comment as a file', async () => {
+    const seen: string[] = [];
+    const mem = memoryStore([
+      { id: 'f1', workflow: 'visual-spec', target: { path: 'docs', kind: 'folder' }, comment: 'x', status: 'open', ts: '' },
+    ]);
+    await runApply(
+      {
+        cwd: '/tmp',
+        comments: mem.store,
+        readSnapshot: async (p) => { seen.push(p); return null; },
+        spawnClaude: () => fakeChild([], 0, () => {}),
+      },
+      () => {},
+    );
+    expect(seen).toEqual([]);
+  });
+
+  it('names files claude wrote that the diff does not cover', async () => {
+    const files: Record<string, string | null> = { 'a.md': 'one\n' };
+    const tool = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: '/tmp/other.md' } }] },
+    });
+    const events = await runWith([rec('c1')], files, () => { files['a.md'] = 'two\n'; }, [tool]);
+    const warn = events.find((e) => e.type === 'log' && e.text?.includes('claude also wrote'));
+    expect(warn).toBeDefined();
+    expect((warn as { text: string }).text).toContain('other.md');
+  });
+
+  it('does not warn when every write lands inside the selected set', async () => {
+    const files: Record<string, string | null> = { 'a.md': 'one\n' };
+    const tool = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: '/tmp/a.md' } }] },
+    });
+    const events = await runWith([rec('c1')], files, () => { files['a.md'] = 'two\n'; }, [tool]);
+    expect(events.find((e) => e.type === 'log' && e.text?.includes('claude also wrote'))).toBeUndefined();
+  });
+
+  it('flags an oversized patch as truncated instead of streaming it whole', async () => {
+    const files: Record<string, string | null> = { 'a.md': '' };
+    const huge = Array.from({ length: 40_000 }, (_, i) => `line ${i}`).join('\n');
+    const events = await runWith([rec('c1')], files, () => { files['a.md'] = huge; });
+    const diff = events.find((e) => e.type === 'diff') as { patch: string; truncated?: boolean };
+    expect(diff.truncated).toBe(true);
+    expect(diff.patch.length).toBe(200_000);
+  });
+});

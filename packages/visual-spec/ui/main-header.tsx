@@ -1075,12 +1075,14 @@ type ApplyFrame =
   | { type: 'log'; kind: ApplyLogKind; text?: string; tool?: string; target?: string; agentId?: string }
   | { type: 'agent-start'; agentId: string; agentType: string; task?: string }
   | { type: 'agent-done'; agentId: string }
+  | { type: 'diff'; path: string; patch: string; truncated?: boolean }
   | { type: 'done'; ok: boolean; applied: number; appliedComments?: AppliedComment[]; exitCode: number | null; cancelled?: boolean }
   | { type: 'error'; message: string };
 
+type FileDiff = { path: string; patch: string; truncated?: boolean };
 type ApplyPhase = 'idle' | 'running' | 'done' | 'error' | 'cancelled';
-type ApplyState = { phase: ApplyPhase; startedAt: number | null; rows: Row[]; summary: string; applied: AppliedComment[]; agents: Agent[] };
-const APPLY_INIT: ApplyState = { phase: 'idle', startedAt: null, rows: [], summary: '', applied: [], agents: [] };
+type ApplyState = { phase: ApplyPhase; startedAt: number | null; rows: Row[]; summary: string; applied: AppliedComment[]; agents: Agent[]; diffs: FileDiff[] };
+const APPLY_INIT: ApplyState = { phase: 'idle', startedAt: null, rows: [], summary: '', applied: [], agents: [], diffs: [] };
 const ROW_CAP = 400;
 
 function applyReduce(s: ApplyState, e: ApplyFrame): ApplyState {
@@ -1105,6 +1107,14 @@ function applyReduce(s: ApplyState, e: ApplyFrame): ApplyState {
       return s.agents.some((a) => a.id === e.agentId)
         ? { ...s, agents: s.agents.map((a) => (a.id === e.agentId ? { ...a, status: 'done' } : a)) }
         : s;
+    case 'diff': {
+      // Last patch per path wins: a file named twice is one file, and a replayed
+      // sync must not stack two copies of the same diff.
+      const entry: FileDiff = { path: e.path, patch: e.patch, truncated: e.truncated };
+      return s.diffs.some((d) => d.path === e.path)
+        ? { ...s, diffs: s.diffs.map((d) => (d.path === e.path ? entry : d)) }
+        : { ...s, diffs: [...s.diffs, entry] };
+    }
     case 'error':
       return { ...s, rows: [...s.rows.slice(-ROW_CAP), { kind: 'error', text: e.message }] };
     case 'done':
@@ -1330,6 +1340,8 @@ function ApplyButton({ open, file, onRunningChange }: { open: CommentRecord[]; f
 
           {state.applied.length > 0 && <AppliedList applied={state.applied} />}
 
+          {state.diffs.length > 0 && <DiffList diffs={state.diffs} />}
+
           {(running || state.agents.length > 0) && <AgentStrip phase={state.phase} agents={state.agents} />}
 
           <div ref={feedRef} style={feedScroll}>
@@ -1479,7 +1491,8 @@ function ScopeChooser({
        */}
       <div style={directWriteNote} data-testid="scope-direct-write">
         <strong style={{ fontWeight: 700 }}>Writes straight to your files.</strong> There is no diff to approve —
-        claude edits as it goes. To read a change before it lands, use <strong style={{ fontWeight: 700 }}>Review &amp; apply</strong>{' '}
+        claude edits as it goes, and you get the diff of what it changed once the run ends. To read a change{' '}
+        <em>before</em> it lands, use <strong style={{ fontWeight: 700 }}>Review &amp; apply</strong>{' '}
         on a single comment in the sidebar.
       </div>
       <div style={modelNote}>Runs with your default Claude model.</div>
@@ -1509,6 +1522,58 @@ function AppliedList({ applied }: { applied: AppliedComment[] }) {
       </ul>
     </div>
   );
+}
+
+/**
+ * What each touched file looked like before this run vs. after it.
+ *
+ * Post-hoc on purpose: claude writes straight to disk, so this is an audit of
+ * what changed, not a proposal to approve. Collapsed by default — the answer to
+ * "what did it touch?" is the file list; the patch is the follow-up question.
+ */
+function DiffList({ diffs }: { diffs: FileDiff[] }) {
+  const [open, setOpen] = useState<string | null>(diffs.length === 1 ? diffs[0].path : null);
+  return (
+    <div style={diffWrap} data-testid="apply-diffs">
+      <div style={diffHead}>
+        ⌁ Changed {diffs.length} file{diffs.length === 1 ? '' : 's'}
+      </div>
+      {diffs.map((d) => (
+        <div key={d.path}>
+          <button
+            type="button"
+            onClick={() => setOpen((cur) => (cur === d.path ? null : d.path))}
+            style={diffToggle}
+            title={d.path}
+          >
+            <span style={{ opacity: 0.55 }}>{open === d.path ? '▾' : '▸'}</span>
+            <code style={diffPath}>{basename(d.path)}</code>
+            {d.truncated && <span style={diffTrunc}>truncated</span>}
+          </button>
+          {open === d.path && (
+            <pre style={diffBody}>
+              {d.patch.split('\n').map((line, i) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: fixed, ordered patch text
+                <div key={i} style={diffLineStyle(line)}>
+                  {line || ' '}
+                </div>
+              ))}
+            </pre>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Colour by unified-diff prefix. `---`/`+++` are headers, not content — they must
+ *  not read as a deletion and an addition of the whole file. */
+function diffLineStyle(line: string): React.CSSProperties {
+  if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('===')) return diffLineMeta;
+  if (line.startsWith('@@')) return diffLineHunk;
+  if (line.startsWith('+')) return diffLineAdd;
+  if (line.startsWith('-')) return diffLineDel;
+  return diffLineCtx;
 }
 
 const AGENT_GLYPH = (type: string) => (type === 'main' ? '✦' : '⚇');
@@ -2663,6 +2728,18 @@ const appliedItem: React.CSSProperties = { display: 'flex', alignItems: 'baselin
 const appliedPath: React.CSSProperties = { flexShrink: 0, font: '600 11px ui-monospace, monospace', color: '#15803d', background: '#dcfce7', borderRadius: 5, padding: '1px 6px' };
 const appliedFlow: React.CSSProperties = { flexShrink: 0, fontSize: 10.5, fontWeight: 700, color: '#7c3aed', background: '#ede9fe', borderRadius: 5, padding: '1px 6px' };
 const appliedText: React.CSSProperties = { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
+const diffWrap: React.CSSProperties = { borderBottom: '1px solid #f1f5f9', background: '#fbfaff' };
+const diffHead: React.CSSProperties = { fontSize: 12, fontWeight: 700, color: '#6d28d9', padding: '8px 12px 4px' };
+const diffToggle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 7, width: '100%', textAlign: 'left', border: 'none', background: 'transparent', padding: '3px 12px', cursor: 'pointer' };
+const diffPath: React.CSSProperties = { font: '600 11px ui-monospace, monospace', color: '#4c1d95', background: '#ede9fe', borderRadius: 5, padding: '1px 6px' };
+const diffTrunc: React.CSSProperties = { fontSize: 10.5, fontWeight: 700, color: '#92400e', background: '#fef3c7', borderRadius: 5, padding: '1px 6px' };
+const diffBody: React.CSSProperties = { margin: '4px 0 8px', maxHeight: 260, overflow: 'auto', background: 'white', borderTop: '1px solid #f1f5f9', borderBottom: '1px solid #f1f5f9', font: '11.5px/1.5 ui-monospace, "SF Mono", monospace', whiteSpace: 'pre' };
+const diffLineBase: React.CSSProperties = { padding: '0 12px' };
+const diffLineCtx: React.CSSProperties = { ...diffLineBase, color: '#64748b' };
+const diffLineAdd: React.CSSProperties = { ...diffLineBase, color: '#166534', background: '#f0fdf4' };
+const diffLineDel: React.CSSProperties = { ...diffLineBase, color: '#b91c1c', background: '#fef2f2' };
+const diffLineHunk: React.CSSProperties = { ...diffLineBase, color: '#6d28d9', background: '#f5f3ff' };
+const diffLineMeta: React.CSSProperties = { ...diffLineBase, color: '#94a3b8' };
 const agentStrip: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 6, padding: '8px 12px', borderBottom: '1px solid #f1f5f9', background: '#faf9ff' };
 const agentChip: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '3px 9px', border: '1px solid #ece6fb', borderRadius: 999, background: 'white', fontSize: 11.5, color: '#475569' };
 const timerPill: React.CSSProperties = { font: '11.5px ui-monospace, "SF Mono", monospace', color: '#6d28d9', background: '#f3f0fc', border: '1px solid #ece6fb', borderRadius: 999, padding: '1px 8px' };
