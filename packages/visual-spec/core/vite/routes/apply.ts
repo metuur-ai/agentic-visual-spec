@@ -14,9 +14,11 @@
  *   POST /__vs/apply/start   → begin a run (409 if one is already running)
  *   POST /__vs/apply/cancel  → SIGKILL the running claude
  *   GET  /__vs/apply         → { running, startedAt } status snapshot
+ *   GET  /__vs/apply/history → { runs } — the last few runs that changed a file
  */
 import { spawn } from 'node:child_process';
 import type { ServerResponse } from 'node:http';
+import { createTwoFilesPatch } from 'diff';
 import { setStatus } from '../../editing/comment-doc';
 import { buildApplyPrompt } from '../../editing/apply-prompt';
 import type { CommentDocStore } from './comments';
@@ -34,12 +36,52 @@ export type ApplyEvent =
   | { type: 'log'; kind: ApplyLogKind; text?: string; tool?: string; target?: string; agentId?: string }
   | { type: 'agent-start'; agentId: string; agentType: string; task?: string }
   | { type: 'agent-done'; agentId: string }
+  /**
+   * What one file looked like before this run vs. after it — a unified diff.
+   *
+   * Emitted after the child exits and **before** `done`, because `done` is the
+   * terminal frame the client reacts to: a diff arriving later would land on a
+   * panel that has already moved on. One frame per changed file; unchanged files
+   * are silent. `truncated` means the patch hit the size cap and is not complete.
+   */
+  | { type: 'diff'; path: string; patch: string; truncated?: boolean }
   | { type: 'done'; ok: boolean; applied: number; appliedComments: AppliedComment[]; exitCode: number | null; cancelled?: boolean }
   | { type: 'error'; message: string };
 
 /** The first frame a subscriber receives: the run so far, so a tab that joins
  *  mid-run (or after) catches up to the same activity + timer. */
 export type ApplySync = { type: 'sync'; running: boolean; startedAt: number | null; events: ApplyEvent[] };
+
+/** One file's before/after, lifted out of a run's frames and kept. */
+export type RunDiff = { path: string; patch: string; truncated?: boolean };
+
+/**
+ * A finished run, kept so the change can be re-read after the panel has closed.
+ *
+ * Deliberately the *facts* and not a sentence: the client already formats
+ * "Applied N comments" / "Cancelled — N applied before stop" from these fields
+ * (`main-header.tsx`, `applyReduce`). Keeping a second copy of that wording on
+ * the server would give the two renderings a chance to disagree.
+ */
+export type RunRecord = {
+  id: string;
+  startedAt: number;
+  endedAt: number;
+  ok: boolean;
+  cancelled: boolean;
+  applied: AppliedComment[];
+  diffs: RunDiff[];
+};
+
+/**
+ * How many finished runs the hub keeps. The oldest falls off the end.
+ *
+ * In memory on purpose: this survives a browser reload (the server holds it) but
+ * not a server restart. The alternative — writing each run to the sidecar — buys
+ * durability for an audit trail nobody asked to keep, at the cost of a disk write
+ * per run and a retention policy to argue about.
+ */
+const HISTORY_CAP = 5;
 
 /** A run that hangs holds the apply lock forever — bound it. Generous: a real
  *  batch (many comments, sub-agents, a headless cold start) legitimately runs
@@ -68,7 +110,23 @@ export interface ApplyDeps {
   timeoutMs?: number;
   /** Clock injection for tests. */
   now?: () => number;
+  /**
+   * Read one file, relative to `cwd`, for the before/after snapshot.
+   *
+   * `null` means "nothing to diff": absent, a directory, binary, or too large.
+   * Deliberately a single function rather than an `fs`-shaped interface — this is
+   * the whole filesystem surface the diff needs, and hosts already own a
+   * `TreeStore` that answers exactly this (traversal, symlink and size guards
+   * included). Omit it and the run emits no `diff` frames at all.
+   */
+  readSnapshot?: (relPath: string) => Promise<string | null>;
 }
+
+/** A patch past this is more scroll than signal; it ships truncated with a flag. */
+const MAX_PATCH_CHARS = 200_000;
+
+/** Tools whose target is a file this run wrote — used to spot edits outside the set. */
+const WRITE_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
 
 /**
  * Spawn the real Claude Code CLI in headless print mode, streaming JSON events.
@@ -156,6 +214,19 @@ export async function runApply(deps: ApplyDeps, emit: (e: ApplyEvent) => void, s
   }
   emit({ type: 'start', openCount: open.length, startedAt: now() });
 
+  // The files this run is *about*, and therefore the only ones we can diff.
+  //
+  // Folder comments are excluded on purpose: `target.path` is a directory, so
+  // reading it as a file is meaningless, and a folder's edits land in files this
+  // set never names — a diff scoped to the selection cannot honestly cover them.
+  // That gap is what the out-of-scope warning below exists to make visible.
+  const snapshot = deps.readSnapshot;
+  const snapPaths = snapshot
+    ? [...new Set(open.filter((c) => c.target.kind !== 'folder').map((c) => c.target.path))]
+    : [];
+  const beforeText = new Map<string, string | null>();
+  for (const p of snapPaths) beforeText.set(p, await snapshot?.(p) ?? null);
+
   const spawnClaude = deps.spawnClaude ?? defaultSpawnClaude;
   let child: ClaudeChild;
   try {
@@ -166,6 +237,10 @@ export async function runApply(deps: ApplyDeps, emit: (e: ApplyEvent) => void, s
     return;
   }
 
+  // Every file the agent actually wrote, as the tool frames reported it. Compared
+  // against `snapPaths` at the end so a run that edits something nobody asked
+  // about says so out loud instead of leaving the diff silently incomplete.
+  const touched = new Set<string>();
   let buf = '';
   child.stdout?.on('data', (chunk: Buffer) => {
     buf += chunk.toString('utf8');
@@ -175,7 +250,12 @@ export async function runApply(deps: ApplyDeps, emit: (e: ApplyEvent) => void, s
       const line = buf.slice(0, nl).trim();
       buf = buf.slice(nl + 1);
       if (!line) continue;
-      for (const frame of summarize(line)) emit(frame);
+      for (const frame of summarize(line)) {
+        if (frame.type === 'log' && frame.tool && WRITE_TOOLS.has(frame.tool) && frame.target) {
+          touched.add(frame.target);
+        }
+        emit(frame);
+      }
     }
   });
   child.stderr?.on('data', (chunk: Buffer) => {
@@ -236,6 +316,31 @@ export async function runApply(deps: ApplyDeps, emit: (e: ApplyEvent) => void, s
   const appliedComments: AppliedComment[] = open
     .filter((c) => !stillOpen.has(c.id))
     .map((c) => ({ id: c.id, path: c.target.path, comment: c.comment, workflow: c.workflow }));
+  // The audit: what the files look like now vs. the snapshot taken before spawn.
+  //
+  // Runs even when the run was cancelled or failed — a killed claude can still have
+  // written half its edits, and that half is exactly what the user needs to see.
+  if (snapshot) {
+    for (const p of snapPaths) {
+      const wasText = beforeText.get(p) ?? null;
+      const nowText = await snapshot(p);
+      if (nowText === wasText) continue; // untouched, or unreadable both times
+      const full = createTwoFilesPatch(p, p, wasText ?? '', nowText ?? '');
+      const truncated = full.length > MAX_PATCH_CHARS;
+      emit({ type: 'diff', path: p, patch: truncated ? full.slice(0, MAX_PATCH_CHARS) : full, ...(truncated ? { truncated } : {}) });
+    }
+    // `target` may be absolute (claude reports what it was handed); make it
+    // comparable to the relative paths the comments carry before judging it.
+    const prefix = deps.cwd.endsWith('/') ? deps.cwd : `${deps.cwd}/`;
+    const inScope = new Set(snapPaths);
+    const outside = [...touched]
+      .map((t) => (t.startsWith(prefix) ? t.slice(prefix.length) : t))
+      .filter((t) => !inScope.has(t));
+    if (outside.length > 0) {
+      emit({ type: 'log', kind: 'system', text: `Not shown above — claude also wrote: ${outside.join(', ')}` });
+    }
+  }
+
   emit({ type: 'done', ok: !cancelled && exitCode === 0, applied: appliedComments.length, appliedComments, exitCode, ...(cancelled ? { cancelled } : {}) });
 }
 
@@ -249,6 +354,8 @@ export interface ApplyHub {
   start(ids?: string[]): RouteResult;
   cancel(): RouteResult;
   status(): RouteResult;
+  /** The last few finished runs that changed something, newest first. */
+  history(): RouteResult;
 }
 
 /**
@@ -265,7 +372,38 @@ export function createApplyHub(getDeps: () => ApplyDeps, lock: RunLock = sharedR
   let running = false;
   let startedAt: number | null = null;
   let abort: AbortController | null = null;
+  let runSeq = 0;
+  const past: RunRecord[] = []; // newest first, capped at HISTORY_CAP
   const subs = new Set<ServerResponse>();
+
+  /**
+   * Fold the run that just ended into `past`.
+   *
+   * Runs that changed no file are dropped rather than kept as empty rows: this
+   * history exists to answer "what did it change?", and a run with nothing to
+   * show would push a real change off the end of a five-slot list. Whether it
+   * ran at all is the activity panel's question, not this one.
+   */
+  const archive = (done: Extract<ApplyEvent, { type: 'done' }>) => {
+    const diffs: RunDiff[] = [];
+    for (const e of events) {
+      if (e.type !== 'diff') continue;
+      diffs.push({ path: e.path, patch: e.patch, ...(e.truncated ? { truncated: e.truncated } : {}) });
+    }
+    if (diffs.length === 0) return;
+    const now = getDeps().now?.() ?? Date.now();
+    runSeq += 1;
+    past.unshift({
+      id: `run-${runSeq}`,
+      startedAt: startedAt ?? now,
+      endedAt: now,
+      ok: done.ok,
+      cancelled: done.cancelled === true,
+      applied: done.appliedComments,
+      diffs,
+    });
+    if (past.length > HISTORY_CAP) past.length = HISTORY_CAP;
+  };
 
   const frame = (res: ServerResponse, f: ApplyEvent | ApplySync) => {
     if (!res.writableEnded) res.write(`data: ${JSON.stringify(f)}\n\n`);
@@ -273,6 +411,9 @@ export function createApplyHub(getDeps: () => ApplyDeps, lock: RunLock = sharedR
   const broadcast = (e: ApplyEvent) => {
     if (e.type === 'start') startedAt = e.startedAt;
     events.push(e);
+    // Archive before the fan-out so a subscriber that reacts to `done` by asking
+    // for the history finds this run already in it.
+    if (e.type === 'done') archive(e);
     for (const res of subs) frame(res, e);
   };
 
@@ -315,6 +456,9 @@ export function createApplyHub(getDeps: () => ApplyDeps, lock: RunLock = sharedR
     },
     status() {
       return { status: 200, json: { running, startedAt } };
+    },
+    history() {
+      return { status: 200, json: { runs: past } };
     },
   };
 }

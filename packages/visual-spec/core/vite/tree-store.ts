@@ -249,6 +249,26 @@ export function treeStore(baseDir: string): TreeStore {
   };
 }
 
+/**
+ * Adapt a store into the `readSnapshot` an apply run needs: text, or nothing.
+ *
+ * Collapses every "no text to diff" case — missing, outside the root, a
+ * directory, image, binary, or past the size ceiling — into `null`, because a
+ * diff cannot tell those apart and shouldn't have to. Reusing the store (rather
+ * than a bare `readFile`) is what keeps the traversal, symlink and size guards
+ * applied to paths that ultimately come from a comment's `target`.
+ */
+export function snapshotReader(store: TreeStore) {
+  return async (rel: string): Promise<string | null> => {
+    try {
+      const f = await store.file(rel);
+      return 'content' in f ? f.content : null;
+    } catch {
+      return null;
+    }
+  };
+}
+
 /** Stream a file's raw bytes — used by the /__vs/raw endpoint for image previews. */
 export function rawStream(store: TreeStore, path: string) {
   return createReadStream(store.resolve(path));

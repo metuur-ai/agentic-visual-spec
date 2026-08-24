@@ -37,7 +37,7 @@ import { currentPlugin } from './current-plugin';
 import { mdSurfaceStore } from './md-store';
 import { pickDirectoryNative } from './native-pick';
 import type { SurfaceStore } from './surface-store';
-import { type TreeStore, treeStore } from './tree-store';
+import { snapshotReader, type TreeStore, treeStore } from './tree-store';
 
 const RAW_MIME: Record<string, string> = {
   '.svg': 'image/svg+xml',
@@ -381,7 +381,8 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       // Apply the open comments via `claude -p` — a shared job any browser can
       // watch (SSE), start, or cancel. The thunk reads the current (mutable)
       // dir + store so a runtime "change directory" re-roots the next run too.
-      const applyHub = createApplyHub(() => ({ cwd: specsRoot, comments }));
+      // See server.ts: `tree` is resolved per run so a re-root is honoured.
+      const applyHub = createApplyHub(() => ({ cwd: specsRoot, comments, readSnapshot: snapshotReader(tree) }));
       server.middlewares.use('/__vs/apply', (req, res, next) => {
         const url = new URL(req.url ?? '', 'http://localhost');
         const sub = url.pathname === '/' ? '' : url.pathname;
@@ -393,6 +394,10 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         }
         if (method === 'POST' && sub === '/cancel') {
           const r = applyHub.cancel();
+          return sendJson(res, r.status, r.json);
+        }
+        if (method === 'GET' && sub === '/history') {
+          const r = applyHub.history();
           return sendJson(res, r.status, r.json);
         }
         if (method === 'GET' && sub === '') {

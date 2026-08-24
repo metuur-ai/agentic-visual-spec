@@ -81,11 +81,13 @@ function fakeChild(lines: string[], code: number, onClose: () => void): ClaudeCh
 describe('R-3.9 — bulk apply has no proposal or approval step', () => {
   const applySrc = src('./apply.ts');
 
-  it('the ApplyHub surface is exactly subscribe/start/cancel/status', () => {
+  it('the ApplyHub surface is exactly subscribe/start/cancel/status/history', () => {
     const mem = memoryStore([]);
     const hub = createApplyHub(() => ({ cwd: '/tmp', comments: mem.store }));
     // A proposal/approval flow could not exist without a method to carry it.
-    expect(Object.keys(hub).sort()).toEqual(['cancel', 'start', 'status', 'subscribe']);
+    // `history` is not such a method: like the `diff` frame, it only reads back
+    // runs that already finished and wrote to disk, so nothing can wait on it.
+    expect(Object.keys(hub).sort()).toEqual(['cancel', 'history', 'start', 'status', 'subscribe']);
   });
 
   it('one start call drives the whole run — the child spawns with no intervening approval', async () => {
@@ -122,7 +124,9 @@ describe('R-3.9 — bulk apply has no proposal or approval step', () => {
       (e) => events.push(e),
     );
 
-    const shipped = ['start', 'log', 'agent-start', 'agent-done', 'done', 'error'];
+    // `diff` is on this list and is *not* a proposal frame: it is emitted after the edits
+    // are already on disk, so it can only ever report, never gate.
+    const shipped = ['start', 'log', 'agent-start', 'agent-done', 'diff', 'done', 'error'];
     expect([...new Set(events.map((e) => e.type))].every((t) => shipped.includes(t))).toBe(true);
     expect(events.at(-1)?.type).toBe('done');
   });
@@ -133,10 +137,13 @@ describe('R-3.9 — bulk apply has no proposal or approval step', () => {
 
   it('the RunLock is the only coupling between apply.ts and the review path', () => {
     // `run-lock.ts` — and nothing else from the review side — may be imported here.
+    // `diff` is a pure text-formatting library: it renders the post-hoc patch and gives
+    // apply.ts no access to the review path's proposal machinery.
     const imports = [...applySrc.matchAll(/^import .*? from '([^']+)';$/gm)].map((m) => m[1]);
     expect(imports).toEqual([
       'node:child_process',
       'node:http',
+      'diff',
       '../../editing/comment-doc',
       '../../editing/apply-prompt',
       './comments',

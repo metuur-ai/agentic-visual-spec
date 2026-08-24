@@ -15,11 +15,12 @@
  *  P8  The provenance chip was per card, repeated verbatim down a column of comments
  *      that all share one origin. It is now one header over the group.
  */
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { InspectorProvider } from '../core/app';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import { CommentPanel, isCommentPanelListening, revealInCommentPanel } from './comment-panel';
+import { recordDiff, resetLastDiffs } from './use-last-diffs';
 
 const local = (id: string, text: string, startLine: number): CommentRecord =>
   ({
@@ -202,5 +203,43 @@ describe('P3 — the panel is the one surface listing these comments', () => {
     const card = document.querySelector('[data-vs-revealed]') as HTMLElement;
     expect(card.style.transition).toBe('');
     expect((Element.prototype.scrollIntoView as ReturnType<typeof vi.fn>).mock.calls[0]![0]).toMatchObject({ behavior: 'auto' });
+  });
+});
+
+/* ================================================================== *
+ * The way back to "what did this say before?"
+ * ================================================================== */
+describe('the panel title offers the before/after read', () => {
+  beforeEach(() => resetLastDiffs());
+
+  it('says nothing until Claude has written to this file', async () => {
+    mount();
+    await screen.findByText('Comments');
+    // An always-present button that opened an empty drawer would be worse than none.
+    expect(screen.queryByTestId('panel-see-before')).toBeNull();
+  });
+
+  it('offers the drawer once a patch exists for the file the panel is scoped to', async () => {
+    mount();
+    await screen.findByText('Comments');
+
+    await act(async () => {
+      recordDiff({ path: 'a.md', patch: '@@ -1 +1 @@\n-before\n+after\n' });
+    });
+
+    fireEvent.click(await screen.findByTestId('panel-see-before'));
+    expect(await screen.findByText('before')).toBeTruthy();
+  });
+
+  it('ignores a patch written to some other file', async () => {
+    mount();
+    await screen.findByText('Comments');
+
+    await act(async () => {
+      recordDiff({ path: 'elsewhere.md', patch: '@@ -1 +1 @@\n-x\n+y\n' });
+    });
+
+    // The panel is scoped to a.md; a run against another file is not its business.
+    expect(screen.queryByTestId('panel-see-before')).toBeNull();
   });
 });
