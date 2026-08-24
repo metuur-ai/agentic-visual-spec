@@ -9,3 +9,4 @@ coverage/
 graphify-out/node_modules
 
 graphify-out/
+.claude/worktrees/
