@@ -123,6 +123,21 @@ The **Agent** zone is the other half of the loop:
 The count on both is every open note in the directory, not only this file's — the panel's
 "N open on this file" is the narrower number.
 
+![The apply run, finished, with the diff of what the agent wrote](images/14-apply-preview.png)
+
+While the run is going the popover streams the agent's activity. When it finishes it shows
+what actually changed on disk: one entry per file, with the diff. The diff is post-hoc —
+the agent has already written the file, this is an audit of it, not a proposal waiting for
+your approval. It is collapsed by default, and it only ever shows the changed regions, so
+a one-line edit in a long document stays a one-line diff.
+
+![The before-and-after drawer, opened from the run](images/15-before-after.png)
+
+**See before comment** opens the same content in the side drawer the pull request review
+uses, with the file as it was before the run on the left and as it is now on the right.
+The button is in two places: on the run, and in the comment panel's header for as long as
+the file has a recorded before-state, so you can still reach it after closing the run.
+
 As notes get applied they stop being open and move to the **History** tab. When a file's
 notes have all been applied and none are left open, **Start collaboration** lights up —
 that is the tool's way of saying *this looks ready to share*. It is a hint, not a gate;
