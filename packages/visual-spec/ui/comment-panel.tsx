@@ -32,6 +32,8 @@ import { useActiveComment } from './active-comment';
 import { useReviewSession } from './review-session';
 import { ReviewDrawer } from './review-view';
 import { BusyLabel } from './spinner';
+import { DiffDrawer } from './diff-drawer';
+import { useLastDiff } from './use-last-diffs';
 
 /** Nearest heading at or above the clicked element — the robust markdown anchor. */
 function nearestHeading(anchor: HTMLElement, root: HTMLElement): string | null {
@@ -373,7 +375,7 @@ function Panel({ width, source }: { width: number | string; source: CommentPanel
   if (!active) {
     return (
       <aside style={{ ...panel, width }}>
-        <Header />
+        <Header path={path} />
         <SelectionHelp />
         <TabBar tab={tab} onTab={setTab} />
         <StartCommenting onStart={() => setActive(true)} nothingYet={!source.comments.some((c) => c.status === 'open')} />
@@ -410,7 +412,7 @@ function Panel({ width, source }: { width: number | string; source: CommentPanel
 
   return (
     <aside style={{ ...panel, width }}>
-      <Header />
+      <Header path={path} />
       <SelectionHelp />
       <TabBar tab={tab} onTab={setTab} />
       {tab === 'open' ? (
@@ -533,8 +535,28 @@ function OrphanList({ orphans }: { orphans: { comment: CommentRecord; targetText
   );
 }
 
-function Header() {
-  return <header style={{ padding: 12, borderBottom: '1px solid #e5e7eb', fontWeight: 700 }}>Comments</header>;
+/*
+ * The sidebar's title doubles as the way back to "what did this file say before Claude
+ * touched it?". The apply popover offers the same drawer, but only while it is open and
+ * only about the run in front of you; this offer is about the file the panel is already
+ * scoped to, and it outlasts both the popover and the next run (`use-last-diffs.ts`).
+ * It appears only once there is something to compare, so the title is unadorned until the
+ * button would do something.
+ */
+function Header({ path }: { path: string }) {
+  const diff = useLastDiff(path);
+  const [beforeOpen, setBeforeOpen] = useState(false);
+  return (
+    <header style={headerBar}>
+      <span>Comments</span>
+      {diff && (
+        <button type="button" onClick={() => setBeforeOpen(true)} style={seeBeforeBtn} data-testid="panel-see-before">
+          See before comment
+        </button>
+      )}
+      {beforeOpen && diff && <DiffDrawer entries={[diff]} onClose={() => setBeforeOpen(false)} />}
+    </header>
+  );
 }
 
 function TabBar({ tab, onTab }: { tab: PanelTab; onTab: (t: PanelTab) => void }) {
@@ -919,3 +941,6 @@ const confirmYes: React.CSSProperties = { padding: '2px 8px', border: '1px solid
 const notCommentable: React.CSSProperties = { margin: '2px 0 0', padding: 8, border: '1px dashed #cbd5e1', borderRadius: 6, background: '#f8fafc', color: '#64748b', fontSize: 12.5 };
 const orphanCard: React.CSSProperties = { ...card, border: '1px dashed #f59e0b', background: '#fffbeb' };
 const confirmNo: React.CSSProperties = { padding: '2px 8px', border: '1px solid #d1d5db', borderRadius: 4, background: 'white', color: '#475569', cursor: 'pointer', fontSize: 12 };
+
+const headerBar: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: 12, borderBottom: '1px solid #e5e7eb', fontWeight: 700 };
+const seeBeforeBtn: React.CSSProperties = { border: '1px solid #ddd6fe', background: 'white', color: '#6d28d9', borderRadius: 6, padding: '2px 8px', font: '600 11px system-ui, sans-serif', cursor: 'pointer' };

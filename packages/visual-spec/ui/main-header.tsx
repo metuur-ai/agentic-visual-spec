@@ -16,6 +16,7 @@ import { type BranchListing, useGitBranches } from './use-git-branches';
 import { type GitContext, useGitContext } from './use-git-context';
 import { useChangedFiles } from './use-changed-files';
 import { recordVisit, useVisitedFiles } from './use-visited-files';
+import { recordDiff } from './use-last-diffs';
 import { Z } from '../core/app/lib/z-layers';
 import { DiffDrawer } from './diff-drawer';
 import { type PatchRow, patchRows } from '../core/app/lib/patch-rows';
@@ -1180,6 +1181,14 @@ function ApplyButton({ open, file, onRunningChange }: { open: CommentRecord[]; f
    * the popover and unmount the state that knows the drawer is open.
    */
   const [beforeOpen, setBeforeOpen] = useState(false);
+  /*
+   * Hand each patch to the per-file store before the next run's `APPLY_INIT` drops it.
+   * `recordDiff` ignores repeats, so re-running this on every unrelated state change (a
+   * row, a phase) costs a comparison and wakes no subscriber.
+   */
+  useEffect(() => {
+    for (const d of state.diffs) recordDiff(d);
+  }, [state.diffs]);
   const feedRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
 
