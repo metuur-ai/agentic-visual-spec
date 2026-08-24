@@ -172,6 +172,14 @@ export async function handleCommentsRequest(
     if (idMatch) {
       const id = idMatch[1]!;
       if (method === 'PATCH') {
+        // R-6.7: `CommentStatus` is the two-value union `open | applied`, and this route
+        // is the only way a client can set it. An unchecked cast let any string through
+        // to the sidecar, which is exactly how an in-progress review status would leak
+        // onto a durable record. `undefined` still passes: a status-less PATCH (result or
+        // comment only) is existing behaviour and stays untouched.
+        if (body.status !== undefined && body.status !== 'open' && body.status !== 'applied') {
+          return { status: 400, json: { error: `invalid status: ${String(body.status)}` } };
+        }
         const result = typeof body.result === 'string' ? body.result : undefined;
         const patch: CommentPatch = { status: body.status as CommentStatus, ...(result !== undefined ? { result } : {}) };
         if (store.updateComment) await store.updateComment(id, patch);

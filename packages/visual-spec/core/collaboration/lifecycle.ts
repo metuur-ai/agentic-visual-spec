@@ -310,6 +310,13 @@ export function createLifecycleBodies(options: LifecycleBodyOptions): LifecycleJ
 
       // Contents API only — a `git add` would normalize line endings and break the
       // publish byte-verification permanently (LLD §7).
+      // Read-before-write: a path that already exists on the base branch is carried onto
+      // the new branch, and the Contents API rejects a `PUT` without the blob sha of the
+      // file being replaced. Omitting it turns "create a document over an existing path"
+      // into a failed commit — and a branch with no Pull Request behind it.
+      const existingDoc = await adapter.getFile(repoRef, doc.documentPath, branch);
+      throwIfAborted(ctx);
+
       ctx.log(`committing ${doc.documentPath}`, 'progress');
       await adapter.commitFile(repoRef, {
         path: doc.documentPath,
@@ -317,6 +324,7 @@ export function createLifecycleBodies(options: LifecycleBodyOptions): LifecycleJ
         content: doc.markdown,
         message: `visual-spec: create ${documentId}`,
         branch,
+        ...(existingDoc ? { sha: existingDoc.sha } : {}),
       });
       throwIfAborted(ctx);
 
@@ -336,12 +344,17 @@ export function createLifecycleBodies(options: LifecycleBodyOptions): LifecycleJ
        * the one thing that breaks it — a Pull Request opened over a partial commit.
        */
       for (const companion of doc.companions ?? []) {
+        // Same read-before-write as the document above, for the same reason.
+        const existingCompanion = await adapter.getFile(repoRef, companion.path, branch);
+        throwIfAborted(ctx);
+
         ctx.log(`committing ${companion.path}`, 'progress');
         await adapter.commitFile(repoRef, {
           path: companion.path,
           content: companion.markdown,
           message: `visual-spec: create ${documentId} — ${companion.path}`,
           branch,
+          ...(existingCompanion ? { sha: existingCompanion.sha } : {}),
         });
         throwIfAborted(ctx);
       }

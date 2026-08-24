@@ -131,12 +131,20 @@ function harness(responses: Array<Partial<GhResult>>, seed?: CollaborationRecord
 
 /** Wait for the in-flight job body — the hub starts bodies synchronously and settles async. */
 const settled = async (): Promise<void> => {
-  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  for (let i = 0; i < 60; i += 1) await Promise.resolve();
+};
+
+/** A path that is not on the branch yet — what `getFile` sees before a first commit. */
+const ABSENT: Partial<GhResult> = {
+  stdout: fixture('error-not-found.json'),
+  stderr: 'gh: Not Found (HTTP 404)',
+  exitCode: 1,
 };
 
 const CREATE_OK: Array<Partial<GhResult>> = [
   { stdout: fixture('git-ref.json') }, // getBranch(main)
   { stdout: fixture('create-ref.json') }, // createBranch
+  ABSENT, // getFile — read-before-write, the document is new
   { stdout: fixture('contents-put.json') }, // commitFile
   { stdout: fixture('pull-create.json') }, // createPullRequest
 ];
@@ -159,11 +167,12 @@ describe('createLifecycle.start (R-8.5)', () => {
     expect(h.calls.map((c) => endpointOf(c.args))).toEqual([
       '/repos/acme/docs/git/ref/heads/main',
       '/repos/acme/docs/git/refs',
+      '/repos/acme/docs/contents/documents/doc-1.json?ref=visual-spec/doc-1',
       '/repos/acme/docs/contents/documents/doc-1.json',
       '/repos/acme/docs/pulls',
     ]);
     // Contents API, never a git subprocess.
-    expect(h.calls[2]?.args).toContain('PUT');
+    expect(h.calls[3]?.args).toContain('PUT');
     expect(JSON.parse(h.calls[1]?.input ?? '{}')).toEqual({
       ref: 'refs/heads/visual-spec/doc-1',
       sha: '5f2a1c9b8d4e6f0a1b2c3d4e5f60718293a4b5c6',
@@ -206,7 +215,7 @@ describe('createLifecycle.start (R-8.5)', () => {
     h.lifecycle.start({ documentId: 'doc-1' });
     await settled();
 
-    const body = JSON.parse(h.calls[2]?.input ?? '{}') as { content: string; branch: string; message: string };
+    const body = JSON.parse(h.calls[3]?.input ?? '{}') as { content: string; branch: string; message: string };
     // R-0.1 — the document is the Markdown, so the artifact is the Markdown.
     expect(Buffer.from(body.content, 'base64').toString('utf8')).toBe(doc.markdown);
     expect(body.branch).toBe('visual-spec/doc-1');
@@ -280,12 +289,15 @@ describe('createLifecycle.start with companion files (R-8.29)', () => {
       ],
     });
 
-  /** One extra `contents` PUT per companion, before the single pull request. */
+  /** One extra `contents` GET+PUT pair per companion, before the single pull request. */
   const CREATE_MULTI: Array<Partial<GhResult>> = [
     { stdout: fixture('git-ref.json') }, // getBranch(main)
     { stdout: fixture('create-ref.json') }, // createBranch
+    ABSENT, // getFile — the document
     { stdout: fixture('contents-put.json') }, // commitFile — the document
+    ABSENT, // getFile — docs/rules.md
     { stdout: fixture('contents-put.json') }, // commitFile — docs/rules.md
+    ABSENT, // getFile — notes/context.md
     { stdout: fixture('contents-put.json') }, // commitFile — notes/context.md
     { stdout: fixture('pull-create.json') }, // createPullRequest
   ];
@@ -298,16 +310,19 @@ describe('createLifecycle.start with companion files (R-8.29)', () => {
     expect(h.calls.map((c) => endpointOf(c.args))).toEqual([
       '/repos/acme/docs/git/ref/heads/main',
       '/repos/acme/docs/git/refs',
+      '/repos/acme/docs/contents/documents/doc-1.json?ref=visual-spec/doc-1',
       '/repos/acme/docs/contents/documents/doc-1.json',
+      '/repos/acme/docs/contents/docs/rules.md?ref=visual-spec/doc-1',
       '/repos/acme/docs/contents/docs/rules.md',
+      '/repos/acme/docs/contents/notes/context.md?ref=visual-spec/doc-1',
       '/repos/acme/docs/contents/notes/context.md',
       '/repos/acme/docs/pulls',
     ]);
     // R-8.29 — one pull request, whatever the file count.
     expect(h.calls.filter((c) => endpointOf(c.args) === '/repos/acme/docs/pulls')).toHaveLength(1);
     // Every companion goes onto the branch the document went onto, not a branch of its own.
-    for (const call of h.calls.slice(2, 5)) {
-      expect(JSON.parse(call.input ?? '{}')).toMatchObject({ branch: 'visual-spec/doc-1' });
+    for (const call of [h.calls[3], h.calls[5], h.calls[7]]) {
+      expect(JSON.parse(call?.input ?? '{}')).toMatchObject({ branch: 'visual-spec/doc-1' });
     }
   });
 
@@ -316,7 +331,7 @@ describe('createLifecycle.start with companion files (R-8.29)', () => {
     h.lifecycle.start({ documentId: 'doc-1' });
     await settled();
 
-    const sent = JSON.parse(h.calls[5]?.input ?? '{}') as { body: string };
+    const sent = JSON.parse(h.calls[8]?.input ?? '{}') as { body: string };
     expect(sent.body).toContain('`docs/rules.md`');
     expect(sent.body).toContain('`notes/context.md`');
     // R-8.30 — and the document is still the one the trailer names.
@@ -332,7 +347,9 @@ describe('createLifecycle.start with companion files (R-8.29)', () => {
     const h = harness([
       { stdout: fixture('git-ref.json') },
       { stdout: fixture('create-ref.json') },
+      ABSENT, // getFile — the document
       { stdout: fixture('contents-put.json') }, // the document commits
+      ABSENT, // getFile — the companion
       { stdout: '{"message":"Validation Failed"}', stderr: 'gh: Validation Failed (HTTP 422)', exitCode: 1 }, // the companion does not
     ], withCompanions());
     h.lifecycle.start({ documentId: 'doc-1' });
@@ -351,7 +368,7 @@ describe('createLifecycle.start with companion files (R-8.29)', () => {
     const h = harness(CREATE_OK);
     h.lifecycle.start({ documentId: 'doc-1' });
     await settled();
-    expect(JSON.parse(h.calls[3]?.input ?? '{}').body).not.toContain('Also on this branch');
+    expect(JSON.parse(h.calls[4]?.input ?? '{}').body).not.toContain('Also on this branch');
   });
 });
 
@@ -399,7 +416,7 @@ describe('buildPullRequestBody (R-11.1)', () => {
     const h = harness(CREATE_OK);
     h.lifecycle.start({ documentId: 'doc-1' });
     await settled();
-    const sent = JSON.parse(h.calls[3]?.input ?? '{}') as { body: string; head: string; base: string; title: string };
+    const sent = JSON.parse(h.calls[4]?.input ?? '{}') as { body: string; head: string; base: string; title: string };
     expect(sent).toMatchObject({ head: 'visual-spec/doc-1', base: 'main', title: 'Onboarding guide' });
     expect(parseCommentBody(sent.body).trailer?.documentId).toBe('doc-1');
   });

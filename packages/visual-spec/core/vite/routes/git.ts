@@ -36,6 +36,7 @@
  */
 import { type GitContext, type GitExecutor, readGitContext } from '../../git-context';
 import { checkoutBranch, listBranches } from '../../git-branches';
+import { readChangedPaths } from '../../git-changed';
 
 export type RouteResult = { status: number; json: unknown };
 
@@ -90,6 +91,22 @@ export async function handleGitRequest(
   if (method === 'GET' && (pathname === '' || pathname === '/')) {
     const context: GitContext = await readGitContext(dir(), exec);
     return { status: 200, json: context };
+  }
+
+  /*
+   * R-8.36 — the uncommitted paths, so the pull request picker can offer the files the
+   * author has actually been changing.
+   *
+   * NOT GATED ON `allowCheckout`. That flag exists because `POST /checkout` WRITES to
+   * the user's working tree (R-6.3), and `/branches` is behind it only because it is
+   * that write's own picker. This is a read of the same kind as `GET /__vs/git` itself,
+   * which has never been gated, and it serves a flow — starting a collaboration — that
+   * must work on a server where branch switching was never turned on.
+   */
+  if (method === 'GET' && pathname === '/changed') {
+    const changed = await readChangedPaths(dir(), exec);
+    if (!changed.ok) return { status: 500, json: { error: changed.reason } };
+    return { status: 200, json: { paths: changed.paths } };
   }
 
   if (allowCheckout && method === 'GET' && pathname === '/branches') {

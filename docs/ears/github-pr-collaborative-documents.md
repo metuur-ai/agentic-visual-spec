@@ -252,8 +252,10 @@ a set without a head.
 | R-8.31 | IF two supplied files declare the same path, THE SYSTEM SHALL reject the request before creating a branch and SHALL name the duplicated path. |
 | R-8.32 | IF any supplied path fails the containment rule a single path must already satisfy, THE SYSTEM SHALL reject the whole request and SHALL commit none of the supplied files. |
 | R-8.33 | IF the create job fails after committing some but not all supplied files, THE SYSTEM SHALL report the failure and SHALL leave no orphaned branch behind, as R-8.18 already requires of the single-file case. |
-| R-8.34 | WHEN offering the author a multi-file start, THE SYSTEM SHALL default the selection to the open file alone, and SHALL offer as candidates only local files that carry notes. |
+| R-8.34 | WHEN offering the author a multi-file start, THE SYSTEM SHALL default the selection to the open file alone, and SHALL offer as candidates the local Markdown files that carry notes, that the working tree reports as changed (R-8.36), or that were opened in the viewer during this session (R-8.37), each offered once. |
 | R-8.35 | THE SYSTEM SHALL include in the request only the files the author selected, and SHALL NOT add a file to a Pull Request because it was merely offered. |
+| R-8.36 | THE SYSTEM SHALL derive the changed candidates from the working tree at the moment the offer is shown, expressed relative to the served directory, and SHALL re-derive them when a file is saved from the editor; IF the working tree cannot be read, THE SYSTEM SHALL offer the remaining candidates rather than refuse the start. |
+| R-8.37 | THE SYSTEM SHALL offer a Markdown file that was opened in the viewer during the session even where it carries no note and the working tree reports no change to it. |
 
 ## Unit 9: Authentication and authorization
 

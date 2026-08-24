@@ -23,9 +23,12 @@ import { type CommentDocStore, fileCommentStore, handleCommentsRequest } from '.
 import { handleFilesRequest } from './routes/files';
 import { handleGitRequest } from './routes/git';
 import { createApplyHub } from './routes/apply';
-import { createCollabRoutes } from './routes/collab';
+import { createReviewHub, handleReviewRequest } from './routes/review';
+import { sharedRunLock } from './routes/run-lock';
+import { createReviewSessionOpsSelector } from '../collaboration/review-session-collab';
+import { createCollabRoutes, parseClientRootEpoch, ROOT_EPOCH_HEADER } from './routes/collab';
 import { createCollabWiring } from './routes/collab-wiring';
-import { collaborationFromOrigin } from '../collaboration/open';
+import { type RebindFailure, rebindCollaboration } from '../collaboration/open';
 import { createJobHubRegistry } from '../collaboration/job-hub';
 import { fsCollaborationStore } from '../collaboration/record-store';
 import { type VisualSpecConfig, resolveConfig } from '../config';
@@ -190,7 +193,15 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       let comments: CommentDocStore = fileCommentStore(commentsPath);
       let watchRoot = specsRoot.replace(/\\/g, '/');
 
-      const setRoot = (dir: string) => {
+      /**
+       * R-10.1 — the collaboration repository moves with the directory, exactly as in
+       * the CLI host (`src/server.ts`). It was the one piece of startup state a re-root
+       * left behind, which is how comments written against directory B could reach the
+       * repository that directory A named. The re-derivation wins over an explicit
+       * `collaboration` block (R-10.2): that block described the directory the server is
+       * no longer serving. `VS_NO_COLLAB` still turns the whole thing off.
+       */
+      const setRoot = async (dir: string) => {
         specsRoot = dir;
         surfaces = mdSurfaceStore(specsRoot);
         tree = treeStore(specsRoot);
@@ -198,7 +209,30 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         comments = fileCommentStore(commentsPath);
         watchRoot = specsRoot.replace(/\\/g, '/');
         server.watcher.add(specsRoot);
+        // Cleared outside the guard on purpose. Under `VS_NO_COLLAB` nothing below
+        // reassigns it, so a reason held from the previous directory would outlive the
+        // directory it described and R-10.7 would explain the new one with the old one's
+        // verdict. Today no startup path leaves a reason here for a `VS_NO_COLLAB` run to
+        // strand — this keeps that a property of the reset rather than of the caller.
+        collabUnavailable = null;
+        if (!process.env.VS_NO_COLLAB) {
+          const rebound = await rebindCollaboration(specsRoot);
+          collabConfig = resolveConfig({ ...opts.config, collaboration: rebound.ok ? rebound.collaboration : undefined });
+          collabUnavailable = rebound.ok ? null : rebound.reason;
+        }
+        // R-10.6 — announced in the same synchronous breath as the reassignment above, so no
+        // request can observe the new configuration without the router having advanced. A
+        // second browser tab is never told to reload, and its next comment or apply would
+        // otherwise resolve through this configuration and write to a repository its reviewer
+        // never chose. Called unconditionally: `baseDir` moved even under `VS_NO_COLLAB`, and
+        // the held review sources are checkouts of the directory that is no longer served.
+        collab.rerooted();
         console.log(`\n  visual-spec (dev) → switched directory: ${specsRoot}\n`);
+        server.config.logger.info(
+          collabConfig.collaboration
+            ? `  visual-spec collab: ${collabConfig.collaboration.owner}/${collabConfig.collaboration.repo} (from origin)`
+            : `  visual-spec collab: off — ${collabUnavailable ?? 'not-configured'}`,
+        );
       };
 
       // Registered first, so every `/__vs` middleware below is behind it —
@@ -232,7 +266,7 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
           } catch {
             return { status: 400, json: { error: `Directory not found: ${picked.path}` } };
           }
-          setRoot(picked.path);
+          await setRoot(picked.path);
           return { status: 200, json: { root: specsRoot, comments: commentsPath } };
         }
         return { status: 404, json: { error: `no route: ${method} /__vs/dir${pathname}` } };
@@ -368,6 +402,36 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
         return next();
       });
 
+      // Interactive review sessions (R-8.1). Same shared-lock slot as the apply hub —
+      // `sharedRunLock` by default — so one of the two runs at a time. The host does
+      // nothing but slice the prefix and hand the request to the shared handler (R-8.2).
+      // The third argument is the local/collab arm selector (EARS Unit 9). It is passed
+      // rather than defaulted so a collaborative start reaches the collaborative
+      // implementation; `review.ts` itself neither imports it nor knows it exists.
+      const reviewHub = createReviewHub(
+        () => ({ cwd: specsRoot, comments }),
+        sharedRunLock,
+        createReviewSessionOpsSelector({ documents: () => fsCollaborationStore(specsRoot) }),
+      );
+      server.middlewares.use('/__vs/review', (req, res) => {
+        void (async () => {
+          try {
+            const url = new URL(req.url ?? '', 'http://localhost');
+            const body = await readJsonBody(req);
+            const r = await handleReviewRequest(reviewHub, {
+              method: req.method ?? 'GET',
+              pathname: url.pathname,
+              body,
+              sse: res,
+            });
+            if ('streamed' in r) return; // SSE: the hub wrote the head and the sync frame
+            sendJson(res, r.status, r.json);
+          } catch (err) {
+            sendJson(res, 500, { error: (err as Error).message });
+          }
+        })();
+      });
+
       // Collaboration routes (R-7.1). Same registry discipline as the standalone host —
       // one registry per server, created here and never at module level — and the same
       // shared router, so neither host owns any collaboration logic of its own (R-7.6).
@@ -386,12 +450,18 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
        * Vite host's `--no-collab`, since a plugin takes flags from nobody.
        */
       let collabConfig = resolveConfig(opts.config);
+      /** R-10.3 — why the current directory has no collaboration repository, for R-10.7. */
+      let collabUnavailable: RebindFailure | null = null;
       let collabFromOrigin: string | null = null;
       if (!collabConfig.collaboration && !process.env.VS_NO_COLLAB) {
-        const inferred = await collaborationFromOrigin(specsRoot);
-        if (inferred) {
-          collabConfig = resolveConfig({ ...opts.config, collaboration: inferred });
-          collabFromOrigin = `${inferred.owner}/${inferred.repo}`;
+        // Same call as the re-root path, so the startup reason and the post-switch
+        // reason are drawn from one place (R-10.7).
+        const inferred = await rebindCollaboration(specsRoot);
+        if (inferred.ok) {
+          collabConfig = resolveConfig({ ...opts.config, collaboration: inferred.collaboration });
+          collabFromOrigin = `${inferred.collaboration.owner}/${inferred.collaboration.repo}`;
+        } else {
+          collabUnavailable = inferred.reason;
         }
       }
       // Said out loud for the same reason the CLI says it: a repository the developer
@@ -412,6 +482,9 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       const collab = createCollabRoutes({
         jobs: collabJobs,
         config: () => collabConfig,
+        // R-10.7 — the re-root verdict, so the browser is told why collaboration went off
+        // rather than only this process's log.
+        unavailable: () => collabUnavailable,
         documents: () => fsCollaborationStore(specsRoot),
         // Same directory the documents come from, read per request for the same reason.
         baseDir: () => specsRoot,
@@ -428,7 +501,17 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
             const sub = url.pathname === '/' ? '' : url.pathname;
             const query = Object.fromEntries(url.searchParams.entries());
             const body = await readJsonBody(req);
-            const r = await collab.handle({ method: req.method ?? 'GET', pathname: sub, query, body, sse: res });
+            // R-10.9 — stamped before `handle` runs, so the SSE path gets it too: the hub
+            // writes its own head, and `writeHead` merges what `setHeader` already set.
+            res.setHeader(ROOT_EPOCH_HEADER, String(collab.rootEpoch()));
+            const r = await collab.handle({
+              method: req.method ?? 'GET',
+              pathname: sub,
+              query,
+              body,
+              clientRootEpoch: parseClientRootEpoch(req.headers[ROOT_EPOCH_HEADER]),
+              sse: res,
+            });
             if (r.streamed) return; // SSE: the hub already wrote the head and the sync frame
             sendJson(res, r.status, r.json);
           } catch (err) {

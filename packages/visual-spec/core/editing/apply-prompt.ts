@@ -56,6 +56,43 @@ function collabInstruction(documentPath: string): string {
   return `Source of truth is the review conversation listed below, NOT visual-spec-comments.json — that sidecar is a non-authoritative cache in this mode, so do not read it, do not edit it, and do not trust it anywhere it disagrees with this list. The one and only file you may edit is the canonical JSON document ${documentPath}; the generated Markdown is write-only output and MUST NOT be edited. Take only status:"open" and GROUP BY workflow. For each comment, locate the target by its nodeId in ${documentPath} — the nodeId identifies the node exactly, and there is no snippet or line-number fallback; a comment with no nodeId is document-level, so treat it as being about the document as a whole. For workflow "visual-spec", apply the change to that node in place and keep the output JSON valid; for any other workflow, hand the resolved comment to that workflow skill. Do not write status or result into any file — resolution is recorded on the conversation, not on disk. Finish with a traceability table: id · workflow · nodeId · what changed / handed off. You cannot publish and MUST NOT attempt to; publishing is initiated by a person. Once every comment is applied, end your reply with this exact final line and nothing after it: ${PUBLISH_HANDOFF_PREFIX}${documentPath}`;
 }
 
+/**
+ * One comment's manifest entry: what it points at, how to find it, and what was asked.
+ *
+ * Shared with `review-prompt.ts` (LLD Constraints) — a review session locates its single
+ * comment by exactly the same ladder the bulk apply uses, and two copies of that ladder
+ * would drift the moment either one is corrected. Nothing else is shared: the review
+ * prompt's instruction text and its envelope are its own.
+ *
+ * **The collab fields stay behind the mode branch.** `local-mode.regression.test.ts:377-383`
+ * asserts that a local-mode prompt names no remote service, pull request or node
+ * identifier, and this function is now the only place that renders the `Node:` line.
+ * Adding a collab field outside the `collab` branch breaks local mode, not just this
+ * module — and now breaks the review prompt with it.
+ *
+ * `index` is 0-based; the rendered number is 1-based.
+ */
+export function formatCommentEntry(c: CommentRecord, index: number, options: ApplyPromptOptions = {}): string[] {
+  const collab = options.mode === 'collab' ? options : null;
+  const t = c.target;
+  const isRange = t.endLine != null && t.endLine > (t.startLine ?? 0);
+  const lines: string[] = [];
+  lines.push(`${index + 1}. [${c.workflow}] ${t.kind === 'folder' ? 'Folder' : 'File'}: ${t.path}`);
+  if (collab) {
+    // Read structurally so this module keeps its zero dependencies; the field is
+    // `ProjectedCommentRecord.collab` from core/collaboration/comment-projection.ts.
+    const nodeId = (c as { collab?: { nodeId?: string } }).collab?.nodeId;
+    lines.push(`   Node: ${nodeId ?? '(document-level — no nodeId)'}`);
+  } else if (t.kind !== 'folder') {
+    const where = t.startLine != null ? (isRange ? `lines ${t.startLine}–${t.endLine}` : `line ${t.startLine}`) : 'whole file';
+    lines.push(`   Where: ${t.heading ? `${t.heading} · ` : ''}${where}`);
+    if (t.snippet) lines.push(`   ${isRange ? 'From' : 'Context'}: "${t.snippet}"`);
+    if (isRange && t.endSnippet) lines.push(`   Through: "${t.endSnippet}"`);
+  }
+  lines.push(`   Comment: ${c.comment}`);
+  return lines;
+}
+
 /** The instruction + comment manifest an agent needs to apply the open comments. */
 export function buildApplyPrompt(open: CommentRecord[], options: ApplyPromptOptions = {}): string {
   const collab = options.mode === 'collab' ? options : null;
@@ -66,22 +103,8 @@ export function buildApplyPrompt(open: CommentRecord[], options: ApplyPromptOpti
   lines.push('');
   lines.push(`Comments (${open.length}):`);
   open.forEach((c, i) => {
-    const t = c.target;
-    const isRange = t.endLine != null && t.endLine > (t.startLine ?? 0);
     lines.push('');
-    lines.push(`${i + 1}. [${c.workflow}] ${t.kind === 'folder' ? 'Folder' : 'File'}: ${t.path}`);
-    if (collab) {
-      // Read structurally so this module keeps its zero dependencies; the field is
-      // `ProjectedCommentRecord.collab` from core/collaboration/comment-projection.ts.
-      const nodeId = (c as { collab?: { nodeId?: string } }).collab?.nodeId;
-      lines.push(`   Node: ${nodeId ?? '(document-level — no nodeId)'}`);
-    } else if (t.kind !== 'folder') {
-      const where = t.startLine != null ? (isRange ? `lines ${t.startLine}–${t.endLine}` : `line ${t.startLine}`) : 'whole file';
-      lines.push(`   Where: ${t.heading ? `${t.heading} · ` : ''}${where}`);
-      if (t.snippet) lines.push(`   ${isRange ? 'From' : 'Context'}: "${t.snippet}"`);
-      if (isRange && t.endSnippet) lines.push(`   Through: "${t.endSnippet}"`);
-    }
-    lines.push(`   Comment: ${c.comment}`);
+    lines.push(...formatCommentEntry(c, i, options));
   });
   return lines.join('\n');
 }

@@ -412,13 +412,38 @@ describe('the host source writes nothing (R-W2.9)', () => {
    * plausibly land in are listed before and after a full review and must be identical.
    * That covers the specific thing this design promised not to do — no cache file, no
    * temp file, and no directory in the user's home.
+   *
+   * The temp directory watched is a PRIVATE one, not the shared system root. Some twenty
+   * test files in this package `mkdtemp` into the system root, vitest runs them in
+   * parallel workers, and a fixture created by one of them mid-review would land in a
+   * listing of that root and fail this assertion for a write nobody here made. Redirecting
+   * `TMPDIR` — which is what `os.tmpdir()` reads, on every call — gives this test a root
+   * only it can write to, so a new entry there is necessarily attributable to the review.
+   *
+   * The trade: a write to a HARDCODED '/tmp' would no longer be seen here. That is the
+   * narrower loss, and levels one and three still cover it — a module that never imports
+   * `node:fs` cannot hardcode a path into it.
    */
   it('performs a whole review without adding a file to cwd, tmp or the home directory', async () => {
-    const watched = [process.cwd(), tmpdir(), homedir()];
-    const listing = () => watched.map((dir) => fs.readdirSync(dir).sort().join('\n'));
-    const before = listing();
-    await fullReview();
-    expect(listing()).toEqual(before);
+    const previousTmpdir = process.env.TMPDIR;
+    const privateTmpdir = fs.mkdtempSync(resolve(tmpdir(), 'review-source-api-rw29-'));
+    process.env.TMPDIR = privateTmpdir;
+    try {
+      // The redirection is load-bearing for what this test claims, so it is asserted, not
+      // assumed: if `os.tmpdir()` ever stopped reading the environment, the watch below
+      // would be pointed at a directory the source never had a chance to write to.
+      expect(tmpdir()).toBe(privateTmpdir);
+
+      const watched = [process.cwd(), tmpdir(), homedir()];
+      const listing = () => watched.map((dir) => fs.readdirSync(dir).sort().join('\n'));
+      const before = listing();
+      await fullReview();
+      expect(listing()).toEqual(before);
+    } finally {
+      if (previousTmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmpdir;
+      fs.rmSync(privateTmpdir, { recursive: true, force: true });
+    }
   });
 
   /*

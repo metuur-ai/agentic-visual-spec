@@ -17,5 +17,5 @@ export {
 } from './components/inspector/inspector-provider';
 export type { SelectedTarget } from './components/inspector/inspector-provider';
 export { InspectOverlay } from './components/inspector/inspect-overlay';
-export { collectSection, headingBlockOf } from './lib/inspector/blocks';
+export { RANGE_KEY_LABEL, collectSection, headingBlockOf, isRangeClick } from './lib/inspector/blocks';
 export { SelectionReporter } from './components/inspector/selection-reporter';

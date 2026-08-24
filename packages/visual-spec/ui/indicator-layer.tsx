@@ -24,6 +24,7 @@ import type { CommentRecord } from '../core/editing/comment-doc';
 import { resolveCodeAnchors, resolveMarkdownAnchors } from './anchor-resolver';
 import { useActiveComment } from './active-comment';
 import { groupByStartLine, type IndicatorGroup } from './indicator-model';
+import { Z } from '../core/app/lib/z-layers';
 
 /**
  * One placeable marker: the comments it stands for, the text it announces, and how
@@ -187,8 +188,8 @@ const overlay: React.CSSProperties = {
   position: 'fixed',
   inset: 0,
   pointerEvents: 'none',
-  // Below InspectOverlay (2147483000) so an active inspector still wins hit-testing.
-  zIndex: 2147482000,
+  // Below InspectOverlay so an active inspector still wins hit-testing.
+  zIndex: Z.INSPECT_INDICATORS,
 };
 
 // Amber, deliberately distinct from the blue selection frames and blue flash (R-1.7).

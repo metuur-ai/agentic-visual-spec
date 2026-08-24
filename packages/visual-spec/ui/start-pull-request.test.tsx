@@ -13,6 +13,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MainHeader, documentIdFromPath } from './main-header';
+import { resetVisitedFiles } from './use-visited-files';
 
 const CONFIGURED = { available: true, login: 'author-ana', repo: { owner: 'acme', repo: 'docs', baseBranch: 'main' }, scopes: [] };
 const FILE = 'test/javier/for-comment.md';
@@ -30,6 +31,8 @@ type Server = {
   start?: () => Response;
   /** The local sidecar's notes, which decide whether the control is promoted. */
   comments?: unknown[];
+  /** R-8.36 — what `git status` reports for the served directory. */
+  changed?: string[];
 };
 
 function installFetch(server: Server = {}) {
@@ -39,6 +42,7 @@ function installFetch(server: Server = {}) {
     calls.push({ url, ...(init?.body ? { body: JSON.parse(init.body as string) } : {}) });
     if (url === '/__vs/git') return jsonRes({ state: 'none' });
     if (url === '/__vs/git/branches') return jsonRes({ error: 'no route' }, 404);
+    if (url === '/__vs/git/changed') return jsonRes({ paths: server.changed ?? [] });
     if (url === '/__vs/collab') return jsonRes(server.availability ?? CONFIGURED);
     if (url === '/__vs/collab/start') return (server.start ?? (() => jsonRes({ ok: true, jobId: 'job-1', kind: 'create' })))();
     if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: [] });
@@ -61,6 +65,8 @@ class FakeEventSource {
 
 beforeEach(() => {
   vi.stubGlobal('EventSource', FakeEventSource);
+  // R-8.37's store is session memory shared by every render in this file.
+  resetVisitedFiles();
 });
 
 afterEach(() => {
@@ -222,7 +228,7 @@ describe('starting a collaboration on more than one file', () => {
     };
   };
 
-  async function openWithCandidates(comments: unknown[]) {
+  async function openWithCandidates(comments: unknown[], changed: string[] = []) {
     const calls: Array<{ url: string; body?: unknown }> = [];
     const answer = fileRead();
     const impl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -230,6 +236,7 @@ describe('starting a collaboration on more than one file', () => {
       calls.push({ url, ...(init?.body ? { body: JSON.parse(init.body as string) } : {}) });
       if (url === '/__vs/git') return jsonRes({ state: 'none' });
       if (url === '/__vs/git/branches') return jsonRes({ error: 'no route' }, 404);
+      if (url === '/__vs/git/changed') return jsonRes({ paths: changed });
       if (url === '/__vs/collab') return jsonRes(CONFIGURED);
       if (url === '/__vs/collab/start') return jsonRes({ ok: true, jobId: 'job-1', kind: 'create' });
       if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: [] });
@@ -285,6 +292,83 @@ describe('starting a collaboration on more than one file', () => {
       { path: FILE, markdown: MARKDOWN },
       { path: OTHER, markdown: OTHER_MARKDOWN },
     ]);
+  });
+
+  /*
+   * R-8.36 — a file the author edited is a file they may want on the request, and the
+   * sidecar knows nothing about it: they changed bytes, they did not leave a note.
+   */
+  it('offers the working tree’s changed files, even with no notes anywhere', async () => {
+    await openWithCandidates([], [OTHER]);
+
+    const box = await screen.findByRole('checkbox', { name: new RegExp(OTHER) });
+    expect((box as HTMLInputElement).checked).toBe(false);
+  });
+
+  it('offers a changed file once, not twice, when it also carries a note', async () => {
+    await openWithCandidates([note('c-1', OTHER)], [OTHER]);
+
+    await screen.findByRole('checkbox', { name: new RegExp(OTHER) });
+    expect(screen.getAllByRole('checkbox')).toHaveLength(1);
+  });
+
+  it('ignores changed files that are not markdown', async () => {
+    await openWithCandidates([], ['src/app.ts', 'docs/logo.png']);
+
+    await screen.findByPlaceholderText('for-comment');
+    expect(screen.queryByRole('checkbox')).toBeNull();
+  });
+
+  /*
+   * The defect that started this: the list was read once and never again, so a save made
+   * after the popover was last populated was invisible. It re-reads on `vs:source-changed`.
+   */
+  it('re-reads the changed files when the editor saves', async () => {
+    const calls = await openWithCandidates([], []);
+    await screen.findByPlaceholderText('for-comment');
+    const before = calls.filter((c) => c.url === '/__vs/git/changed').length;
+
+    fireEvent(window, new CustomEvent('vs:source-changed'));
+
+    await waitFor(() => expect(calls.filter((c) => c.url === '/__vs/git/changed').length).toBe(before + 1));
+  });
+
+  /*
+   * R-8.37 — a file needs no change and no note to join the request. Having been opened
+   * in the viewer is enough to be offered; it still has to be ticked to be sent.
+   */
+  it('offers a file that was merely opened in the viewer', async () => {
+    const { unmount } = render(<div />);
+    unmount();
+    // The first document the author looked at, before moving to `FILE`.
+    const VISITED = 'docs/visited.md';
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    const answer = fileRead();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        calls.push({ url, ...(init?.body ? { body: JSON.parse(init.body as string) } : {}) });
+        if (url === '/__vs/git') return jsonRes({ state: 'none' });
+        if (url === '/__vs/git/branches') return jsonRes({ error: 'no route' }, 404);
+        if (url === '/__vs/git/changed') return jsonRes({ paths: [] });
+        if (url === '/__vs/collab') return jsonRes(CONFIGURED);
+        if (url.startsWith('/__vs/collab/pulls')) return jsonRes({ pulls: [] });
+        if (url.startsWith('/__vs/tree/file')) return answer(url);
+        if (url.startsWith('/__vs/comments')) return jsonRes([]);
+        if (url === '/__vs/source/root') return jsonRes({ root: '/repo' });
+        throw new Error(`unexpected fetch: ${url}`);
+      }),
+    );
+
+    const view = render(<MainHeader file={VISITED} isMarkdown onModeChange={() => {}} />);
+    view.rerender(<MainHeader file={FILE} isMarkdown onModeChange={() => {}} />);
+    fireEvent.click(await screen.findByRole('button', { name: /Start collaboration/ }));
+
+    const box = await screen.findByRole('checkbox', { name: new RegExp(VISITED) });
+    expect((box as HTMLInputElement).checked).toBe(false);
+    // The file on screen is the document; it is never offered as an extra.
+    expect(screen.queryByRole('checkbox', { name: new RegExp(FILE) })).toBeNull();
   });
 });
 

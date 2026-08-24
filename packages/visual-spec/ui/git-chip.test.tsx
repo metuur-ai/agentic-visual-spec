@@ -367,6 +367,21 @@ describe('the branch at the point of apply (R-4.1 / R-4.2)', () => {
       expect(vi.mocked(fetch).mock.calls.some(([u]) => String(u) === '/__vs/apply/start')).toBe(true),
     );
   });
+
+  /*
+   * The scope chooser is the last screen before an agent edits files, so it is the only
+   * place where "this writes without showing you first" is still actionable. Stated
+   * afterwards it is not a warning, it is an explanation of what already happened.
+   */
+  it('says the run writes directly, and names the path that proposes first', async () => {
+    await openScopeChooser(REMOTE_GITHUB);
+    const note = await screen.findByTestId('scope-direct-write');
+    const text = (note.textContent ?? '').replace(/\s+/g, ' ');
+    expect(text).toContain('Writes straight to your files');
+    expect(text).toContain('no diff to approve');
+    // The alternative is only useful if it is named — otherwise the note is a dead end.
+    expect(text).toContain('Review & apply');
+  });
 });
 
 /*
@@ -935,5 +950,57 @@ describe('the counts waiting on you are two chips, captioned once', () => {
 
     expect((await screen.findByTestId('git-pull-menu')).textContent).toContain('readme');
     expect(screen.queryByTestId('git-pull-menu-repo')).toBeNull();
+  });
+});
+
+/*
+ * A second run after the first one finished. The activity panel and the scope
+ * chooser hang off the same button, and once a run has completed the panel is
+ * still the thing the button has to show *for that run* — until you ask for
+ * another one. Asking is the click, and the click has to reach the chooser, or
+ * the second run starts with a scope nobody picked (or does not start at all).
+ */
+describe('applying again after a finished run', () => {
+  /** Captures the instance so a test can drive the run to completion. */
+  class CapturingEventSource extends FakeEventSource {
+    static last: CapturingEventSource | null = null;
+    constructor(url: string) {
+      super(url);
+      CapturingEventSource.last = this;
+    }
+  }
+
+  beforeEach(() => {
+    CapturingEventSource.last = null;
+    vi.stubGlobal('EventSource', CapturingEventSource);
+  });
+
+  /** Drives the header's stream through a whole run, start to done. */
+  function finishARun() {
+    const es = CapturingEventSource.last;
+    if (!es?.onmessage) throw new Error('the header never opened the apply stream');
+    const send = (frame: unknown) => es.onmessage?.({ data: JSON.stringify(frame) });
+    send({ type: 'start', openCount: 1, startedAt: Date.now() });
+    send({ type: 'log', kind: 'assistant', text: 'edited docs/spec.md' });
+    send({ type: 'done', ok: true, applied: 1, exitCode: 0 });
+  }
+
+  it('opens the scope chooser, not the finished run, on the next click', async () => {
+    installFetch(REMOTE_GITHUB);
+    render(<MainHeader file="docs/spec.md" />);
+
+    const applyBtn = await screen.findByTitle(/Apply the open comments/);
+    await waitFor(() => expect((applyBtn as HTMLButtonElement).disabled).toBe(false));
+
+    fireEvent.click(applyBtn);
+    fireEvent.click(await screen.findByText('Whole workspace'));
+    finishARun();
+    // The panel for the run that just ended — this much was never broken.
+    await screen.findByText(/Applied/);
+
+    // Dismissing the panel and asking again is the whole of the report.
+    fireEvent.click(screen.getByTitle(/Apply the open comments/));
+
+    expect(await screen.findByText('Apply comments…')).toBeTruthy();
   });
 });

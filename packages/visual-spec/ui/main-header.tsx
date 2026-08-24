@@ -14,6 +14,9 @@ import { useAwaitingPulls } from './use-awaiting-pulls';
 import { type CollabPulls, type ConfiguredRepo, useCollabPulls } from './use-collab-pulls';
 import { type BranchListing, useGitBranches } from './use-git-branches';
 import { type GitContext, useGitContext } from './use-git-context';
+import { useChangedFiles } from './use-changed-files';
+import { recordVisit, useVisitedFiles } from './use-visited-files';
+import { Z } from '../core/app/lib/z-layers';
 
 /**
  * What the chip needs from the shell around it, and the whole of it.
@@ -1230,11 +1233,22 @@ function ApplyButton({ open, file, onRunningChange }: { open: CommentRecord[]; f
   };
   const cancel = () => void fetch('/__vs/apply/cancel', { method: 'POST' }).catch(() => {});
 
-  // Button click: while there's a run (live or finished) toggle the activity panel;
-  // otherwise open the scope chooser to pick what to apply.
+  /*
+   * Button click. While a run is live the panel is the only thing worth showing, so the
+   * button toggles it. Once the run has finished the button's label goes back to naming
+   * comments to apply ("Apply 1 comment"), and a control that names an action has to
+   * perform it: a *finished* run's rows are history, and routing the click back to them
+   * left the newly-written comment unreachable except via the panel's own "Run again"
+   * — three clicks through a stale summary to do what the label already promised.
+   *
+   * The finished panel stays one click away only when there is nothing left to apply,
+   * which is the case the summary is actually for (and why the button stays enabled at
+   * `openCount === 0`; see the `disabled` prop below).
+   */
   const onButton = () => {
-    if (running || state.rows.length || state.summary) setView((v) => (v === 'closed' ? 'activity' : 'closed'));
-    else setView((v) => (v === 'scope' ? 'closed' : 'scope'));
+    if (running) setView((v) => (v === 'closed' ? 'activity' : 'closed'));
+    else if (openCount > 0) setView((v) => (v === 'scope' ? 'closed' : 'scope'));
+    else setView((v) => (v === 'closed' ? 'activity' : 'closed'));
   };
 
   const titles: Record<ApplyPhase, string> = { running: 'Applying comments', done: 'Done', cancelled: 'Cancelled', error: 'Stopped', idle: 'Apply' };
@@ -1257,7 +1271,7 @@ function ApplyButton({ open, file, onRunningChange }: { open: CommentRecord[]; f
         type="button"
         onClick={onButton}
         disabled={openCount === 0 && state.phase === 'idle'}
-        title="Apply the open comments with claude (runs the apply-comments skill)"
+        title="Apply the open comments with claude — edits are written straight to your files, with no diff to approve first"
         style={{ ...applyBtn, opacity: openCount === 0 && state.phase === 'idle' ? 0.5 : 1 }}
       >
         {running ? <PulseDot /> : '✨'}{' '}
@@ -1455,6 +1469,19 @@ function ScopeChooser({
           </div>
         </>
       )}
+      {/*
+       * What the run actually does, stated where you commit to it. The header button is the
+       * loud control, so a reader reasonably expects it to show them the change first — it
+       * does not, and finding that out afterwards is finding it out from your files. The
+       * same sentence carries the other half: the per-comment "Review & apply" is the path
+       * that *does* propose first, and this is the only moment the difference is worth
+       * knowing, so it is named here rather than left to be discovered in the sidebar.
+       */}
+      <div style={directWriteNote} data-testid="scope-direct-write">
+        <strong style={{ fontWeight: 700 }}>Writes straight to your files.</strong> There is no diff to approve —
+        claude edits as it goes. To read a change before it lands, use <strong style={{ fontWeight: 700 }}>Review &amp; apply</strong>{' '}
+        on a single comment in the sidebar.
+      </div>
       <div style={modelNote}>Runs with your default Claude model.</div>
     </div>
   );
@@ -1680,6 +1707,38 @@ async function readMarkdown(path: string): Promise<string> {
  * below still says what it will do to the repository, so nobody has to infer the
  * mechanics from the verb.
  */
+/**
+ * R-10.7 — the short form of the server's reason, for the chip. `message` is the whole
+ * sentence and stays in the tooltip; this is what fits beside the other header controls.
+ *
+ * FOUR ANSWERS, NOT ONE. R-10.4 is explicit that a GitHub repository nobody has a
+ * credential for must not be reported as an unrecognised repository: `no_credential`
+ * means "found the repo, could not authenticate", and the author's fix is `gh auth
+ * login`, not a different directory. An unmapped code falls through to itself rather
+ * than to a guess — the codes come from the server's own vocabulary and a new one should
+ * arrive visibly.
+ */
+function collabOffLabel(reason: string): string {
+  switch (reason) {
+    case 'not-configured':
+      return 'no repository configured';
+    case 'not-a-repo':
+      return 'not a git repository';
+    case 'no-remote':
+      return 'this repository has no remote';
+    case 'remote-not-github':
+      return 'the remote is not GitHub';
+    case 'no_credential':
+      return 'no GitHub credential';
+    case 'missing_scope':
+      return 'the credential is missing a scope';
+    case 'executor_unavailable':
+      return 'the gh CLI is unavailable';
+    default:
+      return reason;
+  }
+}
+
 function StartPullRequestButton({
   file,
   ready = false,
@@ -1689,7 +1748,10 @@ function StartPullRequestButton({
   file: string;
   /** The caller's verdict that this document's notes are worked through — see `readyToShare`. */
   ready?: boolean;
-  /** R-8.34 — other local files that carry notes, offerable on the same pull request. */
+  /**
+   * R-8.34 — other local files that carry notes. Merged with the working tree's changed
+   * files (R-8.36) and this session's visited files (R-8.37) into what is offered.
+   */
   candidates?: string[];
   onStarted?: (documentId: string) => void;
 }) {
@@ -1707,6 +1769,33 @@ function StartPullRequestButton({
    */
   const [chosen, setChosen] = useState<ReadonlySet<string>>(() => new Set());
   const rootRef = useRef<HTMLDivElement>(null);
+  // R-8.36 — read while the popover is open, and re-read when a save lands, so the list
+  // is what the working tree holds now rather than what it held at boot.
+  const changed = useChangedFiles(open);
+  const visited = useVisitedFiles();
+
+  // R-8.37 — looking at a file is what puts it in reach of the next pull request.
+  useEffect(() => {
+    recordVisit(file);
+  }, [file]);
+
+  /*
+   * R-8.34 — everything offerable, from the three things that can make a file relevant:
+   * a note left on it, an uncommitted edit to it, and a visit to it. One list, because
+   * the author is answering one question — "what else goes on this?" — and splitting it
+   * by provenance would make them ask it three times.
+   *
+   * The open file is removed rather than listed: it is the document, always sent, and a
+   * checkbox for it would be one that cannot be unticked (R-8.35's default lives in
+   * `chosen` holding only the extras).
+   */
+  const offered = useMemo(() => {
+    const paths = new Set<string>(candidates);
+    for (const path of changed) if (path.endsWith('.md')) paths.add(path);
+    for (const path of visited) if (path.endsWith('.md')) paths.add(path);
+    paths.delete(file);
+    return [...paths].sort();
+  }, [candidates, changed, visited, file]);
 
   useEffect(() => {
     let live = true;
@@ -1741,7 +1830,24 @@ function StartPullRequestButton({
     return () => document.removeEventListener('mousedown', onDown);
   }, [open]);
 
-  if (!availability?.available) return null;
+  // A probe that never answered is not a verdict — still nothing, as before.
+  if (!availability) return null;
+  /*
+   * R-10.7 — collaboration is off, and this is where it is said. Until now this returned
+   * `null`: the author switched directory, the control vanished, and the reason existed
+   * only in the server's log. A chip that names the cause is the difference between "the
+   * button moved" and "this directory has no repository to collaborate on".
+   */
+  if (!availability.available) {
+    return (
+      <Tooltip label={availability.message}>
+        <span style={{ ...gitChip, ...gitToneNone }} data-testid="collab-unavailable" data-vs-collab-off={availability.reason}>
+          <BranchOffIcon />
+          <span>collaboration off — {collabOffLabel(availability.reason)}</span>
+        </span>
+      </Tooltip>
+    );
+  }
   const blocked = availability.canPublish === false;
 
   async function start() {
@@ -1765,7 +1871,7 @@ function StartPullRequestButton({
      * quietly contains three of the four files someone chose is worse than one that was
      * never opened, because nothing afterwards says a file is missing.
      */
-    const selection = [file, ...candidates.filter((p) => chosen.has(p))];
+    const selection = [file, ...offered.filter((p) => chosen.has(p))];
     let files: { path: string; markdown: string }[];
     try {
       files = await Promise.all(selection.map(async (path) => ({ path, markdown: await readMarkdown(path) })));
@@ -1838,14 +1944,14 @@ function StartPullRequestButton({
                   include" list is a control that explains a capability nobody can use
                   here, and it would sit in the popover every single time.
                 */}
-                {candidates.length > 0 && (
+                {offered.length > 0 && (
                   <fieldset style={prFieldset} data-vs-start-pr-companions>
                     <legend style={prLegend}>Also include</legend>
                     {/* The document, stated and not offered — it is not the author's to untick. */}
                     <p style={prCompanionDoc}>
                       <code>{file}</code> — the document
                     </p>
-                    {candidates.map((path) => (
+                    {offered.map((path) => (
                       <label key={path} style={prCompanionRow}>
                         <input
                           type="checkbox"
@@ -2294,9 +2400,11 @@ const bar: React.CSSProperties = {
   flexShrink: 0,
   // Establish a stacking context above the content below so header popovers
   // (Apply activity, all-comments) paint over the editor + inspector instead of
-  // being overlapped by them. Below the full-screen help modal (zIndex 100).
+  // being overlapped by them. This has to clear the inspector's own surfaces,
+  // which sit near the z-index ceiling to beat arbitrary spec content — a
+  // human-sized value here loses to a selection frame. Below the modals.
   position: 'relative',
-  zIndex: 60,
+  zIndex: Z.CHROME,
 };
 /*
  * `center`, not `baseline`, since the chips joined it: a pill has no text baseline worth
@@ -2541,6 +2649,7 @@ const prCompanionRow: React.CSSProperties = { display: 'flex', alignItems: 'cent
 const prOk: React.CSSProperties = { margin: 0, fontSize: 12, color: '#0f766e' };
 const prError: React.CSSProperties = { margin: 0, fontSize: 12, color: '#b91c1c', overflowWrap: 'anywhere' };
 const modelNote: React.CSSProperties = { padding: '7px 12px', borderTop: '1px solid #f1f5f9', color: '#94a3b8', fontSize: 11, fontStyle: 'italic', background: '#fbfaff' };
+const directWriteNote: React.CSSProperties = { padding: '8px 12px', borderTop: '1px solid #fde68a', background: '#fffbeb', color: '#92400e', fontSize: 11.5, lineHeight: 1.5 };
 const scopeRow: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, width: '100%', textAlign: 'left', padding: '10px 11px', margin: '2px 0', border: '1px solid #ece6fb', borderRadius: 9, background: '#fbfaff', color: '#1e293b', cursor: 'pointer', font: '13px system-ui' };
 const scopeTitle: React.CSSProperties = { fontWeight: 600, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
 const scopeSub: React.CSSProperties = { fontWeight: 400, color: '#7c3aed', font: '12px ui-monospace, monospace' };
@@ -2569,7 +2678,15 @@ const allPop: React.CSSProperties = { position: 'absolute', right: 0, top: 'calc
 const allTitle: React.CSSProperties = { fontSize: 12, opacity: 0.6, padding: '2px 4px 8px', borderBottom: '1px solid #f1f5f9', marginBottom: 4 };
 const allFile: React.CSSProperties = { display: 'block', width: '100%', textAlign: 'left', border: 'none', background: 'transparent', padding: '2px 4px', cursor: 'pointer', font: '12px ui-monospace, monospace', color: '#1d4ed8', fontWeight: 600 };
 const allItem: React.CSSProperties = { padding: '4px 4px 4px 10px', borderLeft: '2px solid #e5e7eb', margin: '4px 0 4px 4px', fontSize: 13, color: '#334155' };
-const progressTrack: React.CSSProperties = { position: 'absolute', left: 0, right: 0, bottom: -1, height: 3, overflow: 'hidden', zIndex: 61, pointerEvents: 'none' };
+/*
+ * Below the header popovers (zIndex 41), not above them. The line is pinned to the
+ * header's bottom edge, but the popovers open from buttons *inside* the header and
+ * hang past that edge — so the two overlap by design, and whichever wins paints
+ * across the other. The line has nothing to say once a panel is open on top of it:
+ * that panel is already reporting the same run in far more detail. It only needs to
+ * clear the header's own in-flow content, which any positive z-index does.
+ */
+const progressTrack: React.CSSProperties = { position: 'absolute', left: 0, right: 0, bottom: -1, height: 3, overflow: 'hidden', zIndex: 40, pointerEvents: 'none' };
 const progressFlow: React.CSSProperties = {
   height: '100%',
   width: '100%',

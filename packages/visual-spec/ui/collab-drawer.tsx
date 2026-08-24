@@ -26,6 +26,7 @@ import { useEffect, useRef } from 'react';
 import type { OpenedReview, PullRequestSummary } from './collab-client';
 import { CollabOpenPanel } from './collab-open-panel';
 import { CollabPullsPanel } from './collab-pulls-panel';
+import { Z } from '../core/app/lib/z-layers';
 
 export type CollabDrawerProps = {
   /** The ✕, and nothing else. */
@@ -169,8 +170,8 @@ const scrim: React.CSSProperties = {
   background: 'rgba(15,23,42,0.45)',
   display: 'flex',
   justifyContent: 'flex-end',
-  // Above the header's tooltips and the unsaved-changes dialogs, which sit at 50.
-  zIndex: 60,
+  // Peer of the header: the scrim covers it, and DOM order settles the tie.
+  zIndex: Z.CHROME,
 };
 
 const panelStyle: React.CSSProperties = {

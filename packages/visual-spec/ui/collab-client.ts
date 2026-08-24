@@ -51,6 +51,9 @@ export type { Awaiting, AwaitingItem, AwaitingMention, AwaitingSide };
 /** Root of the route family. Not configurable — the server mounts it at one path. */
 const BASE = '/__vs/collab';
 
+/** R-10.9 — root-epoch header, mirrored from `core/vite/routes/collab.ts`. */
+export const ROOT_EPOCH_HEADER = 'x-vs-root-epoch';
+
 /** The `CollabAvailability` shape `GET /__vs/collab` serves (`core/vite/routes/collab.ts`). */
 export type CollabAvailabilitySnapshot =
   | {
@@ -540,14 +543,26 @@ function failureOf(status: number, body: unknown): CollabFailure {
 export function createCollabClient(fetchImpl?: typeof fetch): CollabClient {
   const doFetch = fetchImpl ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
 
+  // R-10.9: the epoch the server last reported. Echoed on every request so a session
+  // started before a re-root is rejected instead of writing to the new repository.
+  //
+  // The name is spelled here rather than imported from `routes/collab` on purpose: that
+  // module is the server router, and a value import would pull it into the browser
+  // bundle. It is asserted equal to the router's export in `collab-client.test.ts`.
+  let rootEpoch: string | null = null;
+
   async function call<T>(path: string, init?: RequestInit): Promise<CollabResult<T>> {
     let res: Response;
     try {
-      res = await doFetch(`${BASE}${path}`, init);
+      const headers = new Headers(init?.headers);
+      if (rootEpoch !== null) headers.set(ROOT_EPOCH_HEADER, rootEpoch);
+      res = await doFetch(`${BASE}${path}`, { ...init, headers });
     } catch (err) {
       // The route layer was never reached, so there is no server message to quote.
       return { ok: false, kind: 'network', message: (err as Error).message };
     }
+    const seen = res.headers?.get(ROOT_EPOCH_HEADER);
+    if (seen !== null && seen !== undefined) rootEpoch = seen;
     let body: unknown;
     try {
       body = await res.json();

@@ -10,6 +10,7 @@ import { MarkdownDocEditor } from './markdown-doc-editor';
 import { toSurfaceId } from './md-path';
 import { useCollabPulls } from './use-collab-pulls';
 import { type TreeEntry, invalidateTree, useTree } from './use-tree';
+import { Z } from '../core/app/lib/z-layers';
 
 const MIN_W = 180;
 const MAX_W = 680;
@@ -560,7 +561,7 @@ const navItemLabel: React.CSSProperties = { flex: 1, textAlign: 'left', lineHeig
 const navCount: React.CSSProperties = { font: '600 11px ui-monospace, monospace', padding: '1px 7px', borderRadius: 99, background: '#ede9fe', color: '#6d28d9', flexShrink: 0 };
 const splitter: React.CSSProperties = { width: 6, flexShrink: 0, cursor: 'col-resize', background: 'transparent', transition: 'background 120ms', marginLeft: -3, zIndex: 5 };
 const filter: React.CSSProperties = { width: '100%', padding: '5px 8px', border: '1px solid #d1d5db', borderRadius: 4, font: 'inherit' };
-const dialogBackdrop: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 100, display: 'grid', placeItems: 'center', background: 'rgba(15,23,42,0.35)' };
+const dialogBackdrop: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: Z.MODAL, display: 'grid', placeItems: 'center', background: 'rgba(15,23,42,0.35)' };
 const dialogCard: React.CSSProperties = { width: 380, maxWidth: 'calc(100vw - 32px)', padding: 20, borderRadius: 12, background: 'white', boxShadow: '0 20px 50px rgba(0,0,0,0.28)', font: 'system-ui' };
 const dialogPrimary: React.CSSProperties = { padding: '7px 14px', border: 'none', borderRadius: 8, background: '#7c3aed', color: 'white', cursor: 'pointer', font: '600 13px system-ui' };
 const dialogCancel: React.CSSProperties = { padding: '7px 14px', border: '1px solid #d1d5db', borderRadius: 8, background: 'white', color: '#475569', cursor: 'pointer', font: '600 13px system-ui' };

@@ -38,10 +38,17 @@ function stubComments(comments: CommentRecord[]) {
   );
 }
 
+/** jsdom has no `EventSource`; the panel's review session opens one unconditionally. */
+class FakeEventSource {
+  onmessage: ((e: { data: string }) => void) | null = null;
+  close() {}
+}
+
 /** jsdom implements neither; both are consulted by the reveal path. */
 beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn();
   vi.stubGlobal('matchMedia', undefined);
+  vi.stubGlobal('EventSource', FakeEventSource);
 });
 
 afterEach(() => {

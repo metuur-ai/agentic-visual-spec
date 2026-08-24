@@ -41,9 +41,12 @@ import { CollabPullsPanel, shortSha } from './collab-pulls-panel';
 import { ActiveCommentProvider } from './active-comment';
 import { BusyLabel, LoadingLine } from './spinner';
 import { CommentPanel, type CommentPanelSource } from './comment-panel';
+import { useReviewSession } from './review-session';
+import { ReviewDrawer } from './review-view';
 import { IndicatorLayer } from './indicator-layer';
 import { MarkdownSurface } from './markdown-surface';
 import { useCollabDocument } from './use-collab-document';
+import { Z } from '../core/app/lib/z-layers';
 
 /**
  * WHY THE TWO MODES ARE A TOGGLE AND NOT ONE SURFACE.
@@ -385,6 +388,59 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
     }
   }, [comments, fullDocument]);
 
+  /*
+   * R-9.8 — the per-comment way into a review session on this surface.
+   *
+   * `copyHandoff` above is untouched and stays on the toolbar. The two are different acts
+   * and both are wanted: the clipboard path hands EVERY open comment to an agent the
+   * reviewer runs themselves, in one shot with no gate, and it is the escape hatch when a
+   * session cannot start or the reviewer would rather drive it. This one is a single
+   * comment, a diff read before anything is written, and an approval. Replacing the first
+   * with the second would take away the only path that works without the server holding a
+   * session, which is exactly the path R-9.8 asks to keep.
+   *
+   * THE RECORD TRAVELS WITH THE REQUEST (R-8.8). A collaborative comment is projected at
+   * runtime and exists only here — the id identifies neither the repository nor the pull
+   * request, and R-9.1 forbids the server resolving it from the sidecar. So the start body
+   * carries the document and the record: `nodeId` is the anchor (absent means
+   * document-level, R-9.3), and the GitHub comment id says which conversation the reply of
+   * R-9.10 belongs on, because the projected `c-<hex>` id is the same shape for a review
+   * thread and a flat issue comment and cannot say which it came from.
+   */
+  const review = useReviewSession();
+  const startReview = review.start;
+  const reviewActions = useCallback(
+    (c: CommentRecord) => {
+      if (!fullDocument) return [];
+      const gh = (c as Partial<ReviewThreadRecord> & { github?: { issueCommentId?: number } }).github;
+      // Read structurally: `collab.nodeId` is `comment-projection.ts`'s trailer field, and
+      // review threads (which is what this surface lists today) carry none — so this is
+      // almost always absent and the comment is document-level (R-9.3).
+      const nodeId = (c as { collab?: { nodeId?: string } }).collab?.nodeId;
+      return [
+        {
+          label: 'Review & apply',
+          tone: 'primary' as const,
+          title: 'Propose a change for this comment, read the diff, then approve it',
+          run: () =>
+            startReview(c.id, {
+              documentId: fullDocument.documentId,
+              documentPath: fullDocument.documentPath,
+              comment: {
+                id: c.id,
+                text: c.comment,
+                workflow: c.workflow,
+                ...(nodeId ? { nodeId } : {}),
+                ...(typeof gh?.reviewCommentId === 'number' ? { reviewCommentId: gh.reviewCommentId } : {}),
+                ...(typeof gh?.issueCommentId === 'number' ? { issueCommentId: gh.issueCommentId } : {}),
+              },
+            }),
+        },
+      ];
+    },
+    [fullDocument, startReview],
+  );
+
   const source = useMemo<CommentPanelSource | null>(
     () =>
       fullDocument
@@ -393,10 +449,14 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
             comments,
             add: addComment,
             reply: replyToComment,
+            actions: reviewActions,
           })
         : null,
-    [fullDocument, comments, addComment, replyToComment],
+    [fullDocument, comments, addComment, replyToComment, reviewActions],
   );
+
+  /** Which comment the drawer is about, so its header names it rather than an id. */
+  const reviewedLabel = review.state.commentId ? (comments.find((c) => c.id === review.state.commentId) ?? null) : null;
 
   if (loading) {
     return (
@@ -530,6 +590,15 @@ function CollabDocumentPane({ documentId }: { documentId: string }) {
           </div>
         </main>
         {mode === 'review' && <CommentPanel width={340} source={source} />}
+        {/*
+          * Beside the panel, not inside it — a diff is not readable in a 340px column, and
+          * the session's stream is subscribed by `useReviewSession` above rather than by
+          * the drawer, so putting the drawer away leaves a subscriber attached and does
+          * not arm the server's abandonment bound (R-7.6, LLD "subscribe ABOVE the view").
+          */}
+        {review.open && (
+          <ReviewDrawer session={review} label={reviewedLabel ? source.label(reviewedLabel) : undefined} />
+        )}
       </div>
       </ActiveCommentProvider>
       {staged !== null && (
@@ -675,7 +744,7 @@ const dialogScrim: React.CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
-  zIndex: 50,
+  zIndex: Z.MODAL,
 };
 
 const dialogCard: React.CSSProperties = {

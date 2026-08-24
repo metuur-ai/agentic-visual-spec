@@ -60,7 +60,7 @@
  * `@lyfie/luthor`, no react (R-3.3 / R-12.6, guarded by `core/bundle-guard.test.ts`).
  */
 import type { ResolvedCollaborationConfig, VisualSpecConfig } from '../config';
-import { type GitContext, readGitContext } from '../git-context';
+import { type GitContext, type GitExecutor, defaultExecGit, readGitContext } from '../git-context';
 import { parseCommentBody } from './comment-projection';
 import { type GitHubBinding, titleFromMarkdown } from './document-record';
 import type { CollaborationStore } from './record-store';
@@ -282,6 +282,64 @@ export async function collaborationFromOrigin(
   const ctx = await read(dir);
   if (ctx.state !== 'remote' || ctx.host !== 'github.com') return null;
   return { owner: ctx.owner, repo: ctx.repo };
+}
+
+/**
+ * Why a re-root could not name a collaboration repository. R-10.3.
+ *
+ * Hyphenated to match `CollabUnavailableReason`, which includes this type verbatim: the
+ * three are surfaced to the user as reasons collaboration is off, so a translation table
+ * between the two spellings would be a place for them to disagree.
+ */
+export type RebindFailure = 'not-a-repo' | 'no-remote' | 'remote-not-github';
+
+/**
+ * R-10.1 — the collaboration repository for a directory the server was *re-rooted* onto.
+ *
+ * WHY THIS IS NOT `collaborationFromOrigin`. That one answers "what does this origin
+ * name", returns `null` for every way of not knowing, and is read at startup where the
+ * only consequence is whether collaboration comes up. After a re-root the same `null`
+ * has to be shown to someone who was already collaborating a second ago, so "no" is not
+ * a sufficient answer — R-10.7 needs to say *which* no, and R-10.3 separates the three
+ * that were previously indistinguishable: not a repository at all, a repository with no
+ * `origin`, an `origin` on a host `gh` cannot serve.
+ *
+ * IT DOES NOT CHECK THE CREDENTIAL. A GitHub origin the token cannot reach comes back
+ * `ok` here and is refused by the preflight as `no_credential` (R-10.4), because that is
+ * a different fact with a different remedy and the preflight is the one thing that reads
+ * identity. Same gating as an inferred or flagged repo — see `collaborationFromOrigin`.
+ *
+ * THE BASE BRANCH IS RE-DERIVED, NOT CARRIED (R-10.5). A `--base-branch develop` given
+ * for repo A is a statement about repo A; `develop` may not exist in B, and carrying it
+ * turns the re-root into a pull-request failure at publish time instead of a wrong
+ * answer here. `origin/HEAD` is a local read — no network — and falls back to the
+ * pre-existing `'main'` default when the ref is absent, which it is unless the
+ * repository was cloned.
+ */
+export async function rebindCollaboration(
+  dir: string,
+  exec: GitExecutor = defaultExecGit,
+): Promise<{ ok: true; collaboration: ResolvedCollaborationConfig } | { ok: false; reason: RebindFailure }> {
+  const ctx = await readGitContext(dir, exec);
+  if (ctx.state === 'none') return { ok: false, reason: 'not-a-repo' };
+  // A `local` state with a `url` is an origin whose host `parseRemoteUrl` did not
+  // recognise — a host problem, not a missing remote.
+  if (ctx.state === 'local') return { ok: false, reason: ctx.url ? 'remote-not-github' : 'no-remote' };
+  if (ctx.host !== 'github.com') return { ok: false, reason: 'remote-not-github' };
+
+  return {
+    ok: true,
+    collaboration: { owner: ctx.owner, repo: ctx.repo, baseBranch: await defaultBranch(dir, exec) },
+  };
+}
+
+/** `origin/HEAD` → the branch it points at, or the `'main'` default. Local read. */
+async function defaultBranch(dir: string, exec: GitExecutor): Promise<string> {
+  const head = await exec(['-C', dir, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
+  if (head.exitCode !== 0) return 'main';
+  const name = head.stdout.trim();
+  // `origin/develop` → `develop`. Any other shape is not a branch name we can trust.
+  return name.startsWith('origin/') ? name.slice('origin/'.length) || 'main' : 'main';
 }
 
 /**

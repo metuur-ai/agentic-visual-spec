@@ -77,8 +77,11 @@ async function serve(args: string[]) {
    * reaches GitHub on an inference alone: with no credential the preflight reports
    * `no_credential` and collaboration stays off exactly as it does today (R-9.19).
    */
+  // Carried into the server because R-10.1 re-derives collaboration on every re-root:
+  // without this the opt-out would last exactly until the user changed directory.
+  const noCollab = args.includes('--no-collab');
   let inferredFrom: string | null = null;
-  if (config === undefined && !args.includes('--no-collab')) {
+  if (config === undefined && !noCollab) {
     const inferred = await collaborationFromOrigin(contentDir);
     if (inferred) {
       config = { collaboration: baseBranchFlag === undefined ? inferred : { ...inferred, baseBranch: baseBranchFlag } };
@@ -86,7 +89,7 @@ async function serve(args: string[]) {
     }
   }
 
-  const { server, commentsPath } = createVisualSpecServer({ contentDir, uiDir: UI_DIR, port: requestedPort, assetsDir, config });
+  const { server, commentsPath } = createVisualSpecServer({ contentDir, uiDir: UI_DIR, port: requestedPort, assetsDir, config, noCollab });
 
   server.on('listening', () => {
     // The real bound port — differs from requestedPort after a port-0 fallback.
