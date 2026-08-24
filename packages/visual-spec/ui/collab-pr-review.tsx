@@ -63,7 +63,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
-import { InspectOverlay, InspectorProvider } from '../core/app';
+import { InspectOverlay, InspectorProvider, RANGE_KEY_LABEL } from '../core/app';
 import { ActiveCommentProvider } from './active-comment';
 import { CodeView, type LineSelection } from './code-view';
 import { CommentPanel } from './comment-panel';
@@ -1001,7 +1001,7 @@ function DraftComposer({
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   if (!selection) {
-    return <p style={{ ...emptyLine, padding: '8px 0' }}>Click a line to comment on it. Shift-click a second line for a range.</p>;
+    return <p style={{ ...emptyLine, padding: '8px 0' }}>Click a line to comment on it. {RANGE_KEY_LABEL}-click a second line for a range.</p>;
   }
   const range =
     selection.endLine === selection.startLine ? `line ${selection.startLine}` : `lines ${selection.startLine}–${selection.endLine}`;

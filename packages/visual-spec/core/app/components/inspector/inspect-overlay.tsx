@@ -4,7 +4,7 @@
  * draws hover (dashed) / selection (solid) frames tracked to the element's rect.
  */
 import { useEffect, useRef, useState } from 'react';
-import { collectRange, collectSection, headingBlockOf } from '../../lib/inspector/blocks';
+import { collectRange, collectSection, headingBlockOf, isRangeClick } from '../../lib/inspector/blocks';
 import { type FindOptions, type SourceLoc, findSurfaceSource } from '../../lib/inspector/fiber';
 import { toSelected, useInspector } from './inspector-provider';
 import { Z } from '../../lib/z-layers';
@@ -78,8 +78,8 @@ export function InspectOverlay({
           return;
         }
       }
-      // Shift+click extends a contiguous range from the first selected block to here.
-      if (e.shiftKey && root && selectionRef.current.length > 0) {
+      // Cmd/Ctrl+click extends a contiguous range from the first selected block to here.
+      if (isRangeClick(e) && root && selectionRef.current.length > 0) {
         const start = selectionRef.current[0]!.anchor;
         if (start.isConnected) {
           const range = collectRange(root, start, loc.anchor);

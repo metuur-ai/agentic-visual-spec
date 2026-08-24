@@ -1,9 +1,10 @@
 /**
  * code-view.tsx — line-numbered viewer for code/text files. Click a line to
- * select it; Shift+click another to select the range. Reports the selection
+ * select it; Cmd+click another to select the range. Reports the selection
  * (1-indexed lines + snippets) up so the comment panel can anchor to it.
  */
 import { useMemo, useRef } from 'react';
+import { isRangeClick } from '../core/app/lib/inspector/blocks';
 
 export type LineSelection = {
   startLine: number;
@@ -24,8 +25,8 @@ export function CodeView({
   const lines = useMemo(() => content.replace(/\n$/, '').split('\n'), [content]);
   const anchor = useRef<number | null>(null);
 
-  const pick = (n: number, shift: boolean) => {
-    if (shift && anchor.current != null) {
+  const pick = (n: number, range: boolean) => {
+    if (range && anchor.current != null) {
       const a = anchor.current;
       const start = Math.min(a, n);
       const end = Math.max(a, n);
@@ -55,7 +56,7 @@ export function CodeView({
               // eslint-disable-next-line react/no-array-index-key
               key={i}
               data-line={n}
-              onClick={(e) => pick(n, e.shiftKey)}
+              onClick={(e) => pick(n, isRangeClick(e))}
               style={{ ...rowStyle, ...(sel ? rowSel : {}) }}
             >
               <span style={{ ...gutter, ...(sel ? gutterSel : {}) }}>{n}</span>

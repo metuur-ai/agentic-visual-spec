@@ -952,3 +952,55 @@ describe('the counts waiting on you are two chips, captioned once', () => {
     expect(screen.queryByTestId('git-pull-menu-repo')).toBeNull();
   });
 });
+
+/*
+ * A second run after the first one finished. The activity panel and the scope
+ * chooser hang off the same button, and once a run has completed the panel is
+ * still the thing the button has to show *for that run* — until you ask for
+ * another one. Asking is the click, and the click has to reach the chooser, or
+ * the second run starts with a scope nobody picked (or does not start at all).
+ */
+describe('applying again after a finished run', () => {
+  /** Captures the instance so a test can drive the run to completion. */
+  class CapturingEventSource extends FakeEventSource {
+    static last: CapturingEventSource | null = null;
+    constructor(url: string) {
+      super(url);
+      CapturingEventSource.last = this;
+    }
+  }
+
+  beforeEach(() => {
+    CapturingEventSource.last = null;
+    vi.stubGlobal('EventSource', CapturingEventSource);
+  });
+
+  /** Drives the header's stream through a whole run, start to done. */
+  function finishARun() {
+    const es = CapturingEventSource.last;
+    if (!es?.onmessage) throw new Error('the header never opened the apply stream');
+    const send = (frame: unknown) => es.onmessage?.({ data: JSON.stringify(frame) });
+    send({ type: 'start', openCount: 1, startedAt: Date.now() });
+    send({ type: 'log', kind: 'assistant', text: 'edited docs/spec.md' });
+    send({ type: 'done', ok: true, applied: 1, exitCode: 0 });
+  }
+
+  it('opens the scope chooser, not the finished run, on the next click', async () => {
+    installFetch(REMOTE_GITHUB);
+    render(<MainHeader file="docs/spec.md" />);
+
+    const applyBtn = await screen.findByTitle(/Apply the open comments/);
+    await waitFor(() => expect((applyBtn as HTMLButtonElement).disabled).toBe(false));
+
+    fireEvent.click(applyBtn);
+    fireEvent.click(await screen.findByText('Whole workspace'));
+    finishARun();
+    // The panel for the run that just ended — this much was never broken.
+    await screen.findByText(/Applied/);
+
+    // Dismissing the panel and asking again is the whole of the report.
+    fireEvent.click(screen.getByTitle(/Apply the open comments/));
+
+    expect(await screen.findByText('Apply comments…')).toBeTruthy();
+  });
+});

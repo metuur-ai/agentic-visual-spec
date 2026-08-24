@@ -3,7 +3,7 @@
  * line range within a code/text file, an image, or a folder. (Markdown keeps its
  * own inspector-based panel in comment-panel.tsx.)
  */
-import { useComments } from '../core/app';
+import { RANGE_KEY_LABEL, useComments } from '../core/app';
 import { useEffect, useRef, useState } from 'react';
 import type { LineSelection } from './code-view';
 import type { FileKind } from './use-tree';
@@ -86,7 +86,7 @@ export function GenericPanel({
           {kind && !isFolder && !selection && <span style={{ opacity: 0.55 }}> · {kind}</span>}
         </div>
         {!isFolder && !selection && kind !== 'image' && kind !== 'binary' && (
-          <p style={tip}>Click a line (Shift+click for a range) to comment on specific lines, or just comment on the whole file.</p>
+          <p style={tip}>Click a line ({RANGE_KEY_LABEL}+click for a range) to comment on specific lines, or just comment on the whole file.</p>
         )}
         <WorkflowSelect value={workflow} onChange={setWorkflow} />
         <textarea

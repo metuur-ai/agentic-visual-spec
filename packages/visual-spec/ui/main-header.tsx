@@ -1233,11 +1233,22 @@ function ApplyButton({ open, file, onRunningChange }: { open: CommentRecord[]; f
   };
   const cancel = () => void fetch('/__vs/apply/cancel', { method: 'POST' }).catch(() => {});
 
-  // Button click: while there's a run (live or finished) toggle the activity panel;
-  // otherwise open the scope chooser to pick what to apply.
+  /*
+   * Button click. While a run is live the panel is the only thing worth showing, so the
+   * button toggles it. Once the run has finished the button's label goes back to naming
+   * comments to apply ("Apply 1 comment"), and a control that names an action has to
+   * perform it: a *finished* run's rows are history, and routing the click back to them
+   * left the newly-written comment unreachable except via the panel's own "Run again"
+   * — three clicks through a stale summary to do what the label already promised.
+   *
+   * The finished panel stays one click away only when there is nothing left to apply,
+   * which is the case the summary is actually for (and why the button stays enabled at
+   * `openCount === 0`; see the `disabled` prop below).
+   */
   const onButton = () => {
-    if (running || state.rows.length || state.summary) setView((v) => (v === 'closed' ? 'activity' : 'closed'));
-    else setView((v) => (v === 'scope' ? 'closed' : 'scope'));
+    if (running) setView((v) => (v === 'closed' ? 'activity' : 'closed'));
+    else if (openCount > 0) setView((v) => (v === 'scope' ? 'closed' : 'scope'));
+    else setView((v) => (v === 'closed' ? 'activity' : 'closed'));
   };
 
   const titles: Record<ApplyPhase, string> = { running: 'Applying comments', done: 'Done', cancelled: 'Cancelled', error: 'Stopped', idle: 'Apply' };

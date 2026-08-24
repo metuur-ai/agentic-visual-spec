@@ -20,7 +20,7 @@
  * `revealInCommentPanel` below, and keeps its popover only for the case the panel
  * cannot serve: no panel on screen, or nothing on this file to reveal.
  */
-import { collectSection, headingBlockOf, useComments, useInspector } from '../core/app';
+import { RANGE_KEY_LABEL, collectSection, headingBlockOf, useComments, useInspector } from '../core/app';
 import type { SelectedTarget } from '../core/app';
 import type { CommentRecord } from '../core/editing/comment-doc';
 import type { ReviewThreadRecord } from '../core/collaboration/review-comments';
@@ -560,7 +560,7 @@ function SelectionHelp() {
       {open && (
         <ul style={helpList}>
           <li><strong>One block</strong> — click any paragraph, list, or heading.</li>
-          <li><strong>A range</strong> — click the first block, then <kbd style={kbd}>Shift</kbd>+click the last. Everything between is included.</li>
+          <li><strong>A range</strong> — click the first block, then <kbd style={kbd}>{RANGE_KEY_LABEL}</kbd>+click the last. Everything between is included.</li>
           <li><strong>A whole section</strong> — click a heading, then <em>“Select all content under this heading”</em>, or <kbd style={kbd}>Alt</kbd>/<kbd style={kbd}>⌥ CMD </kbd> + click the heading. Grabs every block down to the next heading of the same or higher level.</li>
           <li><kbd style={kbd}>Esc</kbd> clears the selection.</li>
         </ul>

@@ -2,9 +2,30 @@
  * blocks.ts — DOM helpers for multi-block selection in the markdown surface.
  * The selectable unit is a "top-level block": a direct child of the inspector
  * root, each stamped with data-vs-loc="<line>:<col>" by the loc-tags transform.
- * Used by the inspect overlay (Shift/Alt gestures) and the comment panel.
+ * Used by the inspect overlay (Cmd/Alt gestures) and the comment panel.
  */
 import type { SelectedTarget } from '../../components/inspector/inspector-provider';
+
+/*
+ * The range gesture is Cmd (Ctrl off the Mac), not Shift.
+ *
+ * Shift+click is the browser's own "extend the text selection to here", and it is not
+ * ours to borrow: holding it painted a native highlight across the document at the same
+ * moment we painted our selection frames, so the surface answered one gesture twice, in
+ * two visual languages. The overlay could not take it back either — it acts on `click`,
+ * and the browser has already extended the selection on `mousedown`.
+ *
+ * This lives beside the block helpers rather than in either caller because the markdown
+ * overlay and the line gutter must agree on it: one rule the reader learns once, in a
+ * single place to change when they disagree.
+ */
+export function isRangeClick(e: { metaKey: boolean; ctrlKey: boolean }): boolean {
+  return e.metaKey || e.ctrlKey;
+}
+
+/** How to spell the range modifier for this platform, for UI that teaches the gesture. */
+export const RANGE_KEY_LABEL: string =
+  typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? '⌘' : 'Ctrl';
 
 /** The direct child of `root` that contains `el` (the top-level block), or null. */
 export function topBlock(root: HTMLElement, el: HTMLElement): HTMLElement | null {
