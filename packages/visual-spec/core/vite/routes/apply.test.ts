@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import type { CommentDoc, CommentRecord } from '../../editing/comment-doc';
-import { type ApplyEvent, type ClaudeChild, createApplyHub, runApply, summarize } from './apply';
+import { type ApplyEvent, type ApplyHub, type ClaudeChild, createApplyHub, runApply, summarize } from './apply';
 import type { CommentDocStore } from './comments';
 
 function rec(id: string, status: 'open' | 'applied' = 'open'): CommentRecord {
@@ -279,6 +279,96 @@ describe('createApplyHub', () => {
     const mem = memoryStore([]);
     const hub = createApplyHub(() => ({ cwd: '/tmp', comments: mem.store }));
     expect(hub.cancel().status).toBe(409);
+  });
+
+  /** Drive one hub run to completion. The child rewrites the fake disk as it closes. */
+  async function runOnce(hub: ApplyHub) {
+    expect(hub.start().status).toBe(200);
+    while ((hub.status().json as { running: boolean }).running !== false) {
+      await new Promise((r) => setImmediate(r));
+    }
+    // `running` flips off inside the same turn that emits `done`; give the
+    // archive that follows it a tick to land before reading the history.
+    await new Promise((r) => setImmediate(r));
+  }
+
+  /** A hub over a mutable fake disk, with the child rewriting files on close. */
+  function diffHub(files: Record<string, string | null>, comments: CommentRecord[], after: () => void) {
+    const mem = memoryStore(comments);
+    return {
+      mem,
+      hub: createApplyHub(() => ({
+        cwd: '/tmp',
+        comments: mem.store,
+        readSnapshot: async (p: string) => files[p] ?? null,
+        spawnClaude: () => fakeChild([], 0, after),
+      })),
+    };
+  }
+
+  it('keeps a finished run so the change is readable after the panel closed', async () => {
+    const files: Record<string, string | null> = { 'a.md': 'one\n' };
+    const { hub } = diffHub(files, [rec('c1')], () => { files['a.md'] = 'two\n'; });
+    await runOnce(hub);
+
+    const { runs } = hub.history().json as { runs: Array<{ diffs: Array<{ path: string; patch: string }> }> };
+    expect(runs).toHaveLength(1);
+    expect(runs[0].diffs).toHaveLength(1);
+    expect(runs[0].diffs[0].path).toBe('a.md');
+    expect(runs[0].diffs[0].patch).toContain('+two');
+  });
+
+  it('drops a run that changed nothing, so it cannot evict a real change', async () => {
+    const files: Record<string, string | null> = { 'a.md': 'same\n' };
+    const { hub } = diffHub(files, [rec('c1')], () => {});
+    await runOnce(hub);
+    expect((hub.history().json as { runs: unknown[] }).runs).toEqual([]);
+  });
+
+  it('keeps only the last five runs, newest first', async () => {
+    const files: Record<string, string | null> = { 'a.md': 'v0\n' };
+    let n = 0;
+    const mem = memoryStore([rec('c1')]);
+    const hub = createApplyHub(() => ({
+      cwd: '/tmp',
+      comments: mem.store,
+      readSnapshot: async (p: string) => files[p] ?? null,
+      spawnClaude: () => fakeChild([], 0, () => { n += 1; files['a.md'] = `v${n}\n`; }),
+    }));
+
+    for (let i = 0; i < 7; i += 1) {
+      mem.set([rec('c1')]); // re-open the comment so each run has work to do
+      await runOnce(hub);
+    }
+
+    const { runs } = hub.history().json as { runs: Array<{ diffs: Array<{ patch: string }> }> };
+    expect(runs).toHaveLength(5);
+    // Newest first: the last run wrote v7 over v6.
+    expect(runs[0].diffs[0].patch).toContain('+v7');
+    expect(runs[4].diffs[0].patch).toContain('+v3');
+  });
+
+  it('records whether the run was cancelled, not just that it ended', async () => {
+    const files: Record<string, string | null> = { 'a.md': 'one\n' };
+    const mem = memoryStore([rec('c1')]);
+    const hub = createApplyHub(() => ({
+      cwd: '/tmp',
+      comments: mem.store,
+      readSnapshot: async (p: string) => files[p] ?? null,
+      spawnClaude: () => { files['a.md'] = 'two\n'; return hungChild(); },
+    }));
+    hub.start();
+    await new Promise((r) => setImmediate(r));
+    expect(hub.cancel().status).toBe(200);
+    while ((hub.status().json as { running: boolean }).running !== false) {
+      await new Promise((r) => setImmediate(r));
+    }
+    await new Promise((r) => setImmediate(r));
+
+    const { runs } = hub.history().json as { runs: Array<{ cancelled: boolean; ok: boolean }> };
+    expect(runs).toHaveLength(1);
+    expect(runs[0].cancelled).toBe(true);
+    expect(runs[0].ok).toBe(false);
   });
 });
 

@@ -396,6 +396,10 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
           const r = applyHub.cancel();
           return sendJson(res, r.status, r.json);
         }
+        if (method === 'GET' && sub === '/history') {
+          const r = applyHub.history();
+          return sendJson(res, r.status, r.json);
+        }
         if (method === 'GET' && sub === '') {
           const r = applyHub.status();
           return sendJson(res, r.status, r.json);

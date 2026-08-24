@@ -14,6 +14,7 @@
  *   POST /__vs/apply/start   → begin a run (409 if one is already running)
  *   POST /__vs/apply/cancel  → SIGKILL the running claude
  *   GET  /__vs/apply         → { running, startedAt } status snapshot
+ *   GET  /__vs/apply/history → { runs } — the last few runs that changed a file
  */
 import { spawn } from 'node:child_process';
 import type { ServerResponse } from 'node:http';
@@ -50,6 +51,37 @@ export type ApplyEvent =
 /** The first frame a subscriber receives: the run so far, so a tab that joins
  *  mid-run (or after) catches up to the same activity + timer. */
 export type ApplySync = { type: 'sync'; running: boolean; startedAt: number | null; events: ApplyEvent[] };
+
+/** One file's before/after, lifted out of a run's frames and kept. */
+export type RunDiff = { path: string; patch: string; truncated?: boolean };
+
+/**
+ * A finished run, kept so the change can be re-read after the panel has closed.
+ *
+ * Deliberately the *facts* and not a sentence: the client already formats
+ * "Applied N comments" / "Cancelled — N applied before stop" from these fields
+ * (`main-header.tsx`, `applyReduce`). Keeping a second copy of that wording on
+ * the server would give the two renderings a chance to disagree.
+ */
+export type RunRecord = {
+  id: string;
+  startedAt: number;
+  endedAt: number;
+  ok: boolean;
+  cancelled: boolean;
+  applied: AppliedComment[];
+  diffs: RunDiff[];
+};
+
+/**
+ * How many finished runs the hub keeps. The oldest falls off the end.
+ *
+ * In memory on purpose: this survives a browser reload (the server holds it) but
+ * not a server restart. The alternative — writing each run to the sidecar — buys
+ * durability for an audit trail nobody asked to keep, at the cost of a disk write
+ * per run and a retention policy to argue about.
+ */
+const HISTORY_CAP = 5;
 
 /** A run that hangs holds the apply lock forever — bound it. Generous: a real
  *  batch (many comments, sub-agents, a headless cold start) legitimately runs
@@ -322,6 +354,8 @@ export interface ApplyHub {
   start(ids?: string[]): RouteResult;
   cancel(): RouteResult;
   status(): RouteResult;
+  /** The last few finished runs that changed something, newest first. */
+  history(): RouteResult;
 }
 
 /**
@@ -338,7 +372,38 @@ export function createApplyHub(getDeps: () => ApplyDeps, lock: RunLock = sharedR
   let running = false;
   let startedAt: number | null = null;
   let abort: AbortController | null = null;
+  let runSeq = 0;
+  const past: RunRecord[] = []; // newest first, capped at HISTORY_CAP
   const subs = new Set<ServerResponse>();
+
+  /**
+   * Fold the run that just ended into `past`.
+   *
+   * Runs that changed no file are dropped rather than kept as empty rows: this
+   * history exists to answer "what did it change?", and a run with nothing to
+   * show would push a real change off the end of a five-slot list. Whether it
+   * ran at all is the activity panel's question, not this one.
+   */
+  const archive = (done: Extract<ApplyEvent, { type: 'done' }>) => {
+    const diffs: RunDiff[] = [];
+    for (const e of events) {
+      if (e.type !== 'diff') continue;
+      diffs.push({ path: e.path, patch: e.patch, ...(e.truncated ? { truncated: e.truncated } : {}) });
+    }
+    if (diffs.length === 0) return;
+    const now = getDeps().now?.() ?? Date.now();
+    runSeq += 1;
+    past.unshift({
+      id: `run-${runSeq}`,
+      startedAt: startedAt ?? now,
+      endedAt: now,
+      ok: done.ok,
+      cancelled: done.cancelled === true,
+      applied: done.appliedComments,
+      diffs,
+    });
+    if (past.length > HISTORY_CAP) past.length = HISTORY_CAP;
+  };
 
   const frame = (res: ServerResponse, f: ApplyEvent | ApplySync) => {
     if (!res.writableEnded) res.write(`data: ${JSON.stringify(f)}\n\n`);
@@ -346,6 +411,9 @@ export function createApplyHub(getDeps: () => ApplyDeps, lock: RunLock = sharedR
   const broadcast = (e: ApplyEvent) => {
     if (e.type === 'start') startedAt = e.startedAt;
     events.push(e);
+    // Archive before the fan-out so a subscriber that reacts to `done` by asking
+    // for the history finds this run already in it.
+    if (e.type === 'done') archive(e);
     for (const res of subs) frame(res, e);
   };
 
@@ -388,6 +456,9 @@ export function createApplyHub(getDeps: () => ApplyDeps, lock: RunLock = sharedR
     },
     status() {
       return { status: 200, json: { running, startedAt } };
+    },
+    history() {
+      return { status: 200, json: { runs: past } };
     },
   };
 }

@@ -81,11 +81,13 @@ function fakeChild(lines: string[], code: number, onClose: () => void): ClaudeCh
 describe('R-3.9 — bulk apply has no proposal or approval step', () => {
   const applySrc = src('./apply.ts');
 
-  it('the ApplyHub surface is exactly subscribe/start/cancel/status', () => {
+  it('the ApplyHub surface is exactly subscribe/start/cancel/status/history', () => {
     const mem = memoryStore([]);
     const hub = createApplyHub(() => ({ cwd: '/tmp', comments: mem.store }));
     // A proposal/approval flow could not exist without a method to carry it.
-    expect(Object.keys(hub).sort()).toEqual(['cancel', 'start', 'status', 'subscribe']);
+    // `history` is not such a method: like the `diff` frame, it only reads back
+    // runs that already finished and wrote to disk, so nothing can wait on it.
+    expect(Object.keys(hub).sort()).toEqual(['cancel', 'history', 'start', 'status', 'subscribe']);
   });
 
   it('one start call drives the whole run — the child spawns with no intervening approval', async () => {
