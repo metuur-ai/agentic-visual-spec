@@ -27,7 +27,7 @@ import { createReviewHub, handleReviewRequest } from './routes/review';
 import { sharedRunLock } from './routes/run-lock';
 import { createReviewSessionOpsSelector } from '../collaboration/review-session-collab';
 import { createCollabRoutes, parseClientRootEpoch, ROOT_EPOCH_HEADER } from './routes/collab';
-import { createCollabWiring } from './routes/collab-wiring';
+import { createRebindableCollabWiring } from './routes/collab-wiring';
 import { type RebindFailure, rebindCollaboration } from '../collaboration/open';
 import { createJobHubRegistry } from '../collaboration/job-hub';
 import { fsCollaborationStore } from '../collaboration/record-store';
@@ -220,6 +220,11 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
           collabConfig = resolveConfig({ ...opts.config, collaboration: rebound.ok ? rebound.collaboration : undefined });
           collabUnavailable = rebound.ok ? null : rebound.reason;
         }
+        // R-10.1 — the wiring reads `collabConfig` at construction, so reassigning it above
+        // is only half the move: without this the adapter, the job bodies and the poller all
+        // stay bound to the directory the server started in. Identical to `src/server.ts`
+        // (R-7.6) — the rebuild itself lives in the shared module, not here.
+        collabWiring.rebind();
         // R-10.6 — announced in the same synchronous breath as the reassignment above, so no
         // request can observe the new configuration without the router having advanced. A
         // second browser tab is never told to reload, and its next comment or apply would
@@ -478,7 +483,7 @@ function mdApiPlugin(opts: Required<MarkdownOptions>): Plugin {
       // The 8.2 job bodies and the interval poller, built once in shared code so both
       // hosts are identical (R-7.6). With no `collaboration` block this constructs no
       // adapter at all and yields no bodies, so 7.2's honest stubs stay in place (R-9.19).
-      const collabWiring = createCollabWiring({
+      const collabWiring = createRebindableCollabWiring({
         config: () => collabConfig,
         documents: () => fsCollaborationStore(specsRoot),
         jobs: collabJobs,

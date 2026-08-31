@@ -33,7 +33,7 @@ import type { CollaborationStore } from '../../collaboration/record-store';
 import { createRecoveryBodies, withOrphanCleanup, withPublishFailureStates } from '../../collaboration/failure-states';
 import { createGitHubAdapter } from '../../collaboration/github-adapter';
 import { type GhExecutor, defaultExecGh } from '../../collaboration/github-executor';
-import type { JobHubRegistry } from '../../collaboration/job-hub';
+import type { JobBody, JobHubRegistry } from '../../collaboration/job-hub';
 import {
   type IntervalScheduler,
   type SyncResult,
@@ -74,6 +74,15 @@ export type CollabWiring = {
   stopAllPolling(): void;
   /** Documents currently being polled, sorted. Empty when collaboration is off. */
   pollingDocumentIds(): string[];
+  /**
+   * Poll `documentId` as though a watcher had just attached. Idempotent.
+   *
+   * Normally nothing calls this — R-8.6 keys polling on watcher count and
+   * `onWatchersChanged` is the only trigger. `rebind` needs it because that listener fires
+   * on *changes*: a document already being watched when the directory changes produces no
+   * change, so a rebuilt wiring would never learn to poll it. See `rebind`.
+   */
+  startPolling(documentId: string): void;
 };
 
 const NOT_CONFIGURED: CollabWiring = {
@@ -85,7 +94,103 @@ const NOT_CONFIGURED: CollabWiring = {
   authorize: (op) => ({ ok: false, status: 403, error: `${op} is unavailable: collaboration is not configured.` }),
   stopAllPolling() {},
   pollingDocumentIds: () => [],
+  startPolling() {},
 };
+
+/**
+ * R-10.1, the half `setRoot` could not reach — a wiring that survives a re-root.
+ *
+ * WHY A FACADE AND NOT A REBUILT ROUTER. `createCollabRoutes` reads `bodies` and
+ * `authorize` once at construction (`collab.ts:976-977`), so handing it a fresh
+ * `CollabWiring` after a re-root changes nothing: the router is still holding the
+ * startup one. Rebuilding the router instead would discard the job hubs, the attached
+ * SSE subscribers and the root epoch, which are the things R-10.6 exists to keep. So the
+ * router keeps one stable `bodies`/`authorize` pair for the life of the process, and
+ * those delegate to whichever wiring is current at the moment they are called.
+ *
+ * WHAT THE REBUILD ACTUALLY FIXES. `createCollabWiring` reads `config()` once, which was
+ * correct when nothing could re-root. Two things were latched by it:
+ *
+ *   1. the `NOT_CONFIGURED` early return — a server started outside a GitHub repository
+ *      stayed uncollaborative for the rest of its life, even after being re-rooted into
+ *      one. The availability route said otherwise, because it re-derives per request, so
+ *      the browser reported an authenticated session for a repository whose every
+ *      operation then failed;
+ *   2. `createLifecycle({ repo })`, which binds the repository into the poller. Its
+ *      syncs went on naming the startup repository while the routes served another.
+ *
+ * `stopAllPolling()` before the rebuild is not tidiness: the old lifecycle's timers hold
+ * the old repository, and `onWatchersChanged` is a single-slot listener (`job-hub.ts:533`)
+ * that the new wiring takes over — so without the stop, the previous pollers would keep
+ * firing against the previous repository with nothing left to cancel them.
+ *
+ * R-9.19 SURVIVES. A rebind onto a directory with no GitHub origin builds
+ * `NOT_CONFIGURED` again, and the delegating bodies below fail closed rather than
+ * reaching an adapter. Nothing here calls GitHub; the availability gate still answers
+ * 503 ahead of every body.
+ */
+export type RebindableCollabWiring = CollabWiring & {
+  /** Re-read `config()` and rebuild. Call from each host's `setRoot`. */
+  rebind(): void;
+};
+
+/**
+ * The body a delegating slot runs when the current wiring has none — an unconfigured
+ * directory. Unreachable while the availability gate holds, and it fails closed for the
+ * same reason `NOT_CONFIGURED.authorize` denies rather than trusting check order.
+ */
+const unconfiguredBody = (op: string): JobBody => async () => {
+  throw new Error(`collab ${op} is unavailable: collaboration is not configured for this directory.`);
+};
+
+export function createRebindableCollabWiring(options: CollabWiringOptions): RebindableCollabWiring {
+  let current = createCollabWiring(options);
+
+  /*
+   * `never` for the input, and a cast on the way out. Each member of `CollabJobBodies`
+   * takes a different input type, so an unresolved `K` makes `Parameters<…>[0]` an
+   * INTERSECTION of all five — a type no real caller can satisfy. The delegate never
+   * inspects the input, it only forwards it, so `never` is the honest annotation for a
+   * parameter this function has no opinion about; the cast restores the per-key signature
+   * the router actually calls through.
+   */
+  const slot = <K extends keyof CollabJobBodies>(key: K): CollabJobBodies[K] =>
+    ((input: never) => {
+      const body = current.bodies[key];
+      return body ? body(input) : unconfiguredBody(key);
+    }) as CollabJobBodies[K];
+
+  return {
+    // Every key is present, so the router's `STUB_BODIES` merge never supplies a
+    // "not implemented" body for an operation this build does support.
+    bodies: {
+      create: slot('create'),
+      open: slot('open'),
+      sync: slot('sync'),
+      publish: slot('publish'),
+      reconcile: slot('reconcile'),
+      markReady: slot('markReady'),
+    },
+    authorize: (...args: Parameters<CollabAuthorizer>) => current.authorize(...args),
+    rebind() {
+      /*
+       * The documents being polled are carried across, because `rerooted()` does not drop
+       * SSE subscribers (`collab.ts:2479-2483`) and `onWatchersChanged` only fires on a
+       * CHANGE. A document watched throughout the re-root produces no change, so without
+       * this the rebuilt wiring would never learn to poll it and a browser that stayed
+       * attached would go quiet for the rest of the session — trading a poller on the
+       * wrong repository for no poller at all.
+       */
+      const watched = current.pollingDocumentIds();
+      current.stopAllPolling();
+      current = createCollabWiring(options);
+      for (const documentId of watched) current.startPolling(documentId);
+    },
+    stopAllPolling: () => current.stopAllPolling(),
+    pollingDocumentIds: () => current.pollingDocumentIds(),
+    startPolling: (documentId) => current.startPolling(documentId),
+  };
+}
 
 export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
   const repo = options.config().collaboration;
@@ -188,5 +293,6 @@ export function createCollabWiring(options: CollabWiringOptions): CollabWiring {
     }),
     stopAllPolling: () => lifecycle.stopAllPolling(),
     pollingDocumentIds: () => lifecycle.pollingDocumentIds(),
+    startPolling: (documentId) => lifecycle.startPolling(documentId),
   };
 }
